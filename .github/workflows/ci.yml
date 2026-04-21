@@ -71,6 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -109,6 +112,15 @@ jobs:
       - name: Run split/fracture tests
         working-directory: blast/js_stress_example
         run: npm run test:split || true  # organicSplit.spec.ts has a known stale expectation
+
+      - name: Run blast-stress-solver-rs Rapier invariants
+        working-directory: blast/blast-stress-solver-rs
+        run: cargo test --features "rapier scenarios" --test rapier_correctness_invariants_test -- --nocapture
+        continue-on-error: true  # includes known active failing regression for default split recentering teleport behavior
+
+      - name: Run blast-stress-solver-rs Rapier integration suite
+        working-directory: blast/blast-stress-solver-rs
+        run: cargo test --features "rapier scenarios" --test rapier_integration_test -- --nocapture
 
   wasm-smoke:
     # Regression tests that build a cdylib consumer for
