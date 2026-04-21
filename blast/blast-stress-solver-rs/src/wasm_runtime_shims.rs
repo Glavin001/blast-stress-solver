@@ -111,6 +111,111 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
 }
 
 // -----------------------------------------------------------------------------
+// C++ new/delete + libc++ fallback symbols
+// -----------------------------------------------------------------------------
+
+#[unsafe(export_name = "_Znwm")]
+pub unsafe extern "C" fn cpp_operator_new(size: usize) -> *mut c_void {
+    malloc(size)
+}
+
+#[unsafe(export_name = "_ZnwmSt11align_val_t")]
+pub unsafe extern "C" fn cpp_operator_new_aligned(size: usize, align: usize) -> *mut c_void {
+    aligned_alloc(align, size)
+}
+
+#[unsafe(export_name = "_ZnwmRKSt9nothrow_t")]
+pub unsafe extern "C" fn cpp_operator_new_nothrow(
+    size: usize,
+    _nothrow_tag: *const c_void,
+) -> *mut c_void {
+    malloc(size)
+}
+
+#[unsafe(export_name = "_ZdlPvm")]
+pub unsafe extern "C" fn cpp_operator_delete_sized(ptr: *mut c_void, _size: usize) {
+    free(ptr);
+}
+
+#[unsafe(export_name = "_ZdlPvmSt11align_val_t")]
+pub unsafe extern "C" fn cpp_operator_delete_sized_aligned(
+    ptr: *mut c_void,
+    _size: usize,
+    _align: usize,
+) {
+    free(ptr);
+}
+
+#[unsafe(export_name = "_ZNSt3__222__libcpp_verbose_abortEPKcz")]
+pub unsafe extern "C" fn libcxx_verbose_abort(_fmt: *const c_char, _unused: *const c_void) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+#[unsafe(export_name = "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEElsEi")]
+pub unsafe extern "C" fn libcxx_ostream_insert_int(
+    _stream: *mut c_void,
+    _value: c_int,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+#[unsafe(export_name = "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev")]
+pub unsafe extern "C" fn libcxx_basic_string_drop(_this: *mut c_void) {}
+
+#[unsafe(export_name = "_ZNKSt3__215basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv")]
+pub unsafe extern "C" fn libcxx_basic_stringbuf_str(_ret: *mut c_void, _this: *const c_void) {
+    core::ptr::write_bytes(_ret, 0, 24);
+}
+
+#[unsafe(export_name = "_ZNSt3__29basic_iosIcNS_11char_traitsIcEEED2Ev")]
+pub unsafe extern "C" fn libcxx_basic_ios_drop(_this: *mut c_void) {}
+
+#[unsafe(export_name = "_ZNSt3__215basic_streambufIcNS_11char_traitsIcEEEC2Ev")]
+pub unsafe extern "C" fn libcxx_basic_streambuf_ctor(_this: *mut c_void) {}
+
+#[unsafe(export_name = "_ZNSt3__28ios_base4initEPv")]
+pub unsafe extern "C" fn libcxx_ios_base_init(_this: *mut c_void, _sb: *mut c_void) {}
+
+#[unsafe(export_name = "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_")]
+pub unsafe extern "C" fn libcxx_ostream_sentry_ctor(_this: *mut c_void, _os: *mut c_void) {}
+
+#[unsafe(export_name = "_ZNSt3__213basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev")]
+pub unsafe extern "C" fn libcxx_ostream_sentry_dtor(_this: *mut c_void) {}
+
+#[unsafe(export_name = "_ZNSt3__212basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc")]
+pub unsafe extern "C" fn libcxx_basic_string_init(_this: *mut c_void, _n: usize, _ch: c_char) {}
+
+#[unsafe(export_name = "_ZNKSt3__28ios_base6getlocEv")]
+pub unsafe extern "C" fn libcxx_ios_base_getloc(_ret: *mut c_void, _this: *const c_void) {
+    core::ptr::write_bytes(_ret, 0, 8);
+}
+
+#[unsafe(export_name = "_ZNSt3__26localeD1Ev")]
+pub unsafe extern "C" fn libcxx_locale_drop(_this: *mut c_void) {}
+
+#[unsafe(export_name = "_ZNKSt3__26locale9use_facetERNS0_2idE")]
+pub unsafe extern "C" fn libcxx_locale_use_facet(
+    _this: *const c_void,
+    _id: *mut c_void,
+) -> *const c_void {
+    core::ptr::null()
+}
+
+#[unsafe(export_name = "_ZNSt3__28ios_base5clearEj")]
+pub unsafe extern "C" fn libcxx_ios_base_clear(_this: *mut c_void, _state: u32) {}
+
+#[unsafe(export_name = "_ZNSt3__214basic_iostreamIcNS_11char_traitsIcEEED2Ev")]
+pub unsafe extern "C" fn libcxx_basic_iostream_drop(_this: *mut c_void) {}
+
+#[unsafe(export_name = "_ZNSt3__215basic_streambufIcNS_11char_traitsIcEEED2Ev")]
+pub unsafe extern "C" fn libcxx_basic_streambuf_drop(_this: *mut c_void) {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __cxa_pure_virtual() -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+// -----------------------------------------------------------------------------
 // Fatal exit
 // -----------------------------------------------------------------------------
 

@@ -103,7 +103,7 @@ fn main() {
         }
     }
 
-    if native_source_build_supported(&target) {
+    if source_build_supported(&target) {
         let bundled_native_root = manifest_dir.join(BUNDLED_NATIVE_ROOT);
         emit_rerun_if_changed(&bundled_native_root);
         if bundled_native_root.exists() {
@@ -120,9 +120,9 @@ fn main() {
 
     let supported = supported_targets(manifest_dir.join("artifacts"));
     let native_help = if find_monorepo_blast_root(&manifest_dir).is_some() {
-        " Native Apple/Linux builds from the monorepo checkout are supported; wasm still requires packaged artifacts."
+        " Native Apple/Linux builds and wasm32-unknown-unknown builds from the monorepo checkout are supported when an appropriate C++ toolchain is installed."
     } else if manifest_dir.join(BUNDLED_NATIVE_ROOT).exists() {
-        " Bundled source fallback is available for Apple/Linux native targets with a C++17 toolchain."
+        " Bundled source fallback is available for Apple/Linux native targets and wasm32-unknown-unknown with an appropriate C++17 toolchain."
     } else {
         ""
     };
@@ -147,14 +147,19 @@ fn env_truthy(name: &str) -> bool {
     )
 }
 
-fn native_source_build_supported(target: &str) -> bool {
-    !target.contains("wasm32") && (target.contains("apple") || target.contains("linux"))
+fn source_build_supported(target: &str) -> bool {
+    // `wasm32-unknown-unknown` can be built from source when a
+    // wasm-capable C++ toolchain is installed (e.g.
+    // `libc++-*-dev-wasm32` on Debian/Ubuntu).
+    target == "wasm32-unknown-unknown"
+        || ((target.contains("apple") || target.contains("linux")) && !target.contains("wasm32"))
 }
 
 fn build_backend_sources(blast_root: &Path, authoring_enabled: bool) {
     let mut build = cc::Build::new();
     build.cpp(true);
     build.std("c++17");
+    configure_wasm_cpp_toolchain(&mut build);
 
     for rel in BRIDGE_SOURCES.iter().chain(BLAST_SOURCES.iter()) {
         build.file(blast_root.join(rel));
@@ -190,6 +195,33 @@ fn build_backend_sources(blast_root: &Path, authoring_enabled: bool) {
     build.flag_if_supported("-Wno-unused-variable");
     build.flag_if_supported("-Wno-deprecated-declarations");
     build.compile(LIB_BASENAME);
+}
+
+fn configure_wasm_cpp_toolchain(build: &mut cc::Build) {
+    let Ok(target) = env::var("TARGET") else {
+        return;
+    };
+    if target != "wasm32-unknown-unknown" {
+        return;
+    }
+
+    build.define("__wasi__", None);
+    build.cpp_link_stdlib(None);
+
+    // Ubuntu runners expose the wasi-libc + libc++ headers in these
+    // locations (installed by `wasi-libc` + `libc++-*-dev-wasm32`).
+    // Without these include roots, clang++ fails on `<new>`.
+    for include in [
+        PathBuf::from("/usr/include/wasm32-wasi/c++/v1"),
+        PathBuf::from("/usr/include/wasm32-wasi"),
+        PathBuf::from("/usr/lib/llvm-18/include/wasm32-wasi/c++/v1"),
+        PathBuf::from("/usr/lib/llvm-19/include/wasm32-wasi/c++/v1"),
+        PathBuf::from("/usr/lib/llvm-20/include/wasm32-wasi/c++/v1"),
+    ] {
+        if include.exists() {
+            build.include(include);
+        }
+    }
 }
 
 fn find_monorepo_blast_root(manifest_dir: &Path) -> Option<PathBuf> {
