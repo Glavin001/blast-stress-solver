@@ -111,6 +111,9 @@ jobs:
           src/tests/rapier.headless-scenarios.test.ts
           src/tests/solver-mechanisms.test.ts
           src/tests/stress.gravity.test.ts
+          src/tests/bondStress.parity.test.ts
+          src/tests/stressLimits.boundary.test.ts
+          src/tests/damage.invariants.test.ts
 
       # NON-BLOCKING soak: the remaining integration/perf assertions are
       # environment-sensitive. Reported but not gating until stabilized (gap #4).

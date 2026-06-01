@@ -176,6 +176,18 @@ Blast computes this with `getExcessForces`.
     `blast-stress-solver` (not `--ignore-scripts`) and the js_stress_example WASM, or link the
     package, so the specs resolve, then promote back to blocking.
 
+### Recently added unit/property coverage (all passing, blocking)
+
+- **Bond stress** (`bond_stress_test.rs` + `bondStress.parity.test.ts`): hand-computed
+  known values that double as a JS↔Rust parity lock, plus the previously-untested angular
+  twist/bend paths and non-negativity properties.
+- **Fracture policy** (`fracture_policy_test.rs`): per-frame budget and child-admission
+  boundary cases (`>=` vs `>`, "0 = unlimited?").
+- **Fatal threshold** (`stressLimits.boundary.test.ts`): `failureMode`'s strict-`>` boundary
+  (at-limit must not fail) and channel priority.
+- **Damage system** (`damage.invariants.test.ts`): health monotonic non-increasing, no
+  healing, destruction irreversible, support chunks never destroyed, preview non-mutating.
+
 > Notes from bug-hunting: JS and Rust `computeBondStress` are byte-identical (verified); the
 > shipped wall/tower/bridge builders are structurally clean (unit normals, no out-of-range
 > bonds); wall-collapse determinism holds across runs. The gap #1 split COM bug only manifests
