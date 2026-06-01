@@ -60,6 +60,9 @@ export function buildScenarioFromFragments(
   const fragmentSizes: Vec3[] = [];
   const fragmentGeometries: THREE.BufferGeometry[] = [];
   const colliderDescForNode: (ColliderDescBuilder | null)[] = [];
+  // Indices of density-less, non-support nodes whose mass is set by the
+  // uniform totalMass / totalVolume scaling pass below.
+  const scaledNodeIndices: number[] = [];
   let totalVolume = 0;
 
   for (let i = 0; i < fragments.length; i++) {
@@ -70,8 +73,17 @@ export function buildScenarioFromFragments(
       z: f.halfExtents.z * 2,
     };
     const volume = size.x * size.y * size.z;
-    const mass = f.isSupport ? 0 : volume; // scaled below
-    if (!f.isSupport) totalVolume += volume;
+    let mass: number;
+    if (f.isSupport) {
+      mass = 0;
+    } else if (typeof f.density === 'number' && Number.isFinite(f.density)) {
+      // Absolute, physically-grounded mass; not affected by the totalMass budget.
+      mass = volume * f.density;
+    } else {
+      mass = volume; // placeholder, rescaled by totalMass below
+      totalVolume += volume;
+      scaledNodeIndices.push(i);
+    }
 
     nodes.push({ centroid: { ...f.worldPosition }, mass, volume });
     fragmentSizes.push(size);
@@ -100,10 +112,11 @@ export function buildScenarioFromFragments(
     }
   }
 
-  // Scale masses
+  // Scale masses (only for density-less, non-support nodes; density-driven
+  // nodes already carry their absolute volume*density mass).
   const scale = totalVolume > 0 ? totalMass / totalVolume : 0;
-  for (const n of nodes) {
-    if (n.mass === 0) continue;
+  for (const i of scaledNodeIndices) {
+    const n = nodes[i];
     n.mass = n.volume > 0 ? n.volume * scale : 0;
   }
 

@@ -316,25 +316,102 @@ export function getBondStrengthMultiplier(
   return 1.0;
 }
 
+/** A function mapping a pair of fragment types to a bond-area (strength) multiplier. */
+export type BondStrengthMultiplierFn = (
+  type0: FragmentType | undefined,
+  type1: FragmentType | undefined,
+) => number;
+
 /**
  * Apply type-based bond strength multipliers by scaling bond areas.
  *
  * Larger area → lower stress → harder to break, so multiplying the area
  * of column-column bonds by 4x makes them 4x stronger than wall-wall bonds.
+ * Multipliers below 1.0 are also honored (e.g. weak frame↔infill joints so
+ * non-structural panels detach locally instead of propagating a shatter).
  *
- * @param bonds - The bond array to modify (mutated in place and returned)
+ * @param bonds - The bond array (returned as a new array; inputs untouched)
  * @param fragmentTypes - Per-node fragment type array (indexed by node index)
+ * @param multiplierFn - Optional custom table. Defaults to getBondStrengthMultiplier
+ *   so existing callers (e.g. the fractured tower) keep their behavior unchanged.
  */
 export function applyBondStrengthMultipliers(
   bonds: ScenarioBond[],
   fragmentTypes: (FragmentType | undefined)[],
+  multiplierFn: BondStrengthMultiplierFn = getBondStrengthMultiplier,
 ): ScenarioBond[] {
   return bonds.map((bond) => {
-    const multiplier = getBondStrengthMultiplier(
+    const multiplier = multiplierFn(
       fragmentTypes[bond.node0],
       fragmentTypes[bond.node1],
     );
     if (multiplier === 1.0) return bond;
     return { ...bond, area: bond.area * multiplier };
   });
+}
+
+// ── Grid box subdivision ──────────────────────────────────────────────────
+
+export type SubdivideBoxOptions = {
+  /** World-space center of the whole box. */
+  center: Vec3;
+  /** Full box size (x, y, z) in meters. */
+  size: Vec3;
+  /** Number of grid cells along each axis (each >= 1). */
+  divisions: { x: number; y: number; z: number };
+  /** Structural role applied to every produced chunk. */
+  fragmentType: FragmentType;
+  /** Material density (kg/m^3). When set, drives realistic per-chunk mass. */
+  density?: number;
+  /** Mark chunks as static supports (mass 0). Default: false. */
+  isSupport?: boolean;
+};
+
+/**
+ * Subdivide an axis-aligned box into a regular grid of smaller box chunks.
+ *
+ * This is a deterministic, dependency-free alternative to Voronoi fracture
+ * (three-pinata): it "fractures" a surface/volume into a controllable number of
+ * box fragments. Coarse divisions (few large chunks) model a stiff skeleton
+ * member; fine divisions (many small chunks) model frangible infill. Each chunk
+ * carries a centered THREE.BoxGeometry (a cheap, small mesh) so the resulting
+ * scene-pack nodeMeshes stay tiny.
+ *
+ * Chunks are placed flush (shared faces), so proximity bond detection
+ * (computeBondsFromFragments) connects neighbors with a contact area equal to
+ * the shared face — yielding material-meaningful areas under areaNormalization:'none'.
+ */
+export function subdivideBoxFragments(options: SubdivideBoxOptions): FragmentInfo[] {
+  const { center, size, divisions, fragmentType, density, isSupport = false } = options;
+  const nx = Math.max(1, Math.round(divisions.x));
+  const ny = Math.max(1, Math.round(divisions.y));
+  const nz = Math.max(1, Math.round(divisions.z));
+  const cell = { x: size.x / nx, y: size.y / ny, z: size.z / nz };
+  const origin = {
+    x: center.x - size.x * 0.5,
+    y: center.y - size.y * 0.5,
+    z: center.z - size.z * 0.5,
+  };
+
+  const fragments: FragmentInfo[] = [];
+  for (let ix = 0; ix < nx; ix++) {
+    for (let iy = 0; iy < ny; iy++) {
+      for (let iz = 0; iz < nz; iz++) {
+        const worldPosition: Vec3 = {
+          x: origin.x + cell.x * (ix + 0.5),
+          y: origin.y + cell.y * (iy + 0.5),
+          z: origin.z + cell.z * (iz + 0.5),
+        };
+        fragments.push({
+          worldPosition,
+          halfExtents: { x: cell.x * 0.5, y: cell.y * 0.5, z: cell.z * 0.5 },
+          geometry: new THREE.BoxGeometry(cell.x, cell.y, cell.z),
+          isSupport,
+          fragmentType,
+          density,
+        });
+      }
+    }
+  }
+  return fragments;
 }

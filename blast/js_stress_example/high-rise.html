@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>High-Rise Demolition — blast-stress-solver Demo</title>
+    <link rel="stylesheet" href="./styles/demo-common.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three/build/three.module.js",
+          "three/addons/": "/vendor/three/examples/jsm/",
+          "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs",
+          "blast-stress-solver": "/vendor/blast-stress-solver/index.js",
+          "blast-stress-solver/rapier": "/vendor/blast-stress-solver/rapier.js",
+          "blast-stress-solver/three": "/vendor/blast-stress-solver/three.js",
+          "blast-stress-solver/scenarios": "/vendor/blast-stress-solver/scenarios.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="viewport">
+        <canvas id="demo-canvas"></canvas>
+        <div class="viewport-hint">Loading high-rise...</div>
+      </section>
+
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
+        <span class="icon-open">&#9776;</span>
+        <span class="icon-close">&#10005;</span>
+      </button>
+      <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+      <aside class="sidebar" id="sidebar">
+        <header>
+          <a href="./demo-index.html" class="back-link">&larr; All Demos</a>
+          <h1>&#127970; High-Rise Demolition</h1>
+          <p>
+            Mid-rise apartment: reinforced-concrete flat-slab skeleton + frangible drywall
+            infill. Loaded from the same shared scene-pack JSON the Rust demo uses. Click to
+            throw the wrecking ball — it punches local holes instead of shattering like glass.
+          </p>
+        </header>
+
+        <div class="control-actions">
+          <button id="btn-reset" class="button button-primary">&orarr; Rebuild</button>
+          <button id="btn-debug" class="button">&#9671; Show Debug</button>
+        </div>
+
+        <section class="status-panel">
+          <h2>Destruction</h2>
+          <div class="status-grid">
+            <div class="status-item"><span class="status-label">Rigid bodies</span><span class="status-value" id="stat-bodies">0</span></div>
+            <div class="status-item"><span class="status-label">Active bonds</span><span class="status-value" id="stat-bonds">0</span></div>
+            <div class="status-item"><span class="status-label">Bonds broken</span><span class="status-value" id="stat-bonds-broken">0</span></div>
+            <div class="status-item"><span class="status-label">COM height</span><span class="status-value" id="stat-com">&mdash;</span></div>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <script>
+      (function () {
+        var toggle = document.getElementById('sidebar-toggle');
+        var sidebar = document.getElementById('sidebar');
+        var backdrop = document.getElementById('sidebar-backdrop');
+        var layout = document.querySelector('.layout');
+        var mql = window.matchMedia('(max-width: 768px)');
+        function isMobile() { return mql.matches; }
+        function close() { toggle.classList.remove('active'); if (isMobile()) { sidebar.classList.remove('open'); backdrop.classList.remove('visible'); } else { layout.classList.add('sidebar-hidden'); } }
+        function open() { toggle.classList.add('active'); if (isMobile()) { sidebar.classList.add('open'); backdrop.classList.add('visible'); } else { layout.classList.remove('sidebar-hidden'); } }
+        function isOpen() { return isMobile() ? sidebar.classList.contains('open') : !layout.classList.contains('sidebar-hidden'); }
+        toggle.addEventListener('click', function () { if (isOpen()) close(); else open(); });
+        backdrop.addEventListener('click', close);
+        if (!isMobile()) toggle.classList.add('active');
+      })();
+    </script>
+    <script type="module" src="./dist/high-rise.js"></script>
+  </body>
+</html>

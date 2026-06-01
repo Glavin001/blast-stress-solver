@@ -5,4 +5,6 @@ export * from './rapier/splitMigrator';
 export * from './rapier/collisionGroups';
 export * from './rapier/contactBuffer';
 export * from './rapier/contactHelpers';
+export * from './rapier/scenePackLoader';
+export * from './rapier/metricsRecorder';
 export type * from './rapier/types';

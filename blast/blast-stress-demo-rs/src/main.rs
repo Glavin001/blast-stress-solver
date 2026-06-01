@@ -33,7 +33,10 @@ use blast_stress_solver::scenarios::{
 };
 use blast_stress_solver::{ScenarioCollider, ScenarioDesc, SolverSettings, Vec3 as SolverVec3};
 use rapier3d::prelude::*;
-use scene_pack::{load_embedded_scene_pack, EmbeddedSceneKey, LoadedScenePack, SceneMeshAsset};
+use scene_pack::{
+    load_embedded_scene_pack, load_scene_pack_file, EmbeddedSceneKey, LoadedScenePack,
+    SceneMeshAsset,
+};
 
 const GRAVITY: f32 = -9.81;
 const CONTACT_FORCE_SCALE: f32 = 30.0;
@@ -58,6 +61,7 @@ enum DemoScenarioKind {
     FracturedTower,
     FracturedBridge,
     BrickBuilding,
+    HighRise,
 }
 
 impl DemoScenarioKind {
@@ -70,6 +74,7 @@ impl DemoScenarioKind {
             Self::FracturedTower => "fractured-tower",
             Self::FracturedBridge => "fractured-bridge",
             Self::BrickBuilding => "brick-building",
+            Self::HighRise => "high-rise",
         }
     }
 }
@@ -85,6 +90,9 @@ struct DemoConfig {
     projectile_ttl: f32,
     gravity: f32,
     material_scale: f32,
+    /// Explicit decoupled stress limits (Pa) from the scene pack; overrides the
+    /// base-ratio * material_scale defaults when present.
+    stress_limits: Option<scene_pack::StressLimits>,
     skip_single_bodies: bool,
     camera_target: Vec3,
     camera_distance: f32,
@@ -2126,6 +2134,9 @@ fn selected_scenario_kind() -> DemoScenarioKind {
         Some("brick-building") | Some("brick_building") | Some("building") => {
             DemoScenarioKind::BrickBuilding
         }
+        Some("high-rise") | Some("high_rise") | Some("highrise") | Some("apartment") => {
+            DemoScenarioKind::HighRise
+        }
         _ => DemoScenarioKind::Wall,
     }
 }
@@ -2141,6 +2152,7 @@ fn build_wall_demo_config() -> DemoConfig {
         projectile_ttl: DEFAULT_PROJECTILE_TTL,
         gravity: GRAVITY,
         material_scale: 1.0e10,
+        stress_limits: None,
         skip_single_bodies: false,
         camera_target: Vec3::new(0.0, 1.5, 0.0),
         camera_distance: 14.0,
@@ -2177,6 +2189,7 @@ fn build_tower_demo_config() -> DemoConfig {
         projectile_ttl: DEFAULT_PROJECTILE_TTL,
         gravity: GRAVITY,
         material_scale: 1.0e10,
+        stress_limits: None,
         skip_single_bodies: false,
         camera_target: Vec3::new(0.0, 1.5, 0.0),
         camera_distance: 20.0,
@@ -2225,6 +2238,7 @@ fn build_bridge_demo_config() -> DemoConfig {
         projectile_ttl: DEFAULT_PROJECTILE_TTL,
         gravity: GRAVITY,
         material_scale: 1.0e10,
+        stress_limits: None,
         skip_single_bodies: false,
         camera_target: Vec3::new(0.0, 2.5, 0.0),
         camera_distance: 24.0,
@@ -2266,6 +2280,7 @@ fn apply_scene_pack(mut base: DemoConfig, pack: LoadedScenePack) -> DemoConfig {
     base.projectile_ttl = pack.projectile_ttl_secs;
     base.gravity = pack.gravity;
     base.material_scale = pack.material_scale;
+    base.stress_limits = pack.stress_limits;
     base.skip_single_bodies = pack.skip_single_bodies;
     base.camera_target = pack.camera_target;
     base.camera_distance = pack.camera_distance;
@@ -2310,12 +2325,27 @@ fn build_demo_config(kind: DemoScenarioKind) -> DemoConfig {
             load_embedded_scene_pack(EmbeddedSceneKey::BrickBuilding)
                 .expect("failed to load brick building scene pack"),
         ),
+        DemoScenarioKind::HighRise => apply_scene_pack(
+            build_tower_demo_config(),
+            // Generated, git-ignored pack loaded at runtime (not embedded).
+            load_scene_pack_file(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets/scenes/high-rise.json"),
+            )
+            .expect(
+                "failed to load high-rise scene pack — generate it with: \
+                 (cd ../blast-stress-solver && npm run build:ts && npm run generate:high-rise)",
+            ),
+        ),
     };
     apply_demo_runtime_defaults(config)
 }
 
 fn build_demo_physics(config: DemoConfig, toggles: &DemoRuntimeToggles) -> DemoPhysicsState {
-    let settings = scaled_solver_settings(config.material_scale);
+    let settings = match config.stress_limits {
+        Some(l) => solver_settings_from_limits(&l),
+        None => scaled_solver_settings(config.material_scale),
+    };
     let gravity = SolverVec3::new(0.0, config.gravity, 0.0);
     let mut destructible =
         DestructibleSet::from_scenario(&config.scenario, settings, gravity, config.policy)
@@ -2433,6 +2463,7 @@ fn build_headless_shot_plan(
         "tower_benchmark" => build_tower_benchmark_shots(config, bounds),
         "bridge_benchmark" => build_bridge_benchmark_shots(config, bounds),
         "building_benchmark" => build_building_benchmark_shots(config, bounds),
+        "high_rise_wrecking_ball" => build_high_rise_wrecking_ball_shots(config, bounds),
         "auto_smoke" => match kind {
             DemoScenarioKind::Wall | DemoScenarioKind::FracturedWall => {
                 build_wall_smoke_shots(config, bounds)
@@ -2444,6 +2475,7 @@ fn build_headless_shot_plan(
                 build_bridge_smoke_shots(config, bounds)
             }
             DemoScenarioKind::BrickBuilding => build_building_smoke_shots(config, bounds),
+            DemoScenarioKind::HighRise => build_high_rise_wrecking_ball_shots(config, bounds),
         },
         "auto_benchmark" => match kind {
             DemoScenarioKind::Wall | DemoScenarioKind::FracturedWall => {
@@ -2456,6 +2488,7 @@ fn build_headless_shot_plan(
                 build_bridge_benchmark_shots(config, bounds)
             }
             DemoScenarioKind::BrickBuilding => build_building_benchmark_shots(config, bounds),
+            DemoScenarioKind::HighRise => build_high_rise_wrecking_ball_shots(config, bounds),
         },
         _ => return None,
     };
@@ -2972,6 +3005,58 @@ fn build_building_benchmark_shots(
     ]
 }
 
+/// Scripted wrecking-ball shots for the mid-rise apartment. Heights are derived
+/// from the (tall) dynamic bounds so shots land on low, mid, and a column rather
+/// than the hardcoded low targets used for the 2-storey brick building.
+fn build_high_rise_wrecking_ball_shots(
+    config: &DemoConfig,
+    bounds: ScenarioBounds,
+) -> Vec<HeadlessShot> {
+    let size = bounds.dynamic.size();
+    let front_z = bounds.dynamic.min.z + 0.25;
+    let base_y = bounds.dynamic.min.y;
+    let low_y = base_y + size.y * 0.12;
+    let mid_y = base_y + size.y * 0.45;
+    let forward_distance = size.z.max(0.5) + 6.0;
+    let left_x = bounds.dynamic.min.x + size.x * 0.25;
+
+    vec![
+        // 1) Low-storey infill panel: should blow out a local hole.
+        make_headless_shot(
+            12,
+            "high-rise-low-infill",
+            nearest_dynamic_node_center(config, Vec3::new(0.0, low_y, front_z)),
+            Vec3::new(0.0, -0.02, 1.0),
+            forward_distance,
+            config.projectile_mass,
+            config.projectile_speed,
+            config.projectile_ttl,
+        ),
+        // 2) Mid-height infill panel.
+        make_headless_shot(
+            54,
+            "high-rise-mid-infill",
+            nearest_dynamic_node_center(config, Vec3::new(left_x, mid_y, front_z)),
+            Vec3::new(0.05, -0.03, 1.0),
+            forward_distance,
+            config.projectile_mass * 1.1,
+            config.projectile_speed * 1.05,
+            config.projectile_ttl,
+        ),
+        // 3) A low corner column: a heavy, fast strike to attack a support.
+        make_headless_shot(
+            96,
+            "high-rise-low-column",
+            nearest_dynamic_node_center(config, Vec3::new(left_x, low_y, front_z)),
+            Vec3::new(0.0, -0.02, 1.0),
+            forward_distance,
+            config.projectile_mass * 1.6,
+            config.projectile_speed * 1.2,
+            config.projectile_ttl,
+        ),
+    ]
+}
+
 fn initialize_rapier_only_bodies(
     scenario: &ScenarioDesc,
     bodies: &mut RigidBodySet,
@@ -3172,6 +3257,23 @@ fn scaled_solver_settings(material_scale: f32) -> SolverSettings {
         tension_fatal_limit: BASE_TENSION_FATAL * material_scale,
         shear_elastic_limit: BASE_SHEAR_ELASTIC * material_scale,
         shear_fatal_limit: BASE_SHEAR_FATAL * material_scale,
+    }
+}
+
+/// Build solver settings from explicit, decoupled stress limits (Pa) carried by a
+/// scene pack. Used by scenes (e.g. high-rise) that ship realistic concrete limits
+/// where tension/shear are much weaker than compression — the key to non-glass,
+/// ductile, localized failure.
+fn solver_settings_from_limits(l: &scene_pack::StressLimits) -> SolverSettings {
+    SolverSettings {
+        max_solver_iterations_per_frame: 24,
+        graph_reduction_level: 0,
+        compression_elastic_limit: l.compression_elastic,
+        compression_fatal_limit: l.compression_fatal,
+        tension_elastic_limit: l.tension_elastic,
+        tension_fatal_limit: l.tension_fatal,
+        shear_elastic_limit: l.shear_elastic,
+        shear_fatal_limit: l.shear_fatal,
     }
 }
 

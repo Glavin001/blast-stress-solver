@@ -52,13 +52,16 @@
     "build": "npm run build:ts && node ./scripts/copy-dist.js",
     "prepare": "npm run build",
     "test": "npm run build && vitest run",
-    "test:invariants": "vitest run src/tests/kernels.proptest.test.ts src/tests/rapier.invariants.test.ts src/tests/rapier.resim-continuity.test.ts src/tests/rapier.splitMigrator.test.ts src/tests/rapier.headless-scenarios.test.ts src/tests/solver-mechanisms.test.ts src/tests/stress.gravity.test.ts src/tests/bondStress.parity.test.ts src/tests/stressLimits.boundary.test.ts src/tests/damage.invariants.test.ts",
+    "test:invariants": "vitest run src/tests/kernels.proptest.test.ts src/tests/highRise.scenario.test.ts src/tests/rapier.invariants.test.ts src/tests/rapier.resim-continuity.test.ts src/tests/rapier.splitMigrator.test.ts src/tests/rapier.headless-scenarios.test.ts src/tests/solver-mechanisms.test.ts src/tests/stress.gravity.test.ts src/tests/bondStress.parity.test.ts src/tests/stressLimits.boundary.test.ts src/tests/damage.invariants.test.ts",
     "test:soak": "vitest run",
     "build:ts": "tsup --config tsup.config.ts",
+    "postbuild:ts": "npm run generate:high-rise",
+    "generate:high-rise": "node ./scripts/export-high-rise.mjs",
     "generate:brick-building-pack": "node ./scripts/generate-brick-building-scene-pack.mjs",
     "bench": "node scripts/bench.mjs",
     "bench:small": "node scripts/bench.mjs --small",
-    "bench:large": "node scripts/bench.mjs --large"
+    "bench:large": "node scripts/bench.mjs --large",
+    "sweep:high-rise": "node scripts/sweep-high-rise.mjs"
   },
   "devDependencies": {
     "@dgreenheck/three-pinata": "^2.0.1",

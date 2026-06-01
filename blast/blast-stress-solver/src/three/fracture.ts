@@ -10,8 +10,22 @@ import type { ScenarioBond, Vec3 } from '../rapier/types';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-/** Fragment structural role, used for bond strength multipliers in multi-component scenarios. */
-export type FragmentType = 'column' | 'floor' | 'wall' | 'foundation';
+/**
+ * Fragment structural role, used for bond strength multipliers in multi-component scenarios.
+ *
+ * Two families exist:
+ * - Skeleton: 'column', 'beam', 'slab' (and legacy 'floor') — the load-bearing RC frame.
+ * - Infill / non-structural: 'wall', 'infill' — frangible panels hung on the frame.
+ * - 'foundation' — static (mass 0) ground anchors.
+ */
+export type FragmentType =
+  | 'column'
+  | 'beam'
+  | 'slab'
+  | 'floor'
+  | 'wall'
+  | 'infill'
+  | 'foundation';
 
 export type FragmentInfo = {
   worldPosition: Vec3;
@@ -20,6 +34,13 @@ export type FragmentInfo = {
   isSupport: boolean;
   /** Optional structural type for bond strength scaling (column > floor > wall). */
   fragmentType?: FragmentType;
+  /**
+   * Optional material density in kg/m^3. When set, the node mass is computed as
+   * `volume * density` (absolute), letting heterogeneous materials (heavy concrete
+   * slabs vs. light drywall) coexist. Fragments without a density fall back to the
+   * uniform `totalMass / totalVolume` scaling in buildScenarioFromFragments().
+   */
+  density?: number;
 };
 
 export type BondDetectionOptions = {
