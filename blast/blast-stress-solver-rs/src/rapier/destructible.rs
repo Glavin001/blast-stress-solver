@@ -104,6 +104,9 @@ pub struct DestructibleSet {
     forces_applied: bool,
     /// Number of frames since the last fracture (for idle skip).
     frames_since_fracture: u32,
+    /// Physics timestep used to convert solver-reported excess *forces* into one-shot
+    /// impulses on newly separated fragments. Defaults to 1/60; set via `set_time_step`.
+    time_step: f32,
 }
 
 impl DestructibleSet {
@@ -158,7 +161,14 @@ impl DestructibleSet {
             pending_split_events: VecDeque::new(),
             forces_applied: false,
             frames_since_fracture: u32::MAX,
+            time_step: 1.0 / 60.0,
         })
+    }
+
+    /// Set the physics timestep (seconds) used to convert solver excess forces into one-shot
+    /// fracture impulses. Match this to your `IntegrationParameters::dt` for accuracy.
+    pub fn set_time_step(&mut self, dt: f32) {
+        self.time_step = dt.max(0.0);
     }
 
     /// Create a destructible set from a scenario description.
@@ -299,8 +309,9 @@ impl DestructibleSet {
             return result;
         }
 
-        // 1. Apply gravity
-        self.solver.add_gravity(self.gravity);
+        // 1. Apply gravity in each actor's CURRENT local frame, so a chunk that has rotated
+        //    feels gravity from the correct direction (gap #7). Mirrors the JS pipeline.
+        self.apply_oriented_gravity(bodies);
         self.forces_applied = false;
 
         // 2. Update solver
@@ -672,6 +683,29 @@ impl DestructibleSet {
         result
     }
 
+    /// Feed gravity to the solver per actor, rotated into each actor's current local frame
+    /// (`R⁻¹·g`). The solver works in the authored frame, so this is how an actor's current
+    /// orientation affects its gravity-induced stress (a tilted beam bends; an upright one
+    /// only compresses). Actors with no body fall back to world-space gravity. See gap #7.
+    fn apply_oriented_gravity(&mut self, bodies: &RigidBodySet) {
+        let g = self.gravity;
+        let world_g = vector![g.x, g.y, g.z];
+        let actors = self.solver.actors();
+        for actor in &actors {
+            let local = actor
+                .nodes
+                .first()
+                .and_then(|&n| self.tracker.node_body(n))
+                .and_then(|h| bodies.get(h))
+                .map(|body| {
+                    let l = body.rotation().inverse_transform_vector(&world_g);
+                    Vec3::new(l.x, l.y, l.z)
+                })
+                .unwrap_or(g);
+            self.solver.add_actor_gravity(actor.actor_index, local);
+        }
+    }
+
     fn apply_excess_forces(&self, bodies: &mut RigidBodySet) {
         let actors = self.solver.actors();
         for actor in &actors {
@@ -695,8 +729,13 @@ impl DestructibleSet {
                 let torque_mag = torque.magnitude_squared();
                 if force_mag > 1.0e-6 || torque_mag > 1.0e-6 {
                     if let Some(body_mut) = bodies.get_mut(body_handle) {
-                        body_mut.add_force(vector![force.x, force.y, force.z], true);
-                        body_mut.add_torque(vector![torque.x, torque.y, torque.z], true);
+                        // Apply the released load as a ONE-SHOT impulse (force x dt), not a
+                        // persistent `add_force` — the latter keeps re-accelerating the
+                        // fragment every step unless the caller resets forces (gap #9).
+                        let dt = self.time_step;
+                        body_mut.apply_impulse(vector![force.x, force.y, force.z] * dt, true);
+                        body_mut
+                            .apply_torque_impulse(vector![torque.x, torque.y, torque.z] * dt, true);
                     }
                 }
             }

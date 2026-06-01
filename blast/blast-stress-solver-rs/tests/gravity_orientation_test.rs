@@ -89,16 +89,12 @@ fn gravity_direction_changes_fracture_behavior() {
     );
 }
 
-/// REPRO — currently FAILS (gap #7). Keep gravity world-`-Y`, but rotate the beam's body a
-/// quarter turn about Z so the beam physically points +Y. In the body's local frame the
-/// load is now axial (compression), so an orientation-aware solver fractures it far less —
-/// like the axial case above. Rust ignores the body's rotation and fractures it exactly as
-/// the un-rotated bending case.
+/// REGRESSION GUARD (gap #7, fixed). Keep gravity world-`-Y`, but rotate the beam's body a
+/// quarter turn about Z so the beam physically points +Y. In the body's local frame the load
+/// is now axial (compression), so the solver — now fed per-actor rotated gravity — fractures
+/// it far less than the un-rotated bending case. (Before the fix, rotation was ignored and
+/// both fractured identically.)
 #[test]
-#[ignore = "gap #7 (blast/TESTING.md): Rust applies global gravity on authored geometry and \
-ignores each actor's current rotation (no per-actor rotated add_actor_gravity, no position \
-sync). A chunk rotated into a different orientation does not feel the correct gravity stress. \
-JS handles this. Remove #[ignore] once Rust applies per-actor rotated gravity."]
 fn actor_rotation_changes_fracture_behavior() {
     let bending = run(Vec3::new(0.0, -30.0, 0.0), None);
     // +90° about Z maps the local +X beam axis onto world +Y, so world -Y gravity becomes

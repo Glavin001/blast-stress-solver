@@ -111,14 +111,10 @@ fn excess_force_kick_is_bounded_when_forces_are_reset() {
     );
 }
 
-/// REPRO — currently FAILS (gap #9). Without resetting forces, the one-time fracture keeps
-/// accelerating the fragment every step (persistent `add_force` instead of an impulse), so
-/// `late` is many times `early`.
+/// REGRESSION GUARD (gap #9, fixed). The fracture kick is a one-shot impulse, so even
+/// without a per-step force reset the fragment speed is stable after fracturing — it does NOT
+/// keep accelerating. (Before the fix this grew unbounded, ~22 -> ~1900 m/s.)
 #[test]
-#[ignore = "gap #9 (blast/TESTING.md): the fracture excess force is applied via Rapier \
-add_force (persistent) rather than apply_impulse, so without a per-step force reset a single \
-fracture re-accelerates fragments unbounded (e.g. ~22 -> ~1900 m/s over a few frames). Remove \
-this #[ignore] once the pipeline applies the excess as a one-shot impulse."]
 fn excess_force_kick_should_be_one_shot() {
     let (early, late) = early_vs_late_speed(false);
     assert!(early > 1.0, "the impact should have thrown fragments (early={early:.2})");

@@ -216,20 +216,12 @@ fn split_preserves_point_velocity_for_aligned_com_child() {
     );
 }
 
-/// The bug repro. Identical to the positive control except node 1 carries a
-/// convex-hull collider whose volume centre of mass is offset from the node
-/// centroid. Because the split path fits the child's motion about its own
-/// node-centroid model instead of Rapier's actual centre of mass, the rotating
-/// parent injects `~|ω × offset|` of spurious velocity into the fragment.
-///
-/// Currently FAILS (that is the detection working). Marked `#[ignore]` so it runs in
-/// the non-blocking "known-bug repro" CI lane; remove `#[ignore]` once the split path
-/// is fixed and it becomes a blocking regression guard. See blast/TESTING.md gap #1.
+/// REGRESSION GUARD (gap #1, fixed). Identical to the positive control except node 1 carries
+/// a convex-hull collider whose volume centre of mass is offset from the node centroid. The
+/// split path now reconciles each child's velocity with Rapier's ACTUAL centre of mass, so a
+/// rotating parent no longer injects `~|ω × offset|` of spurious velocity — the fragment stays
+/// point-velocity continuous. (Before the fix this drifted ~2.1 m/s.)
 #[test]
-#[ignore = "repro of split COM/velocity bug (blast/TESTING.md gap #1): the Rust split path \
-fits child velocity about its node-centroid model instead of Rapier's collider centre of mass, \
-so a rotating parent with an offset-COM (convex-hull) fragment gains spurious velocity. Remove \
-this #[ignore] once fixed to turn it into a blocking regression guard."]
 fn split_preserves_point_velocity_for_offset_com_child() {
     let (records, _) = drive_rotating_pair_split(&pair_scenario(Some(offset_hull())));
     let worst = worst_continuity(&records);

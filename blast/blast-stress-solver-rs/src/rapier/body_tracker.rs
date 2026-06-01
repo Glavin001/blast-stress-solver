@@ -553,6 +553,13 @@ impl BodyTracker {
             result.stats.sleep_init_ms += sleep_started_at.elapsed().as_secs_f64() as f32 * 1_000.0;
         }
 
+        // Reconcile each dynamic child's velocity with Rapier's real centre of mass, in a
+        // SEPARATE pass after every child's colliders have been migrated (so the COM is final).
+        for (child_index, target) in child_targets.iter().map(|(k, v)| (*k, *v)) {
+            let fit_center = child_target_states[&child_index].pose.translation.vector;
+            self.reconcile_child_velocity_with_com(target.handle(), fit_center, bodies, colliders);
+        }
+
         // Record split continuity in a SEPARATE pass, after every child's colliders have
         // been migrated — otherwise a reused parent body would still hold a sibling's
         // collider and report a spurious (and nondeterministic) centre of mass.
@@ -1245,6 +1252,41 @@ impl BodyTracker {
         } else if velocity_changed || body.is_sleeping() {
             body.wake_up(true);
         }
+    }
+
+    /// Reconcile a freshly-split dynamic child's velocity with Rapier's ACTUAL centre of mass.
+    ///
+    /// `fit_child_motion` expresses the child's motion about `fit_center` (the body origin =
+    /// mass-weighted node-centroid model). Rapier, however, integrates rotation about the
+    /// collider-derived centre of mass, which differs for offset shapes (e.g. convex-hull
+    /// fragments). Left uncorrected, a rotating fragment gains spurious velocity
+    /// `omega x (rapier_com - fit_center)` — the "sudden movement after destruction" bug
+    /// (gap #1). Shifting `linvel` by exactly that term makes the body's velocity field match
+    /// the fitted (parent-continuous) field at the node points.
+    fn reconcile_child_velocity_with_com(
+        &self,
+        body_handle: RigidBodyHandle,
+        fit_center: Vector<Real>,
+        bodies: &mut RigidBodySet,
+        colliders: &ColliderSet,
+    ) {
+        let Some(body) = bodies.get_mut(body_handle) else {
+            return;
+        };
+        if !body.is_dynamic() {
+            return;
+        }
+        // Collider migration updates mass properties lazily; force a recompute so the COM is
+        // current before we read it.
+        body.recompute_mass_properties_from_colliders(colliders);
+        let real_com = body.center_of_mass().coords;
+        let lever = real_com - fit_center;
+        if lever.norm_squared() <= f32::EPSILON {
+            return;
+        }
+        let angvel = *body.angvel();
+        let linvel = *body.linvel();
+        body.set_linvel(linvel + angvel.cross(&lever), false);
     }
 
     /// Observability hook (only invoked when `record_split_continuity` is on):

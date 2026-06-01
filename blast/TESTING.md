@@ -66,7 +66,7 @@ Both languages assert the same quantities with the same tolerances. The JS copy 
 | Dynamic mass conservation | rel `< 1e-4` | A split repartitions mass; it never creates/destroys it. |
 | No NaN/Inf | all finite | Guards the ill-conditioned angular fit on near-singular fragments. |
 
-## The known bug (gap #1), reproduced and localized
+## The split COM/velocity bug (gap #1) — fixed
 
 The JS library transfers a fragment's velocity using Rapier's **real** centre of mass
 (`syncBodyVelocityFromSource` in `destructible-core.ts`):
@@ -84,14 +84,15 @@ symptom.
 `tests/kinematic_invariants_test.rs` makes this concrete and self-validating:
 
 - `split_preserves_point_velocity_for_aligned_com_child` — cuboid fragment, same spin →
-  continuity `< 1e-3`. **Passes** (positive control: the measurement is real).
+  continuity `< 1e-3`. Positive control (the measurement is real).
 - `split_preserves_point_velocity_for_offset_com_child` — convex-hull fragment, same spin →
-  **fails today** (`#[ignore]`d, runs in the non-blocking repro lane), reporting e.g.
-  `node 1 ... drifted 0.84 m/s (parent v {0.75,0,0} vs child v {1.5,-0.375,0})`.
+  also continuous now (drifted ~2.1 m/s before the fix).
 
-The matched pair isolates the root cause to COM handling. **Detection only — this work does
-not fix the bug.** Remove the `#[ignore]` once `fit_child_motion` is reconciled with Rapier's
-COM, and the repro becomes a blocking regression guard automatically.
+**Fix:** `handle_split` runs a post-migration pass (`reconcile_child_velocity_with_com`) that
+recomputes each dynamic child's mass properties and shifts its `linvel` by
+`ω × (real_com − fit_center)`, so the body's velocity field matches the fitted
+(parent-continuous) field at the node points regardless of collider-COM offset. Both tests in
+the matched pair are now passing, blocking regression guards.
 
 ## Physics mechanisms: gravity orientation & momentum transfer
 
@@ -106,9 +107,9 @@ must apply gravity in each actor's *local* frame.
   `solver-mechanisms.test.ts` — `addGravity` and `addActorGravity` are direction-sensitive.
 - JS pipeline: rotates gravity per actor into its local frame and calls `addActorGravity`
   (`destructible-core.ts`, on by default). Orientation-correct.
-- Rust pipeline: calls the **global** `add_gravity` only — never `add_actor_gravity`, never
-  syncs positions. **Orientation-blind** (gap #7). `gravity_orientation_test.rs` proves the
-  control (gravity direction matters) passes while the rotation repro fails.
+- Rust pipeline: **fixed** (gap #7) — `apply_oriented_gravity` now rotates gravity into each
+  actor's local frame and calls `add_actor_gravity`, like JS. `gravity_orientation_test.rs`
+  (control + rotation guard) both pass.
 
 **Momentum transfer on fracture ("excess force").** When an impact breaks bonds, the load the
 broken bonds carried should be released onto the freed fragments so they fly apart. NVIDIA
@@ -116,11 +117,12 @@ Blast computes this with `getExcessForces`.
 - Solver mechanism (proven both langs): a released 10 kg / 100 m·s⁻² load reports ~1000 N of
   excess force (`solver_mechanisms_test.rs` / `solver-mechanisms.test.ts`). The pre-existing
   Rust test only checked finiteness, so this magnitude had never been asserted.
-- Rust pipeline: applies it (`apply_excess_forces`, default on). `excess_force_integration_test.rs`
-  shows fragments reach ~22 m/s with it on vs 0 with it off (physics must be integrated by the
-  caller via `PhysicsPipeline`; `DestructibleSet::step` does not).
+- Rust pipeline: applies it (`apply_excess_forces`, default on) as a **one-shot impulse**
+  (`force × time_step`) after the gap #9 fix. `excess_force_integration_test.rs` shows fragments
+  reach ~22 m/s with it on vs 0 with it off (physics integrated by the caller via
+  `PhysicsPipeline`; `DestructibleSet::step` does not).
 - JS pipeline: **never calls `getExcessForces`** — fragments get no kick without resimulation
-  (gap #8).
+  (gap #8, still open).
 
 ## CI gating
 
@@ -134,14 +136,15 @@ Blast computes this with `getExcessForces`.
 
 ## Coverage gaps (the live list — what to address next)
 
-1. **Rust split COM/velocity bug** — open. Repro: the `#[ignore]`d
-   `split_preserves_point_velocity_for_offset_com_child`. Fix: make `fit_child_motion`
-   express the fit about Rapier's actual centre of mass (read it back, as JS does), then
-   un-ignore the test.
-2. **Rust split-planner determinism** — unverified at scale. `fit_child_motion` /
-   `handle_split` iterate `HashMap`s whose order is process-random; the small determinism
-   test passes, but large scenarios aren't covered. Next: a multi-fracture determinism
-   test, or switch the planner to ordered maps.
+1. **Rust split COM/velocity bug** — ✅ FIXED. `handle_split` now reconciles each dynamic
+   child's velocity with Rapier's actual centre of mass
+   (`reconcile_child_velocity_with_com`: `linvel += ω × (real_com − fit_center)`). The former
+   repro `kinematic_invariants_test.rs::split_preserves_point_velocity_for_offset_com_child`
+   is now a passing, blocking regression guard.
+2. **Rust split-planner determinism** — covered for wall + tower at scale
+   (`multi_fracture_test.rs::tower_collapse_is_deterministic_at_scale`,
+   `scenario_invariants_test.rs::wall_collapse_is_deterministic`); both pass, so the
+   `HashMap` ordering doesn't affect results in practice. Bridge-scale still uncovered.
 3. **No cross-language _state_ parity** — by deliberate decision. We assert the same
    invariants in each language and keep topological **count** parity
    (`cross_validation_test.rs`), but not bit-level JS↔Rust agreement on positions/velocities
@@ -154,24 +157,21 @@ Blast computes this with `getExcessForces`.
    would catch rendering/positioning regressions the headless invariants can't see.
 6. **JS mass/COM conservation** — only asserted Rust-side (where `RigidBody::mass()` is
    reachable in tests). The JS core would need a small per-body mass accessor to mirror it.
-7. **Rust gravity is orientation-blind** — open, HIGH severity. The Rust pipeline applies
-   global `add_gravity` on the authored geometry and ignores each actor's current rotation, so
-   a chunk rotated into a stress-inducing orientation feels the wrong stress. JS handles it.
-   Repro: `gravity_orientation_test.rs::actor_rotation_changes_fracture_behavior` (`#[ignore]`).
-   Fix: in `DestructibleSet::step`, per actor, rotate gravity into the body's local frame and
-   call `add_actor_gravity` (as `destructible-core.ts` does), then un-ignore the repro.
+7. **Rust gravity orientation** — ✅ FIXED. `DestructibleSet::step` now applies gravity per
+   actor, rotated into the body's current local frame via `add_actor_gravity`
+   (`apply_oriented_gravity`), matching the JS pipeline. Guard:
+   `gravity_orientation_test.rs::actor_rotation_changes_fracture_behavior` (now passing,
+   blocking). No regression in the count-based wall/tower tests.
 8. **JS does not transfer momentum on fracture** — open. The JS pipeline never calls
    `getExcessForces`, so fractured pieces get no outward kick unless resimulation is on; with
    resim off they just sit/inherit the rigid recoil. Rust applies excess forces and works.
    Fix: mirror Rust's `apply_excess_forces` in `destructible-core.ts`. (A JS integration test
    needs a per-body velocity/mass accessor on the core to assert fragment momentum.)
-9. **Rust excess force is applied as a persistent force (CONFIRMED bug)** — `apply_excess_forces`
-   uses Rapier `add_force` (continuous until reset) instead of a one-shot `apply_impulse`. Unless
-   the consuming app resets forces every step, a single fracture re-accelerates fragments every
-   physics step — fragment speed grows unbounded (repro: ~22 → ~1900 m/s over a few frames). A
-   strong candidate for the "sudden movement" report — and, unlike gap #1, it needs no rotation.
-   Repro: `excess_force_persistence_test.rs::excess_force_kick_should_be_one_shot` (`#[ignore]`).
-   Fix: apply the excess as an impulse (or reset forces each step); then un-ignore.
+9. **Rust excess force persistence** — ✅ FIXED. The fracture kick is now a one-shot impulse
+   (`apply_impulse(force × time_step)`; set `time_step` via `set_time_step` to match your
+   `IntegrationParameters::dt`) instead of a persistent `add_force`, so fragment speed no longer
+   grows unbounded. Guard: `excess_force_persistence_test.rs::excess_force_kick_should_be_one_shot`
+   (now passing without any per-step force reset).
 10. **js_stress_example split specs don't run on CI** — open. `npm run test:split` fails at
     module resolution in the Test job (`blast-stress-solver/scenarios` export and
     `./stress_solver.cjs` are not built/linked there); it never actually ran — the old

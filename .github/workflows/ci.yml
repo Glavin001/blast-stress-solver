@@ -151,9 +151,9 @@ jobs:
 
       - name: Reproduce known bugs (non-blocking)
         working-directory: blast/blast-stress-solver-rs
-        # Runs every #[ignore]d repro across all test binaries (gaps #1, #7, #9) — no need to
-        # name individual test files. --no-fail-fast so all repros report, not just the first.
-        # Stays visible without gating until the bugs are fixed.
+        # Runs every #[ignore]d detect-first repro across all test binaries (no per-file naming;
+        # --no-fail-fast so all report). Gaps #1/#7/#9 are now FIXED and their repros promoted to
+        # blocking guards, so this is currently a no-op placeholder for future repros.
         run: cargo test --features rapier,scenarios --no-fail-fast -- --ignored
         continue-on-error: true
 
