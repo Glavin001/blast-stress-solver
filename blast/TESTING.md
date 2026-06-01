@@ -126,6 +126,10 @@ Blast computes this with `getExcessForces`.
   does not).
 - JS pipeline: **never calls `getExcessForces`** — it gets fragment momentum from resimulation
   instead (gap #8 is therefore "by design" on the JS side).
+- Resimulation validated in `resimulation_test.rs`: `BodySnapshots` capture/restore round-trips
+  exactly, and with excess force OFF, the rollback + re-resolved contact gives fragments
+  ~0.65× the ball's speed (sound recoil) — vs the excess-force estimate's transient ~8.7×, vs
+  ~0.4× with neither mechanism. This is why resimulation is the preferred momentum source.
 
 ## CI gating
 
