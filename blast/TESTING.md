@@ -178,6 +178,15 @@ Blast computes this with `getExcessForces`.
     `|| true` hid it. Now reporting-only (non-gating). Fix: have the Test job build
     `blast-stress-solver` (not `--ignore-scripts`) and the js_stress_example WASM, or link the
     package, so the specs resolve, then promote back to blocking.
+11. **Excess-force fragment fly-back magnitude (tuning, open)** — after the gap #9 fix the kick
+    is bounded, but the realistic projectile test (`projectile_impact_test.rs`: 2 kg ball @
+    30 m/s → 6×5 wall) shows the impacted fragment reaching **~8.7× the ball's speed** (total
+    fragment momentum ~1.7×). Partly small-fragment physics (a chunk is ~16× lighter than the
+    ball) and partly the excess-force "explosion." Motion is bounded and momentum roughly
+    conserved (both guarded), but whether ~8.7× is the desired feel — vs damping/clamping the
+    excess, or crediting the contact momentum the fragment already inherits to avoid
+    double-counting — is an open decision. The test guards only against runaway (regression to
+    the old unbounded behavior), not the exact factor.
 
 ### Recently added unit/property coverage (all passing, blocking)
 
