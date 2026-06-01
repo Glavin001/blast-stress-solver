@@ -178,15 +178,22 @@ Blast computes this with `getExcessForces`.
     `|| true` hid it. Now reporting-only (non-gating). Fix: have the Test job build
     `blast-stress-solver` (not `--ignore-scripts`) and the js_stress_example WASM, or link the
     package, so the specs resolve, then promote back to blocking.
-11. **Excess-force fragment fly-back magnitude (tuning, open)** — after the gap #9 fix the kick
-    is bounded, but the realistic projectile test (`projectile_impact_test.rs`: 2 kg ball @
-    30 m/s → 6×5 wall) shows the impacted fragment reaching **~8.7× the ball's speed** (total
-    fragment momentum ~1.7×). Partly small-fragment physics (a chunk is ~16× lighter than the
-    ball) and partly the excess-force "explosion." Motion is bounded and momentum roughly
-    conserved (both guarded), but whether ~8.7× is the desired feel — vs damping/clamping the
-    excess, or crediting the contact momentum the fragment already inherits to avoid
-    double-counting — is an open decision. The test guards only against runaway (regression to
-    the old unbounded behavior), not the exact factor.
+11. **Excess-force one-frame spike on simultaneous mass-fracture (tuning, open)** — diagnosed
+    precisely (projectile test, 2 kg ball @ 30 m/s → 6×5 wall):
+    - NOT double-counting: with `apply_excess_forces` off, the anchored wall's fragments get
+      ~0.4 m/s (Rapier's contact momentum drains into the anchor, not the fragments).
+    - NOT a steady over-speed: the end-state fly-back is ~31.8 m/s ≈ **1× the ball** (reasonable
+      recoil); momentum stays ~1.7× the ball.
+    - It IS a **one-frame transient**: when many bonds break in a single frame (44 at once at
+      unlimited rate), their per-bond excess forces SUM onto the impacted fragment that frame →
+      a ~262 m/s (~8.7×) spike, which settles to ~31.8 the next frame as inter-fragment
+      collisions redistribute it.
+    Mitigation that already works: `max_fractures_per_frame` spreads the breaks across frames —
+    at limit 4 the spike is gone and end-speed drops to ~3.7 m/s. Optional code safeguard: clamp
+    the per-fragment excess Δv per frame so the spike can't occur regardless of fracture rate.
+    Open decision: rely on the rate-limit knob vs add the per-fragment clamp. The
+    `projectile_impact_test.rs` guard only catches runaway (regression to the old unbounded
+    behavior), not this transient.
 
 ### Recently added unit/property coverage (all passing, blocking)
 

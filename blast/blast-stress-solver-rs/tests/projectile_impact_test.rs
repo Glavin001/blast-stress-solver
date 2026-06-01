@@ -3,12 +3,14 @@
 //! *actual* behavior — not just that the split math round-trips — specifically that
 //! excess-force fragments don't fly back at runaway speeds.
 //!
-//! After the gap #9 fix (2 kg ball @ 30 m/s into a 6x5 wall): fragments are BOUNDED — max
-//! fragment speed ~260 m/s (~8.7x the ball; a fragment is ~16x lighter than the ball, so a
-//! high speed from the shared impulse is expected) and total fragment momentum ~1.7x the
-//! ball's. Before the fix the kick was a persistent force and fragments ran away to ~1900 m/s
-//! (>60x). This guards against regressing to that unbounded behavior. Whether ~8.7x is the
-//! desired "feel" is a tuning question (TESTING.md gap #11).
+//! After the gap #9 fix (2 kg ball @ 30 m/s into a 6x5 wall): fragments are BOUNDED. The
+//! `max_frag_speed` measured here is the PEAK across frames (~260 m/s, ~8.7x the ball) — a
+//! one-frame transient on the frame the wall shatters (many bonds break at once and their
+//! per-bond excess forces sum onto the impacted chunk). It settles to ~31.8 m/s (~1x the ball)
+//! the next frame, and rate-limiting fractures removes the spike entirely. Total fragment
+//! momentum stays ~1.7x the ball. Before the gap #9 fix the kick was a persistent force and
+//! fragments ran away past ~1900 m/s (>60x). This test guards against regressing to that
+//! unbounded behavior; the transient peak itself is the open tuning question (TESTING.md gap #11).
 #![cfg(feature = "rapier")]
 
 use rapier3d::prelude::*;
