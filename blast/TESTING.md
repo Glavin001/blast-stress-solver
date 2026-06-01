@@ -93,6 +93,35 @@ The matched pair isolates the root cause to COM handling. **Detection only — t
 not fix the bug.** Remove the `#[ignore]` once `fit_child_motion` is reconciled with Rapier's
 COM, and the repro becomes a blocking regression guard automatically.
 
+## Physics mechanisms: gravity orientation & momentum transfer
+
+Two real-world behaviors were investigated and tested empirically in BOTH languages (don't
+trust code inspection — assert the numbers). The *solver* implements both mechanisms in both
+languages; the difference is which *pipeline* wires them up.
+
+**Orientation-dependent gravity.** Gravity is global, but a chunk can be at any orientation;
+a beam loaded perpendicular bends (and snaps), loaded axially only compresses. The solver
+must apply gravity in each actor's *local* frame.
+- Solver mechanism (proven both langs): `solver_mechanisms_test.rs` /
+  `solver-mechanisms.test.ts` — `addGravity` and `addActorGravity` are direction-sensitive.
+- JS pipeline: rotates gravity per actor into its local frame and calls `addActorGravity`
+  (`destructible-core.ts`, on by default). Orientation-correct.
+- Rust pipeline: calls the **global** `add_gravity` only — never `add_actor_gravity`, never
+  syncs positions. **Orientation-blind** (gap #7). `gravity_orientation_test.rs` proves the
+  control (gravity direction matters) passes while the rotation repro fails.
+
+**Momentum transfer on fracture ("excess force").** When an impact breaks bonds, the load the
+broken bonds carried should be released onto the freed fragments so they fly apart. NVIDIA
+Blast computes this with `getExcessForces`.
+- Solver mechanism (proven both langs): a released 10 kg / 100 m·s⁻² load reports ~1000 N of
+  excess force (`solver_mechanisms_test.rs` / `solver-mechanisms.test.ts`). The pre-existing
+  Rust test only checked finiteness, so this magnitude had never been asserted.
+- Rust pipeline: applies it (`apply_excess_forces`, default on). `excess_force_integration_test.rs`
+  shows fragments reach ~22 m/s with it on vs 0 with it off (physics must be integrated by the
+  caller via `PhysicsPipeline`; `DestructibleSet::step` does not).
+- JS pipeline: **never calls `getExcessForces`** — fragments get no kick without resimulation
+  (gap #8).
+
 ## CI gating
 
 `.github/workflows/ci.yml`:
@@ -125,3 +154,24 @@ COM, and the repro becomes a blocking regression guard automatically.
    would catch rendering/positioning regressions the headless invariants can't see.
 6. **JS mass/COM conservation** — only asserted Rust-side (where `RigidBody::mass()` is
    reachable in tests). The JS core would need a small per-body mass accessor to mirror it.
+7. **Rust gravity is orientation-blind** — open, HIGH severity. The Rust pipeline applies
+   global `add_gravity` on the authored geometry and ignores each actor's current rotation, so
+   a chunk rotated into a stress-inducing orientation feels the wrong stress. JS handles it.
+   Repro: `gravity_orientation_test.rs::actor_rotation_changes_fracture_behavior` (`#[ignore]`).
+   Fix: in `DestructibleSet::step`, per actor, rotate gravity into the body's local frame and
+   call `add_actor_gravity` (as `destructible-core.ts` does), then un-ignore the repro.
+8. **JS does not transfer momentum on fracture** — open. The JS pipeline never calls
+   `getExcessForces`, so fractured pieces get no outward kick unless resimulation is on; with
+   resim off they just sit/inherit the rigid recoil. Rust applies excess forces and works.
+   Fix: mirror Rust's `apply_excess_forces` in `destructible-core.ts`. (A JS integration test
+   needs a per-body velocity/mass accessor on the core to assert fragment momentum.)
+9. **Rust excess force may be applied as a persistent force** — to verify. `apply_excess_forces`
+   uses Rapier `add_force` (continuous until reset) rather than a one-shot impulse; whether the
+   consuming app resets forces each step affects whether fragments are over-kicked. Worth an
+   explicit impulse or a documented reset contract.
+
+> Notes from bug-hunting: JS and Rust `computeBondStress` are byte-identical (verified); the
+> shipped wall/tower/bridge builders are structurally clean (unit normals, no out-of-range
+> bonds); wall-collapse determinism holds across runs. The gap #1 split COM bug only manifests
+> when a fragment is *rotating at the fracture instant* (stress-driven fractures usually fire
+> before rotation develops), which matches the "sometimes" sudden-movement report.

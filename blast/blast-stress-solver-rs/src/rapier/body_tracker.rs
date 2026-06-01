@@ -551,9 +551,15 @@ impl BodyTracker {
                 bodies,
             );
             result.stats.sleep_init_ms += sleep_started_at.elapsed().as_secs_f64() as f32 * 1_000.0;
+        }
 
-            if self.record_split_continuity {
-                self.record_split_child_continuity(target_body, child, &planning, bodies, colliders);
+        // Record split continuity in a SEPARATE pass, after every child's colliders have
+        // been migrated — otherwise a reused parent body would still hold a sibling's
+        // collider and report a spurious (and nondeterministic) centre of mass.
+        if self.record_split_continuity {
+            for (child_index, target) in child_targets.iter().map(|(k, v)| (*k, *v)) {
+                let child = &event.children[child_index];
+                self.record_split_child_continuity(target.handle(), child, &planning, bodies, colliders);
             }
         }
 
