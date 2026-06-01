@@ -271,6 +271,27 @@ pub extern "C" fn __ctype_tolower_loc() -> *const *const c_int {
 // The stress solver only uses stdio for error / profiling output,
 // which we don't need.  Each stub succeeds silently.
 
+// The standard stream `FILE*` globals are referenced directly as data
+// symbols by both the Blast C++ backend (`std::fprintf(stderr, …)` in
+// the assert / profiler paths) and libc++'s own `iostream.cpp` /
+// `abort_message.cpp`.  We never perform real I/O — every stdio stub
+// here ignores its stream argument — but the symbols still have to
+// resolve at link time.  Back each with its own one-byte buffer so the
+// pointer is non-null and distinct (some libc++ stream constructors
+// compare the underlying `FILE*`s); the buffer itself is never touched.
+static mut FAKE_STDIN_FILE: [u8; 1] = [0];
+static mut FAKE_STDOUT_FILE: [u8; 1] = [0];
+static mut FAKE_STDERR_FILE: [u8; 1] = [0];
+
+#[unsafe(no_mangle)]
+pub static mut stdin: *mut c_void = core::ptr::addr_of_mut!(FAKE_STDIN_FILE) as *mut c_void;
+
+#[unsafe(no_mangle)]
+pub static mut stdout: *mut c_void = core::ptr::addr_of_mut!(FAKE_STDOUT_FILE) as *mut c_void;
+
+#[unsafe(no_mangle)]
+pub static mut stderr: *mut c_void = core::ptr::addr_of_mut!(FAKE_STDERR_FILE) as *mut c_void;
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fwrite(
     _ptr: *const c_void,
@@ -377,11 +398,18 @@ pub unsafe extern "C" fn vasprintf(
     -1
 }
 
-static mut ERRNO_VALUE: c_int = 0;
+// `errno` is referenced two ways by the wasi libc++ build: some objects
+// call the POSIX `__errno_location()` accessor while others — notably
+// libc++'s `locale.cpp` — reference the `errno` data symbol directly.
+// Provide both, backed by the same storage, so either form resolves at
+// link time. Nothing reads the value meaningfully; the stress solver
+// only touches `errno` through otherwise-stubbed libc paths.
+#[unsafe(no_mangle)]
+pub static mut errno: c_int = 0;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __errno_location() -> *mut c_int {
-    &raw mut ERRNO_VALUE
+    &raw mut errno
 }
 
 #[unsafe(no_mangle)]
