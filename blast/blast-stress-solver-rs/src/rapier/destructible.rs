@@ -385,6 +385,23 @@ impl DestructibleSet {
         self.forces_applied = true;
     }
 
+    /// Enable/disable per-split point-velocity continuity recording. Observability
+    /// only — does not change the simulation. Off by default (zero production cost).
+    pub fn set_record_split_continuity(&mut self, enabled: bool) {
+        self.tracker.set_record_split_continuity(enabled);
+    }
+
+    /// Clear accumulated split continuity records.
+    pub fn clear_split_continuity(&mut self) {
+        self.tracker.clear_split_continuity();
+    }
+
+    /// Per-node split continuity records accumulated since the last clear. See
+    /// [`super::SplitContinuityRecord`].
+    pub fn split_continuity(&self) -> &[super::SplitContinuityRecord] {
+        self.tracker.split_continuity()
+    }
+
     /// Get the Rapier body handle for a node.
     pub fn node_body(&self, node_index: u32) -> Option<RigidBodyHandle> {
         self.tracker.node_body(node_index)

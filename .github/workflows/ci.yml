@@ -97,18 +97,64 @@ jobs:
           name: demo-site
           path: blast/
 
-      - name: Run blast-stress-solver tests
+      # BLOCKING: tight physical-law invariants + pure kernel properties. These encode
+      # physical truth (point-velocity continuity, no-NaN, planner structure) and must
+      # gate the build — no continue-on-error masking. See blast/TESTING.md.
+      - name: Run invariant + kernel tests (blocking)
+        working-directory: blast/blast-stress-solver
+        run: >-
+          npx vitest run --reporter=verbose
+          src/tests/kernels.proptest.test.ts
+          src/tests/rapier.invariants.test.ts
+          src/tests/rapier.resim-continuity.test.ts
+          src/tests/rapier.splitMigrator.test.ts
+          src/tests/rapier.headless-scenarios.test.ts
+
+      # NON-BLOCKING soak: the remaining integration/perf assertions are
+      # environment-sensitive. Reported but not gating until stabilized (gap #4).
+      - name: Run full test suite (soak, non-blocking)
         working-directory: blast/blast-stress-solver
         run: npx vitest run --reporter=verbose
-        continue-on-error: true  # integration tests have physics-dependent assertions that vary across environments
+        continue-on-error: true
 
-      - name: Run headless scenario tests
-        working-directory: blast/blast-stress-solver
-        run: npx vitest run src/tests/rapier.headless-scenarios.test.ts --reporter=verbose
-
-      - name: Run split/fracture tests
+      # BLOCKING: split/fracture specs. The single stale spec is quarantined in-file
+      # (organicSplit.spec.ts -> it.skip with a tracked reason), so the suite no longer
+      # needs `|| true` masking.
+      - name: Run split/fracture tests (blocking)
         working-directory: blast/js_stress_example
-        run: npm run test:split || true  # organicSplit.spec.ts has a known stale expectation
+        run: npm run test:split
+
+  rust-tests:
+    # Rust library tests, including the Tier-0 kernel property tests (motion_fit) and
+    # the Tier-1 kinematic invariants (point-velocity continuity, no-NaN, mass
+    # conservation, determinism). These are BLOCKING. The known split COM/velocity bug
+    # is reproduced by an #[ignore]d test that runs in a separate, non-blocking lane so
+    # it stays visible without blocking unrelated work. See blast/TESTING.md.
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            blast/blast-stress-solver-rs/target
+          key: rust-tests-${{ runner.os }}-${{ hashFiles('blast/blast-stress-solver-rs/Cargo.lock', 'blast/blast-stress-solver-rs/Cargo.toml') }}
+
+      - name: Run Rust invariant + kernel tests (blocking)
+        working-directory: blast/blast-stress-solver-rs
+        run: cargo test --features rapier,scenarios
+
+      - name: Reproduce known split COM/velocity bug (non-blocking)
+        working-directory: blast/blast-stress-solver-rs
+        run: cargo test --features rapier,scenarios --test kinematic_invariants_test -- --ignored
+        continue-on-error: true  # documents blast/TESTING.md gap #1 until the split path is fixed
 
   wasm-smoke:
     # Regression tests that build a cdylib consumer for
@@ -229,7 +275,7 @@ jobs:
 
   deploy-production:
     name: Deploy Production
-    needs: [build, test]
+    needs: [build, test, rust-tests]
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', vars.PRODUCTION_BRANCH || 'feat/rapier-destruction')
     runs-on: ubuntu-latest
     environment:

@@ -63,6 +63,7 @@
     "@dimforge/rapier3d-compat": "^0.19.2",
     "@types/node": "^20.11.0",
     "@types/three": "^0.181.0",
+    "fast-check": "^3.23.1",
     "three": "^0.181.1",
     "tsup": "^8.0.1",
     "typescript": "^5.9.3",
