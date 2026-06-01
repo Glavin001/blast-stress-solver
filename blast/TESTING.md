@@ -165,10 +165,13 @@ Blast computes this with `getExcessForces`.
    resim off they just sit/inherit the rigid recoil. Rust applies excess forces and works.
    Fix: mirror Rust's `apply_excess_forces` in `destructible-core.ts`. (A JS integration test
    needs a per-body velocity/mass accessor on the core to assert fragment momentum.)
-9. **Rust excess force may be applied as a persistent force** — to verify. `apply_excess_forces`
-   uses Rapier `add_force` (continuous until reset) rather than a one-shot impulse; whether the
-   consuming app resets forces each step affects whether fragments are over-kicked. Worth an
-   explicit impulse or a documented reset contract.
+9. **Rust excess force is applied as a persistent force (CONFIRMED bug)** — `apply_excess_forces`
+   uses Rapier `add_force` (continuous until reset) instead of a one-shot `apply_impulse`. Unless
+   the consuming app resets forces every step, a single fracture re-accelerates fragments every
+   physics step — fragment speed grows unbounded (repro: ~22 → ~1900 m/s over a few frames). A
+   strong candidate for the "sudden movement" report — and, unlike gap #1, it needs no rotation.
+   Repro: `excess_force_persistence_test.rs::excess_force_kick_should_be_one_shot` (`#[ignore]`).
+   Fix: apply the excess as an impulse (or reset forces each step); then un-ignore.
 10. **js_stress_example split specs don't run on CI** — open. `npm run test:split` fails at
     module resolution in the Test job (`blast-stress-solver/scenarios` export and
     `./stress_solver.cjs` are not built/linked there); it never actually ran — the old
