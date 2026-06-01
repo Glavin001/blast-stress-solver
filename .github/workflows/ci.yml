@@ -97,29 +97,18 @@ jobs:
           name: demo-site
           path: blast/
 
-      # BLOCKING: tight physical-law invariants + pure kernel properties. These encode
-      # physical truth (point-velocity continuity, no-NaN, planner structure) and must
-      # gate the build — no continue-on-error masking. See blast/TESTING.md.
+      # BLOCKING: deterministic physical-law invariants + pure kernel properties. The set is
+      # defined once in the package's `test:invariants` script (single source of truth) so this
+      # stays a one-liner and new invariant tests don't have to be threaded through CI by hand.
       - name: Run invariant + kernel tests (blocking)
         working-directory: blast/blast-stress-solver
-        run: >-
-          npx vitest run --reporter=verbose
-          src/tests/kernels.proptest.test.ts
-          src/tests/rapier.invariants.test.ts
-          src/tests/rapier.resim-continuity.test.ts
-          src/tests/rapier.splitMigrator.test.ts
-          src/tests/rapier.headless-scenarios.test.ts
-          src/tests/solver-mechanisms.test.ts
-          src/tests/stress.gravity.test.ts
-          src/tests/bondStress.parity.test.ts
-          src/tests/stressLimits.boundary.test.ts
-          src/tests/damage.invariants.test.ts
+        run: npm run test:invariants
 
-      # NON-BLOCKING soak: the remaining integration/perf assertions are
-      # environment-sensitive. Reported but not gating until stabilized (gap #4).
+      # NON-BLOCKING soak: the full suite, including environment-sensitive integration/perf
+      # assertions. Reported but not gating until stabilized (gap #4).
       - name: Run full test suite (soak, non-blocking)
         working-directory: blast/blast-stress-solver
-        run: npx vitest run --reporter=verbose
+        run: npm run test:soak
         continue-on-error: true
 
       # REPORTING ONLY (non-gating): the js_stress_example split specs currently fail to
@@ -160,10 +149,13 @@ jobs:
         working-directory: blast/blast-stress-solver-rs
         run: cargo test --features rapier,scenarios
 
-      - name: Reproduce known split COM/velocity bug (non-blocking)
+      - name: Reproduce known bugs (non-blocking)
         working-directory: blast/blast-stress-solver-rs
-        run: cargo test --features rapier,scenarios --test kinematic_invariants_test -- --ignored
-        continue-on-error: true  # documents blast/TESTING.md gap #1 until the split path is fixed
+        # Runs every #[ignore]d repro across all test binaries (gaps #1, #7, #9) — no need to
+        # name individual test files. --no-fail-fast so all repros report, not just the first.
+        # Stays visible without gating until the bugs are fixed.
+        run: cargo test --features rapier,scenarios --no-fail-fast -- --ignored
+        continue-on-error: true
 
   wasm-smoke:
     # Regression tests that build a cdylib consumer for

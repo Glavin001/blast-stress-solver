@@ -33,18 +33,18 @@ just as importantly, **a living map of what we do _not_ yet cover** (see
 | **3 — Browser** | Playwright smoke (non-blocking) | `js_stress_example/tests/stress.spec.js` | — |
 
 ```bash
-# Rust (Tier 0 + 1 + 2) — blocking in CI
+# Rust (Tier 0 + 1 + 2) — blocking in CI; runs every test file
 cargo test --manifest-path blast/blast-stress-solver-rs/Cargo.toml --features rapier,scenarios
 
-# Rust — the known-bug repro (currently fails by design; see gap #1)
+# Rust — all known-bug repros (currently fail by design; gaps #1, #7, #9)
 cargo test --manifest-path blast/blast-stress-solver-rs/Cargo.toml \
-  --features rapier,scenarios --test kinematic_invariants_test -- --ignored
+  --features rapier,scenarios --no-fail-fast -- --ignored
 
-# JS — build the WASM runtime once, then run the invariant + kernel suites
+# JS — build the WASM runtime once, then run the blocking invariant + kernel suite.
+# The set is defined once in the `test:invariants` package script (single source of truth).
 cd blast/blast-stress-solver && npm install --ignore-scripts && npm run build
-npx vitest run src/tests/kernels.proptest.test.ts src/tests/rapier.invariants.test.ts \
-  src/tests/rapier.resim-continuity.test.ts src/tests/rapier.splitMigrator.test.ts \
-  src/tests/rapier.headless-scenarios.test.ts
+npm run test:invariants     # blocking, deterministic
+npm run test:soak           # full suite, non-gating (environment-sensitive integration/perf)
 ```
 
 > The JS `npm run build` step needs the Emscripten toolchain (emsdk `3.1.51`, as in CI).
