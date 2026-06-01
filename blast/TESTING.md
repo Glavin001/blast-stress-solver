@@ -169,6 +169,12 @@ Blast computes this with `getExcessForces`.
    uses Rapier `add_force` (continuous until reset) rather than a one-shot impulse; whether the
    consuming app resets forces each step affects whether fragments are over-kicked. Worth an
    explicit impulse or a documented reset contract.
+10. **js_stress_example split specs don't run on CI** — open. `npm run test:split` fails at
+    module resolution in the Test job (`blast-stress-solver/scenarios` export and
+    `./stress_solver.cjs` are not built/linked there); it never actually ran — the old
+    `|| true` hid it. Now reporting-only (non-gating). Fix: have the Test job build
+    `blast-stress-solver` (not `--ignore-scripts`) and the js_stress_example WASM, or link the
+    package, so the specs resolve, then promote back to blocking.
 
 > Notes from bug-hunting: JS and Rust `computeBondStress` are byte-identical (verified); the
 > shipped wall/tower/bridge builders are structurally clean (unit normals, no out-of-range
