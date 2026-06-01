@@ -210,6 +210,11 @@ jobs:
       github.event_name == 'pull_request' ||
       (github.event_name == 'push' && github.ref != format('refs/heads/{0}', vars.PRODUCTION_BRANCH || 'feat/rapier-destruction'))
     runs-on: ubuntu-latest
+    # The "Comment preview URL on PR" step posts via the GITHUB_TOKEN.
+    # The repo default is read-only, so grant just enough to comment.
+    permissions:
+      contents: read
+      pull-requests: write
     environment:
       name: preview
       url: ${{ steps.deploy.outputs.url }}
