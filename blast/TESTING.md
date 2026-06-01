@@ -117,12 +117,15 @@ Blast computes this with `getExcessForces`.
 - Solver mechanism (proven both langs): a released 10 kg / 100 m·s⁻² load reports ~1000 N of
   excess force (`solver_mechanisms_test.rs` / `solver-mechanisms.test.ts`). The pre-existing
   Rust test only checked finiteness, so this magnitude had never been asserted.
-- Rust pipeline: applies it (`apply_excess_forces`, default on) as a **one-shot impulse**
-  (`force × time_step`) after the gap #9 fix. `excess_force_integration_test.rs` shows fragments
-  reach ~22 m/s with it on vs 0 with it off (physics integrated by the caller via
-  `PhysicsPipeline`; `DestructibleSet::step` does not).
-- JS pipeline: **never calls `getExcessForces`** — fragments get no kick without resimulation
-  (gap #8, still open).
+- Rust pipeline: supports it as an **opt-in alternative** (`apply_excess_forces`, default
+  **off**), applied as a **one-shot impulse** (`force × time_step`) about the body's real centre
+  of mass. **Resimulation is the preferred, more sound source of fragment momentum** (re-resolve
+  the actual contact against the fractured pieces); excess force is for consumers who don't
+  resimulate. `excess_force_integration_test.rs` shows fragments reach ~22 m/s with it on vs 0
+  with it off (physics integrated by the caller via `PhysicsPipeline`; `DestructibleSet::step`
+  does not).
+- JS pipeline: **never calls `getExcessForces`** — it gets fragment momentum from resimulation
+  instead (gap #8 is therefore "by design" on the JS side).
 
 ## CI gating
 

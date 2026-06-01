@@ -51,7 +51,7 @@ fn projectile_fragments_stay_bounded() {
         shear_elastic_limit: 0.01, shear_fatal_limit: 0.02,
         ..SolverSettings::default()
     };
-    let policy = FracturePolicy { idle_skip: false, ..FracturePolicy::default() };
+    let policy = FracturePolicy { idle_skip: false, apply_excess_forces: true, ..FracturePolicy::default() };
     let dt = 1.0 / 60.0;
     let mut set = DestructibleSet::from_scenario(&scenario, settings, Vec3::ZERO, policy).unwrap();
     set.set_time_step(dt);

@@ -721,8 +721,10 @@ impl DestructibleSet {
                 Some(b) if b.is_dynamic() => b,
                 _ => continue,
             };
-            let pos = body.translation();
-            let com = Vec3::new(pos.x, pos.y, pos.z);
+            // Pass Blast the body's REAL centre of mass (not its origin) so the released-load
+            // torque is computed about the correct point — matters for offset-COM fragments.
+            let c = body.center_of_mass();
+            let com = Vec3::new(c.x, c.y, c.z);
 
             if let Some((force, torque)) = self.solver.get_excess_forces(actor.actor_index, com) {
                 let force_mag = force.magnitude_squared();

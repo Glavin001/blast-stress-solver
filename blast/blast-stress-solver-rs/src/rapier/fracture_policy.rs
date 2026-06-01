@@ -15,7 +15,10 @@ pub struct FracturePolicy {
     pub min_child_node_count: u32,
     /// Skip solver on idle frames (no forces, no recent fractures). Default: true.
     pub idle_skip: bool,
-    /// Apply solver-reported excess forces to newly separated bodies. Default: true.
+    /// Opt-in: apply NVIDIA Blast's solver-reported excess forces to newly separated bodies as
+    /// a one-shot impulse. Default: **false**. Resimulation is the preferred, more physically
+    /// sound source of fragment momentum (it re-resolves the real contact against the fractured
+    /// pieces); enable this only as an alternative when you are NOT resimulating.
     pub apply_excess_forces: bool,
 }
 
@@ -28,7 +31,7 @@ impl Default for FracturePolicy {
             max_collider_migrations_per_frame: -1,
             min_child_node_count: 1,
             idle_skip: true,
-            apply_excess_forces: true,
+            apply_excess_forces: false,
         }
     }
 }

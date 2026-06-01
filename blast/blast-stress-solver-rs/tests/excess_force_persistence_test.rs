@@ -59,7 +59,7 @@ fn early_vs_late_speed(reset_forces_each_step: bool) -> (f32, f32) {
         shear_elastic_limit: 0.002, shear_fatal_limit: 0.004,
         ..SolverSettings::default()
     };
-    let policy = FracturePolicy { idle_skip: false, ..FracturePolicy::default() };
+    let policy = FracturePolicy { idle_skip: false, apply_excess_forces: true, ..FracturePolicy::default() };
     let mut set = DestructibleSet::from_scenario(&scenario, settings, Vec3::ZERO, policy).unwrap();
     let (mut b, mut c, mut isl, mut ij, mut mj) = (
         RigidBodySet::new(), ColliderSet::new(), IslandManager::new(), ImpulseJointSet::new(), MultibodyJointSet::new(),
