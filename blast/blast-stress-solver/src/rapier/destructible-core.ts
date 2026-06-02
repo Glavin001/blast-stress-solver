@@ -64,6 +64,12 @@ export type BuildDestructibleCoreOptions = {
   /** Scale factor for contact forces fed into the stress solver (default 30).
    * Higher values make projectile impacts break more bonds. */
   contactForceScale?: number;
+  /** When the damage system is enabled, the contact force injected into the *stress*
+   *  solver is scaled by this factor instead of contactForceScale, so impact energy
+   *  drives local per-node damage (a hole) rather than the global stress cascade.
+   *  Default 0 = fully decouple impacts from the stress solver (the solver then only
+   *  carries gravity / structural load, which redistributes robustly around holes). */
+  damageContactStressScale?: number;
   /** Whether newly created split bodies should enable CCD (default true for compatibility). */
   fractureBodyCcdEnabled?: boolean;
   /** Whether spawned projectiles should enable CCD (default true). */
@@ -159,6 +165,7 @@ export async function buildDestructibleCore({
   onWorldReplaced,
   resimulateOnDamageDestroy = !!damage?.enabled,
   contactForceScale = 30,
+  damageContactStressScale = 0,
   fractureBodyCcdEnabled = true,
   projectileCcdEnabled = true,
   skipSingleBodies = false,
@@ -738,6 +745,15 @@ export async function buildDestructibleCore({
     nodesForBody: (bodyHandle: number) => nodesByBodyHandle.get(bodyHandle)?.values(),
   });
 
+  // When the damage system owns impact destruction, decouple contacts from the global
+  // stress solver: impacts become local per-node health loss (a hole), while the stress
+  // solver keeps carrying gravity/structural load (which redistributes robustly around
+  // missing nodes). Without this, a large contact force collapses the whole structure
+  // globally regardless of how it is partitioned. See contact-injection loop below.
+  const effectiveContactStressScale = damageOptions.enabled
+    ? damageContactStressScale
+    : contactForceScale;
+
   function rebuildColliderToNodeMap() {
     const t0 = startTiming();
     colliderToNode.clear();
@@ -1257,7 +1273,7 @@ export async function buildDestructibleCore({
       const ly = -2 * qw * qz * fx + qw * qw * fy + 2 * qw * qx * fz + 2 * qx * qy * fx + qy * qy * fy - 2 * qz * qy * fz - qx * qx * fy - qz * qz * fy
         + 2 * qy * qz * fz;
       const lz = 2 * qw * qy * fx - 2 * qw * qx * fy + qw * qw * fz + 2 * qx * qz * fx + 2 * qy * qz * fy + qz * qz * fz - qx * qx * fz - qy * qy * fz;
-      const scaledForce = { x: lx * contactForceScale, y: ly * contactForceScale, z: lz * contactForceScale };
+      const scaledForce = { x: lx * effectiveContactStressScale, y: ly * effectiveContactStressScale, z: lz * effectiveContactStressScale };
 
       // Apply to hit node at full strength
       solver.addForce(contact.nodeIndex, hitChunk.baseLocalOffset, scaledForce);
