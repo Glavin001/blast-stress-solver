@@ -108,6 +108,40 @@ pub fn plan_split_migration_with_support(
         .collect();
 
     if !unmatched_bodies.is_empty() && !unmatched_children.is_empty() {
+        // Fast path: a single remaining parent body splitting into many children — the
+        // common catastrophic-cascade case (one actor lets go into N fragments in a
+        // frame). The maximum-overlap assignment for a single row is exactly its
+        // argmax child, so we skip building the overlap matrix and the square-padded
+        // O(max(R,C)^3) Hungarian (which for 1×256 would do ~256^3 work). Result is
+        // identical: the one body reuses its best-overlap child, the rest are created.
+        if unmatched_bodies.len() == 1 {
+            let body = &bodies[unmatched_bodies[0]];
+            let mut best: Option<(usize, usize)> = None; // (child_index, overlap)
+            for &ci in &unmatched_children {
+                let overlap = children[ci]
+                    .nodes
+                    .iter()
+                    .filter(|n| body.node_indices.contains(n))
+                    .count();
+                if overlap > 0 && best.map_or(true, |(_, b)| overlap > b) {
+                    best = Some((ci, overlap));
+                }
+            }
+            let reused_child = best.map(|(ci, _)| {
+                reuse.push(ReuseEntry {
+                    child_index: ci,
+                    body_handle: body.handle,
+                });
+                ci
+            });
+            let create = unmatched_children
+                .into_iter()
+                .filter(|ci| Some(*ci) != reused_child)
+                .map(|child_index| CreateEntry { child_index })
+                .collect();
+            return SplitMigrationPlan { reuse, create };
+        }
+
         let overlap =
             build_overlap_matrix(bodies, &unmatched_bodies, children, &unmatched_children);
         let assignments = hungarian_max(&overlap);

@@ -66,6 +66,12 @@ pub mod scenarios;
 #[cfg(feature = "rapier")]
 pub mod rapier;
 
+// Reusable benchmarking/profiling harness, gated behind `bench-support` (off by
+// default, never shipped). Shared by the criterion benches, the `frame_profile`
+// example, and the perf-regression test so every measurement describes the same work.
+#[cfg(feature = "bench-support")]
+pub mod bench_harness;
+
 // Re-export primary types at crate root for convenience
 pub use bond_stress::compute_bond_stress;
 pub use ext_stress_solver::ExtStressSolver;

@@ -14,8 +14,16 @@ links = "blast_stress_solver_ffi"
 [features]
 default = []
 rapier = ["dep:rapier3d"]
+# Force the scalar stress-solver kernels even on x86/x86_64 (the build otherwise
+# enables the AVX/FMA path with a runtime CPUID fallback). Useful for reproducible
+# cross-platform numerics or CPUs without AVX.
+force-scalar-solver = []
 # Pre-built scenario builders + JSON scene loader (the loader needs serde/serde_json).
 scenarios = ["dep:serde", "dep:serde_json"]
+# Reusable benchmarking/profiling harness (`src/bench_harness.rs`) shared by the
+# criterion benches, the `frame_profile` example, and the perf-regression test.
+# Off by default and never shipped in a release.
+bench-support = ["rapier", "scenarios"]
 # Opt-in regression tests for the `wasm32-unknown-unknown` build. These
 # shell out to `cargo` to build a fixture cdylib under
 # `tests/wasm_smoke/fixture/`, then inspect the resulting .wasm for
@@ -39,3 +47,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasmparser = "0.224"
 proptest = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "destruction"
+harness = false
+required-features = ["bench-support"]
+
+# Per-frame spike/percentile profiler over a full destruction timeline.
+[[example]]
+name = "frame_profile"
+required-features = ["bench-support"]
