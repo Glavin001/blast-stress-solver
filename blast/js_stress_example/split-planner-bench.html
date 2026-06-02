@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Split-Planner Benchmark — blast-stress-solver</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Inter", system-ui, -apple-system, sans-serif;
+        color: #f5f7ff;
+        background: #030510;
+        padding: 2.5rem 1.5rem 4rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+      a.back {
+        align-self: flex-start;
+        color: rgba(140, 170, 255, 0.7);
+        text-decoration: none;
+        font-size: 0.8rem;
+        margin-bottom: 1.25rem;
+      }
+      a.back:hover { color: rgba(160, 190, 255, 1); }
+      .wrap { width: 100%; max-width: 860px; }
+      h1 { font-size: 1.7rem; font-weight: 700; margin: 0 0 0.4rem; letter-spacing: -0.02em; }
+      .subtitle {
+        font-size: 0.86rem; color: rgba(200, 210, 240, 0.6);
+        margin: 0 0 1.5rem; line-height: 1.55; max-width: 720px;
+      }
+      .subtitle code {
+        background: rgba(255,255,255,0.06); padding: 0.05rem 0.3rem;
+        border-radius: 4px; font-size: 0.8rem;
+      }
+      .controls {
+        display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+        margin-bottom: 1.5rem;
+      }
+      select, button {
+        font: inherit; color: #f5f7ff;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.14);
+        border-radius: 8px; padding: 0.5rem 0.9rem; cursor: pointer;
+      }
+      button { background: rgba(107,140,255,0.18); border-color: rgba(107,140,255,0.4); font-weight: 600; }
+      button:hover:not(:disabled) { background: rgba(107,140,255,0.3); }
+      button:disabled { opacity: 0.5; cursor: default; }
+      label.field { font-size: 0.78rem; color: rgba(200,210,240,0.6); display: flex; align-items: center; gap: 0.5rem; }
+      #status { font-size: 0.78rem; color: rgba(200,210,240,0.5); min-height: 1.1em; }
+
+      .headline { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+      .stat {
+        flex: 1; min-width: 200px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px; padding: 1.1rem 1.25rem;
+      }
+      .stat-num { font-size: 1.9rem; font-weight: 800; letter-spacing: -0.02em; color: #9fffd0; }
+      .stat-label { font-size: 0.8rem; color: rgba(220,228,255,0.85); margin-top: 0.2rem; line-height: 1.4; }
+      .muted { color: rgba(200,210,240,0.45); }
+
+      .chart-card, .table-card {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;
+      }
+      .chart-card h2, .table-card h2 { margin: 0 0 0.6rem; font-size: 0.95rem; font-weight: 600; }
+      .chart-card p { margin: 0 0 0.75rem; font-size: 0.76rem; color: rgba(200,210,240,0.5); }
+      canvas#chart { width: 100%; height: 360px; display: block; }
+
+      table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+      th, td { text-align: right; padding: 0.4rem 0.55rem; }
+      th:first-child, td:first-child { text-align: left; }
+      thead th {
+        color: rgba(200,210,240,0.55); font-weight: 600; font-size: 0.72rem;
+        text-transform: uppercase; letter-spacing: 0.04em;
+        border-bottom: 1px solid rgba(255,255,255,0.1);
+      }
+      tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
+      tbody td { font-variant-numeric: tabular-nums; }
+      td.good, .good { color: #7fe3b0; }
+      td.warn, .warn { color: #ffb454; }
+      .ok { color: #7fe3b0; font-weight: 700; }
+      .bad { color: #ff7a7a; font-weight: 700; }
+
+      footer { margin-top: 1.5rem; font-size: 0.72rem; color: rgba(200,210,240,0.35); }
+      footer code { background: rgba(255,255,255,0.06); padding: 0.05rem 0.35rem; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <a class="back" href="./demo-index.html">← all demos</a>
+      <h1>⚡ Split-Planner Benchmark</h1>
+      <p class="subtitle">
+        When a structure fractures, the runtime runs a <strong>split planner</strong> — a topology-diff that
+        decides which existing Rapier bodies to <em>reuse</em> (keep their handle + colliders, the cheapest
+        edit) versus which fragments need a <em>new</em> body. The old planner padded this to a dense
+        <code>O(max(M,N)³)</code> Hungarian, so a single cascade into a few hundred fragments could stall a
+        frame for tens-to-hundreds of milliseconds. The shipping planner solves it per
+        <strong>connected component</strong> with an argmax fast path — provably the same optimal assignment,
+        in near-linear time. This page measures the pure planner (no physics, no WASM) so you can watch the
+        difference live.
+      </p>
+
+      <div class="controls">
+        <label class="field">scenario
+          <select id="scenario">
+            <option value="shatter">shatter — 1 body → N fragments</option>
+            <option value="merge">merge — 2N bodies → N pieces</option>
+          </select>
+        </label>
+        <button id="run">Re-run benchmark</button>
+        <span id="status"></span>
+      </div>
+
+      <div class="headline" id="headline"></div>
+
+      <div class="chart-card">
+        <h2>Planner cost vs. fragment count (log–log)</h2>
+        <p>
+          Lower is better. The amber line (old dense Hungarian) rockets past the 60&nbsp;fps frame budget;
+          the green line (connected components) stays flat and keeps going far past where the old planner is
+          even feasible.
+        </p>
+        <canvas id="chart"></canvas>
+      </div>
+
+      <div class="table-card">
+        <h2>Per-size results</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>N (fragments)</th>
+              <th>bodies</th>
+              <th>before (dense)</th>
+              <th>after (components)</th>
+              <th>speedup</th>
+              <th>same optimum?</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+
+      <footer>
+        Source: <code>blast-stress-solver/src/rapier/splitMigrator.ts</code> ·
+        driver: <code>splitPlannerBench.ts</code> · CLI equivalent:
+        <code>npm run bench:split-planner</code>
+      </footer>
+    </div>
+
+    <script type="module" src="./dist/split-planner-bench.js"></script>
+  </body>
+</html>

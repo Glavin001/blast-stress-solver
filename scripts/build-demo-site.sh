@@ -17,6 +17,12 @@ echo "Building TypeScript in js_stress_example..."
 # but still exits non-zero. Ignore the exit code since the output is valid.
 (cd "$DEMO_SRC" && npm install --ignore-scripts 2>/dev/null; npx -y tsc || true)
 
+# Standalone, dependency-free demos (no three/rapier/WASM, no import map) are
+# bundled with esbuild so they're fully self-contained. The split-planner
+# benchmark pulls the pure-TS planner straight from the library source.
+echo "Bundling standalone demos (split-planner-bench)..."
+(cd "$DEMO_SRC" && npx -y esbuild split-planner-bench.ts --bundle --outfile=dist/split-planner-bench.js --format=esm || true)
+
 # Ensure blast-stress-solver dev deps (three-pinata) are installed for vendor copy
 BSS_DIR="$ROOT/blast/blast-stress-solver"
 if [ -d "$BSS_DIR" ] && [ ! -d "$BSS_DIR/node_modules/@dgreenheck/three-pinata" ]; then
