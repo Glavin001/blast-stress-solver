@@ -61,6 +61,7 @@
     "bench": "node scripts/bench.mjs",
     "bench:small": "node scripts/bench.mjs --small",
     "bench:large": "node scripts/bench.mjs --large",
+    "bench:split-planner": "node scripts/bench-split-planner.mjs",
     "sweep:high-rise": "node scripts/sweep-high-rise.mjs"
   },
   "devDependencies": {
