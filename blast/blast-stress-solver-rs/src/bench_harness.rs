@@ -263,6 +263,9 @@ pub struct Sim {
     now_secs: f32,
     frame: u32,
     record_timing: bool,
+    /// Reused across frames so per-frame resim capture allocates nothing once the
+    /// (non-fixed) body count is stable.
+    resim_snapshot: BodySnapshots,
 }
 
 impl Sim {
@@ -377,6 +380,7 @@ impl Sim {
             now_secs: 0.0,
             frame: 0,
             record_timing: true,
+            resim_snapshot: BodySnapshots::default(),
         }
     }
 
@@ -503,14 +507,12 @@ impl Sim {
         let want_snapshot = resim.enabled && self.set.needs_resimulation_snapshot();
 
         let mut resim_ms = 0.0f64;
-        let mut snapshot = if want_snapshot {
+        let mut have_snapshot = want_snapshot;
+        if want_snapshot {
             let t = Instant::now();
-            let snap = BodySnapshots::capture(&self.bodies);
+            self.resim_snapshot.capture_into(&self.bodies);
             resim_ms += t.elapsed().as_secs_f64() * 1e3;
-            Some(snap)
-        } else {
-            None
-        };
+        }
         let mut passes_left = resim.max_passes;
 
         loop {
@@ -556,14 +558,16 @@ impl Sim {
 
             // 4. Roll the pre-existing bodies back; new fragment bodies persist, so the
             //    next pass re-resolves the real contact against the fractured pieces.
-            if let Some(snap) = snapshot.as_ref() {
+            if have_snapshot {
                 let t = Instant::now();
-                snap.restore(&mut self.bodies);
+                self.resim_snapshot.restore(&mut self.bodies);
                 resim_ms += t.elapsed().as_secs_f64() * 1e3;
             }
             passes_left -= 1;
+            // Re-snapshot into the same buffer (no allocation when body count is stable).
             let t = Instant::now();
-            snapshot = Some(BodySnapshots::capture(&self.bodies));
+            self.resim_snapshot.capture_into(&self.bodies);
+            have_snapshot = true;
             resim_ms += t.elapsed().as_secs_f64() * 1e3;
         }
 

@@ -198,6 +198,11 @@ fn bench_snapshot(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("capture", n), &bodies, |b, bodies| {
             b.iter(|| black_box(BodySnapshots::capture(black_box(bodies))))
         });
+        // capture_into reuses its buffer — no per-call allocation once warm (the resim path).
+        let mut reused = BodySnapshots::capture(&bodies);
+        group.bench_with_input(BenchmarkId::new("capture_into_reused", n), &bodies, |b, bodies| {
+            b.iter(|| reused.capture_into(black_box(bodies)))
+        });
         let snap = BodySnapshots::capture(&bodies);
         group.bench_with_input(BenchmarkId::new("restore", n), &snap, |b, snap| {
             b.iter(|| snap.restore(black_box(&mut bodies)))
