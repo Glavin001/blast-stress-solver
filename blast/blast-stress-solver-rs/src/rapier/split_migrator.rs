@@ -50,17 +50,28 @@ pub fn plan_split_migration(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlannerMode {
+    /// Shipping path: solve the assignment per connected component of the body↔child
+    /// overlap graph, with argmax shortcuts for single-body / single-child components.
+    Production,
+    /// Reference path (test/bench only): one square-padded dense Hungarian over all
+    /// unmatched bodies × children. Kept as an independent oracle for the tests.
+    #[cfg(any(test, feature = "bench-support"))]
+    ReferenceDense,
+}
+
 pub fn plan_split_migration_with_support(
     bodies: &[ExistingBodyState],
     children: &[SplitChild],
     child_support: &[PlannerChildSupport],
 ) -> SplitMigrationPlan {
-    plan_split_migration_inner(bodies, children, child_support, true)
+    plan_split_migration_inner(bodies, children, child_support, PlannerMode::Production)
 }
 
-/// Test/bench-only entry point that forces the general overlap-matrix + Hungarian
-/// assignment, bypassing the single-parent fast path. Used to prove the fast path is
-/// equivalent (equally optimal, same edit set) to the reference algorithm and to A/B
+/// Test/bench-only entry point that forces the original square-padded dense Hungarian over
+/// the whole unmatched set (no component decomposition, no fast path). Kept as an
+/// independent reference to prove the shipping planner is equally optimal, and to A/B
 /// their cost at scale. Never compiled into shipped builds.
 #[cfg(any(test, feature = "bench-support"))]
 pub fn plan_split_migration_reference(
@@ -68,14 +79,14 @@ pub fn plan_split_migration_reference(
     children: &[SplitChild],
     child_support: &[PlannerChildSupport],
 ) -> SplitMigrationPlan {
-    plan_split_migration_inner(bodies, children, child_support, false)
+    plan_split_migration_inner(bodies, children, child_support, PlannerMode::ReferenceDense)
 }
 
 fn plan_split_migration_inner(
     bodies: &[ExistingBodyState],
     children: &[SplitChild],
     _child_support: &[PlannerChildSupport],
-    fast_path: bool,
+    mode: PlannerMode,
 ) -> SplitMigrationPlan {
     if bodies.is_empty() || children.is_empty() {
         return SplitMigrationPlan {
@@ -130,66 +141,29 @@ fn plan_split_migration_inner(
         .collect();
 
     if !unmatched_bodies.is_empty() && !unmatched_children.is_empty() {
-        // Fast path: a single remaining parent body splitting into many children — the
-        // common catastrophic-cascade case (one actor lets go into N fragments in a
-        // frame). The maximum-overlap assignment for a single row is exactly its
-        // argmax child, so we skip building the overlap matrix and the square-padded
-        // O(max(R,C)^3) Hungarian (which for 1×256 would do ~256^3 work). Result is
-        // identical: the one body reuses its best-overlap child, the rest are created.
-        if fast_path && unmatched_bodies.len() == 1 {
-            let body = &bodies[unmatched_bodies[0]];
-            let mut best: Option<(usize, usize)> = None; // (child_index, overlap)
-            for &ci in &unmatched_children {
-                let overlap = children[ci]
-                    .nodes
-                    .iter()
-                    .filter(|n| body.node_indices.contains(n))
-                    .count();
-                if overlap > 0 && best.map_or(true, |(_, b)| overlap > b) {
-                    best = Some((ci, overlap));
-                }
-            }
-            let reused_child = best.map(|(ci, _)| {
-                reuse.push(ReuseEntry {
-                    child_index: ci,
-                    body_handle: body.handle,
-                });
-                ci
-            });
-            let create = unmatched_children
-                .into_iter()
-                .filter(|ci| Some(*ci) != reused_child)
-                .map(|child_index| CreateEntry { child_index })
-                .collect();
-            return SplitMigrationPlan { reuse, create };
-        }
-
-        let overlap =
-            build_overlap_matrix(bodies, &unmatched_bodies, children, &unmatched_children);
-        let assignments = hungarian_max(&overlap);
-        let mut reused_children = HashSet::new();
-
-        for (row_idx, assignment) in assignments.into_iter().enumerate() {
-            let Some(col_idx) = assignment else {
-                continue;
-            };
-            let overlap_score = overlap
-                .get(row_idx)
-                .and_then(|row| row.get(col_idx))
-                .copied()
-                .unwrap_or(0);
-            if overlap_score == 0 {
-                continue;
-            }
-
-            let body_idx = unmatched_bodies[row_idx];
-            let child_index = unmatched_children[col_idx];
-            reuse.push(ReuseEntry {
-                child_index,
-                body_handle: bodies[body_idx].handle,
-            });
-            reused_children.insert(child_index);
-        }
+        // Assign existing bodies to children by maximum node overlap (reusing a body keeps
+        // its handle + colliders — the cheapest Rapier edit). The shipping path decomposes
+        // the body↔child overlap graph into connected components and solves each in
+        // isolation, which is provably identical to one global assignment — cross-component
+        // pairs share no node, so they never help — but avoids the O(max(M,N)^3) blow-up of
+        // a single square-padded Hungarian over the whole (usually sparse) set.
+        let reused_children = match mode {
+            PlannerMode::Production => assign_by_components(
+                bodies,
+                &unmatched_bodies,
+                children,
+                &unmatched_children,
+                &mut reuse,
+            ),
+            #[cfg(any(test, feature = "bench-support"))]
+            PlannerMode::ReferenceDense => assign_dense_hungarian(
+                bodies,
+                &unmatched_bodies,
+                children,
+                &unmatched_children,
+                &mut reuse,
+            ),
+        };
 
         let create = unmatched_children
             .into_iter()
@@ -206,6 +180,197 @@ fn plan_split_migration_inner(
     SplitMigrationPlan { reuse, create }
 }
 
+/// Maximum-overlap assignment via connected-component decomposition of the body↔child
+/// overlap graph. Each component is solved independently: single-body and single-child
+/// components by argmax (O(size)); only a component with multiple bodies AND multiple
+/// mutually-overlapping children falls back to a Hungarian, and only over that small
+/// component. This is equivalent to a single global maximum-overlap matching, because an
+/// optimal matching never pairs a body with a 0-overlap child — so no beneficial edge ever
+/// crosses a component boundary — while avoiding the O(max(M,N)^3) cost of one dense
+/// square-padded Hungarian over the whole (usually sparse) unmatched set.
+///
+/// Pushes the chosen reuse pairs into `reuse` (ascending child index, for a deterministic
+/// plan) and returns the set of reused global child indices.
+fn assign_by_components(
+    bodies: &[ExistingBodyState],
+    unmatched_bodies: &[usize],
+    children: &[SplitChild],
+    unmatched_children: &[usize],
+    reuse: &mut Vec<ReuseEntry>,
+) -> HashSet<usize> {
+    let nb = unmatched_bodies.len();
+    let nc = unmatched_children.len();
+
+    // node -> local body index. Existing bodies are disjoint node sets (each node lives on
+    // exactly one rigid body), so a node maps to at most one unmatched body.
+    let mut node_to_local_body: HashMap<u32, usize> = HashMap::new();
+    for (bi, &gb) in unmatched_bodies.iter().enumerate() {
+        for &node in &bodies[gb].node_indices {
+            node_to_local_body.insert(node, bi);
+        }
+    }
+
+    // Sparse overlaps (per child: body local index -> shared node count) + union the body
+    // and child into one component for every positive overlap edge.
+    let mut overlaps: Vec<HashMap<usize, usize>> = vec![HashMap::new(); nc];
+    let mut uf = UnionFind::new(nb + nc); // bodies are [0, nb), children are [nb, nb + nc)
+    for (ci, &gc) in unmatched_children.iter().enumerate() {
+        for &node in &children[gc].nodes {
+            if let Some(&bi) = node_to_local_body.get(&node) {
+                *overlaps[ci].entry(bi).or_insert(0) += 1;
+                uf.union(bi, nb + ci);
+            }
+        }
+    }
+
+    // Group bodies and (overlapping) children by component root. A child with no overlap is
+    // left out — it is created, not reused; a body in no edge stays unmatched and is retired.
+    let mut comp_bodies: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut comp_children: HashMap<usize, Vec<usize>> = HashMap::new();
+    for bi in 0..nb {
+        comp_bodies.entry(uf.find(bi)).or_default().push(bi);
+    }
+    for ci in 0..nc {
+        if !overlaps[ci].is_empty() {
+            comp_children.entry(uf.find(nb + ci)).or_default().push(ci);
+        }
+    }
+
+    // Solve each component (deterministic order: ascending root; members are already in
+    // ascending local-index order from the loops above).
+    let mut roots: Vec<usize> = comp_children.keys().copied().collect();
+    roots.sort_unstable();
+    let mut pairs: Vec<(usize, usize)> = Vec::new(); // (local body, local child)
+    for root in roots {
+        // Every child in `comp_children` was unioned with a body, so `comp_bodies` has it.
+        solve_component(&comp_bodies[&root], &comp_children[&root], &overlaps, &mut pairs);
+    }
+
+    pairs.sort_unstable_by_key(|&(_, ci)| ci);
+    let mut reused_children = HashSet::with_capacity(pairs.len());
+    for (bi, ci) in pairs {
+        reuse.push(ReuseEntry {
+            child_index: unmatched_children[ci],
+            body_handle: bodies[unmatched_bodies[bi]].handle,
+        });
+        reused_children.insert(unmatched_children[ci]);
+    }
+    reused_children
+}
+
+/// Optimal maximum-overlap matching within one component, appended to `pairs` as
+/// (local body, local child). Argmax for single-body / single-child components (covering
+/// the 1×N cascade and the N×1 merge); a small dense Hungarian otherwise.
+fn solve_component(
+    comp_bodies: &[usize],
+    comp_children: &[usize],
+    overlaps: &[HashMap<usize, usize>],
+    pairs: &mut Vec<(usize, usize)>,
+) {
+    let ov = |bi: usize, ci: usize| overlaps[ci].get(&bi).copied().unwrap_or(0);
+
+    if comp_bodies.len() == 1 {
+        let bi = comp_bodies[0];
+        let mut best: Option<(usize, usize)> = None; // (local child, overlap)
+        for &ci in comp_children {
+            let o = ov(bi, ci);
+            if o > 0 && best.map_or(true, |(_, b)| o > b) {
+                best = Some((ci, o));
+            }
+        }
+        if let Some((ci, _)) = best {
+            pairs.push((bi, ci));
+        }
+        return;
+    }
+    if comp_children.len() == 1 {
+        let ci = comp_children[0];
+        let mut best: Option<(usize, usize)> = None; // (local body, overlap)
+        for &bi in comp_bodies {
+            let o = ov(bi, ci);
+            if o > 0 && best.map_or(true, |(_, b)| o > b) {
+                best = Some((bi, o));
+            }
+        }
+        if let Some((bi, _)) = best {
+            pairs.push((bi, ci));
+        }
+        return;
+    }
+
+    // Dense component (multiple bodies AND children): Hungarian over just these members.
+    let matrix: Vec<Vec<usize>> = comp_bodies
+        .iter()
+        .map(|&bi| comp_children.iter().map(|&ci| ov(bi, ci)).collect())
+        .collect();
+    for (row, assignment) in hungarian_max(&matrix).into_iter().enumerate() {
+        let Some(col) = assignment else { continue };
+        if matrix[row][col] == 0 {
+            continue;
+        }
+        pairs.push((comp_bodies[row], comp_children[col]));
+    }
+}
+
+/// Minimal union-find with path compression; `union` attaches the larger root under the
+/// smaller, so a component's root is its lowest member (keeps component order stable).
+struct UnionFind {
+    parent: Vec<usize>,
+}
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self { parent: (0..n).collect() }
+    }
+    fn find(&mut self, x: usize) -> usize {
+        let mut root = x;
+        while self.parent[root] != root {
+            root = self.parent[root];
+        }
+        let mut cur = x;
+        while self.parent[cur] != cur {
+            let next = self.parent[cur];
+            self.parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            self.parent[ra.max(rb)] = ra.min(rb);
+        }
+    }
+}
+
+/// Reference assignment (test/bench only): the original single square-padded dense
+/// Hungarian over all unmatched bodies × children. Kept as an independent oracle so the
+/// component-decomposed shipping path can be proven equally optimal.
+#[cfg(any(test, feature = "bench-support"))]
+fn assign_dense_hungarian(
+    bodies: &[ExistingBodyState],
+    unmatched_bodies: &[usize],
+    children: &[SplitChild],
+    unmatched_children: &[usize],
+    reuse: &mut Vec<ReuseEntry>,
+) -> HashSet<usize> {
+    let overlap = build_overlap_matrix(bodies, unmatched_bodies, children, unmatched_children);
+    let assignments = hungarian_max(&overlap);
+    let mut reused_children = HashSet::new();
+    for (row_idx, assignment) in assignments.into_iter().enumerate() {
+        let Some(col_idx) = assignment else { continue };
+        let score = overlap.get(row_idx).and_then(|r| r.get(col_idx)).copied().unwrap_or(0);
+        if score == 0 {
+            continue;
+        }
+        reuse.push(ReuseEntry {
+            child_index: unmatched_children[col_idx],
+            body_handle: bodies[unmatched_bodies[row_idx]].handle,
+        });
+        reused_children.insert(unmatched_children[col_idx]);
+    }
+    reused_children
+}
+
 fn hash_node_set(nodes: &HashSet<u32>) -> u64 {
     let mut sorted: Vec<u32> = nodes.iter().copied().collect();
     sorted.sort_unstable();
@@ -218,6 +383,7 @@ fn hash_node_set(nodes: &HashSet<u32>) -> u64 {
     hash
 }
 
+#[cfg(any(test, feature = "bench-support"))]
 fn build_overlap_matrix(
     bodies: &[ExistingBodyState],
     unmatched_bodies: &[usize],
