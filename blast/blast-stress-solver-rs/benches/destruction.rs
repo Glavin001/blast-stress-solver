@@ -256,11 +256,47 @@ fn bench_snapshot(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cost of the Rapier topology edits a split applies (create/recycle/retire + collider
+/// re-parent), in isolation — no solve, no physics step, no resim. `iter_batched` rebuilds
+/// the pre-split structure per sample so each measures exactly one `apply`.
+fn bench_apply(c: &mut Criterion) {
+    use criterion::BatchSize;
+    let mut group = c.benchmark_group("apply");
+    for &side in &[8u32, 16, 32] {
+        let scn = wall(side, side, 1);
+        let w = scn.nodes.len() as u32;
+
+        // 1×N shatter (create/insert-dominated).
+        group.bench_with_input(BenchmarkId::new("shatter", w), &w, |b, &w| {
+            b.iter_batched(
+                || Sim::new(&scn, SimConfig::default()),
+                |mut sim| black_box(sim.apply_split_only(&shatter_event(w))),
+                BatchSize::LargeInput,
+            )
+        });
+
+        // M→M/2 merge/reparent (retire/remove-dominated). Setup shatters into singletons.
+        group.bench_with_input(BenchmarkId::new("merge_reparent", w), &w, |b, &w| {
+            b.iter_batched(
+                || {
+                    let mut sim = Sim::new(&scn, SimConfig::default());
+                    sim.apply_split_only(&shatter_event(w));
+                    sim
+                },
+                |mut sim| black_box(sim.apply_split_only(&merge_pairs_event(w / 2))),
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_solver_update,
     bench_full_step_steady,
     bench_split_planning,
-    bench_snapshot
+    bench_snapshot,
+    bench_apply
 );
 criterion_main!(benches);

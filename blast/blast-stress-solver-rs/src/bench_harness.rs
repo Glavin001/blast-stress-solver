@@ -23,7 +23,7 @@ use rapier3d::prelude::*;
 
 use crate::rapier::{
     BodySnapshots, DestructibleConfig, DestructibleSet, FracturePolicy, ResimulationOptions,
-    SleepThresholdOptions, SmallBodyDampingOptions,
+    SleepThresholdOptions, SmallBodyDampingOptions, SplitApplyResult,
 };
 use crate::rapier::{DebrisCleanupOptions, OptimizationMode};
 use crate::scenarios::{
@@ -102,6 +102,28 @@ pub fn bridge(span_segments: u32, width_segments: u32, thickness_layers: u32) ->
         thickness_layers,
         ..BridgeOptions::default()
     })
+}
+
+/// A `SplitEvent` that shatters one parent body holding nodes `0..n` into `n` singleton
+/// children — the common 1×N cascade (create/insert-dominated apply).
+pub fn shatter_event(n: u32) -> SplitEvent {
+    SplitEvent {
+        parent_actor_index: 0,
+        children: (0..n).map(|k| SplitChild { actor_index: k, nodes: vec![k] }).collect(),
+    }
+}
+
+/// A `SplitEvent` that regroups `2 * n_pairs` singleton nodes into `n_pairs` two-node
+/// children. When the inputs currently sit in distinct singleton bodies, each child pulls
+/// from two different bodies, so the planner sees a real M×N assignment and the apply path
+/// reuses one body per child and *retires* the other — a retire/remove-dominated apply.
+pub fn merge_pairs_event(n_pairs: u32) -> SplitEvent {
+    SplitEvent {
+        parent_actor_index: 0,
+        children: (0..n_pairs)
+            .map(|k| SplitChild { actor_index: k, nodes: vec![2 * k, 2 * k + 1] })
+            .collect(),
+    }
 }
 
 /// Absolute path to a committed scene pack under the Bevy demo's `assets/scenes/`,
@@ -489,6 +511,21 @@ impl Sim {
             .iter()
             .map(|(h, _)| self.bodies.get(*h).map(|b| *b.linvel()).unwrap_or_else(Vector::zeros))
             .collect()
+    }
+
+    /// Apply a contrived split through the real Rapier apply path **only** — no stress
+    /// solve, no physics step, no resim. Returns the per-op `SplitEditStats` so the cost
+    /// of the topology edits can be profiled in isolation at any scale.
+    pub fn apply_split_only(&mut self, event: &SplitEvent) -> SplitApplyResult {
+        self.set.bench_apply_split(
+            event,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.islands,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            self.now_secs,
+        )
     }
 
     /// Advance one full frame, including the resim rollback loop (mirrors the demo).

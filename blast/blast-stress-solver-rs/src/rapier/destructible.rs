@@ -27,6 +27,8 @@ use crate::ext_stress_solver::ExtStressSolver;
 use crate::types::*;
 
 use super::body_tracker::{BodyTracker, SplitEditStats};
+#[cfg(any(test, feature = "bench-support"))]
+use super::body_tracker::SplitApplyResult;
 use super::collision_groups::DebrisCollisionMode;
 use super::fracture_policy::FracturePolicy;
 use super::optimization::SleepThresholdOptions;
@@ -403,6 +405,37 @@ impl DestructibleSet {
         self.solver
             .add_force(node_index, position, acceleration, ForceMode::Acceleration);
         self.forces_applied = true;
+    }
+
+    /// Bench/test-only: apply a contrived [`SplitEvent`] through the real Rapier apply
+    /// path (`BodyTracker::handle_split`) and return its per-op `SplitEditStats`, *without*
+    /// running the stress solver, a physics step, or resim. This isolates the cost of the
+    /// topology edits themselves (body create/recycle/retire, collider re-parent/insert)
+    /// so it can be profiled at arbitrary scale on a pre-built structure. Never shipped.
+    #[cfg(any(test, feature = "bench-support"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_apply_split(
+        &mut self,
+        event: &SplitEvent,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        island_manager: &mut IslandManager,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        now_secs: f32,
+    ) -> SplitApplyResult {
+        self.tracker.handle_split(
+            event,
+            bodies,
+            colliders,
+            island_manager,
+            impulse_joints,
+            multibody_joints,
+            now_secs,
+            self.small_body_damping,
+            self.sleep_thresholds,
+            self.debris_cleanup.max_colliders_for_debris,
+        )
     }
 
     /// Enable/disable per-split point-velocity continuity recording. Observability
