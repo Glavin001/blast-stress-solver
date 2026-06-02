@@ -70,8 +70,9 @@ fi
 BSS_DIST="$ROOT/blast/blast-stress-solver/dist"
 if [ -d "$BSS_DIST" ]; then
   mkdir -p "$OUT/vendor/blast-stress-solver"
-  # Copy ESM bundles and WASM — the import maps in the new demos resolve here
-  for f in "$BSS_DIST"/*.mjs "$BSS_DIST"/*.wasm "$BSS_DIST"/*.js; do
+  # Copy ESM bundles + WASM (resolved via the demos' import maps) and the generated
+  # scene packs (e.g. high-rise.json, fetched at runtime via loadScenePackFromUrl).
+  for f in "$BSS_DIST"/*.mjs "$BSS_DIST"/*.wasm "$BSS_DIST"/*.js "$BSS_DIST"/*.json; do
     [ -f "$f" ] && cp "$f" "$OUT/vendor/blast-stress-solver/"
   done
   echo "Copied blast-stress-solver dist to vendor/"
