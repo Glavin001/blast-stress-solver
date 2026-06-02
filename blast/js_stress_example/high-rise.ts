@@ -85,18 +85,26 @@ let recorder: ReturnType<typeof createBondBreakRecorder> | null = null;
 let frame = 0;
 let rebuilding = false;
 
-// User-controlled settings (top-right panel). `damage` is OFF by default: the
-// default experience is the pure stress-solver response to impacts; the toggle
-// flips on the per-chunk contact-damage layer (local holes) and rebuilds.
-const settings = { damage: false, debug: false, radius: 0.6, mass: 2500, speed: 8 };
-// Projectile ttl comes from the scene pack; radius/mass/speed are slider-driven.
-let projectileTtlMs = 8000;
+// User-controlled settings (top-right panel). `damage` is ON by default: it is the only
+// mode that produces reasonable LOCAL destruction. The bare stress solver is bimodal —
+// a hard enough impact seeds a slow global collapse, anything softer does nothing — so
+// toggling damage OFF shows the frame robustly *withstanding* the ball (see
+// STRESS_CONTACT_SCALE), not local chipping.
+const settings = { damage: true, debug: false, radius: 0.6, mass: 2500, speed: 8 };
+// Projectile ttl comes from the scene pack (capped); radius/mass/speed are slider-driven.
+let projectileTtlMs = 3000;
 let packDamage: Record<string, unknown> = {};
 // Building bounds (computed from the scenario at load). The wrecking ball spawns just
 // in FRONT of the clicked surface (a local impact) rather than plowing ~45 m from the
 // camera, which would rake a diagonal tunnel / trigger a global stress cascade.
 const STANDOFF = 6;
 const buildingBox = new THREE.Box3();
+// Contact->stress coupling for the DEFAULT (damage-off) path. Kept low: the high-rise's
+// stress response to impacts is bimodal, and the pack's value (30) seeds a slow global
+// cascade that collapses the building several seconds after a hit. At 8 the frame
+// robustly withstands the ball. Ignored when the damage system is enabled (impacts then
+// drive local per-chunk damage, decoupled from the stress solver).
+const STRESS_CONTACT_SCALE = 8;
 
 async function initScene() {
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
@@ -104,7 +112,7 @@ async function initScene() {
 
   const pack = await loadScenePackFromUrl(SCENE_URL);
   const { scenario, defaults } = pack;
-  projectileTtlMs = (defaults.projectile as any)?.ttlMs ?? 8000;
+  projectileTtlMs = Math.min((defaults.projectile as any)?.ttlMs ?? 3000, 3000);
   packDamage = (defaults.damage as Record<string, unknown>) ?? {};
   // Axis-aligned bounds of the building (centroids + a chunk half-extent margin),
   // used to place the wrecking ball just in front of the clicked surface.
@@ -131,12 +139,14 @@ async function initScene() {
     solverSettings: defaults.solverSettings,
     friction: defaults.physics.friction,
     restitution: defaults.physics.restitution,
-    contactForceScale: defaults.physics.contactForceScale,
+    // Low coupling so the stress-only (damage-off) path withstands the ball instead of
+    // slowly collapsing; ignored once damage is enabled. See STRESS_CONTACT_SCALE.
+    contactForceScale: STRESS_CONTACT_SCALE,
     debrisCollisionMode: defaults.physics.debrisCollisionMode as any,
-    // Per-chunk contact damage (health + splash) localizes wrecking-ball destruction
-    // into a local hole instead of a global stress cascade. Tuned params come from the
-    // scene pack; the `enabled` flag is driven by the top-right "Custom damage system"
-    // toggle — OFF by default, so the default impact response is the pure stress solver.
+    // Per-chunk contact damage (health + splash) localizes wrecking-ball destruction into
+    // a local hole instead of a global stress cascade. Tuned params come from the scene
+    // pack; the `enabled` flag is driven by the top-right "Custom damage system" toggle —
+    // ON by default (the only mode with reasonable local destruction).
     damage: { ...packDamage, enabled: settings.damage } as any,
     debrisCleanup: {
       mode: defaults.optimization.debrisCleanupMode as any,

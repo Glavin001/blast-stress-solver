@@ -38,10 +38,10 @@
           <h1>&#127970; High-Rise Demolition</h1>
           <p>
             Mid-rise apartment: reinforced-concrete flat-slab skeleton + frangible drywall
-            infill, loaded from the same shared scene-pack JSON the Rust demo uses. By default
-            the stress solver alone keeps the frame standing under a wrecking-ball hit; enable
-            the <em>Custom damage system</em> toggle to add per-chunk material fracture &mdash;
-            local holes that scale with the ball.
+            infill, loaded from the same shared scene-pack JSON the Rust demo uses. Click the
+            building to throw the wrecking ball &mdash; it punches a local hole that scales with
+            the ball while the frame redistributes load and stays standing. Toggle
+            <em>Custom damage system</em> off to watch the bare stress solver withstand the same hit.
           </p>
         </header>
 
@@ -52,10 +52,10 @@
         <section class="config-section">
           <h2 class="section-title">Features</h2>
           <label class="toggle-row">
-            <input type="checkbox" id="opt-damage" />
+            <input type="checkbox" id="opt-damage" checked />
             <span class="toggle-text">
               Custom damage system
-              <small>Per-chunk health: the ball punches a local hole instead of a global stress cascade. Toggling rebuilds the scene.</small>
+              <small>Per-chunk health: the ball punches a local hole. Toggle off to watch the bare stress solver withstand the hit. Toggling rebuilds the scene.</small>
             </span>
           </label>
           <label class="toggle-row">
