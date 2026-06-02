@@ -42,6 +42,8 @@ export type ScenePackDefaults = {
     debrisTtlMs: number;
     maxCollidersForDebris: number;
   };
+  /** Contact-damage options (per-chunk health + splash) — the local-destruction knob. */
+  damage?: Record<string, unknown>;
 };
 
 export type LoadedScenePack = {
@@ -72,6 +74,7 @@ type RawScenePack = {
     solver: { gravity: number; materialScale: number; limits?: RawLimits };
     physics: ScenePackDefaults['physics'];
     optimization: ScenePackDefaults['optimization'];
+    damage?: Record<string, unknown>;
   };
   scenario: {
     nodes: Array<{ centroid: RawVec3; mass: number; volume: number }>;
@@ -149,6 +152,7 @@ export function parseScenePack(raw: unknown): LoadedScenePack {
     solverSettings: d.solver.limits ? limitsToSolverSettings(d.solver.limits) : undefined,
     physics: d.physics,
     optimization: d.optimization,
+    damage: d.damage,
   };
 
   return {

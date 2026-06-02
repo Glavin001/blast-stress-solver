@@ -69,11 +69,13 @@ export type HighRiseOptions = {
   concreteDensity?: number;
   /** Bond mode for the assembler. 'proximity' is pure-JS (default); 'auto' needs WASM. */
   bondMode?: 'proximity' | 'auto';
+  /** Override individual bond-strength multipliers (for parameter sweeps / tuning). */
+  multipliers?: Partial<HighRiseMultipliers>;
 };
 
-export const DEFAULT_HIGH_RISE_OPTIONS: Required<Omit<HighRiseOptions, 'bondMode'>> & {
-  bondMode: 'proximity' | 'auto';
-} = {
+export const DEFAULT_HIGH_RISE_OPTIONS: Required<
+  Omit<HighRiseOptions, 'bondMode' | 'multipliers'>
+> & { bondMode: 'proximity' | 'auto' } = {
   floorCount: 9,
   floorHeight: 3.2,
   width: 18,
@@ -99,53 +101,76 @@ export const DEFAULT_HIGH_RISE_OPTIONS: Required<Omit<HighRiseOptions, 'bondMode
  * The GLOBAL solver stress limits represent concrete (see the scene-pack `solver`
  * block). Multipliers > 1 strengthen a joint relative to plain concrete (rebar
  * continuity / monolithic pours); multipliers < 1 weaken it (drywall infill, which
- * per unit area is ~10x weaker than concrete, and its light attachment to the frame
- * weaker still). The result is a ~100-300x strength ratio between skeleton joints and
- * infill joints, so a wrecking ball blows out local panels while the frame survives
- * unless hit hard. These are the primary knobs the parameter sweep explores.
+ * per unit area is much weaker than concrete, and its light attachment to the frame
+ * weaker still). These are the primary knobs the parameter sweep explores; the
+ * defaults below were tuned against the FULL Rapier pipeline (contacts + collapse),
+ * not just the headless stress solver, so a realistic ball blows out local infill
+ * while the frame survives a single hit.
  */
-export const HIGH_RISE_MULTIPLIERS = {
-  foundationColumn: 12.0, // strongest joint: base anchor (no "footing rips off")
-  foundationSkeleton: 6.0, // foundation <-> slab/beam
-  columnColumn: 8.0, // stacked columns (if any touch directly)
-  columnSlab: 6.0, // primary vertical load path
-  beamColumn: 6.0,
-  beamBeam: 5.0,
-  beamSlab: 4.0,
-  slabSlab: 3.0, // floor-plate diaphragm continuity
-  infillInfill: 0.1, // drywall internal (vs concrete)
-  slabInfill: 0.06, // panel sits in the slab band
-  frameInfill: 0.04, // column/beam/foundation <-> drywall (light attachment)
-} as const;
-
-export const HIGH_RISE_BOND_MULTIPLIERS: BondStrengthMultiplierFn = (t0, t1) => {
-  const M = HIGH_RISE_MULTIPLIERS;
-  const pair = (a: FragmentType, b: FragmentType) =>
-    (t0 === a && t1 === b) || (t0 === b && t1 === a);
-  const has = (a: FragmentType) => t0 === a || t1 === a;
-  const isInfill = (t?: FragmentType) => t === 'infill' || t === 'wall';
-
-  // Weak infill joints first, so any skeleton<->infill pair resolves to "weak".
-  if (isInfill(t0) || isInfill(t1)) {
-    if (isInfill(t0) && isInfill(t1)) return M.infillInfill;
-    if (has('slab') || has('floor')) return M.slabInfill;
-    return M.frameInfill; // column / beam / foundation <-> infill
-  }
-
-  // Anchoring: the base must be the strongest joint in the structure.
-  if (pair('foundation', 'column')) return M.foundationColumn;
-  if (has('foundation')) return M.foundationSkeleton;
-
-  // Stiff reinforced-concrete skeleton.
-  if (pair('column', 'column')) return M.columnColumn;
-  if (pair('column', 'beam')) return M.beamColumn;
-  if (pair('beam', 'beam')) return M.beamBeam;
-  if (pair('column', 'slab') || pair('column', 'floor')) return M.columnSlab;
-  if (pair('beam', 'slab') || pair('beam', 'floor')) return M.beamSlab;
-  if (has('slab') || has('floor')) return M.slabSlab;
-
-  return 1.0;
+export type HighRiseMultipliers = {
+  foundationColumn: number;
+  foundationSkeleton: number;
+  columnColumn: number;
+  columnSlab: number;
+  beamColumn: number;
+  beamBeam: number;
+  beamSlab: number;
+  slabSlab: number;
+  infillInfill: number;
+  slabInfill: number;
+  frameInfill: number;
 };
+
+export const DEFAULT_HIGH_RISE_MULTIPLIERS: HighRiseMultipliers = {
+  foundationColumn: 24.0, // strongest joint: base anchor (no "footing rips off")
+  foundationSkeleton: 12.0, // foundation <-> slab/beam
+  columnColumn: 16.0, // stacked columns (if any touch directly)
+  columnSlab: 14.0, // primary vertical load path — must survive a single heavy hit
+  beamColumn: 12.0,
+  beamBeam: 10.0,
+  beamSlab: 9.0,
+  slabSlab: 7.0, // floor-plate diaphragm continuity
+  infillInfill: 0.03, // drywall internal — weak so a realistic ball blows panels out
+  slabInfill: 0.02, // panel sits in the slab band
+  frameInfill: 0.015, // column/beam/foundation <-> drywall (light attachment)
+};
+
+/** Build a bond-strength multiplier function from the (optionally overridden) table. */
+export function makeHighRiseBondMultiplier(
+  overrides?: Partial<HighRiseMultipliers>,
+): BondStrengthMultiplierFn {
+  const M = { ...DEFAULT_HIGH_RISE_MULTIPLIERS, ...overrides };
+  const isInfill = (t?: FragmentType) => t === 'infill' || t === 'wall';
+  return (t0, t1) => {
+    const pair = (a: FragmentType, b: FragmentType) =>
+      (t0 === a && t1 === b) || (t0 === b && t1 === a);
+    const has = (a: FragmentType) => t0 === a || t1 === a;
+
+    // Weak infill joints first, so any skeleton<->infill pair resolves to "weak".
+    if (isInfill(t0) || isInfill(t1)) {
+      if (isInfill(t0) && isInfill(t1)) return M.infillInfill;
+      if (has('slab') || has('floor')) return M.slabInfill;
+      return M.frameInfill; // column / beam / foundation <-> infill
+    }
+
+    // Anchoring: the base must be the strongest joint in the structure.
+    if (pair('foundation', 'column')) return M.foundationColumn;
+    if (has('foundation')) return M.foundationSkeleton;
+
+    // Stiff reinforced-concrete skeleton.
+    if (pair('column', 'column')) return M.columnColumn;
+    if (pair('column', 'beam')) return M.beamColumn;
+    if (pair('beam', 'beam')) return M.beamBeam;
+    if (pair('column', 'slab') || pair('column', 'floor')) return M.columnSlab;
+    if (pair('beam', 'slab') || pair('beam', 'floor')) return M.beamSlab;
+    if (has('slab') || has('floor')) return M.slabSlab;
+
+    return 1.0;
+  };
+}
+
+/** Default high-rise bond-strength multiplier (uses DEFAULT_HIGH_RISE_MULTIPLIERS). */
+export const HIGH_RISE_BOND_MULTIPLIERS: BondStrengthMultiplierFn = makeHighRiseBondMultiplier();
 
 function linspace(min: number, max: number, n: number): number[] {
   if (n <= 1) return [(min + max) * 0.5];
@@ -303,7 +328,11 @@ export function buildHighRiseScenario(options: HighRiseOptions = {}): ScenarioDe
   });
 
   const fragmentTypes = fragments.map((f) => f.fragmentType);
-  scenario.bonds = applyBondStrengthMultipliers(scenario.bonds, fragmentTypes, HIGH_RISE_BOND_MULTIPLIERS);
+  scenario.bonds = applyBondStrengthMultipliers(
+    scenario.bonds,
+    fragmentTypes,
+    makeHighRiseBondMultiplier(o.multipliers),
+  );
   scenario.parameters = {
     ...scenario.parameters,
     highRise: {

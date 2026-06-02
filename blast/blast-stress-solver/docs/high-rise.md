@@ -1,9 +1,12 @@
 # High-Rise Apartment — realistic, non-glass destruction
 
-A mid-rise (≈9-storey) reinforced-concrete apartment building designed to be destroyed by
-a wrecking ball *realistically* — punching local holes and shedding sections incrementally
-(Red Faction: Guerrilla style) instead of shattering uniformly like glass. The same building
-runs in the **web demo** and the **Bevy Rust demo** from one shared, generated scene pack.
+A mid-rise (≈9-storey) reinforced-concrete apartment building that, unlike a uniform-material
+structure, does **not** shatter its whole face like glass when hit: walls are frangible infill
+hung on a stiff, strongly-anchored skeleton, so the frame refuses to propagate the failure, and
+the building sheds a section only when a support is knocked out (Red Faction: Guerrilla style).
+The same building runs in the **web demo** and the **Bevy Rust demo** from one shared, generated
+scene pack. (See "Destruction model & honest limitations" for what the stress solver alone does
+and does not do.)
 
 ## Why uniform structures shatter like glass (the problem)
 
@@ -46,11 +49,28 @@ localizes damage.
   **4 MPa** (≈10× weaker — concrete cracks locally under impact, the key non-glass knob), with
   a wide elastic→fatal band for ductility.
 - **Wrecking ball**: radius 0.6 m, **2500 kg**, 18 m/s (a believable demolition ball).
+### Destruction model & honest limitations (verified in the full Rapier sim)
 
-These were tuned with the headless sweep (below). Measured response on an infill hit: nothing
-below 1 MN, a **local hole** (12-26 bonds, zero skeleton) at 3-10 MN, and a true glass cascade
-(>45% of bonds) only at ~300 MN — i.e. ~100× a realistic ball. Columns shrug off everything
-below ~30 MN; even a 300 MN strike punches a **local** hole (6.6% of bonds, base stays anchored).
+Destruction relies on the **heterogeneous structure** + the solver's **built-in bond health
+(elastic→fatal band)** + **splash-localized** contact forces. Both runtimes share this exact
+mechanism (the JS core and the Bevy demo apply contact force the same way: full force at the
+hit node + quadratic-falloff splash within ~2 m, `contactForceScale = 30`).
+
+What this **fixes** (the original problem): a uniform building shatters its whole face from one
+hit. Here, walls are *infill* hung weakly on a stiff frame, so hitting a wall does **not** blow
+out the face — the strong skeleton refuses to propagate the failure. A single heavy ball into a
+wall barely dents it; gravity-only is stable; the base never rips off (anchored). Verified.
+
+What it **does not** do, and why: the Blast stress solver is a *global* quasi-static solve, so a
+contact force is spatially **all-or-nothing** — below a threshold nothing breaks; once a load
+path is severed (e.g. a low column hit hard) the section above progressively collapses. There
+is no graceful *per-hit local chipping* from the stress solver alone. That graceful, graded
+local destruction is what an **optional contact-damage layer** (per-chunk health + splash,
+`DestructibleDamageSystem`) provides — it is wired through the scene pack's `defaults.damage`
+block and the web loader but ships **disabled** (out of current scope). A tuned starting point
+(`strengthPerVolume 500, kImpact 0.2, contactDamageScale 10, splashRadius 3 m`) is kept in the
+block; flipping `enabled: true` (and porting an equivalent to the Rust crate) is the documented
+next step when fine-grained local destruction is in scope.
 
 ## Composable building kit
 

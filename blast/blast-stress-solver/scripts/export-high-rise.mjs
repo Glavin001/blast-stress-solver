@@ -56,6 +56,21 @@ const DEFAULTS = {
     contactForceScale: 30,
     skipSingleBodies: false,
   },
+  // OPTIONAL contact-damage layer (per-chunk health + splash), DISABLED by default and
+  // out of current scope. Destruction here relies on the heterogeneous structure + the
+  // solver's built-in elastic/fatal bond health + splash-localized contact forces.
+  // The plumbing is wired (loader + web demo read this block) so the damage layer can be
+  // turned on later for graceful per-hit local chipping, which the global stress solver
+  // alone cannot do (it is spatially all-or-nothing). The params below are a tuned
+  // starting point from the Rapier sweep, kept for that future work.
+  damage: {
+    enabled: false,
+    strengthPerVolume: 500,
+    kImpact: 0.2,
+    contactDamageScale: 10,
+    splashRadius: 3.0,
+    splashFalloffExp: 1.5,
+  },
   optimization: {
     smallBodyDampingMode: 'always',
     debrisCleanupMode: 'always',

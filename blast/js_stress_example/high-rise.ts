@@ -112,7 +112,9 @@ async function initScene() {
     restitution: defaults.physics.restitution,
     contactForceScale: defaults.physics.contactForceScale,
     debrisCollisionMode: defaults.physics.debrisCollisionMode as any,
-    damage: { enabled: false },
+    // Contact damage (per-chunk health + splash) localizes wrecking-ball destruction:
+    // it blows out a local hole instead of cascading like glass. From the scene pack.
+    damage: (defaults.damage as any) ?? { enabled: false },
     debrisCleanup: {
       mode: defaults.optimization.debrisCleanupMode as any,
       debrisTtlMs: defaults.optimization.debrisTtlMs,
