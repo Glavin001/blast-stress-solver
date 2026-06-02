@@ -88,11 +88,41 @@ symptom.
 - `split_preserves_point_velocity_for_offset_com_child` — convex-hull fragment, same spin →
   also continuous now (drifted ~2.1 m/s before the fix).
 
-**Fix:** `handle_split` runs a post-migration pass (`reconcile_child_velocity_with_com`) that
-recomputes each dynamic child's mass properties and shifts its `linvel` by
+**Fix (Rust):** `handle_split` runs a post-migration pass (`reconcile_child_velocity_with_com`)
+that recomputes each dynamic child's mass properties and shifts its `linvel` by
 `ω × (real_com − fit_center)`, so the body's velocity field matches the fitted
 (parent-continuous) field at the node points regardless of collider-COM offset. Both tests in
 the matched pair are now passing, blocking regression guards.
+
+### JS reused-fragment path (gap #1b) — OPEN
+
+The "JS already satisfies this" claim above is only true for the **created** child bodies. A
+fracture partitions a parent into one **reused** body (the largest fragment — it keeps the
+parent's Rapier handle and merely *loses* the colliders that migrated to the new children) and
+N **created** bodies. `syncBodyVelocityFromSource` / `recordBodyContinuity` only ever run for
+the *created* targets (`flushColliderMigrations`'s `targetBodiesAffected`; `bodyRestoreProvenance`
+is only set for created bodies). The reused body is never re-derived for its shifted COM.
+
+Because Rapier stores `linvel` as the velocity *of the centre of mass* and keeps it when
+`removeCollider` shifts the COM (the recompute is even deferred to the next `step`), the reused
+fragment's velocity field jumps by `ω × ΔCOM` on every fracture. While a large slab tumbles and
+re-shatters on ground impact this repeatedly perturbs the biggest piece's velocity — the
+"big fragment hovers while small debris falls normally" report. The split-continuity log stays
+green (~1e-7) throughout because it structurally never observes the reused body.
+
+This is now covered by:
+- `src/tests/rapier.splitVelocity.mechanism.test.ts` — pure-Rapier, no WASM. Pins the
+  mechanism with exact magnitudes: removeCollider defers the recompute; a spinning body that
+  loses a collider gains `ω × ΔCOM` of point-velocity drift; symmetric loss is the zero control;
+  `linvel += ω × ΔCOM` is the fix spec; the created-child transfer formula is the positive control.
+- `src/tests/rapier.splitVelocity.noHover.test.ts` — real pipeline (WASM). Blocking guards
+  (no NaN, mass conserved, log green but structurally blind to the reused body, no *gross* hover)
+  plus an `it.skip` repro (`[repro] reused fragment preserves point velocity…`) that fails by
+  ~7.5 m/s when un-skipped — the JS analogue of the Rust `#[ignore]` repro lane.
+
+**Fix (JS, when prioritized):** mirror Rust — after `flushColliderMigrations`, also reconcile the
+*reused* body's `linvel` by `ω × (newCom − oldCom)` (recompute its mass properties first, since
+`removeCollider` leaves them stale).
 
 ## Physics mechanisms: gravity orientation & momentum transfer
 
@@ -148,6 +178,11 @@ Blast computes this with `getExcessForces`.
    (`reconcile_child_velocity_with_com`: `linvel += ω × (real_com − fit_center)`). The former
    repro `kinematic_invariants_test.rs::split_preserves_point_velocity_for_offset_com_child`
    is now a passing, blocking regression guard.
+   - **1b. JS reused-fragment COM/velocity — ❌ OPEN.** The JS pipeline corrects *created*
+     children but never the *reused* fragment (largest piece, keeps the parent handle, loses
+     colliders), so its velocity field drifts by `ω × ΔCOM` on every fracture ("big fragment
+     hovers" report). Covered by `rapier.splitVelocity.mechanism.test.ts` (blocking) and the
+     `it.skip` repro in `rapier.splitVelocity.noHover.test.ts`. See the section above for the fix.
 2. **Rust split-planner determinism** — covered for wall + tower at scale
    (`multi_fracture_test.rs::tower_collapse_is_deterministic_at_scale`,
    `scenario_invariants_test.rs::wall_collapse_is_deterministic`); both pass, so the
@@ -162,8 +197,10 @@ Blast computes this with `getExcessForces`.
 5. **No visual regression** — fractured/Voronoi demos (`fractured-tower.ts`, …) are
    browser-only; we have no screenshot/visual diff. A future Playwright visual-diff lane
    would catch rendering/positioning regressions the headless invariants can't see.
-6. **JS mass/COM conservation** — only asserted Rust-side (where `RigidBody::mass()` is
-   reachable in tests). The JS core would need a small per-body mass accessor to mirror it.
+6. **JS mass/COM conservation** — ⚠️ PARTIAL. Dynamic *mass* conservation is now asserted
+   JS-side too (`rapier.splitVelocity.noHover.test.ts` sums `RigidBody::mass()` over
+   `world.forEachRigidBody`). *Momentum*/COM-velocity conservation across a rotating split is
+   still not a blocking assertion on the reused fragment (blocked on gap #1b).
 7. **Rust gravity orientation** — ✅ FIXED. `DestructibleSet::step` now applies gravity per
    actor, rotated into the body's current local frame via `add_actor_gravity`
    (`apply_oriented_gravity`), matching the JS pipeline. Guard:
