@@ -83,8 +83,15 @@ let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let recorder: ReturnType<typeof createBondBreakRecorder> | null = null;
 let frame = 0;
-let showDebug = false;
-let projectile = { radius: 0.6, mass: 2500, speed: 18, ttlMs: 8000 };
+let rebuilding = false;
+
+// User-controlled settings (top-right panel). `damage` is OFF by default: the
+// default experience is the pure stress-solver response to impacts; the toggle
+// flips on the per-chunk contact-damage layer (local holes) and rebuilds.
+const settings = { damage: false, debug: false, mass: 2500, speed: 18 };
+// Projectile radius + ttl come from the scene pack; mass + speed are slider-driven.
+let projectileShape = { radius: 0.6, ttlMs: 8000 };
+let packDamage: Record<string, unknown> = {};
 
 async function initScene() {
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
@@ -92,7 +99,11 @@ async function initScene() {
 
   const pack = await loadScenePackFromUrl(SCENE_URL);
   const { scenario, defaults } = pack;
-  projectile = defaults.projectile;
+  projectileShape = {
+    radius: (defaults.projectile as any)?.radius ?? 0.6,
+    ttlMs: (defaults.projectile as any)?.ttlMs ?? 8000,
+  };
+  packDamage = (defaults.damage as Record<string, unknown>) ?? {};
   console.log(
     `High-rise: ${scenario.nodes.length} nodes, ${scenario.bonds.length} bonds, ` +
       `limits comp/ten/shear=${defaults.solverSettings?.compressionFatalLimit}/` +
@@ -112,9 +123,11 @@ async function initScene() {
     restitution: defaults.physics.restitution,
     contactForceScale: defaults.physics.contactForceScale,
     debrisCollisionMode: defaults.physics.debrisCollisionMode as any,
-    // Contact damage (per-chunk health + splash) localizes wrecking-ball destruction:
-    // it blows out a local hole instead of cascading like glass. From the scene pack.
-    damage: (defaults.damage as any) ?? { enabled: false },
+    // Per-chunk contact damage (health + splash) localizes wrecking-ball destruction
+    // into a local hole instead of a global stress cascade. Tuned params come from the
+    // scene pack; the `enabled` flag is driven by the top-right "Custom damage system"
+    // toggle — OFF by default, so the default impact response is the pure stress solver.
+    damage: { ...packDamage, enabled: settings.damage } as any,
     debrisCleanup: {
       mode: defaults.optimization.debrisCleanupMode as any,
       debrisTtlMs: defaults.optimization.debrisTtlMs,
@@ -140,7 +153,7 @@ async function initScene() {
   });
 
   rapierDebug?.dispose();
-  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
+  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: settings.debug });
 
   coreRef = core;
   visualsRef = visuals;
@@ -157,10 +170,10 @@ function shootProjectile(ndcX: number, ndcY: number) {
   const dir = raycaster.ray.direction.clone().normalize();
   core.enqueueProjectile({
     position: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
-    velocity: { x: dir.x * projectile.speed, y: dir.y * projectile.speed, z: dir.z * projectile.speed },
-    radius: projectile.radius,
-    mass: projectile.mass,
-    ttl: projectile.ttlMs,
+    velocity: { x: dir.x * settings.speed, y: dir.y * settings.speed, z: dir.z * settings.speed },
+    radius: projectileShape.radius,
+    mass: settings.mass,
+    ttl: projectileShape.ttlMs,
   });
 }
 
@@ -171,17 +184,51 @@ canvas.addEventListener('click', (e) => {
   shootProjectile(ndcX, ndcY);
 });
 
-document.getElementById('btn-reset')?.addEventListener('click', async () => {
+async function rebuild() {
+  if (rebuilding) return;
+  rebuilding = true;
   visualsRef?.dispose();
   coreRef?.dispose();
   coreRef = null;
   visualsRef = null;
-  await initScene();
+  try {
+    await initScene();
+  } finally {
+    rebuilding = false;
+  }
+}
+
+// ── Top-right panel: feature toggles + settings ──────────────
+document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });
+
+const optDamage = document.getElementById('opt-damage') as HTMLInputElement | null;
+if (optDamage) optDamage.checked = settings.damage;
+optDamage?.addEventListener('change', () => {
+  settings.damage = !!optDamage.checked;
+  // Per-chunk health is allocated at construction, so applying the damage feature
+  // rebuilds the scene with the current settings.
+  void rebuild();
 });
-document.getElementById('btn-debug')?.addEventListener('click', () => {
-  showDebug = !showDebug;
-  rapierDebug?.setEnabled(showDebug);
+
+const optDebug = document.getElementById('opt-debug') as HTMLInputElement | null;
+if (optDebug) optDebug.checked = settings.debug;
+optDebug?.addEventListener('change', () => {
+  settings.debug = !!optDebug.checked;
+  rapierDebug?.setEnabled(settings.debug);
 });
+
+const optMass = document.getElementById('opt-mass') as HTMLInputElement | null;
+const optSpeed = document.getElementById('opt-speed') as HTMLInputElement | null;
+function syncBallLabels() {
+  setHud('val-mass', `${settings.mass} kg`);
+  setHud('val-speed', `${settings.speed} m/s`);
+}
+optMass?.addEventListener('input', () => { settings.mass = Number(optMass.value); syncBallLabels(); });
+optSpeed?.addEventListener('input', () => { settings.speed = Number(optSpeed.value); syncBallLabels(); });
+// Initialize settings + labels from the control defaults.
+if (optMass) settings.mass = Number(optMass.value);
+if (optSpeed) settings.speed = Number(optSpeed.value);
+syncBallLabels();
 
 // ── Render loop ──────────────────────────────────────────────
 const clock = new THREE.Clock();
@@ -193,7 +240,7 @@ function loop() {
 
   if (coreRef && visualsRef) {
     coreRef.step(dt);
-    visualsRef.update({ debug: showDebug, updateBVH: false, updateProjectiles: true });
+    visualsRef.update({ debug: settings.debug, updateBVH: false, updateProjectiles: true });
     rapierDebug?.update();
     const s = recorder?.sample(frame++);
     if (s) {

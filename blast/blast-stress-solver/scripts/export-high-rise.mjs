@@ -57,7 +57,9 @@ const DEFAULTS = {
     skipSingleBodies: false,
   },
   // CONTACT-DAMAGE layer (per-chunk health + splash) — the local-destruction knob.
-  // ENABLED: this is what makes a wrecking ball punch a *local* hole instead of
+  // OFF BY DEFAULT: the web demo exposes a "Custom damage system" toggle that flips
+  // this on at runtime, so the default experience is the pure stress-solver behavior.
+  // When enabled, this is what makes a wrecking ball punch a *local* hole instead of
   // collapsing the whole structure. Impacts deposit per-chunk health damage (with a
   // splash AOE); when a chunk's health hits zero it detaches, and the stress solver
   // simply redistributes gravity around the missing nodes (which it does robustly).
@@ -69,7 +71,7 @@ const DEFAULTS = {
   // (comDrop ~0.02 m, building stands); heavier/faster impacts make bigger holes and
   // begin chipping columns. See highRise.damage.rapier.test.ts.
   damage: {
-    enabled: true,
+    enabled: false,
     strengthPerVolume: 200,
     kImpact: 0.15,
     contactDamageScale: 1,

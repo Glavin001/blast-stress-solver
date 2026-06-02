@@ -38,15 +38,47 @@
           <h1>&#127970; High-Rise Demolition</h1>
           <p>
             Mid-rise apartment: reinforced-concrete flat-slab skeleton + frangible drywall
-            infill. Loaded from the same shared scene-pack JSON the Rust demo uses. Click to
-            throw the wrecking ball — it punches local holes instead of shattering like glass.
+            infill, loaded from the same shared scene-pack JSON the Rust demo uses. Click to
+            throw the wrecking ball. Enable the <em>Custom damage system</em> toggle to localize
+            impacts into per-chunk holes instead of the default global stress response.
           </p>
         </header>
 
         <div class="control-actions">
-          <button id="btn-reset" class="button button-primary">&orarr; Rebuild</button>
-          <button id="btn-debug" class="button">&#9671; Show Debug</button>
+          <button id="btn-reset" class="button button-primary">&orarr; Reset / Retry</button>
         </div>
+
+        <section class="config-section">
+          <h2 class="section-title">Features</h2>
+          <label class="toggle-row">
+            <input type="checkbox" id="opt-damage" />
+            <span class="toggle-text">
+              Custom damage system
+              <small>Per-chunk health: the ball punches a local hole instead of a global stress cascade. Toggling rebuilds the scene.</small>
+            </span>
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="opt-debug" />
+            <span class="toggle-text">
+              Debug wireframe
+              <small>Show Rapier colliders &amp; bond lines</small>
+            </span>
+          </label>
+        </section>
+
+        <section class="config-section">
+          <h2 class="section-title">Wrecking ball</h2>
+          <div class="config-row">
+            <span class="config-label">Mass</span>
+            <input type="range" class="config-slider" id="opt-mass" min="500" max="8000" step="100" value="2500" />
+            <span class="config-value" id="val-mass">2500 kg</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Speed</span>
+            <input type="range" class="config-slider" id="opt-speed" min="6" max="40" step="1" value="18" />
+            <span class="config-value" id="val-speed">18 m/s</span>
+          </div>
+        </section>
 
         <section class="status-panel">
           <h2>Destruction</h2>
