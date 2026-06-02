@@ -71,10 +71,31 @@ export type HighRiseOptions = {
   bondMode?: 'proximity' | 'auto';
   /** Override individual bond-strength multipliers (for parameter sweeps / tuning). */
   multipliers?: Partial<HighRiseMultipliers>;
+  /**
+   * Vertical separation-seam planes, given as X positions (meters). Bonds whose two
+   * endpoints straddle a seam are weakened by `seamMultiplier`, compartmentalizing the
+   * footprint so a collapse on one side detaches at the seam instead of dragging the
+   * rest down (a structural "fuse" / expansion joint). Place seams in the gaps
+   * *between* column lines so each compartment keeps its own vertical load path.
+   */
+  seamsX?: number[];
+  /** Strength multiplier applied to seam-straddling bonds (default 0.12; <1 = weak fuse). */
+  seamMultiplier?: number;
+  /**
+   * Storey indices whose slab acts as a stiff "transfer/firewall" belt: bonds in that
+   * slab's Y-band are strengthened by `transferMultiplier` so a cascade can't punch
+   * vertically through it (cf. real outrigger/transfer floors).
+   */
+  transferFloors?: number[];
+  /** Strength multiplier applied to transfer-floor bonds (default 2.5; >1 = firewall). */
+  transferMultiplier?: number;
 };
 
 export const DEFAULT_HIGH_RISE_OPTIONS: Required<
-  Omit<HighRiseOptions, 'bondMode' | 'multipliers'>
+  Omit<
+    HighRiseOptions,
+    'bondMode' | 'multipliers' | 'seamsX' | 'seamMultiplier' | 'transferFloors' | 'transferMultiplier'
+  >
 > & { bondMode: 'proximity' | 'auto' } = {
   floorCount: 9,
   floorHeight: 3.2,
@@ -333,6 +354,40 @@ export function buildHighRiseScenario(options: HighRiseOptions = {}): ScenarioDe
     fragmentTypes,
     makeHighRiseBondMultiplier(o.multipliers),
   );
+
+  // ── Spatial heterogeneity: separation seams + transfer (firewall) floors ──
+  // These run *after* the type-based multipliers and scale bond area further, so a
+  // seam-straddling slab bond becomes a weak fuse and a transfer-floor bond a strong
+  // belt. Strong "blocks" joined by weak "seams" fail at the seams (compartmentalized
+  // collapse) instead of propagating a brittle stress wave across the whole structure.
+  const seamsX = o.seamsX ?? [];
+  const seamMultiplier = o.seamMultiplier ?? 0.12;
+  const transferFloors = o.transferFloors ?? [];
+  const transferMultiplier = o.transferMultiplier ?? 2.5;
+  if (seamsX.length > 0 || transferFloors.length > 0) {
+    const nodeX = (i: number) => scenario.nodes[i]?.centroid.x ?? 0;
+    const transferYs = transferFloors.map((k) => slabTopY(k) - slabThickness * 0.5);
+    const yBand = slabThickness * 0.75;
+    scenario.bonds = scenario.bonds.map((bond) => {
+      let mul = 1;
+      // Weaken bonds whose endpoints sit on opposite sides of a seam plane.
+      for (const sx of seamsX) {
+        if ((nodeX(bond.node0) - sx) * (nodeX(bond.node1) - sx) < 0) {
+          mul *= seamMultiplier;
+          break;
+        }
+      }
+      // Strengthen bonds sitting within a transfer floor's slab band.
+      for (const ty of transferYs) {
+        if (Math.abs(bond.centroid.y - ty) <= yBand) {
+          mul *= transferMultiplier;
+          break;
+        }
+      }
+      return mul === 1 ? bond : { ...bond, area: bond.area * mul };
+    });
+  }
+
   scenario.parameters = {
     ...scenario.parameters,
     highRise: {
