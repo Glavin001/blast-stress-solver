@@ -2,28 +2,60 @@
  * High-Rise Apartment Demolition Demo
  *
  * A mid-rise reinforced-concrete apartment building (flat-slab skeleton + frangible
- * drywall infill) destroyed by a thrown "wrecking ball". The building is loaded from
- * the SAME shared scene-pack JSON the Rust/Bevy demo uses (single source of truth),
- * including its realistic, decoupled concrete stress limits.
+ * drywall infill) loaded from the SAME shared scene-pack JSON the Rust/Bevy demo uses.
  *
- * Click the viewport to launch the wrecking ball. The HUD shows bonds broken over
- * time + rigid-body count — the key signals for "local damage, not glass shatter".
+ * Destruction is driven by the stress solver: a wrecking ball is spawned just in front
+ * of the clicked surface (a LOCAL impact) and the solver fractures bonds where stress
+ * exceeds the material limits. The top-right panel exposes the projectile, gravity,
+ * material strength, physics, and optimization knobs so the behavior can be tuned live.
+ *
+ * The optional per-chunk "Custom damage system" is OFF by default (it can over-soften
+ * the structure); toggle it on to compare.
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import {
-  buildDestructibleCore,
-  loadScenePackFromUrl,
-  createBondBreakRecorder,
-} from 'blast-stress-solver/rapier';
-import {
-  createDestructibleThreeBundle,
-  RapierDebugRenderer,
-} from 'blast-stress-solver/three';
+import { buildDestructibleCore, loadScenePackFromUrl } from 'blast-stress-solver/rapier';
+import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
 
-// Served via serve.js: /vendor/blast-stress-solver/ -> blast-stress-solver/dist/
 const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
+
+// ── Mutable demo config (driven by the control panel) ──────────
+const CONFIG = {
+  projectile: { radius: 0.6, mass: 2500, speed: 8 },
+  solver: {
+    gravity: -9.81,
+    // Multiplier on the pack's concrete stress limits: >1 = stronger / harder to break,
+    // <1 = more fragile. This is the "material strength" knob (clearer than materialScale).
+    strength: 1.0,
+    // Couples projectile impacts into the *stress* solver. Kept low by default: the
+    // high-rise's stress response is near-bimodal, and a high value lets one hit seed a
+    // slow global collapse. Raise it for a more impact-reactive (and collapse-prone) frame.
+    contactForceScale: 8,
+  },
+  physics: { debrisCollisionMode: 'all', friction: 0.25, restitution: 0 },
+  optimization: {
+    smallBodyDampingMode: 'always',
+    debrisCleanupMode: 'always',
+    debrisTtlMs: 10000,
+    maxCollidersForDebris: 3,
+  },
+  features: { damage: false, debug: false },
+};
+
+// Captured from the scene pack at load.
+let baseLimits: Record<string, number> = {};
+let packDamage: Record<string, unknown> = {};
+let projectileTtlMs = 3000;
+const STANDOFF = 6; // metres in front of the clicked surface to spawn the ball
+const buildingBox = new THREE.Box3();
+
+function scaledLimits(): Record<string, number> {
+  const s = CONFIG.solver.strength;
+  const out: Record<string, number> = {};
+  for (const k of Object.keys(baseLimits)) out[k] = baseLimits[k] * s;
+  return out;
+}
 
 // ── Three.js setup ────────────────────────────────────────────
 const canvas = document.getElementById('demo-canvas') as HTMLCanvasElement;
@@ -72,39 +104,44 @@ stats.dom.style.top = '0';
 stats.dom.style.left = '0';
 (document.querySelector('.viewport') as HTMLElement)?.appendChild(stats.dom);
 
-function setHud(id: string, value: string) {
+// ── Stats / perf ──────────────────────────────────────────────
+let _physicsMs = 0;
+let _renderMs = 0;
+const EMA = 0.12;
+let initialBonds = 0;
+let baselineY = 0;
+
+function setText(id: string, value: string) {
   const el = document.getElementById(id);
   if (el) el.textContent = value;
 }
+function avgDynamicY(core: any): number {
+  const dyn = core.chunks.filter((c: any) => c.active && !c.isSupport);
+  if (!dyn.length) return 0;
+  return dyn.reduce((s: number, c: any) => s + (c.worldPosition ?? c.baseLocalOffset).y, 0) / dyn.length;
+}
+function updateStatus(core: any) {
+  setText('stat-bodies', String(core.getRigidBodyCount()));
+  setText('stat-bonds', `${core.getActiveBondsCount()} / ${initialBonds}`);
+  setText('stat-projectiles', String(core.projectiles.length));
+  const active = core.chunks.filter((c: any) => c.active).length;
+  const detached = core.chunks.filter((c: any) => c.detached).length;
+  setText('stat-chunks', `${active} / ${detached} detached`);
+  setText('stat-fragments', String(core.chunks.length));
+  setText('stat-settle', (baselineY - avgDynamicY(core)).toFixed(2) + ' m');
+}
+function updatePerf() {
+  setText('stat-physics-ms', _physicsMs.toFixed(1) + ' ms');
+  setText('stat-render-ms', _renderMs.toFixed(1) + ' ms');
+  setText('stat-draw-calls', String(renderer.info.render.calls));
+  setText('stat-triangles', renderer.info.render.triangles.toLocaleString());
+}
 
-// ── Main ─────────────────────────────────────────────────────
+// ── Scene lifecycle ───────────────────────────────────────────
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
-let recorder: ReturnType<typeof createBondBreakRecorder> | null = null;
-let frame = 0;
 let rebuilding = false;
-
-// User-controlled settings (top-right panel). `damage` is ON by default: it is the only
-// mode that produces reasonable LOCAL destruction. The bare stress solver is bimodal —
-// a hard enough impact seeds a slow global collapse, anything softer does nothing — so
-// toggling damage OFF shows the frame robustly *withstanding* the ball (see
-// STRESS_CONTACT_SCALE), not local chipping.
-const settings = { damage: true, debug: false, radius: 0.6, mass: 2500, speed: 8 };
-// Projectile ttl comes from the scene pack (capped); radius/mass/speed are slider-driven.
-let projectileTtlMs = 3000;
-let packDamage: Record<string, unknown> = {};
-// Building bounds (computed from the scenario at load). The wrecking ball spawns just
-// in FRONT of the clicked surface (a local impact) rather than plowing ~45 m from the
-// camera, which would rake a diagonal tunnel / trigger a global stress cascade.
-const STANDOFF = 6;
-const buildingBox = new THREE.Box3();
-// Contact->stress coupling for the DEFAULT (damage-off) path. Kept low: the high-rise's
-// stress response to impacts is bimodal, and the pack's value (30) seeds a slow global
-// cascade that collapses the building several seconds after a hit. At 8 the frame
-// robustly withstands the ball. Ignored when the damage system is enabled (impacts then
-// drive local per-chunk damage, decoupled from the stress solver).
-const STRESS_CONTACT_SCALE = 8;
 
 async function initScene() {
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
@@ -112,49 +149,37 @@ async function initScene() {
 
   const pack = await loadScenePackFromUrl(SCENE_URL);
   const { scenario, defaults } = pack;
-  projectileTtlMs = Math.min((defaults.projectile as any)?.ttlMs ?? 3000, 3000);
+  baseLimits = (defaults.solverSettings as Record<string, number>) ?? {};
   packDamage = (defaults.damage as Record<string, unknown>) ?? {};
-  // Axis-aligned bounds of the building (centroids + a chunk half-extent margin),
-  // used to place the wrecking ball just in front of the clicked surface.
+  projectileTtlMs = Math.min((defaults.projectile as any)?.ttlMs ?? 3000, 3000);
+
   buildingBox.makeEmpty();
   const boundsPoint = new THREE.Vector3();
   for (const n of scenario.nodes) {
     buildingBox.expandByPoint(boundsPoint.set(n.centroid.x, n.centroid.y, n.centroid.z));
   }
   buildingBox.expandByScalar(1.0);
-  console.log(
-    `High-rise: ${scenario.nodes.length} nodes, ${scenario.bonds.length} bonds, ` +
-      `limits comp/ten/shear=${defaults.solverSettings?.compressionFatalLimit}/` +
-      `${defaults.solverSettings?.tensionFatalLimit}/${defaults.solverSettings?.shearFatalLimit}`,
-  );
 
   controls.target.set(defaults.camera.target.x, defaults.camera.target.y, defaults.camera.target.z);
   controls.update();
 
   const core = await buildDestructibleCore({
     scenario,
-    gravity: defaults.gravity,
+    gravity: CONFIG.solver.gravity,
     materialScale: defaults.materialScale,
-    // Decoupled concrete limits from the pack win over the materialScale defaults.
-    solverSettings: defaults.solverSettings,
-    friction: defaults.physics.friction,
-    restitution: defaults.physics.restitution,
-    // Low coupling so the stress-only (damage-off) path withstands the ball instead of
-    // slowly collapsing; ignored once damage is enabled. See STRESS_CONTACT_SCALE.
-    contactForceScale: STRESS_CONTACT_SCALE,
-    debrisCollisionMode: defaults.physics.debrisCollisionMode as any,
-    // Per-chunk contact damage (health + splash) localizes wrecking-ball destruction into
-    // a local hole instead of a global stress cascade. Tuned params come from the scene
-    // pack; the `enabled` flag is driven by the top-right "Custom damage system" toggle —
-    // ON by default (the only mode with reasonable local destruction).
-    damage: { ...packDamage, enabled: settings.damage } as any,
+    solverSettings: scaledLimits(),
+    friction: CONFIG.physics.friction,
+    restitution: CONFIG.physics.restitution,
+    contactForceScale: CONFIG.solver.contactForceScale,
+    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
+    damage: { ...packDamage, enabled: CONFIG.features.damage } as any,
     debrisCleanup: {
-      mode: defaults.optimization.debrisCleanupMode as any,
-      debrisTtlMs: defaults.optimization.debrisTtlMs,
-      maxCollidersForDebris: defaults.optimization.maxCollidersForDebris,
+      mode: CONFIG.optimization.debrisCleanupMode as any,
+      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
+      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
     },
     smallBodyDamping: {
-      mode: defaults.optimization.smallBodyDampingMode as any,
+      mode: CONFIG.optimization.smallBodyDampingMode as any,
       colliderCountThreshold: 3,
       minLinearDamping: 2,
       minAngularDamping: 2,
@@ -173,47 +198,14 @@ async function initScene() {
   });
 
   rapierDebug?.dispose();
-  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: settings.debug });
+  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: CONFIG.features.debug });
 
   coreRef = core;
   visualsRef = visuals;
-  recorder = createBondBreakRecorder(core);
-  frame = 0;
-  if (hint) {
-    hint.textContent = settings.damage
-      ? 'Click the building to throw the wrecking ball'
-      : 'Click the building to throw the wrecking ball — enable "Custom damage system" for fracturing';
-  }
+  initialBonds = core.getActiveBondsCount();
+  baselineY = avgDynamicY(core);
+  if (hint) hint.textContent = 'Click the building to throw the wrecking ball';
 }
-
-function shootProjectile(ndcX: number, ndcY: number) {
-  const core = coreRef;
-  if (!core) return;
-  const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
-  const dir = raycaster.ray.direction.clone().normalize();
-  // Find where the click ray meets the building, then spawn the ball STANDOFF metres in
-  // front of that surface so it delivers a local impact. Spawning at the camera instead
-  // makes the heavy ball plow ~45 m diagonally through the whole structure, raking a
-  // tunnel and (in stress-only mode) triggering a global collapse.
-  const entry = new THREE.Vector3();
-  if (!raycaster.ray.intersectBox(buildingBox, entry)) return; // clicked empty space
-  const spawn = entry.addScaledVector(dir, -STANDOFF);
-  core.enqueueProjectile({
-    position: { x: spawn.x, y: spawn.y, z: spawn.z },
-    velocity: { x: dir.x * settings.speed, y: dir.y * settings.speed, z: dir.z * settings.speed },
-    radius: settings.radius,
-    mass: settings.mass,
-    ttl: projectileTtlMs,
-  });
-}
-
-canvas.addEventListener('click', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  shootProjectile(ndcX, ndcY);
-});
 
 async function rebuild() {
   if (rebuilding) return;
@@ -229,43 +221,99 @@ async function rebuild() {
   }
 }
 
-// ── Top-right panel: feature toggles + settings ──────────────
-document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });
+// ── Projectile ────────────────────────────────────────────────
+function shootProjectile(ndcX: number, ndcY: number) {
+  const core = coreRef;
+  if (!core) return;
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+  const dir = raycaster.ray.direction.clone().normalize();
+  // Spawn the ball just in FRONT of where the click ray meets the building, so it
+  // delivers a local hit instead of plowing ~45 m diagonally through the structure.
+  const entry = new THREE.Vector3();
+  if (!raycaster.ray.intersectBox(buildingBox, entry)) return; // clicked empty space
+  const spawn = entry.addScaledVector(dir, -STANDOFF);
+  const speed = CONFIG.projectile.speed;
+  core.enqueueProjectile({
+    position: { x: spawn.x, y: spawn.y, z: spawn.z },
+    velocity: { x: dir.x * speed, y: dir.y * speed, z: dir.z * speed },
+    radius: CONFIG.projectile.radius,
+    mass: CONFIG.projectile.mass,
+    ttl: projectileTtlMs,
+  });
+}
 
-const optDamage = document.getElementById('opt-damage') as HTMLInputElement | null;
-if (optDamage) optDamage.checked = settings.damage;
-optDamage?.addEventListener('change', () => {
-  settings.damage = !!optDamage.checked;
-  // Per-chunk health is allocated at construction, so applying the damage feature
-  // rebuilds the scene with the current settings.
-  void rebuild();
+canvas.addEventListener('click', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  shootProjectile(ndcX, ndcY);
 });
+
+// ── Control panel wiring ──────────────────────────────────────
+function bindSlider(
+  id: string,
+  obj: Record<string, any>,
+  key: string,
+  fmt?: (v: number) => string,
+  onInput?: (v: number) => void,
+) {
+  const slider = document.getElementById(id) as HTMLInputElement | null;
+  const display = document.getElementById(id + '-value');
+  if (!slider) return;
+  slider.value = String(obj[key]);
+  if (display) display.textContent = fmt ? fmt(obj[key]) : String(obj[key]);
+  slider.addEventListener('input', () => {
+    const v = parseFloat(slider.value);
+    obj[key] = v;
+    if (display) display.textContent = fmt ? fmt(v) : String(v);
+    onInput?.(v);
+  });
+}
+function bindSelect(id: string, obj: Record<string, any>, key: string, onChange?: (v: string) => void) {
+  const select = document.getElementById(id) as HTMLSelectElement | null;
+  if (!select) return;
+  select.value = String(obj[key]);
+  select.addEventListener('change', () => { obj[key] = select.value; onChange?.(select.value); });
+}
+
+// Projectile (read live at shoot time)
+bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
+bindSlider('cfg-proj-mass', CONFIG.projectile, 'mass', (v) => v.toLocaleString() + ' kg');
+bindSlider('cfg-proj-speed', CONFIG.projectile, 'speed', (v) => v.toFixed(0) + ' m/s');
+
+// Structure / solver
+bindSlider('cfg-strength', CONFIG.solver, 'strength', (v) => v.toFixed(2) + '×');
+bindSlider('cfg-contact-force', CONFIG.solver, 'contactForceScale', (v) => v.toFixed(0));
+bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1) + ' m/s²', (v) => coreRef?.setGravity(v));
+
+// Physics
+bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) => coreRef?.setDebrisCollisionMode(v as any));
+bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
+bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));
+
+// Optimization (live)
+bindSelect('cfg-damping-mode', CONFIG.optimization, 'smallBodyDampingMode', (v) => coreRef?.setSmallBodyDamping?.({ mode: v as any }));
+bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) =>
+  coreRef?.setDebrisCleanup?.({ mode: v as any, debrisTtlMs: CONFIG.optimization.debrisTtlMs }));
+bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 1000).toFixed(1) + 's', (v) =>
+  coreRef?.setDebrisCleanup?.({ mode: CONFIG.optimization.debrisCleanupMode as any, debrisTtlMs: v }));
+
+// Features
+const optDamage = document.getElementById('opt-damage') as HTMLInputElement | null;
+if (optDamage) optDamage.checked = CONFIG.features.damage;
+optDamage?.addEventListener('change', () => { CONFIG.features.damage = !!optDamage.checked; void rebuild(); });
 
 const optDebug = document.getElementById('opt-debug') as HTMLInputElement | null;
-if (optDebug) optDebug.checked = settings.debug;
+if (optDebug) optDebug.checked = CONFIG.features.debug;
 optDebug?.addEventListener('change', () => {
-  settings.debug = !!optDebug.checked;
-  rapierDebug?.setEnabled(settings.debug);
+  CONFIG.features.debug = !!optDebug.checked;
+  rapierDebug?.setEnabled(CONFIG.features.debug);
 });
 
-const optRadius = document.getElementById('opt-radius') as HTMLInputElement | null;
-const optMass = document.getElementById('opt-mass') as HTMLInputElement | null;
-const optSpeed = document.getElementById('opt-speed') as HTMLInputElement | null;
-function syncBallLabels() {
-  setHud('val-radius', `${settings.radius.toFixed(2)} m`);
-  setHud('val-mass', `${settings.mass} kg`);
-  setHud('val-speed', `${settings.speed} m/s`);
-}
-optRadius?.addEventListener('input', () => { settings.radius = Number(optRadius.value); syncBallLabels(); });
-optMass?.addEventListener('input', () => { settings.mass = Number(optMass.value); syncBallLabels(); });
-optSpeed?.addEventListener('input', () => { settings.speed = Number(optSpeed.value); syncBallLabels(); });
-// Initialize settings + labels from the control defaults.
-if (optRadius) settings.radius = Number(optRadius.value);
-if (optMass) settings.mass = Number(optMass.value);
-if (optSpeed) settings.speed = Number(optSpeed.value);
-syncBallLabels();
+document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });
 
-// ── Render loop ──────────────────────────────────────────────
+// ── Render loop ───────────────────────────────────────────────
 const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
@@ -274,18 +322,18 @@ function loop() {
   controls.update();
 
   if (coreRef && visualsRef) {
+    const t0 = performance.now();
     coreRef.step(dt);
-    visualsRef.update({ debug: settings.debug, updateBVH: false, updateProjectiles: true });
+    _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
+    visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true });
     rapierDebug?.update();
-    const s = recorder?.sample(frame++);
-    if (s) {
-      setHud('stat-bodies', String(s.rigidBodies));
-      setHud('stat-bonds', String(s.activeBonds));
-      setHud('stat-bonds-broken', String(s.bondsBrokenCumulative));
-      setHud('stat-com', s.comHeight.toFixed(1) + ' m');
-    }
+    updateStatus(coreRef);
   }
+
+  const t1 = performance.now();
   renderer.render(scene, camera);
+  _renderMs += ((performance.now() - t1) - _renderMs) * EMA;
+  updatePerf();
   stats.end();
 }
 
