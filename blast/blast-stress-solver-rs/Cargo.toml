@@ -58,3 +58,8 @@ required-features = ["bench-support"]
 [[example]]
 name = "frame_profile"
 required-features = ["bench-support"]
+
+# Apply-path micro-profiler: cost of the Rapier topology edits a split triggers.
+[[example]]
+name = "apply_profile"
+required-features = ["bench-support"]
