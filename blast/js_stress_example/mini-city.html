@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mini-City — blast-stress-solver Demo</title>
+    <link rel="stylesheet" href="./styles/demo-common.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three/build/three.module.js",
+          "three/addons/": "/vendor/three/examples/jsm/",
+          "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs",
+          "@dgreenheck/three-pinata": "/vendor/three-pinata/three-pinata.es.js",
+          "blast-stress-solver": "/vendor/blast-stress-solver/index.js",
+          "blast-stress-solver/rapier": "/vendor/blast-stress-solver/rapier.js",
+          "blast-stress-solver/three": "/vendor/blast-stress-solver/three.js",
+          "blast-stress-solver/scenarios": "/vendor/blast-stress-solver/scenarios.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="viewport">
+        <canvas id="demo-canvas"></canvas>
+        <div class="viewport-hint">Building city…</div>
+      </section>
+
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
+        <span class="icon-open">&#9776;</span>
+        <span class="icon-close">&#10005;</span>
+      </button>
+      <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+      <aside class="sidebar" id="sidebar">
+        <header>
+          <a href="./demo-index.html" class="back-link">&larr; All Demos</a>
+          <h1>&#127961;&#65039; Mini-City</h1>
+          <p>A grid of independently fractured towers composed into one physics world — then flatten the whole skyline.</p>
+        </header>
+
+        <!-- Destruction (immediate) -->
+        <section class="config-section">
+          <h2 class="section-title">Demolish the City</h2>
+          <div class="control-actions">
+            <button id="btn-meteor" class="button button-primary">&#9732; Meteor Storm</button>
+            <button id="btn-detonate" class="button button-primary">&#10040; Detonate</button>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-meteors">Meteors</label>
+            <input type="range" id="cfg-meteors" class="config-slider" min="6" max="120" step="1" value="36" />
+            <span class="config-value"><span id="cfg-meteors-value">36</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-blast">Blast Force</label>
+            <input type="range" id="cfg-blast" class="config-slider" min="0" max="30" step="1" value="6" />
+            <span class="config-value"><span id="cfg-blast-value">6×</span></span>
+          </div>
+        </section>
+
+        <!-- City Config (deferred – needs Rebuild) -->
+        <section class="config-section">
+          <h2 class="section-title">City (Rebuild to apply)</h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-grid">Grid</label>
+            <input type="range" id="cfg-grid" class="config-slider" min="1" max="6" step="1" value="3" />
+            <span class="config-value"><span id="cfg-grid-value">3×3</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-street">Street Width</label>
+            <input type="range" id="cfg-street" class="config-slider" min="3" max="20" step="1" value="9" />
+            <span class="config-value"><span id="cfg-street-value">9 m</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-min-floors">Min Floors</label>
+            <input type="range" id="cfg-min-floors" class="config-slider" min="1" max="8" step="1" value="2" />
+            <span class="config-value"><span id="cfg-min-floors-value">2</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-max-floors">Max Floors</label>
+            <input type="range" id="cfg-max-floors" class="config-slider" min="2" max="12" step="1" value="6" />
+            <span class="config-value"><span id="cfg-max-floors-value">6</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-frags">Fragments / Wall</label>
+            <input type="range" id="cfg-frags" class="config-slider" min="3" max="12" step="1" value="5" />
+            <span class="config-value"><span id="cfg-frags-value">5</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-seed">Seed</label>
+            <input type="range" id="cfg-seed" class="config-slider" min="1" max="999" step="1" value="7" />
+            <span class="config-value"><span id="cfg-seed-value">7</span></span>
+          </div>
+        </section>
+
+        <!-- Projectile (immediate) -->
+        <section class="config-section">
+          <h2 class="section-title">Wrecking Ball</h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-proj-radius">Radius</label>
+            <input type="range" id="cfg-proj-radius" class="config-slider" min="0.1" max="3.0" step="0.05" value="0.6" />
+            <span class="config-value"><span id="cfg-proj-radius-value">0.60</span> m</span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-proj-mass">Mass</label>
+            <input type="range" id="cfg-proj-mass" class="config-slider" min="100" max="200000" step="100" value="1500" />
+            <span class="config-value"><span id="cfg-proj-mass-value">1,500</span> kg</span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-proj-speed">Speed</label>
+            <input type="range" id="cfg-proj-speed" class="config-slider" min="5" max="100" step="1" value="35" />
+            <span class="config-value"><span id="cfg-proj-speed-value">35</span> m/s</span>
+          </div>
+        </section>
+
+        <!-- Solver (deferred) -->
+        <section class="config-section">
+          <h2 class="section-title">Solver <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-gravity">Gravity &#9733;</label>
+            <input type="range" id="cfg-gravity" class="config-slider" min="-30" max="0" step="0.5" value="-9.81" />
+            <span class="config-value"><span id="cfg-gravity-value">-9.8</span> m/s&sup2;</span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-material">Material Scale (Rebuild)</label>
+            <input type="range" id="cfg-material" class="config-slider" min="-2" max="14" step="0.1" value="10" />
+            <span class="config-value"><span id="cfg-material-value">1e10</span></span>
+          </div>
+        </section>
+
+        <!-- Physics -->
+        <section class="config-section">
+          <h2 class="section-title">Physics <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-debris-collision">Debris Collision &#9733;</label>
+            <select id="cfg-debris-collision" class="config-select">
+              <option value="all">All (full collisions)</option>
+              <option value="noDebrisPairs" selected>No debris pairs</option>
+              <option value="debrisGroundOnly">Debris &harr; ground only</option>
+              <option value="debrisNone">Debris: none</option>
+            </select>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-friction">Friction</label>
+            <input type="range" id="cfg-friction" class="config-slider" min="0" max="2" step="0.05" value="0.25" />
+            <span class="config-value"><span id="cfg-friction-value">0.25</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-restitution">Restitution</label>
+            <input type="range" id="cfg-restitution" class="config-slider" min="0" max="1" step="0.05" value="0.00" />
+            <span class="config-value"><span id="cfg-restitution-value">0.00</span></span>
+          </div>
+        </section>
+
+        <!-- Optimization -->
+        <section class="config-section">
+          <h2 class="section-title">Optimization <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-damping-mode">Small Body Damping &#9733;</label>
+            <select id="cfg-damping-mode" class="config-select">
+              <option value="off">Off</option>
+              <option value="always" selected>Always</option>
+              <option value="afterGroundCollision">After ground hit</option>
+            </select>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-cleanup-mode">Debris Cleanup &#9733;</label>
+            <select id="cfg-cleanup-mode" class="config-select">
+              <option value="off">Off</option>
+              <option value="always" selected>Always</option>
+              <option value="afterGroundCollision">After ground hit</option>
+            </select>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-debris-ttl">Debris TTL &#9733;</label>
+            <input type="range" id="cfg-debris-ttl" class="config-slider" min="1000" max="30000" step="500" value="8000" />
+            <span class="config-value"><span id="cfg-debris-ttl-value">8.0s</span></span>
+          </div>
+        </section>
+
+        <!-- Actions -->
+        <div class="control-actions">
+          <button id="btn-reset" class="button button-primary">&orarr; Rebuild City</button>
+          <button id="btn-debug" class="button">&#9671; Show Debug</button>
+        </div>
+
+        <!-- Status -->
+        <section class="status-panel">
+          <h2>Simulation</h2>
+          <div class="status-grid">
+            <div class="status-item"><span class="status-label">Bodies</span><span class="status-value" id="stat-bodies">0</span></div>
+            <div class="status-item"><span class="status-label">Bonds</span><span class="status-value" id="stat-bonds">0</span></div>
+            <div class="status-item"><span class="status-label">Fragments</span><span class="status-value" id="stat-fragments">0</span></div>
+            <div class="status-item"><span class="status-label">Projectiles</span><span class="status-value" id="stat-projectiles">0</span></div>
+            <div class="status-item"><span class="status-label">Chunks</span><span class="status-value" id="stat-chunks">0</span></div>
+          </div>
+        </section>
+
+        <!-- Performance -->
+        <section class="status-panel">
+          <h2>Performance</h2>
+          <div class="status-grid">
+            <div class="status-item"><span class="status-label">Physics</span><span class="status-value" id="stat-physics-ms">&mdash; ms</span></div>
+            <div class="status-item"><span class="status-label">Render</span><span class="status-value" id="stat-render-ms">&mdash; ms</span></div>
+            <div class="status-item"><span class="status-label">Draw Calls</span><span class="status-value" id="stat-draw-calls">0</span></div>
+            <div class="status-item"><span class="status-label">Triangles</span><span class="status-value" id="stat-triangles">0</span></div>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <script>
+      (function () {
+        var toggle = document.getElementById('sidebar-toggle');
+        var sidebar = document.getElementById('sidebar');
+        var backdrop = document.getElementById('sidebar-backdrop');
+        var layout = document.querySelector('.layout');
+        var mql = window.matchMedia('(max-width: 768px)');
+        function isMobile() { return mql.matches; }
+        function close() { toggle.classList.remove('active'); if (isMobile()) { sidebar.classList.remove('open'); backdrop.classList.remove('visible'); } else { layout.classList.add('sidebar-hidden'); } }
+        function open() { toggle.classList.add('active'); if (isMobile()) { sidebar.classList.add('open'); backdrop.classList.add('visible'); } else { layout.classList.remove('sidebar-hidden'); } }
+        function isOpen() { return isMobile() ? sidebar.classList.contains('open') : !layout.classList.contains('sidebar-hidden'); }
+        toggle.addEventListener('click', function () { if (isOpen()) close(); else open(); });
+        backdrop.addEventListener('click', close);
+        if (!isMobile()) toggle.classList.add('active');
+      })();
+    </script>
+    <script type="module" src="./dist/mini-city.js"></script>
+  </body>
+</html>
