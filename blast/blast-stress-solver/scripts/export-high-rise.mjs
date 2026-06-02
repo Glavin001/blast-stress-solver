@@ -56,18 +56,25 @@ const DEFAULTS = {
     contactForceScale: 30,
     skipSingleBodies: false,
   },
-  // OPTIONAL contact-damage layer (per-chunk health + splash), DISABLED by default and
-  // out of current scope. Destruction here relies on the heterogeneous structure + the
-  // solver's built-in elastic/fatal bond health + splash-localized contact forces.
-  // The plumbing is wired (loader + web demo read this block) so the damage layer can be
-  // turned on later for graceful per-hit local chipping, which the global stress solver
-  // alone cannot do (it is spatially all-or-nothing). The params below are a tuned
-  // starting point from the Rapier sweep, kept for that future work.
+  // CONTACT-DAMAGE layer (per-chunk health + splash) — the local-destruction knob.
+  // ENABLED: this is what makes a wrecking ball punch a *local* hole instead of
+  // collapsing the whole structure. Impacts deposit per-chunk health damage (with a
+  // splash AOE); when a chunk's health hits zero it detaches, and the stress solver
+  // simply redistributes gravity around the missing nodes (which it does robustly).
+  // Impacts are decoupled from the stress solver via the core's damageContactStressScale
+  // (default 0 when damage is enabled), so a large contact force no longer drives the
+  // global stress cascade. Per-chunk health = strengthPerVolume * volume, so the thin
+  // drywall infill blows out easily while the larger concrete columns/slabs resist.
+  // Params tuned against the full Rapier pipeline: a realistic ball blows out ~a panel
+  // (comDrop ~0.02 m, building stands); heavier/faster impacts make bigger holes and
+  // begin chipping columns. See highRise.damage.rapier.test.ts.
   damage: {
-    enabled: false,
-    strengthPerVolume: 500,
-    kImpact: 0.2,
-    contactDamageScale: 10,
+    enabled: true,
+    strengthPerVolume: 200,
+    kImpact: 0.15,
+    contactDamageScale: 1,
+    minImpulseThreshold: 5,
+    internalMinImpulseThreshold: 8,
     splashRadius: 3.0,
     splashFalloffExp: 1.5,
   },
