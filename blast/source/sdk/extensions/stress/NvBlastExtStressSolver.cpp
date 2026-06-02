@@ -609,7 +609,11 @@ private:
     {
         m_overstressedBondCount = 0;
 
-        Array<uint32_t>::type bondIndicesToRemove;
+        // Reuse a persistent scratch buffer instead of allocating one every solve.
+        // NsArray::clear() keeps capacity, so reserve() only allocates on the first call
+        // (or when the bond count grows); this loop runs every frame the solver is active.
+        Array<uint32_t>::type& bondIndicesToRemove = m_bondIndicesToRemove;
+        bondIndicesToRemove.clear();
         bondIndicesToRemove.reserve(getBondCount());
         for (uint32_t i = 0; i < m_solverBondsData.size(); ++i)
         {
@@ -998,6 +1002,9 @@ private:
 
     Array<BondData>::type               m_bondsData;
     Array<NodeData>::type               m_nodesData;
+
+    // Persistent scratch for updateBondStress() so it doesn't heap-allocate per solve.
+    Array<uint32_t>::type               m_bondIndicesToRemove;
 };
 
 

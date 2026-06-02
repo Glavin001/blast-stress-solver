@@ -699,30 +699,26 @@ impl DestructibleSet {
     fn apply_oriented_gravity(&mut self, bodies: &RigidBodySet) {
         let g = self.gravity;
         let world_g = vector![g.x, g.y, g.z];
-        let actors = self.solver.actors();
-        for actor in &actors {
-            let local = actor
-                .nodes
-                .first()
-                .and_then(|&n| self.tracker.node_body(n))
+        // Only the first node per actor is needed (to find the actor's body orientation),
+        // so use the allocation-light rep collector instead of `actors()`.
+        for (actor_index, first_node) in self.solver.collect_actor_reps() {
+            let local = self
+                .tracker
+                .node_body(first_node)
                 .and_then(|h| bodies.get(h))
                 .map(|body| {
                     let l = body.rotation().inverse_transform_vector(&world_g);
                     Vec3::new(l.x, l.y, l.z)
                 })
                 .unwrap_or(g);
-            self.solver.add_actor_gravity(actor.actor_index, local);
+            self.solver.add_actor_gravity(actor_index, local);
         }
     }
 
     fn apply_excess_forces(&self, bodies: &mut RigidBodySet, dt: f32) {
-        let actors = self.solver.actors();
-        for actor in &actors {
-            if actor.nodes.is_empty() {
-                continue;
-            }
+        for (actor_index, first_node) in self.solver.collect_actor_reps() {
             // Find the body for this actor
-            let body_handle = match self.tracker.node_body(actor.nodes[0]) {
+            let body_handle = match self.tracker.node_body(first_node) {
                 Some(h) => h,
                 None => continue,
             };
@@ -735,7 +731,7 @@ impl DestructibleSet {
             let c = body.center_of_mass();
             let com = Vec3::new(c.x, c.y, c.z);
 
-            if let Some((force, torque)) = self.solver.get_excess_forces(actor.actor_index, com) {
+            if let Some((force, torque)) = self.solver.get_excess_forces(actor_index, com) {
                 let force_mag = force.magnitude_squared();
                 let torque_mag = torque.magnitude_squared();
                 if force_mag > 1.0e-6 || torque_mag > 1.0e-6 {
