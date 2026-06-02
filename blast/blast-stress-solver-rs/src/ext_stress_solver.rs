@@ -94,6 +94,30 @@ impl ExtStressSolver {
         unsafe { ffi::ext_stress_solver_add_actor_gravity(self.handle, actor_index, &gravity) != 0 }
     }
 
+    /// Apply the centrifugal acceleration produced by an actor's angular movement.
+    ///
+    /// Mirrors NVIDIA Blast's default of applying scene gravity to static actors and
+    /// centrifugal force to dynamic (tumbling) actors each frame, so spinning debris keeps
+    /// accumulating stress and can secondary-fracture. `local_center_mass` and
+    /// `local_angular_velocity` are expressed in the actor's local frame; the acceleration is
+    /// applied to every node in the actor. Returns `false` if the actor no longer exists or no
+    /// node received the acceleration.
+    pub fn add_centrifugal_acceleration(
+        &mut self,
+        actor_index: u32,
+        local_center_mass: Vec3,
+        local_angular_velocity: Vec3,
+    ) -> bool {
+        unsafe {
+            ffi::ext_stress_solver_add_centrifugal_acceleration(
+                self.handle,
+                actor_index,
+                &local_center_mass,
+                &local_angular_velocity,
+            ) != 0
+        }
+    }
+
     /// Run one solver update (computes stresses from accumulated forces).
     pub fn update(&mut self) {
         unsafe { ffi::ext_stress_solver_update(self.handle) }

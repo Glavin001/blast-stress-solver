@@ -537,6 +537,20 @@ export interface ExtStressSolver {
    * Passing `{0,0,0}` is a no-op, so skip the call entirely when you do not need to apply per-actor gravity for that frame.
    */
   addActorGravity(actorIndex: number, localGravity?: Vec3): boolean;
+  /**
+   * Apply the centrifugal acceleration produced by an actor's angular movement, in that actor's
+   * local frame. Mirrors NVIDIA Blast's default of applying scene gravity to static actors and
+   * centrifugal force to dynamic (tumbling) actors each frame, so spinning debris keeps
+   * accumulating stress and can secondary-fracture.
+   *
+   * Typical workflow per frame, for each dynamic actor:
+   * 1. Convert the body's world angular velocity into the actor's local space.
+   * 2. Pass the actor's local center of mass and that local angular velocity here.
+   *
+   * Returns `false` if the actor no longer exists (e.g., split/destroyed) or no node received the
+   * acceleration. Passing a zero angular velocity is effectively a no-op.
+   */
+  addCentrifugalAcceleration(actorIndex: number, localCenterMass?: Vec3, localAngularVelocity?: Vec3): boolean;
   /** Run one solver update using previously applied forces/accelerations. */
   update(): void;
   /** Count of bonds currently overstressed beyond elastic limits. */

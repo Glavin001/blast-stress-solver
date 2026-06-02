@@ -236,6 +236,13 @@ extern "C" {
         local_gravity: *const Vec3,
     ) -> u8;
 
+    pub(crate) fn ext_stress_solver_add_centrifugal_acceleration(
+        handle: *mut ExtStressSolverHandle,
+        actor_index: u32,
+        local_center_mass: *const Vec3,
+        local_angular_velocity: *const Vec3,
+    ) -> u8;
+
     pub(crate) fn ext_stress_solver_update(handle: *mut ExtStressSolverHandle);
 
     pub(crate) fn ext_stress_solver_overstressed_bond_count(

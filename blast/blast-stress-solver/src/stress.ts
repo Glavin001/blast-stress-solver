@@ -743,6 +743,17 @@ class ExtStressSolver implements ExtStressSolverType {
     return result !== 0;
   }
 
+  addCentrifugalAcceleration(actorIndex: number, localCenterMass?: Vec3, localAngularVelocity?: Vec3): boolean {
+    if (!this.handle) return false;
+    // Reuse the pre-allocated scratch buffers: _torquePtr for the center of mass,
+    // _forcePtr for the angular velocity (both are plain vec3 slots).
+    const view = this.memory.view();
+    writeVec3(view, this._torquePtr, localCenterMass ?? vec3());
+    writeVec3(view, this._forcePtr, localAngularVelocity ?? vec3());
+    const result = this.module.ccall('ext_stress_solver_add_centrifugal_acceleration', 'number', ['number', 'number', 'number', 'number'], [this.handle, actorIndex >>> 0, this._torquePtr, this._forcePtr]) >>> 0;
+    return result !== 0;
+  }
+
   update(): void { if (!this.handle) return; this.module.ccall('ext_stress_solver_update', null, ['number'], [this.handle]); }
   overstressedBondCount(): number { if (!this.handle) return 0; return this.module.ccall('ext_stress_solver_overstressed_bond_count', 'number', ['number'], [this.handle]) >>> 0; }
 

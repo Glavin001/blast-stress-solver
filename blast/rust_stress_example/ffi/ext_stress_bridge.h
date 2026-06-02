@@ -97,6 +97,11 @@ uint8_t ext_stress_solver_add_actor_gravity(ExtStressSolverHandle* handle,
                                             uint32_t actor_index,
                                             const StressVec3* local_gravity);
 
+uint8_t ext_stress_solver_add_centrifugal_acceleration(ExtStressSolverHandle* handle,
+                                                       uint32_t actor_index,
+                                                       const StressVec3* local_center_mass,
+                                                       const StressVec3* local_angular_velocity);
+
 void ext_stress_solver_update(ExtStressSolverHandle* handle);
 
 uint32_t ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* handle);

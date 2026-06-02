@@ -110,6 +110,50 @@ fn ext_solver_strong_gravity_causes_overstress() {
 }
 
 #[test]
+fn ext_solver_centrifugal_acceleration_causes_overstress() {
+    let (nodes, bonds) = triangle_nodes_and_bonds();
+    // Low limits so the outward centrifugal pull on the dynamic node easily exceeds them.
+    let settings = SolverSettings {
+        compression_elastic_limit: 0.001,
+        compression_fatal_limit: 0.002,
+        tension_elastic_limit: 0.001,
+        tension_fatal_limit: 0.002,
+        shear_elastic_limit: 0.001,
+        shear_fatal_limit: 0.002,
+        ..SolverSettings::default()
+    };
+    let mut solver = ExtStressSolver::new(&nodes, &bonds, &settings).unwrap();
+
+    // Spin the initial actor (index 0) hard about the Z axis. The dynamic node at
+    // (0, 1.5, 0) is flung outward (centrifugal accel = omega^2 * r), stressing its bonds.
+    let applied =
+        solver.add_centrifugal_acceleration(0, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 20.0));
+    assert!(applied, "centrifugal accel should apply to the live actor 0");
+    solver.update();
+
+    let overstressed = solver.overstressed_bond_count();
+    assert!(
+        overstressed > 0,
+        "strong spin should overstress at least one bond, got {overstressed}"
+    );
+}
+
+#[test]
+fn ext_solver_centrifugal_acceleration_invalid_actor_returns_false() {
+    let (nodes, bonds) = triangle_nodes_and_bonds();
+    let settings = SolverSettings::default();
+    let mut solver = ExtStressSolver::new(&nodes, &bonds, &settings).unwrap();
+
+    // Only actor 0 exists at creation; a bogus index must report no application.
+    let applied = solver.add_centrifugal_acceleration(
+        9999,
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 20.0),
+    );
+    assert!(!applied, "centrifugal accel on a nonexistent actor should return false");
+}
+
+#[test]
 fn ext_solver_fracture_and_split() {
     let (nodes, bonds) = triangle_nodes_and_bonds();
     let settings = SolverSettings {
