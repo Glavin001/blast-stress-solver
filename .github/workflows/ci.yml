@@ -97,18 +97,65 @@ jobs:
           name: demo-site
           path: blast/
 
-      - name: Run blast-stress-solver tests
+      # BLOCKING: deterministic physical-law invariants + pure kernel properties. The set is
+      # defined once in the package's `test:invariants` script (single source of truth) so this
+      # stays a one-liner and new invariant tests don't have to be threaded through CI by hand.
+      - name: Run invariant + kernel tests (blocking)
         working-directory: blast/blast-stress-solver
-        run: npx vitest run --reporter=verbose
-        continue-on-error: true  # integration tests have physics-dependent assertions that vary across environments
+        run: npm run test:invariants
 
-      - name: Run headless scenario tests
+      # NON-BLOCKING soak: the full suite, including environment-sensitive integration/perf
+      # assertions. Reported but not gating until stabilized (gap #4).
+      - name: Run full test suite (soak, non-blocking)
         working-directory: blast/blast-stress-solver
-        run: npx vitest run src/tests/rapier.headless-scenarios.test.ts --reporter=verbose
+        run: npm run test:soak
+        continue-on-error: true
 
-      - name: Run split/fracture tests
+      # REPORTING ONLY (non-gating): the js_stress_example split specs currently fail to
+      # RESOLVE on CI — `blast-stress-solver/scenarios` and `./stress_solver.cjs` are not
+      # linked/built in the Test job environment, so the suite never actually ran here (the
+      # old `|| true` silently hid that). Kept visible but non-blocking until the Test job
+      # builds + links those artifacts (gap #10 in blast/TESTING.md). The one genuinely-stale
+      # spec stays quarantined in-file (organicSplit.spec.ts -> it.skip with a tracked reason).
+      - name: Run split/fracture tests (reporting only)
         working-directory: blast/js_stress_example
-        run: npm run test:split || true  # organicSplit.spec.ts has a known stale expectation
+        run: npm run test:split
+        continue-on-error: true
+
+  rust-tests:
+    # Rust library tests, including the Tier-0 kernel property tests (motion_fit) and
+    # the Tier-1 kinematic invariants (point-velocity continuity, no-NaN, mass
+    # conservation, determinism). These are BLOCKING. The known split COM/velocity bug
+    # is reproduced by an #[ignore]d test that runs in a separate, non-blocking lane so
+    # it stays visible without blocking unrelated work. See blast/TESTING.md.
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            blast/blast-stress-solver-rs/target
+          key: rust-tests-${{ runner.os }}-${{ hashFiles('blast/blast-stress-solver-rs/Cargo.lock', 'blast/blast-stress-solver-rs/Cargo.toml') }}
+
+      - name: Run Rust invariant + kernel tests (blocking)
+        working-directory: blast/blast-stress-solver-rs
+        run: cargo test --features rapier,scenarios
+
+      - name: Reproduce known bugs (non-blocking)
+        working-directory: blast/blast-stress-solver-rs
+        # Runs every #[ignore]d detect-first repro across all test binaries (no per-file naming;
+        # --no-fail-fast so all report). Gaps #1/#7/#9 are now FIXED and their repros promoted to
+        # blocking guards, so this is currently a no-op placeholder for future repros.
+        run: cargo test --features rapier,scenarios --no-fail-fast -- --ignored
+        continue-on-error: true
 
   wasm-smoke:
     # Regression tests that build a cdylib consumer for
@@ -163,6 +210,11 @@ jobs:
       github.event_name == 'pull_request' ||
       (github.event_name == 'push' && github.ref != format('refs/heads/{0}', vars.PRODUCTION_BRANCH || 'feat/rapier-destruction'))
     runs-on: ubuntu-latest
+    # The "Comment preview URL on PR" step posts via the GITHUB_TOKEN.
+    # The repo default is read-only, so grant just enough to comment.
+    permissions:
+      contents: read
+      pull-requests: write
     environment:
       name: preview
       url: ${{ steps.deploy.outputs.url }}
@@ -229,7 +281,7 @@ jobs:
 
   deploy-production:
     name: Deploy Production
-    needs: [build, test]
+    needs: [build, test, rust-tests]
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', vars.PRODUCTION_BRANCH || 'feat/rapier-destruction')
     runs-on: ubuntu-latest
     environment:

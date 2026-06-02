@@ -121,6 +121,32 @@ pub struct SplitApplyResult {
     pub stats: SplitEditStats,
 }
 
+/// Per-node observability record captured at the instant of a split when
+/// continuity recording is enabled (see [`BodyTracker::set_record_split_continuity`]).
+///
+/// This is the Rust analog of the JS library's `recordBodyContinuity`
+/// (`destructible-core.ts`): for a node migrating from a parent body to a child
+/// body, a faithful rigid split must preserve the node's world-space point
+/// velocity, i.e. `point_velocity_error ≈ 0`. A large value is exactly the
+/// "sudden movement/rotation after destruction" symptom.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitContinuityRecord {
+    /// The child body the node was migrated to.
+    pub target_body: RigidBodyHandle,
+    /// The migrated node.
+    pub node_index: u32,
+    /// `‖child.velocity_at_point(p) − parent.velocity_at_point(p)‖` at the node
+    /// world point `p`, measured against Rapier's freshly-recomputed centre of
+    /// mass on the child body. This is the workhorse continuity metric.
+    pub point_velocity_error: f32,
+    /// Parent body's velocity at the node point (captured pre-split).
+    pub parent_point_velocity: Vec3,
+    /// Child body's velocity at the same world point, post-split.
+    pub child_point_velocity: Vec3,
+    /// Whether all measured child velocity components are finite (no NaN/Inf).
+    pub finite: bool,
+}
+
 /// Tracks the mapping between stress graph nodes and Rapier rigid bodies.
 pub struct BodyTracker {
     /// For each node index, which body it belongs to (if any).
@@ -155,6 +181,11 @@ pub struct BodyTracker {
     split_child_recentering_enabled: bool,
     /// Whether split children should get fitted kinematics on handoff.
     split_child_velocity_fit_enabled: bool,
+    /// Observability: when enabled, per-split point-velocity continuity is recorded.
+    /// Off by default so production behavior/cost is unchanged.
+    record_split_continuity: bool,
+    /// Continuity records accumulated since the last `clear_split_continuity`.
+    split_continuity: Vec<SplitContinuityRecord>,
 }
 
 impl BodyTracker {
@@ -191,11 +222,29 @@ impl BodyTracker {
             ground_body_handle: None,
             split_child_recentering_enabled: true,
             split_child_velocity_fit_enabled: true,
+            record_split_continuity: false,
+            split_continuity: Vec::new(),
         }
     }
 
     pub fn set_dynamic_body_ccd_enabled(&mut self, enabled: bool) {
         self.dynamic_body_ccd_enabled = enabled;
+    }
+
+    /// Enable/disable per-split point-velocity continuity recording (observability
+    /// only; does not change simulation). Off by default.
+    pub fn set_record_split_continuity(&mut self, enabled: bool) {
+        self.record_split_continuity = enabled;
+    }
+
+    /// Clear accumulated continuity records.
+    pub fn clear_split_continuity(&mut self) {
+        self.split_continuity.clear();
+    }
+
+    /// Continuity records accumulated since the last `clear_split_continuity`.
+    pub fn split_continuity(&self) -> &[SplitContinuityRecord] {
+        &self.split_continuity
     }
 
     pub fn debris_collision_mode(&self) -> DebrisCollisionMode {
@@ -502,6 +551,23 @@ impl BodyTracker {
                 bodies,
             );
             result.stats.sleep_init_ms += sleep_started_at.elapsed().as_secs_f64() as f32 * 1_000.0;
+        }
+
+        // Reconcile each dynamic child's velocity with Rapier's real centre of mass, in a
+        // SEPARATE pass after every child's colliders have been migrated (so the COM is final).
+        for (child_index, target) in child_targets.iter().map(|(k, v)| (*k, *v)) {
+            let fit_center = child_target_states[&child_index].pose.translation.vector;
+            self.reconcile_child_velocity_with_com(target.handle(), fit_center, bodies, colliders);
+        }
+
+        // Record split continuity in a SEPARATE pass, after every child's colliders have
+        // been migrated — otherwise a reused parent body would still hold a sibling's
+        // collider and report a spurious (and nondeterministic) centre of mass.
+        if self.record_split_continuity {
+            for (child_index, target) in child_targets.iter().map(|(k, v)| (*k, *v)) {
+                let child = &event.children[child_index];
+                self.record_split_child_continuity(target.handle(), child, &planning, bodies, colliders);
+            }
         }
 
         result.cohort_handles = child_targets
@@ -951,22 +1017,20 @@ impl BodyTracker {
     }
 
     fn child_world_center_of_mass(&self, child: &SplitChild, planning: &SplitPlanningData) -> Vec3 {
-        let mut weighted_sum = Vec3::ZERO;
-        let mut total_mass = 0.0f32;
-        for &node in &child.nodes {
-            if let Some(source) = planning.node_sources.get(&node) {
-                let mass = self.node_masses[node as usize].max(0.0);
-                if mass > 0.0 {
-                    weighted_sum += source.world_centroid * mass;
-                    total_mass += mass;
-                }
-            }
-        }
-        if total_mass <= f32::EPSILON {
-            self.child_world_centroid(child, planning)
-        } else {
-            weighted_sum / total_mass
-        }
+        let samples: Vec<(Vec3, f32)> = child
+            .nodes
+            .iter()
+            .filter_map(|&node| {
+                planning.node_sources.get(&node).map(|source| {
+                    (
+                        source.world_centroid,
+                        self.node_masses[node as usize].max(0.0),
+                    )
+                })
+            })
+            .collect();
+        super::motion_fit::weighted_center_of_mass(&samples)
+            .unwrap_or_else(|| self.child_world_centroid(child, planning))
     }
 
     fn dominant_child_rotation(
@@ -1017,11 +1081,10 @@ impl BodyTracker {
             return (Vector::zeros(), Vector::zeros(), false);
         }
 
-        let child_com = Point::from(target_pose.translation.vector);
-        let mut linvel_sum = Vector::zeros();
-        let mut total_mass = 0.0f32;
+        let t = target_pose.translation.vector;
+        let child_com = Vec3::new(t.x, t.y, t.z);
         let mut all_sleeping = true;
-        let mut samples = Vec::new();
+        let mut samples: Vec<(Vec3, Vec3, f32)> = Vec::new();
         let mut source_weights: HashMap<RigidBodyHandle, f32> = HashMap::new();
 
         for &node in &child.nodes {
@@ -1032,62 +1095,25 @@ impl BodyTracker {
                 continue;
             };
             let mass = self.node_masses[node as usize].max(1.0e-4);
-            let velocity = vector![
-                source.world_velocity.x,
-                source.world_velocity.y,
-                source.world_velocity.z
-            ];
-            linvel_sum += velocity * mass;
-            total_mass += mass;
             all_sleeping &= parent_state.was_sleeping;
             *source_weights.entry(source.body_handle).or_insert(0.0) += mass;
-            let point = point![
-                source.world_centroid.x,
-                source.world_centroid.y,
-                source.world_centroid.z
-            ];
-            samples.push((point, velocity, mass));
+            samples.push((source.world_centroid, source.world_velocity, mass));
         }
 
-        if samples.is_empty() || total_mass <= f32::EPSILON {
+        // Mass/COM/inertia fit is delegated to the pure kernel so it can be
+        // property-tested in isolation (see `super::motion_fit`).
+        let Some(fit) = super::motion_fit::fit_rigid_motion(&samples, child_com) else {
             return (Vector::zeros(), Vector::zeros(), false);
-        }
-
-        let linvel = linvel_sum / total_mass;
-        let mut normal = [[0.0f32; 3]; 3];
-        let mut rhs = [0.0f32; 3];
-        for (point, velocity, mass) in &samples {
-            let r = point - child_com;
-            let r_vec = Vec3::new(r.x, r.y, r.z);
-            let v_rel = Vec3::new(
-                velocity.x - linvel.x,
-                velocity.y - linvel.y,
-                velocity.z - linvel.z,
-            );
-            let r2 = r_vec.magnitude_squared();
-            let rr = [
-                [r_vec.x * r_vec.x, r_vec.x * r_vec.y, r_vec.x * r_vec.z],
-                [r_vec.y * r_vec.x, r_vec.y * r_vec.y, r_vec.y * r_vec.z],
-                [r_vec.z * r_vec.x, r_vec.z * r_vec.y, r_vec.z * r_vec.z],
-            ];
-            for row in 0..3 {
-                for col in 0..3 {
-                    normal[row][col] += mass * ((if row == col { r2 } else { 0.0 }) - rr[row][col]);
-                }
-            }
-            let cross = r_vec.cross(v_rel);
-            rhs[0] += mass * cross.x;
-            rhs[1] += mass * cross.y;
-            rhs[2] += mass * cross.z;
-        }
+        };
+        let linvel = vector![fit.linvel.x, fit.linvel.y, fit.linvel.z];
 
         let dominant_source = source_weights
             .iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .and_then(|(handle, _)| planning.parent_states.get(handle));
 
-        let angvel = self
-            .solve_symmetric_3x3(normal, rhs)
+        let angvel = fit
+            .angvel
             .map(|omega| vector![omega.x, omega.y, omega.z])
             .or_else(|| dominant_source.map(|state| state.angvel))
             .unwrap_or_else(Vector::zeros);
@@ -1228,36 +1254,85 @@ impl BodyTracker {
         }
     }
 
-    fn solve_symmetric_3x3(&self, m: [[f32; 3]; 3], rhs: [f32; 3]) -> Option<Vec3> {
-        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-        if det.abs() <= 1.0e-6 {
-            return None;
+    /// Reconcile a freshly-split dynamic child's velocity with Rapier's ACTUAL centre of mass.
+    ///
+    /// `fit_child_motion` expresses the child's motion about `fit_center` (the body origin =
+    /// mass-weighted node-centroid model). Rapier, however, integrates rotation about the
+    /// collider-derived centre of mass, which differs for offset shapes (e.g. convex-hull
+    /// fragments). Left uncorrected, a rotating fragment gains spurious velocity
+    /// `omega x (rapier_com - fit_center)` — the "sudden movement after destruction" bug
+    /// (gap #1). Shifting `linvel` by exactly that term makes the body's velocity field match
+    /// the fitted (parent-continuous) field at the node points.
+    fn reconcile_child_velocity_with_com(
+        &self,
+        body_handle: RigidBodyHandle,
+        fit_center: Vector<Real>,
+        bodies: &mut RigidBodySet,
+        colliders: &ColliderSet,
+    ) {
+        let Some(body) = bodies.get_mut(body_handle) else {
+            return;
+        };
+        if !body.is_dynamic() {
+            return;
         }
-        let inv_det = 1.0 / det;
-        let inv = [
-            [
-                (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
-                (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
-                (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
-            ],
-            [
-                (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
-                (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
-                (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
-            ],
-            [
-                (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
-                (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
-                (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
-            ],
-        ];
-        Some(Vec3::new(
-            inv[0][0] * rhs[0] + inv[0][1] * rhs[1] + inv[0][2] * rhs[2],
-            inv[1][0] * rhs[0] + inv[1][1] * rhs[1] + inv[1][2] * rhs[2],
-            inv[2][0] * rhs[0] + inv[2][1] * rhs[1] + inv[2][2] * rhs[2],
-        ))
+        // Collider migration updates mass properties lazily; force a recompute so the COM is
+        // current before we read it.
+        body.recompute_mass_properties_from_colliders(colliders);
+        let real_com = body.center_of_mass().coords;
+        let lever = real_com - fit_center;
+        if lever.norm_squared() <= f32::EPSILON {
+            return;
+        }
+        let angvel = *body.angvel();
+        let linvel = *body.linvel();
+        body.set_linvel(linvel + angvel.cross(&lever), false);
+    }
+
+    /// Observability hook (only invoked when `record_split_continuity` is on):
+    /// for each node migrated to `target_body`, measure how far the child body's
+    /// world point velocity drifts from the parent's at the same point. Mass
+    /// properties are recomputed first so `velocity_at_point` uses Rapier's true
+    /// centre of mass — which is precisely where the centroid-model split diverges.
+    fn record_split_child_continuity(
+        &mut self,
+        target_body: RigidBodyHandle,
+        child: &SplitChild,
+        planning: &SplitPlanningData,
+        bodies: &mut RigidBodySet,
+        colliders: &ColliderSet,
+    ) {
+        if let Some(body) = bodies.get_mut(target_body) {
+            body.recompute_mass_properties_from_colliders(colliders);
+        }
+        let Some(body) = bodies.get(target_body) else {
+            return;
+        };
+        if !body.is_dynamic() {
+            return;
+        }
+        for &node in &child.nodes {
+            let Some(source) = planning.node_sources.get(&node) else {
+                continue;
+            };
+            let p = point![
+                source.world_centroid.x,
+                source.world_centroid.y,
+                source.world_centroid.z
+            ];
+            let cv = body.velocity_at_point(&p);
+            let child_v = Vec3::new(cv.x, cv.y, cv.z);
+            let parent_v = source.world_velocity;
+            let finite = child_v.x.is_finite() && child_v.y.is_finite() && child_v.z.is_finite();
+            self.split_continuity.push(SplitContinuityRecord {
+                target_body,
+                node_index: node,
+                point_velocity_error: (child_v - parent_v).magnitude(),
+                parent_point_velocity: parent_v,
+                child_point_velocity: child_v,
+                finite,
+            });
+        }
     }
 
     fn attach_node(

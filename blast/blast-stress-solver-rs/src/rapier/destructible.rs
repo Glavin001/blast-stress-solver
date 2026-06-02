@@ -104,6 +104,9 @@ pub struct DestructibleSet {
     forces_applied: bool,
     /// Number of frames since the last fracture (for idle skip).
     frames_since_fracture: u32,
+    /// Physics timestep used to convert solver-reported excess *forces* into one-shot
+    /// impulses on newly separated fragments. Defaults to 1/60; set via `set_time_step`.
+    time_step: f32,
 }
 
 impl DestructibleSet {
@@ -158,7 +161,15 @@ impl DestructibleSet {
             pending_split_events: VecDeque::new(),
             forces_applied: false,
             frames_since_fracture: u32::MAX,
+            time_step: 1.0 / 60.0,
         })
+    }
+
+    /// Set the default physics timestep (seconds) used by [`step`](Self::step) to convert
+    /// opt-in excess forces into one-shot impulses. Prefer [`step_with_time`](Self::step_with_time),
+    /// which takes the real frame `dt` directly so the kick stays in sync with each frame.
+    pub fn set_time_step(&mut self, dt: f32) {
+        self.time_step = dt.max(0.0);
     }
 
     /// Create a destructible set from a scenario description.
@@ -253,8 +264,12 @@ impl DestructibleSet {
         impulse_joints: &mut ImpulseJointSet,
         multibody_joints: &mut MultibodyJointSet,
     ) -> StepResult {
+        // `step` uses the configured default timestep (see `set_time_step`); prefer
+        // `step_with_time` and pass your real frame dt when using opt-in excess forces.
+        let dt = self.time_step;
         self.step_with_time(
             0.0,
+            dt,
             bodies,
             colliders,
             island_manager,
@@ -263,9 +278,13 @@ impl DestructibleSet {
         )
     }
 
+    /// Like [`step`](Self::step) but takes the current time and the physics `dt` (seconds).
+    /// `dt` should equal your `IntegrationParameters::dt`; it converts the opt-in excess force
+    /// into a one-shot impulse (force × dt), keeping fragment kicks in sync with the real frame.
     pub fn step_with_time(
         &mut self,
         now_secs: f32,
+        dt: f32,
         bodies: &mut RigidBodySet,
         colliders: &mut ColliderSet,
         island_manager: &mut IslandManager,
@@ -299,8 +318,9 @@ impl DestructibleSet {
             return result;
         }
 
-        // 1. Apply gravity
-        self.solver.add_gravity(self.gravity);
+        // 1. Apply gravity in each actor's CURRENT local frame, so a chunk that has rotated
+        //    feels gravity from the correct direction (gap #7). Mirrors the JS pipeline.
+        self.apply_oriented_gravity(bodies);
         self.forces_applied = false;
 
         // 2. Update solver
@@ -364,7 +384,7 @@ impl DestructibleSet {
 
         // Optional: kick separated actors with solver-reported excess forces.
         if self.policy.apply_excess_forces {
-            self.apply_excess_forces(bodies);
+            self.apply_excess_forces(bodies, dt);
         }
 
         self.frames_since_fracture = 0;
@@ -383,6 +403,23 @@ impl DestructibleSet {
         self.solver
             .add_force(node_index, position, acceleration, ForceMode::Acceleration);
         self.forces_applied = true;
+    }
+
+    /// Enable/disable per-split point-velocity continuity recording. Observability
+    /// only — does not change the simulation. Off by default (zero production cost).
+    pub fn set_record_split_continuity(&mut self, enabled: bool) {
+        self.tracker.set_record_split_continuity(enabled);
+    }
+
+    /// Clear accumulated split continuity records.
+    pub fn clear_split_continuity(&mut self) {
+        self.tracker.clear_split_continuity();
+    }
+
+    /// Per-node split continuity records accumulated since the last clear. See
+    /// [`super::SplitContinuityRecord`].
+    pub fn split_continuity(&self) -> &[super::SplitContinuityRecord] {
+        self.tracker.split_continuity()
     }
 
     /// Get the Rapier body handle for a node.
@@ -655,7 +692,30 @@ impl DestructibleSet {
         result
     }
 
-    fn apply_excess_forces(&self, bodies: &mut RigidBodySet) {
+    /// Feed gravity to the solver per actor, rotated into each actor's current local frame
+    /// (`R⁻¹·g`). The solver works in the authored frame, so this is how an actor's current
+    /// orientation affects its gravity-induced stress (a tilted beam bends; an upright one
+    /// only compresses). Actors with no body fall back to world-space gravity. See gap #7.
+    fn apply_oriented_gravity(&mut self, bodies: &RigidBodySet) {
+        let g = self.gravity;
+        let world_g = vector![g.x, g.y, g.z];
+        let actors = self.solver.actors();
+        for actor in &actors {
+            let local = actor
+                .nodes
+                .first()
+                .and_then(|&n| self.tracker.node_body(n))
+                .and_then(|h| bodies.get(h))
+                .map(|body| {
+                    let l = body.rotation().inverse_transform_vector(&world_g);
+                    Vec3::new(l.x, l.y, l.z)
+                })
+                .unwrap_or(g);
+            self.solver.add_actor_gravity(actor.actor_index, local);
+        }
+    }
+
+    fn apply_excess_forces(&self, bodies: &mut RigidBodySet, dt: f32) {
         let actors = self.solver.actors();
         for actor in &actors {
             if actor.nodes.is_empty() {
@@ -670,16 +730,22 @@ impl DestructibleSet {
                 Some(b) if b.is_dynamic() => b,
                 _ => continue,
             };
-            let pos = body.translation();
-            let com = Vec3::new(pos.x, pos.y, pos.z);
+            // Pass Blast the body's REAL centre of mass (not its origin) so the released-load
+            // torque is computed about the correct point — matters for offset-COM fragments.
+            let c = body.center_of_mass();
+            let com = Vec3::new(c.x, c.y, c.z);
 
             if let Some((force, torque)) = self.solver.get_excess_forces(actor.actor_index, com) {
                 let force_mag = force.magnitude_squared();
                 let torque_mag = torque.magnitude_squared();
                 if force_mag > 1.0e-6 || torque_mag > 1.0e-6 {
                     if let Some(body_mut) = bodies.get_mut(body_handle) {
-                        body_mut.add_force(vector![force.x, force.y, force.z], true);
-                        body_mut.add_torque(vector![torque.x, torque.y, torque.z], true);
+                        // Apply the released load as a ONE-SHOT impulse (force x dt, using the
+                        // caller's real frame dt), not a persistent `add_force` — the latter
+                        // keeps re-accelerating the fragment every step (gap #9).
+                        body_mut.apply_impulse(vector![force.x, force.y, force.z] * dt, true);
+                        body_mut
+                            .apply_torque_impulse(vector![torque.x, torque.y, torque.z] * dt, true);
                     }
                 }
             }
