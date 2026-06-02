@@ -53,7 +53,29 @@ pub fn plan_split_migration(
 pub fn plan_split_migration_with_support(
     bodies: &[ExistingBodyState],
     children: &[SplitChild],
+    child_support: &[PlannerChildSupport],
+) -> SplitMigrationPlan {
+    plan_split_migration_inner(bodies, children, child_support, true)
+}
+
+/// Test/bench-only entry point that forces the general overlap-matrix + Hungarian
+/// assignment, bypassing the single-parent fast path. Used to prove the fast path is
+/// equivalent (equally optimal, same edit set) to the reference algorithm and to A/B
+/// their cost at scale. Never compiled into shipped builds.
+#[cfg(any(test, feature = "bench-support"))]
+pub fn plan_split_migration_reference(
+    bodies: &[ExistingBodyState],
+    children: &[SplitChild],
+    child_support: &[PlannerChildSupport],
+) -> SplitMigrationPlan {
+    plan_split_migration_inner(bodies, children, child_support, false)
+}
+
+fn plan_split_migration_inner(
+    bodies: &[ExistingBodyState],
+    children: &[SplitChild],
     _child_support: &[PlannerChildSupport],
+    fast_path: bool,
 ) -> SplitMigrationPlan {
     if bodies.is_empty() || children.is_empty() {
         return SplitMigrationPlan {
@@ -114,7 +136,7 @@ pub fn plan_split_migration_with_support(
         // argmax child, so we skip building the overlap matrix and the square-padded
         // O(max(R,C)^3) Hungarian (which for 1×256 would do ~256^3 work). Result is
         // identical: the one body reuses its best-overlap child, the rest are created.
-        if unmatched_bodies.len() == 1 {
+        if fast_path && unmatched_bodies.len() == 1 {
             let body = &bodies[unmatched_bodies[0]];
             let mut best: Option<(usize, usize)> = None; // (child_index, overlap)
             for &ci in &unmatched_children {
@@ -310,4 +332,345 @@ fn hungarian(cost: &[Vec<i64>]) -> Vec<usize> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    //! Focused, no-simulation tests for the split planner — the topology-diff that
+    //! decides which existing Rapier bodies are *reused* (handle + colliders stay put,
+    //! the cheapest edit) vs. which children get *new* bodies. We drive the planner
+    //! directly with contrived fractures, so we can scale to large/intricate cases and,
+    //! crucially, assert that the single-parent fast path is never bought at the expense
+    //! of the genuinely hard case: many surviving multi-node bodies competing for many
+    //! reparented children (a true M×N maximum-overlap assignment).
+    //!
+    //! Fractures are modelled realistically: every node belongs to exactly one existing
+    //! body *and* exactly one child (a disjoint partition), so total reuse-overlap is a
+    //! well-defined objective and an independent brute-force optimum is meaningful.
+
+    use super::*;
+    use rapier3d::prelude::{RigidBodyBuilder, RigidBodyHandle, RigidBodySet};
+
+    fn mk_bodies(sets: &[Vec<u32>], rbs: &mut RigidBodySet) -> Vec<ExistingBodyState> {
+        sets.iter()
+            .map(|nodes| ExistingBodyState {
+                handle: rbs.insert(RigidBodyBuilder::dynamic()),
+                node_indices: nodes.iter().copied().collect(),
+                is_fixed: false,
+            })
+            .collect()
+    }
+
+    fn mk_children(sets: &[Vec<u32>]) -> Vec<SplitChild> {
+        sets.iter()
+            .enumerate()
+            .map(|(i, nodes)| SplitChild { actor_index: i as u32, nodes: nodes.clone() })
+            .collect()
+    }
+
+    fn support(children: &[SplitChild]) -> Vec<PlannerChildSupport> {
+        vec![PlannerChildSupport::default(); children.len()]
+    }
+
+    fn plan(bodies: &[ExistingBodyState], children: &[SplitChild]) -> SplitMigrationPlan {
+        plan_split_migration_with_support(bodies, children, &support(children))
+    }
+
+    /// The shipping planner with the fast path bypassed — the reference algorithm.
+    fn plan_ref(bodies: &[ExistingBodyState], children: &[SplitChild]) -> SplitMigrationPlan {
+        plan_split_migration_reference(bodies, children, &support(children))
+    }
+
+    fn overlap(body: &ExistingBodyState, child: &SplitChild) -> usize {
+        child.nodes.iter().filter(|n| body.node_indices.contains(n)).count()
+    }
+
+    /// Assert the plan is a valid partition of the children (each assigned exactly once,
+    /// reuse XOR create; each body reused at most once; reused pairs share ≥1 node) and
+    /// return the total reuse-overlap, which the planner maximizes — and which is the
+    /// proxy for "colliders that stay attached to their body" (the cheapest Rapier edit).
+    fn validate_and_score(
+        p: &SplitMigrationPlan,
+        bodies: &[ExistingBodyState],
+        children: &[SplitChild],
+    ) -> usize {
+        let mut assigned = vec![0u32; children.len()];
+        for r in &p.reuse {
+            assigned[r.child_index] += 1;
+        }
+        for c in &p.create {
+            assigned[c.child_index] += 1;
+        }
+        assert!(
+            assigned.iter().all(|&t| t == 1),
+            "each child must be assigned exactly once (reuse XOR create): {assigned:?}"
+        );
+
+        let mut reuse_count: std::collections::HashMap<RigidBodyHandle, u32> = Default::default();
+        let mut total = 0usize;
+        for r in &p.reuse {
+            *reuse_count.entry(r.body_handle).or_insert(0) += 1;
+            let body = bodies
+                .iter()
+                .find(|b| b.handle == r.body_handle)
+                .expect("reused handle must be an existing body");
+            let ov = overlap(body, &children[r.child_index]);
+            assert!(ov > 0, "a reused (body,child) pair must share at least one node");
+            total += ov;
+        }
+        assert!(
+            reuse_count.values().all(|&c| c <= 1),
+            "an existing body may be reused by at most one child"
+        );
+        total
+    }
+
+    /// Independent brute-force optimum: max total overlap over all body→distinct-child
+    /// assignments (a body may also stay unmatched). Exponential — small instances only.
+    fn brute_optimum(bodies: &[ExistingBodyState], children: &[SplitChild]) -> usize {
+        fn rec(bi: usize, b: &[ExistingBodyState], c: &[SplitChild], used: &mut [bool]) -> usize {
+            if bi == b.len() {
+                return 0;
+            }
+            let mut best = rec(bi + 1, b, c, used); // body bi takes no child
+            for ci in 0..c.len() {
+                if used[ci] {
+                    continue;
+                }
+                let ov = overlap(&b[bi], &c[ci]);
+                if ov == 0 {
+                    continue;
+                }
+                used[ci] = true;
+                best = best.max(ov + rec(bi + 1, b, c, used));
+                used[ci] = false;
+            }
+            best
+        }
+        let mut used = vec![false; children.len()];
+        rec(0, bodies, children, &mut used)
+    }
+
+    fn reuse_pairs(p: &SplitMigrationPlan) -> Vec<(usize, RigidBodyHandle)> {
+        let mut v: Vec<_> = p.reuse.iter().map(|r| (r.child_index, r.body_handle)).collect();
+        v.sort_by_key(|(c, _)| *c);
+        v
+    }
+    fn create_set(p: &SplitMigrationPlan) -> Vec<usize> {
+        let mut v: Vec<_> = p.create.iter().map(|c| c.child_index).collect();
+        v.sort_unstable();
+        v
+    }
+
+    // === 1. Degenerate cascade (the fast path): one parent -> N children. =========
+    #[test]
+    fn cascade_fastpath_equals_reference_and_is_optimal() {
+        let mut rbs = RigidBodySet::new();
+        for n in [2u32, 5, 33, 256] {
+            let bodies = mk_bodies(&[(0..n).collect()], &mut rbs);
+            let children = mk_children(&(0..n).map(|k| vec![k]).collect::<Vec<_>>());
+
+            let fast = plan(&bodies, &children);
+            let reference = plan_ref(&bodies, &children);
+            let s_fast = validate_and_score(&fast, &bodies, &children);
+            let s_ref = validate_and_score(&reference, &bodies, &children);
+
+            assert_eq!(fast.reuse.len(), 1, "n={n}: the one body reuses one child");
+            assert_eq!(fast.create.len(), (n - 1) as usize, "n={n}: the rest are created");
+            assert_eq!(s_fast, 1, "n={n}: best single-node overlap is 1");
+            assert_eq!(s_fast, s_ref, "n={n}: fast path must be as optimal as the Hungarian");
+            if n <= 8 {
+                assert_eq!(s_fast, brute_optimum(&bodies, &children), "n={n}: globally optimal");
+            }
+        }
+    }
+
+    // === 2. Complex partial reparenting (the real worst case). ====================
+    #[test]
+    fn complex_reparenting_is_optimal_and_matches_reference() {
+        let mut rbs = RigidBodySet::new();
+        // 4 bodies partition nodes 0..16; a shear regroups them into 4 children that each
+        // straddle two old bodies — a genuine 4×4 reparenting assignment (no exact match,
+        // so the fast path must NOT fire; the Hungarian must be globally optimal).
+        let bodies = mk_bodies(
+            &[vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11], vec![12, 13, 14, 15]],
+            &mut rbs,
+        );
+        let children = mk_children(&[
+            vec![0, 1, 4],            // body0:2  body1:1  -> body0
+            vec![2, 3, 5, 6, 7],      // body0:2  body1:3  -> body1
+            vec![8, 9, 12],           // body2:2  body3:1  -> body2
+            vec![10, 11, 13, 14, 15], // body2:2  body3:3  -> body3
+        ]);
+
+        let fast = plan(&bodies, &children);
+        let reference = plan_ref(&bodies, &children);
+        let s_fast = validate_and_score(&fast, &bodies, &children);
+        let s_ref = validate_and_score(&reference, &bodies, &children);
+
+        assert_eq!(s_fast, brute_optimum(&bodies, &children), "must be globally optimal");
+        assert_eq!(s_fast, s_ref, "fast and reference agree on the multi-body case");
+        assert_eq!(create_set(&fast), Vec::<usize>::new(), "all 4 chunks reuse a body");
+        assert_eq!(reuse_pairs(&fast), reuse_pairs(&reference), "identical (no ties here)");
+    }
+
+    // === 3. Realistic mixed scene: most bodies survive, one interior body shatters. =
+    #[test]
+    fn mostly_persist_one_shatters_uses_fastpath_correctly() {
+        let mut rbs = RigidBodySet::new();
+        // bodies 0..4 persist unchanged; body 4 (nodes 100..108) shatters into 8 shards.
+        let persist = [vec![0u32, 1], vec![2, 3], vec![4, 5], vec![6, 7]];
+        let mut bsets = persist.to_vec();
+        bsets.push((100..108).collect());
+        let bodies = mk_bodies(&bsets, &mut rbs);
+
+        let mut csets = persist.to_vec(); // the 4 survivors (exact matches)
+        csets.extend((100..108u32).map(|k| vec![k])); // + 8 shards
+        let children = mk_children(&csets);
+
+        let fast = plan(&bodies, &children);
+        let s_fast = validate_and_score(&fast, &bodies, &children);
+        let s_ref = validate_and_score(&plan_ref(&bodies, &children), &bodies, &children);
+
+        // Survivors must be reused with their *own* body (never needlessly recreated):
+        for (ci, _) in persist.iter().enumerate() {
+            let r = fast.reuse.iter().find(|r| r.child_index == ci).expect("survivor reused");
+            assert_eq!(bodies[ci].handle, r.body_handle, "exact match reuses its own body");
+        }
+        // After exact matches drop out, only the shattered body is unmatched -> fast path
+        // legitimately fires inside a complex scene: it reuses 1 shard, creates 7.
+        assert_eq!(fast.create.len(), 7);
+        assert_eq!(s_fast, s_ref, "fast (fast-path firing) equals the reference");
+        assert_eq!(s_fast, brute_optimum(&bodies, &children), "globally optimal (= 8 + 1)");
+    }
+
+    // === 4. Ties: equal-overlap children -> equally optimal, identical edit count. =
+    #[test]
+    fn ties_are_resolved_equally_optimally() {
+        let mut rbs = RigidBodySet::new();
+        let bodies = mk_bodies(&[vec![0, 1, 2, 3]], &mut rbs);
+        let children = mk_children(&[vec![0, 1], vec![2, 3]]); // both overlap the body by 2
+        let fast = plan(&bodies, &children);
+        let s_fast = validate_and_score(&fast, &bodies, &children);
+        let s_ref = validate_and_score(&plan_ref(&bodies, &children), &bodies, &children);
+        assert_eq!((fast.reuse.len(), fast.create.len()), (1, 1));
+        assert_eq!(s_fast, 2);
+        assert_eq!(s_fast, s_ref, "tie resolved with equal total overlap & edit count");
+        assert_eq!(s_fast, brute_optimum(&bodies, &children));
+    }
+
+    // === 5. Exact node-set matches must always be reused (cheapest possible edit). =
+    #[test]
+    fn exact_matches_are_always_reused() {
+        let mut rbs = RigidBodySet::new();
+        let bodies = mk_bodies(&[vec![0, 1, 2], vec![3, 4], vec![5, 6, 7, 8]], &mut rbs);
+        let children = mk_children(&[vec![5, 6, 7, 8], vec![0, 1, 2], vec![3, 4]]); // permuted
+        let fast = plan(&bodies, &children);
+        validate_and_score(&fast, &bodies, &children);
+        assert!(fast.create.is_empty(), "all children are exact matches -> zero creates");
+        assert_eq!(fast.reuse.len(), 3);
+        for r in &fast.reuse {
+            let body = bodies.iter().find(|b| b.handle == r.body_handle).unwrap();
+            let cset: std::collections::HashSet<u32> =
+                children[r.child_index].nodes.iter().copied().collect();
+            assert_eq!(body.node_indices, cset, "exact match reused the identical body");
+        }
+    }
+
+    // === 6. Randomized property sweep — the core anti-regression guard. ===========
+    #[test]
+    fn randomized_fractures_planner_equals_reference_and_optimum() {
+        // dependency-free deterministic PRNG (SplitMix64).
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            }
+            fn below(&mut self, n: u32) -> u32 {
+                (self.next() % n as u64) as u32
+            }
+        }
+
+        let mut rng = Rng(0xDEAD_BEEF);
+        let mut checked = 0;
+        for case in 0..400 {
+            let node_count = 1 + rng.below(24);
+            let nb = 1 + rng.below(6); // up to 6 bodies  } small enough for brute force,
+            let nc = 1 + rng.below(7); // up to 7 children } spans degenerate..complex
+            // Disjoint partition: each node gets one body label and one child label.
+            let mut bn: Vec<Vec<u32>> = vec![Vec::new(); nb as usize];
+            let mut cn: Vec<Vec<u32>> = vec![Vec::new(); nc as usize];
+            for node in 0..node_count {
+                bn[rng.below(nb) as usize].push(node);
+                cn[rng.below(nc) as usize].push(node);
+            }
+            let bsets: Vec<Vec<u32>> = bn.into_iter().filter(|v| !v.is_empty()).collect();
+            let csets: Vec<Vec<u32>> = cn.into_iter().filter(|v| !v.is_empty()).collect();
+            if bsets.is_empty() || csets.is_empty() {
+                continue;
+            }
+            let mut rbs = RigidBodySet::new();
+            let bodies = mk_bodies(&bsets, &mut rbs);
+            let children = mk_children(&csets);
+
+            let fast = plan(&bodies, &children);
+            let reference = plan_ref(&bodies, &children);
+            let s_fast = validate_and_score(&fast, &bodies, &children);
+            let s_ref = validate_and_score(&reference, &bodies, &children);
+            let opt = brute_optimum(&bodies, &children);
+
+            assert_eq!(
+                s_fast, opt,
+                "case {case}: shipping planner not globally optimal\n bodies={bsets:?}\n children={csets:?}"
+            );
+            assert_eq!(
+                s_ref, opt,
+                "case {case}: reference not globally optimal\n bodies={bsets:?}\n children={csets:?}"
+            );
+            assert_eq!(
+                s_fast, s_ref,
+                "case {case}: fast path traded optimality vs the Hungarian\n bodies={bsets:?}\n children={csets:?}"
+            );
+            // determinism: identical plan on a repeat run.
+            let again = plan(&bodies, &children);
+            assert_eq!(reuse_pairs(&fast), reuse_pairs(&again), "case {case}: nondeterministic reuse");
+            assert_eq!(create_set(&fast), create_set(&again), "case {case}: nondeterministic create");
+            checked += 1;
+        }
+        assert!(checked > 300, "expected most random cases to be checked, got {checked}");
+    }
+
+    // === 7. Scale: fast path stays O(N) & correct at huge N; large complex stays valid. =
+    #[test]
+    fn scales_to_large_inputs() {
+        // 7a. one body -> 8192 shards (fast path). Reuse exactly one, create the rest.
+        let mut rbs = RigidBodySet::new();
+        let bodies = mk_bodies(&[(0..8192).collect()], &mut rbs);
+        let children = mk_children(&(0..8192u32).map(|k| vec![k]).collect::<Vec<_>>());
+        let p = plan(&bodies, &children);
+        validate_and_score(&p, &bodies, &children);
+        assert_eq!((p.reuse.len(), p.create.len()), (1, 8191));
+
+        // 7b. 64 bodies: 32 persist exactly, 32 reshuffle into children that straddle two
+        // adjacent old bodies. After exact matches drop out a 32×32 Hungarian remains
+        // (fast path must NOT fire). Assert valid + survivors reused + fast == reference.
+        let mut rbs2 = RigidBodySet::new();
+        let bsets: Vec<Vec<u32>> = (0..64u32).map(|k| vec![k * 2, k * 2 + 1]).collect();
+        let bodies2 = mk_bodies(&bsets, &mut rbs2);
+        let mut csets: Vec<Vec<u32>> = (0..32u32).map(|k| vec![k * 2, k * 2 + 1]).collect();
+        csets.extend((32..64u32).map(|k| vec![k * 2, ((k + 1) % 64) * 2 + 1]));
+        let children2 = mk_children(&csets);
+        let p2 = plan(&bodies2, &children2);
+        let s2 = validate_and_score(&p2, &bodies2, &children2);
+        let s_ref2 = validate_and_score(&plan_ref(&bodies2, &children2), &bodies2, &children2);
+        assert_eq!(s2, s_ref2, "large complex case: fast and reference agree");
+        for k in 0..32usize {
+            let r = p2.reuse.iter().find(|r| r.child_index == k).expect("survivor reused");
+            assert_eq!(bodies2[k].handle, r.body_handle, "survivor keeps its own body");
+        }
+    }
 }

@@ -21,8 +21,8 @@ use rapier3d::prelude::*;
 
 use blast_stress_solver::bench_harness::*;
 use blast_stress_solver::rapier::{
-    plan_split_migration_with_support, BodySnapshots, ExistingBodyState, FracturePolicy,
-    PlannerChildSupport, ResimulationOptions,
+    plan_split_migration_reference, plan_split_migration_with_support, BodySnapshots,
+    ExistingBodyState, FracturePolicy, PlannerChildSupport, ResimulationOptions,
 };
 use blast_stress_solver::*;
 
@@ -169,6 +169,51 @@ fn bench_split_planning(c: &mut Criterion) {
             .collect();
         let support = vec![PlannerChildSupport::default(); 256];
         group.bench_function("cascade_1body_256children", |b| {
+            b.iter(|| {
+                black_box(plan_split_migration_with_support(
+                    black_box(&existing),
+                    black_box(&children),
+                    black_box(&support),
+                ))
+            })
+        });
+        // Fast path vs. the reference (forced) Hungarian on the *same* 1×256 input — the
+        // A/B that isolates the planner optimization (O(N) argmax vs O(N^3) padded solve).
+        group.bench_function("cascade_1body_256children_reference_hungarian", |b| {
+            b.iter(|| {
+                black_box(plan_split_migration_reference(
+                    black_box(&existing),
+                    black_box(&children),
+                    black_box(&support),
+                ))
+            })
+        });
+    }
+
+    // Case D: complex partial reparenting — the genuine worst case. Many surviving
+    // multi-node bodies competing for many reparented children (no single-parent shortcut;
+    // this always runs the full overlap-matrix + Hungarian). Scaled to show O(max(R,C)^3).
+    for &m in &[16usize, 32, 64] {
+        // m bodies own 4 nodes each; the shatter regroups into m children that each
+        // straddle two adjacent bodies (overlap 2 vs 2 — dense, non-trivial assignment).
+        let mut existing = Vec::new();
+        for k in 0..m as u32 {
+            let h = set.insert(RigidBodyBuilder::dynamic());
+            existing.push(ExistingBodyState {
+                handle: h,
+                node_indices: (k * 4..k * 4 + 4).collect::<HashSet<_>>(),
+                is_fixed: false,
+            });
+        }
+        let children: Vec<SplitChild> = (0..m as u32)
+            .map(|k| {
+                let a = k * 4 + 2; // last 2 nodes of body k
+                let b = ((k + 1) % m as u32) * 4; // first 2 nodes of body k+1
+                SplitChild { actor_index: k, nodes: vec![a, a + 1, b, b + 1] }
+            })
+            .collect();
+        let support = vec![PlannerChildSupport::default(); m];
+        group.bench_function(BenchmarkId::new("complex_reparent_MxM", m), |b| {
             b.iter(|| {
                 black_box(plan_split_migration_with_support(
                     black_box(&existing),

@@ -20,3 +20,5 @@ pub use split_migrator::{
     plan_split_migration, plan_split_migration_with_support, CreateEntry, ExistingBodyState,
     PlannerChildSupport, ReuseEntry, SplitMigrationPlan,
 };
+#[cfg(any(test, feature = "bench-support"))]
+pub use split_migrator::plan_split_migration_reference;
