@@ -56,21 +56,28 @@ Destruction relies on the **heterogeneous structure** + the solver's **built-in 
 mechanism (the JS core and the Bevy demo apply contact force the same way: full force at the
 hit node + quadratic-falloff splash within ~2 m, `contactForceScale = 30`).
 
-What this **fixes** (the original problem): a uniform building shatters its whole face from one
-hit. Here, walls are *infill* hung weakly on a stiff frame, so hitting a wall does **not** blow
-out the face — the strong skeleton refuses to propagate the failure. A single heavy ball into a
-wall barely dents it; gravity-only is stable; the base never rips off (anchored). Verified.
+**Verified, robust wins:** gravity-only is stable (0 fractures); the base never rips off
+(strongly-anchored `foundation→column`); and a uniform-material **wall no longer shatters its
+whole face** — a realistic ball into a wall does essentially nothing because the infill is weak
+and the stiff frame refuses to propagate the failure. These are the core fixes and they hold.
 
-What it **does not** do, and why: the Blast stress solver is a *global* quasi-static solve, so a
-contact force is spatially **all-or-nothing** — below a threshold nothing breaks; once a load
-path is severed (e.g. a low column hit hard) the section above progressively collapses. There
-is no graceful *per-hit local chipping* from the stress solver alone. That graceful, graded
-local destruction is what an **optional contact-damage layer** (per-chunk health + splash,
-`DestructibleDamageSystem`) provides — it is wired through the scene pack's `defaults.damage`
-block and the web loader but ships **disabled** (out of current scope). A tuned starting point
-(`strengthPerVolume 500, kImpact 0.2, contactDamageScale 10, splashRadius 3 m`) is kept in the
-block; flipping `enabled: true` (and porting an equivalent to the Rust crate) is the documented
-next step when fine-grained local destruction is in scope.
+**Honest limitation of stress-only impact (why this is hard without the damage layer):** the
+Blast stress solver is a *global* quasi-static solve, so a contact force is spatially
+**all-or-nothing** — there is no graceful *per-hit local chipping*. In practice the wrecking
+ball is either ignored (realistic energies, the building is tough) or, past a threshold / when a
+heavy projectile lodges against the structure and acts as a large sustained load, triggers a
+**progressive collapse** that runs much further than a real local breach (e.g. a 4-ton ball
+parked against a wall crushes a large fraction over a few seconds). Measured single-shot outcomes
+vary strongly with impact location, energy, and how long the projectile rests on the structure;
+treat the stress-only impact response as coarse.
+
+Graceful, graded, *local* impact destruction is the job of the **optional contact-damage layer**
+(per-chunk health + splash, `DestructibleDamageSystem`). It is wired through the scene pack's
+`defaults.damage` block and the web loader but ships **disabled** (out of current scope). A tuned
+starting point (`strengthPerVolume 500, kImpact 0.2, contactDamageScale 10, splashRadius 3 m`,
+which in testing gave a realistic ball a ~7-chunk local hole with the building standing) is kept
+in the block; enabling it (and porting an equivalent to the Rust crate) is the documented next
+step when fine-grained local destruction is in scope.
 
 ## Composable building kit
 
