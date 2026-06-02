@@ -165,8 +165,9 @@ impl DestructibleSet {
         })
     }
 
-    /// Set the physics timestep (seconds) used to convert solver excess forces into one-shot
-    /// fracture impulses. Match this to your `IntegrationParameters::dt` for accuracy.
+    /// Set the default physics timestep (seconds) used by [`step`](Self::step) to convert
+    /// opt-in excess forces into one-shot impulses. Prefer [`step_with_time`](Self::step_with_time),
+    /// which takes the real frame `dt` directly so the kick stays in sync with each frame.
     pub fn set_time_step(&mut self, dt: f32) {
         self.time_step = dt.max(0.0);
     }
@@ -263,8 +264,12 @@ impl DestructibleSet {
         impulse_joints: &mut ImpulseJointSet,
         multibody_joints: &mut MultibodyJointSet,
     ) -> StepResult {
+        // `step` uses the configured default timestep (see `set_time_step`); prefer
+        // `step_with_time` and pass your real frame dt when using opt-in excess forces.
+        let dt = self.time_step;
         self.step_with_time(
             0.0,
+            dt,
             bodies,
             colliders,
             island_manager,
@@ -273,9 +278,13 @@ impl DestructibleSet {
         )
     }
 
+    /// Like [`step`](Self::step) but takes the current time and the physics `dt` (seconds).
+    /// `dt` should equal your `IntegrationParameters::dt`; it converts the opt-in excess force
+    /// into a one-shot impulse (force × dt), keeping fragment kicks in sync with the real frame.
     pub fn step_with_time(
         &mut self,
         now_secs: f32,
+        dt: f32,
         bodies: &mut RigidBodySet,
         colliders: &mut ColliderSet,
         island_manager: &mut IslandManager,
@@ -375,7 +384,7 @@ impl DestructibleSet {
 
         // Optional: kick separated actors with solver-reported excess forces.
         if self.policy.apply_excess_forces {
-            self.apply_excess_forces(bodies);
+            self.apply_excess_forces(bodies, dt);
         }
 
         self.frames_since_fracture = 0;
@@ -706,7 +715,7 @@ impl DestructibleSet {
         }
     }
 
-    fn apply_excess_forces(&self, bodies: &mut RigidBodySet) {
+    fn apply_excess_forces(&self, bodies: &mut RigidBodySet, dt: f32) {
         let actors = self.solver.actors();
         for actor in &actors {
             if actor.nodes.is_empty() {
@@ -731,10 +740,9 @@ impl DestructibleSet {
                 let torque_mag = torque.magnitude_squared();
                 if force_mag > 1.0e-6 || torque_mag > 1.0e-6 {
                     if let Some(body_mut) = bodies.get_mut(body_handle) {
-                        // Apply the released load as a ONE-SHOT impulse (force x dt), not a
-                        // persistent `add_force` — the latter keeps re-accelerating the
-                        // fragment every step unless the caller resets forces (gap #9).
-                        let dt = self.time_step;
+                        // Apply the released load as a ONE-SHOT impulse (force x dt, using the
+                        // caller's real frame dt), not a persistent `add_force` — the latter
+                        // keeps re-accelerating the fragment every step (gap #9).
                         body_mut.apply_impulse(vector![force.x, force.y, force.z] * dt, true);
                         body_mut
                             .apply_torque_impulse(vector![torque.x, torque.y, torque.z] * dt, true);

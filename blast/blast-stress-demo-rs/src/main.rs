@@ -3822,6 +3822,7 @@ fn physics_step_system(
             } = &mut *state;
             destructible.step_with_time(
                 now_secs,
+                dt,
                 bodies,
                 colliders,
                 island_manager,

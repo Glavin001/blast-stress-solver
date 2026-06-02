@@ -118,7 +118,7 @@ Blast computes this with `getExcessForces`.
   excess force (`solver_mechanisms_test.rs` / `solver-mechanisms.test.ts`). The pre-existing
   Rust test only checked finiteness, so this magnitude had never been asserted.
 - Rust pipeline: supports it as an **opt-in alternative** (`apply_excess_forces`, default
-  **off**), applied as a **one-shot impulse** (`force × time_step`) about the body's real centre
+  **off**), applied as a **one-shot impulse** (`force × dt`, the real frame dt) about the body's real centre
   of mass. **Resimulation is the preferred, more sound source of fragment momentum** (re-resolve
   the actual contact against the fractured pieces); excess force is for consumers who don't
   resimulate. `excess_force_integration_test.rs` shows fragments reach ~22 m/s with it on vs 0
@@ -175,9 +175,11 @@ Blast computes this with `getExcessForces`.
    Fix: mirror Rust's `apply_excess_forces` in `destructible-core.ts`. (A JS integration test
    needs a per-body velocity/mass accessor on the core to assert fragment momentum.)
 9. **Rust excess force persistence** — ✅ FIXED. The fracture kick is now a one-shot impulse
-   (`apply_impulse(force × time_step)`; set `time_step` via `set_time_step` to match your
-   `IntegrationParameters::dt`) instead of a persistent `add_force`, so fragment speed no longer
-   grows unbounded. Guard: `excess_force_persistence_test.rs::excess_force_kick_should_be_one_shot`
+   (`apply_impulse(force × dt)`) instead of a persistent `add_force`, so fragment speed no longer
+   grows unbounded. `dt` is the real frame timestep, threaded through
+   `step_with_time(now_secs, dt, …)` (the demo passes its `IntegrationParameters::dt`); `step()`
+   uses the `set_time_step` default. Guard:
+   `excess_force_persistence_test.rs::excess_force_kick_should_be_one_shot`
    (now passing without any per-step force reset).
 10. **js_stress_example split specs don't run on CI** — open. `npm run test:split` fails at
     module resolution in the Test job (`blast-stress-solver/scenarios` export and
