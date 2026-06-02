@@ -88,10 +88,15 @@ let rebuilding = false;
 // User-controlled settings (top-right panel). `damage` is OFF by default: the
 // default experience is the pure stress-solver response to impacts; the toggle
 // flips on the per-chunk contact-damage layer (local holes) and rebuilds.
-const settings = { damage: false, debug: false, mass: 2500, speed: 18 };
-// Projectile radius + ttl come from the scene pack; mass + speed are slider-driven.
-let projectileShape = { radius: 0.6, ttlMs: 8000 };
+const settings = { damage: false, debug: false, radius: 0.6, mass: 2500, speed: 8 };
+// Projectile ttl comes from the scene pack; radius/mass/speed are slider-driven.
+let projectileTtlMs = 8000;
 let packDamage: Record<string, unknown> = {};
+// Building bounds (computed from the scenario at load). The wrecking ball spawns just
+// in FRONT of the clicked surface (a local impact) rather than plowing ~45 m from the
+// camera, which would rake a diagonal tunnel / trigger a global stress cascade.
+const STANDOFF = 6;
+const buildingBox = new THREE.Box3();
 
 async function initScene() {
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
@@ -99,11 +104,16 @@ async function initScene() {
 
   const pack = await loadScenePackFromUrl(SCENE_URL);
   const { scenario, defaults } = pack;
-  projectileShape = {
-    radius: (defaults.projectile as any)?.radius ?? 0.6,
-    ttlMs: (defaults.projectile as any)?.ttlMs ?? 8000,
-  };
+  projectileTtlMs = (defaults.projectile as any)?.ttlMs ?? 8000;
   packDamage = (defaults.damage as Record<string, unknown>) ?? {};
+  // Axis-aligned bounds of the building (centroids + a chunk half-extent margin),
+  // used to place the wrecking ball just in front of the clicked surface.
+  buildingBox.makeEmpty();
+  const boundsPoint = new THREE.Vector3();
+  for (const n of scenario.nodes) {
+    buildingBox.expandByPoint(boundsPoint.set(n.centroid.x, n.centroid.y, n.centroid.z));
+  }
+  buildingBox.expandByScalar(1.0);
   console.log(
     `High-rise: ${scenario.nodes.length} nodes, ${scenario.bonds.length} bonds, ` +
       `limits comp/ten/shear=${defaults.solverSettings?.compressionFatalLimit}/` +
@@ -159,7 +169,11 @@ async function initScene() {
   visualsRef = visuals;
   recorder = createBondBreakRecorder(core);
   frame = 0;
-  if (hint) hint.textContent = 'Click to throw the wrecking ball';
+  if (hint) {
+    hint.textContent = settings.damage
+      ? 'Click the building to throw the wrecking ball'
+      : 'Click the building to throw the wrecking ball — enable "Custom damage system" for fracturing';
+  }
 }
 
 function shootProjectile(ndcX: number, ndcY: number) {
@@ -168,12 +182,19 @@ function shootProjectile(ndcX: number, ndcY: number) {
   const raycaster = new THREE.Raycaster();
   raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
   const dir = raycaster.ray.direction.clone().normalize();
+  // Find where the click ray meets the building, then spawn the ball STANDOFF metres in
+  // front of that surface so it delivers a local impact. Spawning at the camera instead
+  // makes the heavy ball plow ~45 m diagonally through the whole structure, raking a
+  // tunnel and (in stress-only mode) triggering a global collapse.
+  const entry = new THREE.Vector3();
+  if (!raycaster.ray.intersectBox(buildingBox, entry)) return; // clicked empty space
+  const spawn = entry.addScaledVector(dir, -STANDOFF);
   core.enqueueProjectile({
-    position: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+    position: { x: spawn.x, y: spawn.y, z: spawn.z },
     velocity: { x: dir.x * settings.speed, y: dir.y * settings.speed, z: dir.z * settings.speed },
-    radius: projectileShape.radius,
+    radius: settings.radius,
     mass: settings.mass,
-    ttl: projectileShape.ttlMs,
+    ttl: projectileTtlMs,
   });
 }
 
@@ -217,15 +238,19 @@ optDebug?.addEventListener('change', () => {
   rapierDebug?.setEnabled(settings.debug);
 });
 
+const optRadius = document.getElementById('opt-radius') as HTMLInputElement | null;
 const optMass = document.getElementById('opt-mass') as HTMLInputElement | null;
 const optSpeed = document.getElementById('opt-speed') as HTMLInputElement | null;
 function syncBallLabels() {
+  setHud('val-radius', `${settings.radius.toFixed(2)} m`);
   setHud('val-mass', `${settings.mass} kg`);
   setHud('val-speed', `${settings.speed} m/s`);
 }
+optRadius?.addEventListener('input', () => { settings.radius = Number(optRadius.value); syncBallLabels(); });
 optMass?.addEventListener('input', () => { settings.mass = Number(optMass.value); syncBallLabels(); });
 optSpeed?.addEventListener('input', () => { settings.speed = Number(optSpeed.value); syncBallLabels(); });
 // Initialize settings + labels from the control defaults.
+if (optRadius) settings.radius = Number(optRadius.value);
 if (optMass) settings.mass = Number(optMass.value);
 if (optSpeed) settings.speed = Number(optSpeed.value);
 syncBallLabels();

@@ -74,7 +74,7 @@ const DEFAULTS = {
     enabled: false,
     strengthPerVolume: 200,
     kImpact: 0.15,
-    contactDamageScale: 1,
+    contactDamageScale: 2,
     minImpulseThreshold: 5,
     internalMinImpulseThreshold: 8,
     splashRadius: 3.0,

@@ -38,9 +38,10 @@
           <h1>&#127970; High-Rise Demolition</h1>
           <p>
             Mid-rise apartment: reinforced-concrete flat-slab skeleton + frangible drywall
-            infill, loaded from the same shared scene-pack JSON the Rust demo uses. Click to
-            throw the wrecking ball. Enable the <em>Custom damage system</em> toggle to localize
-            impacts into per-chunk holes instead of the default global stress response.
+            infill, loaded from the same shared scene-pack JSON the Rust demo uses. By default
+            the stress solver alone keeps the frame standing under a wrecking-ball hit; enable
+            the <em>Custom damage system</em> toggle to add per-chunk material fracture &mdash;
+            local holes that scale with the ball.
           </p>
         </header>
 
@@ -69,14 +70,19 @@
         <section class="config-section">
           <h2 class="section-title">Wrecking ball</h2>
           <div class="config-row">
+            <span class="config-label">Radius</span>
+            <input type="range" class="config-slider" id="opt-radius" min="0.3" max="1.5" step="0.1" value="0.6" />
+            <span class="config-value" id="val-radius">0.60 m</span>
+          </div>
+          <div class="config-row">
             <span class="config-label">Mass</span>
-            <input type="range" class="config-slider" id="opt-mass" min="500" max="8000" step="100" value="2500" />
+            <input type="range" class="config-slider" id="opt-mass" min="500" max="5000" step="100" value="2500" />
             <span class="config-value" id="val-mass">2500 kg</span>
           </div>
           <div class="config-row">
             <span class="config-label">Speed</span>
-            <input type="range" class="config-slider" id="opt-speed" min="6" max="40" step="1" value="18" />
-            <span class="config-value" id="val-speed">18 m/s</span>
+            <input type="range" class="config-slider" id="opt-speed" min="4" max="12" step="1" value="8" />
+            <span class="config-value" id="val-speed">8 m/s</span>
           </div>
         </section>
 
