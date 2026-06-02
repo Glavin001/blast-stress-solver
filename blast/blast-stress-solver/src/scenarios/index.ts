@@ -15,3 +15,14 @@ export type { FracturedTowerOptions } from './fracturedTowerScenario';
 
 export { buildFracturedBridgeScenario } from './fracturedBridgeScenario';
 export type { FracturedBridgeOptions } from './fracturedBridgeScenario';
+
+export {
+  buildHighRiseScenario,
+  DEFAULT_HIGH_RISE_OPTIONS,
+  HIGH_RISE_BOND_MULTIPLIERS,
+  DEFAULT_HIGH_RISE_MULTIPLIERS,
+  makeHighRiseBondMultiplier,
+  CONCRETE_DENSITY,
+  DRYWALL_DENSITY,
+} from './highRiseScenario';
+export type { HighRiseOptions, HighRiseMultipliers } from './highRiseScenario';

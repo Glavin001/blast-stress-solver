@@ -136,6 +136,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # The high-rise scene pack is a generated, git-ignored artifact. Generate it
+      # from the TypeScript composer (no Emscripten/WASM needed for build:ts) so the
+      # Rust high-rise behavior tests run against the real building instead of skipping.
+      - name: Generate shared scene pack
+        working-directory: blast/blast-stress-solver
+        run: |
+          npm install --ignore-scripts
+          npm run build:ts
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:

@@ -33,11 +33,31 @@ The demo also ships embedded authored scene packs for:
 - `fractured-tower`
 - `fractured-bridge`
 - `brick-building`
+- `high-rise` (generated, not embedded — see note below)
 
 The brick building preset is a coarse 2-story shell with staggered brick
 coursing, interlocking corners, window and door openings, a flat roof, and a
 2-course parapet. Its bond graph is generated from the authored brick geometry
 rather than hand-authored connectivity.
+
+### High-rise apartment (`high-rise`)
+
+A mid-rise reinforced-concrete apartment (flat-slab skeleton + frangible drywall
+infill) tuned for realistic, non-glass destruction. It is authored in TypeScript
+and shares ONE generated scene pack with the web demo. The JSON is **git-ignored**
+and loaded at runtime, so generate it first:
+
+```bash
+(cd ../blast-stress-solver && npm install --ignore-scripts && npm run build:ts)
+BLAST_STRESS_DEMO_SCENARIO=high-rise BLAST_STRESS_DEMO_SHOW_MESHES=1 cargo run
+# Scripted wrecking-ball run (headless):
+BLAST_STRESS_DEMO_SCENARIO=high-rise BLAST_STRESS_DEMO_HEADLESS=1 \
+  BLAST_STRESS_DEMO_HEADLESS_FRAMES=300 \
+  BLAST_STRESS_DEMO_HEADLESS_SHOT_SCRIPT=high_rise_wrecking_ball cargo run
+```
+
+See `../blast-stress-solver/docs/high-rise.md` for the structural model, realistic
+material values, tests, and parameter sweeps.
 
 ## Run Modes
 

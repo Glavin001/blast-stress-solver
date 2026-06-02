@@ -49,6 +49,8 @@ pub struct LoadedScenePack {
     pub projectile_ttl_secs: f32,
     pub gravity: f32,
     pub material_scale: f32,
+    /// Explicit decoupled stress limits if the pack provided them.
+    pub stress_limits: Option<StressLimits>,
     pub skip_single_bodies: bool,
     pub small_body_damping: SmallBodyDampingOptions,
     pub debris_cleanup: DebrisCleanupOptions,
@@ -97,6 +99,32 @@ struct ProjectileDefaultsJson {
 struct SolverDefaultsJson {
     gravity: f32,
     material_scale: f32,
+    /// Optional explicit, decoupled stress limits (Pa). When present, the demo uses
+    /// these verbatim instead of scaling base ratios by `material_scale`.
+    #[serde(default)]
+    limits: Option<LimitsJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LimitsJson {
+    compression_elastic: f32,
+    compression_fatal: f32,
+    tension_elastic: f32,
+    tension_fatal: f32,
+    shear_elastic: f32,
+    shear_fatal: f32,
+}
+
+/// Explicit, decoupled stress limits (Pa) carried by a scene pack.
+#[derive(Clone, Copy, Debug)]
+pub struct StressLimits {
+    pub compression_elastic: f32,
+    pub compression_fatal: f32,
+    pub tension_elastic: f32,
+    pub tension_fatal: f32,
+    pub shear_elastic: f32,
+    pub shear_fatal: f32,
 }
 
 #[derive(Deserialize)]
@@ -187,14 +215,32 @@ pub fn load_embedded_scene_pack(key: EmbeddedSceneKey) -> Result<LoadedScenePack
             include_str!("../assets/scenes/brick-building.json")
         }
     };
+    parse_scene_pack(payload)
+}
 
+/// Load a scene pack from a JSON file at runtime. Used for generated, git-ignored
+/// packs (e.g. high-rise.json) that are not embedded via `include_str!`.
+pub fn load_scene_pack_file(path: &std::path::Path) -> Result<LoadedScenePack, String> {
+    let payload = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "could not read scene pack {}: {error}\n\
+             Generate it with: (cd ../blast-stress-solver && npm run build:ts && npm run generate:high-rise)",
+            path.display()
+        )
+    })?;
+    parse_scene_pack(&payload)
+}
+
+fn parse_scene_pack(payload: &str) -> Result<LoadedScenePack, String> {
     let pack: ScenePackJson = serde_json::from_str(payload)
         .map_err(|error| format!("invalid scene pack JSON: {error}"))?;
     if pack.version != 1 {
         return Err(format!("unsupported scene pack version {}", pack.version));
     }
 
-    if pack.scenario.nodes.len() != pack.node_meshes.len() {
+    // `nodeMeshes` may be omitted (empty) for all-box scenes; in that case meshes
+    // are derived from the per-node collider/size below. When present, counts must match.
+    if !pack.node_meshes.is_empty() && pack.scenario.nodes.len() != pack.node_meshes.len() {
         return Err(format!(
             "scene pack node/mesh count mismatch: {} nodes vs {} meshes",
             pack.scenario.nodes.len(),
@@ -216,11 +262,27 @@ pub fn load_embedded_scene_pack(key: EmbeddedSceneKey) -> Result<LoadedScenePack
         ));
     }
 
-    let node_meshes = pack
-        .node_meshes
-        .iter()
-        .map(parse_mesh_asset)
-        .collect::<Result<Vec<_>, _>>()?;
+    let node_meshes = if pack.node_meshes.is_empty() {
+        // Derive a box mesh per node from its collider (cuboid) or size.
+        pack.scenario
+            .node_colliders
+            .iter()
+            .zip(pack.scenario.node_sizes.iter())
+            .map(|(collider, size)| match collider {
+                NodeColliderJson::Cuboid { half_extents } => {
+                    box_mesh_asset(half_extents.x, half_extents.y, half_extents.z)
+                }
+                NodeColliderJson::ConvexHull { .. } => {
+                    box_mesh_asset(size.x * 0.5, size.y * 0.5, size.z * 0.5)
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        pack.node_meshes
+            .iter()
+            .map(parse_mesh_asset)
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     Ok(LoadedScenePack {
         title: pack.title,
@@ -236,6 +298,14 @@ pub fn load_embedded_scene_pack(key: EmbeddedSceneKey) -> Result<LoadedScenePack
         projectile_ttl_secs: pack.defaults.projectile.ttl_ms / 1000.0,
         gravity: pack.defaults.solver.gravity,
         material_scale: pack.defaults.solver.material_scale,
+        stress_limits: pack.defaults.solver.limits.as_ref().map(|l| StressLimits {
+            compression_elastic: l.compression_elastic,
+            compression_fatal: l.compression_fatal,
+            tension_elastic: l.tension_elastic,
+            tension_fatal: l.tension_fatal,
+            shear_elastic: l.shear_elastic,
+            shear_fatal: l.shear_fatal,
+        }),
         skip_single_bodies: pack.defaults.physics.skip_single_bodies,
         small_body_damping: SmallBodyDampingOptions {
             mode: parse_optimization_mode(&pack.defaults.optimization.small_body_damping_mode)?,
@@ -306,6 +376,42 @@ fn parse_mesh_asset(mesh: &NodeMeshJson) -> Result<SceneMeshAsset, String> {
     })
 }
 
+/// Build a unit box mesh (centered at origin) with the given half-extents.
+/// Used to derive node meshes for all-box scene packs that omit `nodeMeshes`.
+fn box_mesh_asset(hx: f32, hy: f32, hz: f32) -> SceneMeshAsset {
+    // 6 faces, each with 4 unique vertices (for flat per-face normals) and 2 tris.
+    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        // +X
+        ([1.0, 0.0, 0.0], [[hx, -hy, -hz], [hx, hy, -hz], [hx, hy, hz], [hx, -hy, hz]]),
+        // -X
+        ([-1.0, 0.0, 0.0], [[-hx, -hy, hz], [-hx, hy, hz], [-hx, hy, -hz], [-hx, -hy, -hz]]),
+        // +Y
+        ([0.0, 1.0, 0.0], [[-hx, hy, -hz], [-hx, hy, hz], [hx, hy, hz], [hx, hy, -hz]]),
+        // -Y
+        ([0.0, -1.0, 0.0], [[-hx, -hy, hz], [-hx, -hy, -hz], [hx, -hy, -hz], [hx, -hy, hz]]),
+        // +Z
+        ([0.0, 0.0, 1.0], [[-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz]]),
+        // -Z
+        ([0.0, 0.0, -1.0], [[hx, -hy, -hz], [-hx, -hy, -hz], [-hx, hy, -hz], [hx, hy, -hz]]),
+    ];
+    let mut positions = Vec::with_capacity(24);
+    let mut normals = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    for (normal, verts) in faces {
+        let base = positions.len() as u32;
+        for v in verts {
+            positions.push(v);
+            normals.push(normal);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    SceneMeshAsset {
+        positions,
+        normals,
+        indices,
+    }
+}
+
 fn triples(values: &[f32], label: &str) -> Result<Vec<[f32; 3]>, String> {
     if values.len() % 3 != 0 {
         return Err(format!(
@@ -353,7 +459,44 @@ impl From<Vec3Json> for SolverVec3 {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_embedded_scene_pack, EmbeddedSceneKey};
+    use super::{load_embedded_scene_pack, parse_scene_pack, EmbeddedSceneKey};
+
+    /// A pack that omits `nodeMeshes` (all-box scene) and carries explicit limits —
+    /// the shape produced by the high-rise generator. Meshes must be derived and the
+    /// limits parsed.
+    #[test]
+    fn box_pack_without_meshes_derives_meshes_and_limits() {
+        let json = r#"{
+            "version": 1, "title": "t",
+            "defaults": {
+                "camera": {"target":{"x":0,"y":0,"z":0},"distance":10},
+                "projectile": {"radius":0.5,"mass":1000,"speed":20,"ttlMs":8000},
+                "solver": {"gravity":-9.81,"materialScale":1e10,
+                    "limits":{"compressionElastic":12e6,"compressionFatal":30e6,
+                              "tensionElastic":1.2e6,"tensionFatal":3e6,
+                              "shearElastic":1.6e6,"shearFatal":4e6}},
+                "physics": {"friction":0.25,"restitution":0,"contactForceScale":30},
+                "optimization": {"smallBodyDampingMode":"always","debrisCleanupMode":"always",
+                                 "debrisTtlMs":10000,"maxCollidersForDebris":3}
+            },
+            "scenario": {
+                "nodes": [{"centroid":{"x":0,"y":0,"z":0},"mass":0,"volume":1},
+                          {"centroid":{"x":0,"y":1,"z":0},"mass":100,"volume":1}],
+                "bonds": [{"node0":0,"node1":1,"centroid":{"x":0,"y":0.5,"z":0},
+                           "normal":{"x":0,"y":1,"z":0},"area":0.25}],
+                "nodeSizes": [{"x":1,"y":1,"z":1},{"x":1,"y":1,"z":1}],
+                "nodeColliders": [{"kind":"cuboid","halfExtents":{"x":0.5,"y":0.5,"z":0.5}},
+                                  {"kind":"cuboid","halfExtents":{"x":0.5,"y":0.5,"z":0.5}}]
+            },
+            "nodeMeshes": []
+        }"#;
+        let pack = parse_scene_pack(json).expect("box pack should parse");
+        assert_eq!(pack.node_meshes.len(), pack.scenario.nodes.len());
+        assert!(pack.node_meshes[0].to_bevy_mesh().count_vertices() > 0);
+        let limits = pack.stress_limits.expect("limits present");
+        assert_eq!(limits.compression_fatal, 30e6);
+        assert_eq!(limits.tension_fatal, 3e6);
+    }
 
     #[test]
     fn fractured_wall_pack_loads() {

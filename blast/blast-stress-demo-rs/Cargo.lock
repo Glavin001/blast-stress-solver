@@ -1352,6 +1352,8 @@ version = "0.1.1"
 dependencies = [
  "cc",
  "rapier3d",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -14,7 +14,8 @@ links = "blast_stress_solver_ffi"
 [features]
 default = []
 rapier = ["dep:rapier3d"]
-scenarios = []
+# Pre-built scenario builders + JSON scene loader (the loader needs serde/serde_json).
+scenarios = ["dep:serde", "dep:serde_json"]
 # Opt-in regression tests for the `wasm32-unknown-unknown` build. These
 # shell out to `cargo` to build a fixture cdylib under
 # `tests/wasm_smoke/fixture/`, then inspect the resulting .wasm for
@@ -26,6 +27,8 @@ wasm-smoke = []
 
 [dependencies]
 rapier3d = { version = "0.30", default-features = false, features = ["dim3", "f32"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [build-dependencies]
 cc = "1.0"

@@ -178,6 +178,43 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* ── Toggle rows (feature switches) ───────────────────── */
+
+.toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  margin-bottom: 0.6rem;
+  cursor: pointer;
+}
+
+.toggle-row:last-child {
+  margin-bottom: 0;
+}
+
+.toggle-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  margin-top: 0.15rem;
+  width: 15px;
+  height: 15px;
+  accent-color: #6b8cff;
+  cursor: pointer;
+}
+
+.toggle-text {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.72rem;
+  color: rgba(220, 228, 255, 0.92);
+}
+
+.toggle-text small {
+  margin-top: 0.12rem;
+  font-size: 0.64rem;
+  line-height: 1.35;
+  color: rgba(200, 210, 240, 0.45);
+}
+
 /* ── Actions ──────────────────────────────────────────── */
 
 .control-actions {
