@@ -125,11 +125,15 @@ function renderTable(rows: BenchRow[]) {
           : r.optimalEquivalent
             ? '<span class="ok">✓</span>'
             : '<span class="bad">✗</span>';
+      const overBudget = (r.referenceMs ?? 0) > FRAME_BUDGET_MS;
+      // Translate the abstract ms into frame-rate impact: how many 60fps frames
+      // the old planner's single call would blow through.
+      const framesDropped =
+        overBudget ? ` <span class="muted">≈${Math.ceil(r.referenceMs! / FRAME_BUDGET_MS)} frames</span>` : "";
       const refCell =
         r.referenceMs == null
           ? '<span class="muted">omitted</span>'
-          : `${fmtMs(r.referenceMs)} ms`;
-      const overBudget = (r.referenceMs ?? 0) > FRAME_BUDGET_MS;
+          : `${fmtMs(r.referenceMs)} ms${framesDropped}`;
       return `<tr>
         <td>${r.n.toLocaleString()}</td>
         <td>${r.bodyCount.toLocaleString()}</td>

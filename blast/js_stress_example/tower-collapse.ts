@@ -10,13 +10,33 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import { buildDestructibleCore } from 'blast-stress-solver/rapier';
+import {
+  buildDestructibleCore,
+  FrameProfilerBuffer,
+  drawFrameProfilerChart,
+  FRAME_PHASES,
+} from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
+
+// ── Live frame profiler ───────────────────────────────────────
+// Streams the core's per-frame profiler samples into a rolling buffer and draws
+// the per-phase breakdown, so a dip below 60fps is immediately attributable to a
+// phase (and, in A/B mode, compared against the old split planner's cost).
+const profilerBuffer = new FrameProfilerBuffer(180);
+const profilerState = { show: true, measureOld: false };
+
+function applyProfiler(core: any) {
+  core.setProfiler({
+    enabled: true,
+    onSample: (s: any) => profilerBuffer.push(s),
+    measureReferencePlanner: profilerState.measureOld,
+  });
+}
 
 // ── Config ────────────────────────────────────────────────────
 
@@ -223,6 +243,86 @@ async function initScene() {
 
   coreRef = core;
   visualsRef = visuals;
+
+  // Feed the live frame profiler from this core.
+  profilerBuffer.clear();
+  applyProfiler(core);
+}
+
+// ── Frame profiler HUD ────────────────────────────────────────
+
+const profilerCanvas = document.getElementById('profiler-canvas') as HTMLCanvasElement | null;
+const profilerCtx = profilerCanvas?.getContext('2d') ?? null;
+
+function renderProfilerHUD() {
+  const overlay = document.getElementById('profiler-overlay');
+  if (overlay) overlay.style.display = profilerState.show ? '' : 'none';
+  if (!profilerState.show || !profilerCanvas || !profilerCtx) return;
+
+  // Size canvas to its CSS box (DPR-aware).
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const cssW = profilerCanvas.clientWidth || 360;
+  const cssH = profilerCanvas.clientHeight || 110;
+  if (profilerCanvas.width !== Math.round(cssW * dpr) || profilerCanvas.height !== Math.round(cssH * dpr)) {
+    profilerCanvas.width = Math.round(cssW * dpr);
+    profilerCanvas.height = Math.round(cssH * dpr);
+  }
+  profilerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const frames = profilerBuffer.frames();
+  drawFrameProfilerChart(profilerCtx, cssW, cssH, frames, {
+    showProjectedOld: profilerState.measureOld,
+  });
+
+  const stats = profilerBuffer.stats();
+  const latest = profilerBuffer.latest();
+
+  // Cause callout.
+  const causeEl = document.getElementById('profiler-cause');
+  if (causeEl && latest) {
+    const def = FRAME_PHASES.find((p) => p.key === latest.dominant);
+    causeEl.innerHTML = latest.totalMs > profilerBuffer.budgetMs
+      ? `spike cause: <b style="color:${def?.color}">${def?.label}</b> (${latest.totalMs.toFixed(1)} ms)`
+      : `<span style="opacity:.55">within budget (${latest.totalMs.toFixed(1)} ms)</span>`;
+  }
+
+  // Legend with live per-phase ms (mean over window), sorted heaviest first.
+  const legendEl = document.getElementById('profiler-legend');
+  if (legendEl) {
+    legendEl.innerHTML = FRAME_PHASES
+      .map((p) => ({ p, ms: stats.perPhaseMean[p.key] }))
+      .filter((x) => x.ms > 0.01)
+      .sort((a, b) => b.ms - a.ms)
+      .map(
+        ({ p, ms }) =>
+          `<span class="pl-item"><i style="background:${p.color}"></i>${p.label} <b>${ms.toFixed(2)}</b></span>`,
+      )
+      .join('');
+  }
+
+  // Stats line: sim cost + spikes + A/B headline.
+  const statsEl = document.getElementById('profiler-stats');
+  if (statsEl) {
+    let s =
+      `sim <b>${stats.meanMs.toFixed(2)} ms</b> avg · p95 ${stats.p95Ms.toFixed(1)} · max ${stats.maxMs.toFixed(1)} · ` +
+      `${stats.spikeCount} spike${stats.spikeCount === 1 ? '' : 's'}>16.7ms`;
+    if (latest) s += ` · resim ${latest.resimPasses} · bodies ${latest.rigidBodies}`;
+    if (profilerState.measureOld) {
+      // Worst projected-old frame over the window — the cost we removed.
+      let worstOld = 0;
+      let worstNew = 0;
+      for (const f of frames) {
+        if (f.projectedOldTotalMs && f.projectedOldTotalMs > worstOld) {
+          worstOld = f.projectedOldTotalMs;
+          worstNew = f.totalMs;
+        }
+      }
+      if (worstOld > 0) {
+        s += ` · <span style="color:#ffb454">OLD planner peak ≈ ${worstOld.toFixed(1)} ms (now ${worstNew.toFixed(1)} ms)</span>`;
+      }
+    }
+    statsEl.innerHTML = s;
+  }
 }
 
 // ── Projectile shooting ───────────────────────────────────────
@@ -364,6 +464,23 @@ bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) => 
 bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 1000).toFixed(1) + 's');
 bindSlider('cfg-max-debris-colliders', CONFIG.optimization, 'maxCollidersForDebris', (v) => v.toFixed(0));
 
+// Frame profiler controls
+{
+  const showCb = document.getElementById('cfg-profiler-show') as HTMLInputElement | null;
+  if (showCb) {
+    showCb.checked = profilerState.show;
+    showCb.addEventListener('change', () => { profilerState.show = showCb.checked; });
+  }
+  const oldCb = document.getElementById('cfg-profiler-old') as HTMLInputElement | null;
+  if (oldCb) {
+    oldCb.checked = profilerState.measureOld;
+    oldCb.addEventListener('change', () => {
+      profilerState.measureOld = oldCb.checked;
+      if (coreRef) applyProfiler(coreRef); // re-apply A/B flag to the live core
+    });
+  }
+}
+
 // ── Render loop ───────────────────────────────────────────────
 
 const clock = new THREE.Clock();
@@ -387,6 +504,7 @@ function loop() {
     });
     rapierDebug?.update();
     updateStatus(coreRef);
+    renderProfilerHUD();
   }
 
   const t1 = performance.now();

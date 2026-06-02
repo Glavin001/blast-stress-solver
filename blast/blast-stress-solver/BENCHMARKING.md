@@ -98,6 +98,23 @@ profiler and prints per-phase timing (Rapier step / stress solve / contact drain
 carries `splitPlannerMs` and `splitChildCounts`, so the split-planner cost above is visible
 in-context during a real cascade.
 
+### Live in-browser frame profiler
+
+`src/rapier/frameProfiler.ts` turns that same `CoreProfilerSample` stream into a rolling,
+chartable breakdown — `FrameProfilerBuffer` (ring buffer + per-phase stats + dominant-cause
+detection) and `drawFrameProfilerChart` (a stacked per-phase area chart with the true
+`totalMs` line and the 60 fps budget). The **Tower Collapse** demo
+([`../js_stress_example/tower-collapse.html`](../js_stress_example/tower-collapse.html))
+overlays it live, so a dip below 60 fps is immediately attributable to a phase (physics,
+stress solve, fracture, **split planning**, topology edits, snapshots…).
+
+It also has an **A/B toggle** — `setProfiler({ measureReferencePlanner: true })` times the
+old dense-Hungarian planner on each frame's real splits (result discarded, the sim keeps the
+fast planner) and records `splitPlannerReferenceMs`; the HUD draws the projected old frame
+time as a dashed line, so you can watch the spike the optimization removed reappear during a
+cascade. The breakdown logic + chart are unit-tested in
+[`src/tests/rapier.frameProfiler.test.ts`](src/tests/rapier.frameProfiler.test.ts).
+
 ## Optimizations landed (same result, faster)
 
 | Change | Where | Effect |
