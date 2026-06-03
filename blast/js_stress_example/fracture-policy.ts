@@ -47,7 +47,9 @@ const CONFIG = {
     skipSingleBodies: false,
   },
   optimization: {
-    smallBodyDampingMode: 'always' as string,
+    // Damp small debris only after it lands ('always' floats falling debris — see
+    // rapier.smallBodyDamping.fall.test.ts).
+    smallBodyDampingMode: 'afterGroundCollision' as string,
     debrisCleanupMode: 'always' as string,
     debrisTtlMs: 10000,
     maxCollidersForDebris: 2,

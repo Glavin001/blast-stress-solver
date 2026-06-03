@@ -35,7 +35,9 @@ const CONFIG = {
   },
   physics: { debrisCollisionMode: 'all', friction: 0.25, restitution: 0 },
   optimization: {
-    smallBodyDampingMode: 'always',
+    // Damp small debris only after it lands; 'always' also damps it mid-air (caps the fall at
+    // ~g/damping ≈ 5 m/s → "floaty" collapse). See rapier.smallBodyDamping.fall.test.ts.
+    smallBodyDampingMode: 'afterGroundCollision',
     debrisCleanupMode: 'always',
     debrisTtlMs: 10000,
     maxCollidersForDebris: 3,
