@@ -70,7 +70,11 @@ export type BuildDestructibleCoreOptions = {
    *  Default 0 = fully decouple impacts from the stress solver (the solver then only
    *  carries gravity / structural load, which redistributes robustly around holes). */
   damageContactStressScale?: number;
-  /** Whether newly created split bodies should enable CCD (default true for compatibility). */
+  /** Whether newly created split bodies should enable CCD. Default **false**: CCD on every
+   *  fragment is expensive (swept tests on hundreds of debris bodies) and, near the debris pile,
+   *  clamps a fast chunk to its first predicted contact each frame — which reads as the big
+   *  chunks "floating"/lagging down while open-air debris falls normally. CCD is kept ON for the
+   *  projectile (which must not tunnel through the structure). Opt back in per-body if needed. */
   fractureBodyCcdEnabled?: boolean;
   /** Whether spawned projectiles should enable CCD (default true). */
   projectileCcdEnabled?: boolean;
@@ -166,7 +170,7 @@ export async function buildDestructibleCore({
   resimulateOnDamageDestroy = !!damage?.enabled,
   contactForceScale = 30,
   damageContactStressScale = 0,
-  fractureBodyCcdEnabled = true,
+  fractureBodyCcdEnabled = false,
   projectileCcdEnabled = true,
   skipSingleBodies = false,
   sleepLinearThreshold = 0.1,

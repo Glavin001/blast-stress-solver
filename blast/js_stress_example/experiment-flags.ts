@@ -24,7 +24,9 @@ export type ExperimentFlags = {
 };
 
 const STORAGE_KEY = 'blastDemoExperiments';
-const DEFAULTS: ExperimentFlags = { resim: true, resimPasses: 1, bodyCcd: true, projectileCcd: true };
+// bodyCcd defaults OFF to match the library default (projectile-only CCD): fragment CCD was the
+// cause of the heavy lag / "floaty" big chunks. Check the box in the panel to A/B it back on.
+const DEFAULTS: ExperimentFlags = { resim: true, resimPasses: 1, bodyCcd: false, projectileCcd: true };
 
 const isOff = (v: string | null) => v === 'off' || v === '0' || v === 'false';
 
