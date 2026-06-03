@@ -50,6 +50,8 @@ const CONFIG = {
     meteors: 36,
     meteorMass: 3000,
     meteorRadius: 1.2,
+    meteorSpeedMin: 50, // each meteor's speed is picked uniformly in [min, max] m/s
+    meteorSpeedMax: 70,
     blastForce: 6, // radial shockwave strength (× per-node mass)
   },
   solver: { gravity: -9.81, materialScale: 1e10 },
@@ -446,7 +448,9 @@ function meteorStorm() {
     const dy = target.y - spawn.y;
     const dz = target.z - spawn.z;
     const len = Math.hypot(dx, dy, dz) || 1;
-    const speed = 50 + rng() * 20;
+    const lo = CONFIG.destroy.meteorSpeedMin;
+    const hi = Math.max(lo, CONFIG.destroy.meteorSpeedMax);
+    const speed = lo + rng() * (hi - lo);
     barrage.push({
       at: now + i * interval,
       spawn: {
@@ -561,6 +565,9 @@ bindSlider('cfg-proj-speed', CONFIG.projectile, 'speed', (v) => v.toFixed(0) + '
 
 // Destruction
 bindSlider('cfg-meteors', CONFIG.destroy, 'meteors', (v) => v.toFixed(0));
+bindSlider('cfg-meteor-mass', CONFIG.destroy, 'meteorMass', (v) => v.toLocaleString() + ' kg');
+bindSlider('cfg-meteor-speed-min', CONFIG.destroy, 'meteorSpeedMin', (v) => v.toFixed(0) + ' m/s');
+bindSlider('cfg-meteor-speed-max', CONFIG.destroy, 'meteorSpeedMax', (v) => v.toFixed(0) + ' m/s');
 bindSlider('cfg-blast', CONFIG.destroy, 'blastForce', (v) => v.toFixed(0) + '×');
 
 // Solver
