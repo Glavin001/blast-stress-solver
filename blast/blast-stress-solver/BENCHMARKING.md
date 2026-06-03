@@ -103,10 +103,23 @@ in-context during a real cascade.
 `src/rapier/frameProfiler.ts` turns that same `CoreProfilerSample` stream into a rolling,
 chartable breakdown — `FrameProfilerBuffer` (ring buffer + per-phase stats + dominant-cause
 detection) and `drawFrameProfilerChart` (a stacked per-phase area chart with the true
-`totalMs` line and the 60 fps budget). The **Tower Collapse** demo
-([`../js_stress_example/tower-collapse.html`](../js_stress_example/tower-collapse.html))
-overlays it live, so a dip below 60 fps is immediately attributable to a phase (physics,
-stress solve, fracture, **split planning**, topology edits, snapshots…).
+`totalMs` line and the 60 fps budget).
+
+`createFrameProfilerOverlay()` (`src/rapier/frameProfilerOverlay.ts`) wraps those into a
+reusable, self-mounting HUD — it builds its own DOM + styles, owns the buffer, wires
+`core.setProfiler(...)`, and exposes `attach(core)` / `render()` / `setMeasureOld(...)`. A
+consumer needs three lines:
+
+```ts
+const profiler = createFrameProfilerOverlay(); // self-mounts into .viewport
+profiler.attach(core);                          // after building/resetting the core
+profiler.render();                              // each frame, after core.step()
+```
+
+It's included across the destruction demos (Tower Collapse, Wall Demolition, Fractured
+Wall/Tower/Bridge, Fracture Policy, High-Rise), so a dip below 60 fps is immediately
+attributable to a phase (physics, stress solve, fracture, **split planning**, topology
+edits, snapshots…).
 
 It also has an **A/B toggle** — `setProfiler({ measureReferencePlanner: true })` times the
 old dense-Hungarian planner on each frame's real splits (result discarded, the sim keeps the

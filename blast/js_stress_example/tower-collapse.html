@@ -18,65 +18,13 @@
         }
       }
     </script>
-    <style>
-      /* Live frame-profiler overlay (bottom of the viewport) */
-      .profiler-overlay {
-        position: absolute;
-        left: 12px;
-        right: 12px;
-        bottom: 12px;
-        background: rgba(8, 11, 20, 0.82);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 10px;
-        padding: 8px 10px 6px;
-        backdrop-filter: blur(6px);
-        font-family: ui-monospace, "SF Mono", Menlo, monospace;
-        color: #e7ecff;
-        pointer-events: none;
-        max-width: 720px;
-      }
-      .profiler-head {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        font-size: 11px;
-        margin-bottom: 4px;
-      }
-      .profiler-head > span:first-child { color: rgba(200, 210, 240, 0.7); font-weight: 600; }
-      #profiler-cause { font-size: 11px; }
-      #profiler-canvas { width: 100%; height: 110px; display: block; border-radius: 6px; }
-      .profiler-legend {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 4px 12px;
-        margin-top: 5px;
-        font-size: 10.5px;
-        color: rgba(220, 228, 255, 0.8);
-      }
-      .profiler-legend .pl-item { display: inline-flex; align-items: center; gap: 4px; }
-      .profiler-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
-      .profiler-legend b { color: #fff; font-weight: 600; }
-      #profiler-stats { margin-top: 4px; font-size: 10.5px; color: rgba(200, 210, 240, 0.7); }
-      #profiler-stats b { color: #fff; }
-      .config-hint { font-size: 10.5px; color: rgba(200, 210, 240, 0.45); margin: 4px 0 0; line-height: 1.45; }
-    </style>
   </head>
   <body>
     <main class="layout">
       <section class="viewport">
         <canvas id="demo-canvas"></canvas>
         <div class="viewport-hint">Click to shoot projectiles at the tower</div>
-
-        <!-- Live frame profiler -->
-        <div class="profiler-overlay" id="profiler-overlay">
-          <div class="profiler-head">
-            <span>⚡ Frame profiler — simulation cost / frame</span>
-            <span id="profiler-cause"></span>
-          </div>
-          <canvas id="profiler-canvas"></canvas>
-          <div class="profiler-legend" id="profiler-legend"></div>
-          <div id="profiler-stats"></div>
-        </div>
+        <!-- The frame-profiler overlay self-mounts here (createFrameProfilerOverlay). -->
       </section>
 
       <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
@@ -199,26 +147,6 @@
             <input type="range" id="cfg-max-debris-colliders" class="config-slider" min="1" max="10" step="1" value="2" />
             <span class="config-value"><span id="cfg-max-debris-colliders-value">2</span></span>
           </div>
-        </section>
-
-        <!-- Frame Profiler (live) -->
-        <section class="config-section">
-          <h2 class="section-title">Frame Profiler <small style="font-weight:normal;opacity:.5">★ = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-profiler-show">Show overlay ★</label>
-            <input type="checkbox" id="cfg-profiler-show" checked />
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-profiler-old">A/B: measure OLD planner ★</label>
-            <input type="checkbox" id="cfg-profiler-old" />
-          </div>
-          <p class="config-hint">
-            Streams the core's per-frame profiler into a live breakdown — see exactly which phase
-            (physics, stress solve, fracture, split planning, topology…) causes each dip below the
-            60&nbsp;fps line. The A/B toggle also times the <em>old</em> O(N³) split planner on the same
-            splits (result discarded — the sim keeps the fast one) and draws it as the dashed amber
-            line, so you can watch the spike it used to add during a cascade.
-          </p>
         </section>
 
         <!-- Bonding (deferred) -->
