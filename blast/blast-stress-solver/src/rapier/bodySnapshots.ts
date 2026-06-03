@@ -6,6 +6,9 @@ export type BodySnapshot = {
   rotation: { x: number; y: number; z: number; w: number };
   linvel: { x: number; y: number; z: number };
   angvel: { x: number; y: number; z: number };
+  /** World-space centre of mass at capture time. Needed to re-derive the velocity field
+   *  of a body whose COM shifted (lost colliders) between capture and restore. */
+  com: { x: number; y: number; z: number };
 };
 
 export type BodySnapshotCaptureResult = {
@@ -29,6 +32,7 @@ export function captureDynamicBodySnapshots(
     const r = body.rotation();
     const lv = body.linvel();
     const av = body.angvel();
+    const com = body.worldCom();
 
     let snap: BodySnapshot;
     if (size < snapshotPool.length) {
@@ -47,6 +51,9 @@ export function captureDynamicBodySnapshots(
       snap.angvel.x = av.x;
       snap.angvel.y = av.y;
       snap.angvel.z = av.z;
+      snap.com.x = com.x;
+      snap.com.y = com.y;
+      snap.com.z = com.z;
     } else {
       snap = {
         handle: body.handle,
@@ -54,6 +61,7 @@ export function captureDynamicBodySnapshots(
         rotation: { x: r.x, y: r.y, z: r.z, w: r.w },
         linvel: { x: lv.x, y: lv.y, z: lv.z },
         angvel: { x: av.x, y: av.y, z: av.z },
+        com: { x: com.x, y: com.y, z: com.z },
       };
       snapshotPool.push(snap);
     }
@@ -65,7 +73,7 @@ export function captureDynamicBodySnapshots(
   return {
     snapshots: snapshotPool,
     size,
-    bytes: size * 13 * 8,
+    bytes: size * 16 * 8, // handle + translation(3) + rotation(4) + linvel(3) + angvel(3) + com(3)
   };
 }
 
