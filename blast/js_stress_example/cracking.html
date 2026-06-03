@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Stress Cracks — blast-stress-solver Demo</title>
+    <link rel="stylesheet" href="./styles/demo-common.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three/build/three.module.js",
+          "three/addons/": "/vendor/three/examples/jsm/",
+          "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs",
+          "blast-stress-solver": "/vendor/blast-stress-solver/index.js",
+          "blast-stress-solver/rapier": "/vendor/blast-stress-solver/rapier.js",
+          "blast-stress-solver/three": "/vendor/blast-stress-solver/three.js",
+          "blast-stress-solver/scenarios": "/vendor/blast-stress-solver/scenarios.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="viewport">
+        <canvas id="demo-canvas"></canvas>
+        <div class="viewport-hint">Loading...</div>
+      </section>
+
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
+        <span class="icon-open">&#9776;</span>
+        <span class="icon-close">&#10005;</span>
+      </button>
+      <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+      <aside class="sidebar" id="sidebar">
+        <header>
+          <a href="./demo-index.html" class="back-link">&larr; All Demos</a>
+          <h1>&#129529; Stress Cracks</h1>
+          <p>
+            A concrete cantilever built into a wall. Drag <em>Load</em> up and watch stress
+            concentrate at the root: bonds bloom green&rarr;yellow&rarr;red as they cross the
+            elastic limit (cracking), then rupture at the fatal limit and the beam falls. The
+            failure is <em>tension</em> at the top fiber &mdash; switch the Stress view to
+            Tension vs Compression to see it. The colored lines are live per-bond stress
+            straight from the solver. Click to throw a small ball, too.
+          </p>
+        </header>
+
+        <div class="control-actions">
+          <button id="btn-reset" class="button button-primary">&orarr; Reset</button>
+        </div>
+
+        <section class="config-section">
+          <h2 class="section-title">Load <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <span class="config-label">Load &#9733;</span>
+            <input type="range" class="config-slider" id="cfg-load" min="1" max="12" step="0.1" value="1" />
+            <span class="config-value" id="cfg-load-value">1.0&times;</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Strength</span>
+            <input type="range" class="config-slider" id="cfg-strength" min="0.3" max="3" step="0.05" value="1" />
+            <span class="config-value" id="cfg-strength-value">1.00&times;</span>
+          </div>
+        </section>
+
+        <section class="config-section">
+          <h2 class="section-title">Stress view <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <span class="config-label">Mode &#9733;</span>
+            <select id="cfg-mode" class="config-select">
+              <option value="0" selected>Max (any)</option>
+              <option value="2">Tension</option>
+              <option value="1">Compression</option>
+              <option value="3">Shear</option>
+            </select>
+          </div>
+          <label class="toggle-row">
+            <input type="checkbox" id="opt-cracks-only" />
+            <span class="toggle-text">
+              Cracks only
+              <small>Hide relaxed (green) bonds so only the cracking ones show</small>
+            </span>
+          </label>
+        </section>
+
+        <section class="status-panel">
+          <h2>Stress</h2>
+          <div class="status-grid">
+            <div class="status-item"><span class="status-label">Peak stress</span><span class="status-value" id="stat-max-stress">0%</span></div>
+            <div class="status-item"><span class="status-label">Cracking bonds</span><span class="status-value" id="stat-cracking">0</span></div>
+            <div class="status-item"><span class="status-label">Bonds broken</span><span class="status-value" id="stat-broken">0</span></div>
+          </div>
+        </section>
+
+        <section class="config-section">
+          <p style="font-size:.7rem;color:rgba(200,210,240,.5);margin:0">
+            Try: Load &asymp; 2.5&times; &rarr; first cracks at the root. &asymp; 4.5&times; &rarr; deep red.
+            &asymp; 7&times; &rarr; it snaps. Set Strength lower to crack sooner. Stress view = Tension
+            shows the top fiber failing while Compression (bottom) stays dark.
+          </p>
+        </section>
+      </aside>
+    </main>
+
+    <script>
+      (function () {
+        var toggle = document.getElementById('sidebar-toggle');
+        var sidebar = document.getElementById('sidebar');
+        var backdrop = document.getElementById('sidebar-backdrop');
+        var layout = document.querySelector('.layout');
+        var mql = window.matchMedia('(max-width: 768px)');
+        function isMobile() { return mql.matches; }
+        function close() { toggle.classList.remove('active'); if (isMobile()) { sidebar.classList.remove('open'); backdrop.classList.remove('visible'); } else { layout.classList.add('sidebar-hidden'); } }
+        function open() { toggle.classList.add('active'); if (isMobile()) { sidebar.classList.add('open'); backdrop.classList.add('visible'); } else { layout.classList.remove('sidebar-hidden'); } }
+        function isOpen() { return isMobile() ? sidebar.classList.contains('open') : !layout.classList.contains('sidebar-hidden'); }
+        toggle.addEventListener('click', function () { if (isOpen()) close(); else open(); });
+        backdrop.addEventListener('click', close);
+        if (!isMobile()) toggle.classList.add('active');
+      })();
+    </script>
+    <script type="module" src="./dist/cracking.js"></script>
+  </body>
+</html>
