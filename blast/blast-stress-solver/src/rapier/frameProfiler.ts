@@ -87,6 +87,8 @@ const LEAF_PHASES = FRAME_PHASES.filter((p) => p.key !== "other");
 
 export type FrameBreakdown = {
   frameIndex: number;
+  /** wall-clock capture time (ms epoch, from the sample) — for "Ns ago" peaks. */
+  timestamp: number;
   totalMs: number;
   /** ms per phase (includes the clamped `other` remainder). */
   phases: Record<FramePhaseKey, number>;
@@ -127,6 +129,7 @@ export function computeFrameBreakdown(sample: CoreProfilerSample): FrameBreakdow
 
   const breakdown: FrameBreakdown = {
     frameIndex: num(sample, "frameIndex"),
+    timestamp: num(sample, "timestamp"),
     totalMs,
     phases,
     dominant,
@@ -151,14 +154,21 @@ export type FrameProfilerStats = {
   spikeCount: number;
   spikeCount2x: number;
   perPhaseMean: Record<FramePhaseKey, number>;
+  /** peak (max over the window) per phase — the worst that phase ever cost. */
+  perPhasePeak: Record<FramePhaseKey, number>;
+  /** worst (max-total) frame in the window, and its position (0 = oldest). */
   worst: FrameBreakdown | null;
+  worstIndex: number;
 };
 
-/** Fixed-capacity ring buffer of per-frame breakdowns + rolling stats. */
+/** Fixed-capacity ring buffer of per-frame breakdowns + rolling stats. Retains
+ *  the raw {@link CoreProfilerSample}s alongside the computed breakdowns so a full
+ *  data dump (every counter, not just the grouped phases) can be exported. */
 export class FrameProfilerBuffer {
   readonly capacity: number;
   readonly budgetMs: number;
   private ring: FrameBreakdown[] = [];
+  private rawRing: CoreProfilerSample[] = [];
   private head = 0;
 
   constructor(capacity = 240, budgetMs = 1000 / 60) {
@@ -166,12 +176,16 @@ export class FrameProfilerBuffer {
     this.budgetMs = budgetMs;
   }
 
-  /** Ingest a raw profiler sample; returns the computed breakdown. */
+  /** Ingest a raw profiler sample; returns the computed breakdown. The sample is
+   *  retained by reference (the core allocates a fresh one each frame). */
   push(sample: CoreProfilerSample): FrameBreakdown {
     const b = computeFrameBreakdown(sample);
-    if (this.ring.length < this.capacity) this.ring.push(b);
-    else {
+    if (this.ring.length < this.capacity) {
+      this.ring.push(b);
+      this.rawRing.push(sample);
+    } else {
       this.ring[this.head] = b;
+      this.rawRing[this.head] = sample;
       this.head = (this.head + 1) % this.capacity;
     }
     return b;
@@ -183,6 +197,12 @@ export class FrameProfilerBuffer {
     return [...this.ring.slice(this.head), ...this.ring.slice(0, this.head)];
   }
 
+  /** Raw profiler samples in chronological order (parallel to {@link frames}). */
+  rawFrames(): CoreProfilerSample[] {
+    if (this.rawRing.length < this.capacity) return this.rawRing.slice();
+    return [...this.rawRing.slice(this.head), ...this.rawRing.slice(0, this.head)];
+  }
+
   latest(): FrameBreakdown | null {
     if (this.ring.length === 0) return null;
     const idx = this.ring.length < this.capacity ? this.ring.length - 1 : (this.head + this.capacity - 1) % this.capacity;
@@ -191,6 +211,7 @@ export class FrameProfilerBuffer {
 
   clear(): void {
     this.ring = [];
+    this.rawRing = [];
     this.head = 0;
   }
 
@@ -205,7 +226,9 @@ export class FrameProfilerBuffer {
       spikeCount: 0,
       spikeCount2x: 0,
       perPhaseMean: Object.fromEntries(FRAME_PHASES.map((p) => [p.key, 0])) as Record<FramePhaseKey, number>,
+      perPhasePeak: Object.fromEntries(FRAME_PHASES.map((p) => [p.key, 0])) as Record<FramePhaseKey, number>,
       worst: null,
+      worstIndex: -1,
     };
     if (frames.length === 0) return empty;
 
@@ -217,11 +240,19 @@ export class FrameProfilerBuffer {
     const maxMs = sorted[sorted.length - 1];
 
     const perPhaseMean = Object.fromEntries(FRAME_PHASES.map((p) => [p.key, 0])) as Record<FramePhaseKey, number>;
+    const perPhasePeak = Object.fromEntries(FRAME_PHASES.map((p) => [p.key, 0])) as Record<FramePhaseKey, number>;
     let worst = frames[0];
-    for (const f of frames) {
-      for (const def of FRAME_PHASES) perPhaseMean[def.key] += f.phases[def.key];
-      if (f.totalMs > worst.totalMs) worst = f;
-    }
+    let worstIndex = 0;
+    frames.forEach((f, i) => {
+      for (const def of FRAME_PHASES) {
+        perPhaseMean[def.key] += f.phases[def.key];
+        if (f.phases[def.key] > perPhasePeak[def.key]) perPhasePeak[def.key] = f.phases[def.key];
+      }
+      if (f.totalMs > worst.totalMs) {
+        worst = f;
+        worstIndex = i;
+      }
+    });
     for (const def of FRAME_PHASES) perPhaseMean[def.key] /= frames.length;
 
     return {
@@ -233,10 +264,79 @@ export class FrameProfilerBuffer {
       spikeCount: totals.filter((t) => t > this.budgetMs).length,
       spikeCount2x: totals.filter((t) => t > this.budgetMs * 2).length,
       perPhaseMean,
+      perPhasePeak,
       worst,
+      worstIndex,
+    };
+  }
+
+  /** A complete, self-describing snapshot of the captured window for export: the
+   *  computed per-frame breakdowns, the raw profiler samples (every counter), the
+   *  rolling stats, the phase legend, and optional caller metadata. */
+  export(meta?: Record<string, unknown>): FrameProfilerExport {
+    return {
+      schema: FRAME_PROFILER_EXPORT_SCHEMA,
+      generatedAt: new Date().toISOString(),
+      budgetMs: this.budgetMs,
+      capacity: this.capacity,
+      frameCount: this.ring.length,
+      meta,
+      stats: this.stats(),
+      phases: FRAME_PHASES.map((p) => ({ key: p.key, label: p.label, color: p.color })),
+      frames: this.frames(),
+      samples: this.rawFrames(),
     };
   }
 }
+
+export const FRAME_PROFILER_EXPORT_SCHEMA = "blast-frame-profiler/v1" as const;
+
+export type FrameProfilerExport = {
+  schema: typeof FRAME_PROFILER_EXPORT_SCHEMA;
+  /** ISO timestamp of the export. */
+  generatedAt: string;
+  budgetMs: number;
+  capacity: number;
+  frameCount: number;
+  /** Caller-supplied context (scenario, config, build info, …). */
+  meta?: Record<string, unknown>;
+  stats: FrameProfilerStats;
+  phases: Array<{ key: FramePhaseKey; label: string; color: string }>;
+  frames: FrameBreakdown[];
+  /** Raw per-frame `CoreProfilerSample`s — every counter, for deep analysis. */
+  samples: CoreProfilerSample[];
+};
+
+/** Flatten an export's per-frame breakdowns to CSV (one row per frame: total,
+ *  each phase, dominant, bodies, resim passes, projected-old). Handy for
+ *  spreadsheets / quick plots; the JSON export carries the full raw samples. */
+export function frameProfilerToCsv(data: FrameProfilerExport): string {
+  const phaseKeys = FRAME_PHASES.map((p) => p.key);
+  const header = [
+    "frameIndex",
+    "totalMs",
+    ...phaseKeys.map((k) => `ms_${k}`),
+    "dominant",
+    "rigidBodies",
+    "resimPasses",
+    "projectedOldTotalMs",
+  ];
+  const rows = data.frames.map((f) => [
+    f.frameIndex,
+    round(f.totalMs),
+    ...phaseKeys.map((k) => round(f.phases[k])),
+    f.dominant,
+    f.rigidBodies,
+    f.resimPasses,
+    f.projectedOldTotalMs != null ? round(f.projectedOldTotalMs) : "",
+  ]);
+  return [header, ...rows].map((r) => r.join(",")).join("\n");
+}
+
+function round(v: number): number {
+  return Math.round(v * 1000) / 1000;
+}
+
 
 export const phaseLabel = (key: FramePhaseKey): string =>
   FRAME_PHASES.find((p) => p.key === key)?.label ?? key;
@@ -250,6 +350,9 @@ export type DrawChartOptions = {
   /** Override the y-axis max (ms). Defaults to auto from the data + budget. */
   yMaxMs?: number;
   background?: string;
+  /** Mark the window's worst (max-total) frame with a persistent marker + a
+   *  peak line, so a spike that has scrolled left stays visible. Default true. */
+  markPeak?: boolean;
 };
 
 /**
@@ -358,4 +461,40 @@ export function drawFrameProfilerChart(
     else ctx.lineTo(x, y);
   }
   ctx.stroke();
+
+  // Persistent peak marker: the window's worst frame stays flagged even after it
+  // scrolls left — a peak line at its height + a vertical guide + a ring at the
+  // top, colored by the phase that caused it.
+  if (opts.markPeak !== false) {
+    let peakIdx = 0;
+    for (let i = 1; i < n; i += 1) if (frames[i].totalMs > frames[peakIdx].totalMs) peakIdx = i;
+    const peak = frames[peakIdx];
+    if (peak.totalMs > 0) {
+      const px = xAt(peakIdx);
+      const py = yAt(peak.totalMs);
+      const peakColor = FRAME_PHASES.find((p) => p.key === peak.dominant)?.color ?? "#ff5d6c";
+      // peak-height line
+      ctx.strokeStyle = "rgba(255,255,255,0.22)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 3]);
+      ctx.beginPath();
+      ctx.moveTo(padL, py);
+      ctx.lineTo(padL + plotW, py);
+      // vertical guide to the peak
+      ctx.moveTo(px, padT);
+      ctx.lineTo(px, padT + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // ring at the peak, in the cause's color
+      ctx.beginPath();
+      ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = peakColor;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(px, py, 5.5, 0, Math.PI * 2);
+      ctx.strokeStyle = peakColor;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
 }

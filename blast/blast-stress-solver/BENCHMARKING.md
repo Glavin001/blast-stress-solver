@@ -121,6 +121,16 @@ Wall/Tower/Bridge, Fracture Policy, High-Rise), so a dip below 60 fps is immedia
 attributable to a phase (physics, stress solve, fracture, **split planning**, topology
 edits, snapshots…).
 
+It also surfaces the **window peak** persistently — the worst frame stays flagged on the
+chart (a ring colored by its cause + a peak line) and is named in the stats line (`peak
+7.1 ms · Fracture · 3.2s ago`), with each phase's peak in the legend (`▲`), so a spike that
+has scrolled off-screen stays explained. And a **⬇ JSON / ⬇ CSV export** button dumps the
+captured window for offline analysis — `buffer.export(meta)` / `overlay.exportData()` return
+a self-describing object (`schema`, stats, the phase legend, every per-frame breakdown, and
+the **raw `CoreProfilerSample`s** with every counter), plus optional caller metadata
+(scenario, config, user agent). `frameProfilerToCsv(...)` flattens the per-frame breakdown
+for spreadsheets.
+
 It also has an **A/B toggle** — `setProfiler({ measureReferencePlanner: true })` times the
 old dense-Hungarian planner on each frame's real splits (result discarded, the sim keeps the
 fast planner) and records `splitPlannerReferenceMs`; the HUD draws the projected old frame

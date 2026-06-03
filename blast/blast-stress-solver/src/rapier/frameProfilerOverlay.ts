@@ -21,6 +21,8 @@ import {
   FrameProfilerBuffer,
   FRAME_PHASES,
   drawFrameProfilerChart,
+  frameProfilerToCsv,
+  type FrameProfilerExport,
 } from "./frameProfiler";
 import type { CoreProfilerConfig } from "./types";
 
@@ -42,6 +44,10 @@ export type FrameProfilerOverlayOptions = {
   startCollapsed?: boolean;
   /** Start with the A/B "old planner" measurement on. */
   measureOld?: boolean;
+  /** Optional context merged into a data export (scenario, config, build info…). */
+  getMeta?: () => Record<string, unknown>;
+  /** Base filename for exported dumps (no extension). Default "frame-profile". */
+  exportName?: string;
 };
 
 export type FrameProfilerOverlayHandle = {
@@ -53,6 +59,12 @@ export type FrameProfilerOverlayHandle = {
   render(): void;
   /** Toggle the A/B old-planner measurement (re-wires the live core). */
   setMeasureOld(on: boolean): void;
+  /** Build a full data dump of the captured window (frames + raw samples +
+   *  stats + metadata) — e.g. to POST somewhere or save yourself. */
+  exportData(): FrameProfilerExport | null;
+  /** Trigger a browser download of the dump as JSON / CSV. */
+  downloadJSON(): void;
+  downloadCSV(): void;
   /** Show/hide the whole overlay. */
   setVisible(visible: boolean): void;
   /** The root DOM element (for custom placement). */
@@ -76,12 +88,17 @@ const STYLE_CSS = `
 .bss-fp-min{pointer-events:auto;cursor:pointer;background:rgba(255,255,255,.07);color:#cfd8ff;
   border:1px solid rgba(255,255,255,.14);border-radius:5px;width:20px;height:18px;line-height:1;
   font-size:11px;padding:0}
+.bss-fp-btn{pointer-events:auto;cursor:pointer;background:rgba(107,140,255,.16);color:#cfd8ff;
+  border:1px solid rgba(107,140,255,.4);border-radius:5px;height:18px;line-height:1;
+  font-size:10px;padding:0 6px;white-space:nowrap}
+.bss-fp-btn:hover{background:rgba(107,140,255,.3)}
 .bss-fp-canvas{width:100%;height:108px;display:block;border-radius:6px}
 .bss-fp-legend{display:flex;flex-wrap:wrap;gap:3px 12px;margin-top:5px;font-size:10.5px;
   color:rgba(220,228,255,.8)}
 .bss-fp-legend .pl{display:inline-flex;align-items:center;gap:4px}
 .bss-fp-legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
 .bss-fp-legend b{color:#fff;font-weight:600}
+.bss-fp-legend .pk{color:rgba(255,170,170,.85);font-size:9.5px}
 .bss-fp-stats{margin-top:4px;font-size:10.5px;color:rgba(200,210,240,.7)}
 .bss-fp-stats b{color:#fff}
 .bss-fp.collapsed .bss-fp-body{display:none}
@@ -100,6 +117,9 @@ const NOOP_HANDLE: FrameProfilerOverlayHandle = {
   attach() {},
   render() {},
   setMeasureOld() {},
+  exportData: () => null,
+  downloadJSON() {},
+  downloadCSV() {},
   setVisible() {},
   el: null,
   destroy() {},
@@ -117,6 +137,8 @@ export function createFrameProfilerOverlay(
     title = "⚡ Frame profiler — simulation cost / frame",
     startCollapsed = false,
     measureOld = false,
+    getMeta,
+    exportName = "frame-profile",
   } = options;
 
   const buffer = new FrameProfilerBuffer(capacity, budgetMs);
@@ -131,6 +153,8 @@ export function createFrameProfilerOverlay(
     <div class="bss-fp-head">
       <span class="bss-fp-title"></span>
       <label class="bss-fp-ab"><input type="checkbox" /> A/B old planner</label>
+      <button class="bss-fp-btn bss-fp-json" title="Download full data dump (JSON: frames + raw samples + stats)">⬇ JSON</button>
+      <button class="bss-fp-btn bss-fp-csv" title="Download per-frame breakdown (CSV)">⬇ CSV</button>
       <button class="bss-fp-min" title="Collapse / expand">▾</button>
       <span class="bss-fp-cause"></span>
     </div>
@@ -147,6 +171,8 @@ export function createFrameProfilerOverlay(
   const statsEl = root.querySelector(".bss-fp-stats") as HTMLElement;
   const abInput = root.querySelector(".bss-fp-ab input") as HTMLInputElement;
   const minBtn = root.querySelector(".bss-fp-min") as HTMLButtonElement;
+  const jsonBtn = root.querySelector(".bss-fp-json") as HTMLButtonElement;
+  const csvBtn = root.querySelector(".bss-fp-csv") as HTMLButtonElement;
   const ctx = canvas.getContext("2d");
 
   abInput.checked = measuringOld;
@@ -155,6 +181,8 @@ export function createFrameProfilerOverlay(
     root.classList.toggle("collapsed");
     minBtn.textContent = root.classList.contains("collapsed") ? "▴" : "▾";
   });
+  jsonBtn.addEventListener("click", () => downloadJSON());
+  csvBtn.addEventListener("click", () => downloadCSV());
 
   const mount = options.mount ?? doc.querySelector(".viewport") ?? doc.body;
   // The viewport is usually position:relative; ensure absolute placement anchors to it.
@@ -195,6 +223,48 @@ export function createFrameProfilerOverlay(
     root.style.display = visible ? "" : "none";
   }
 
+  function exportData(): FrameProfilerExport {
+    let meta: Record<string, unknown> | undefined;
+    try {
+      meta = getMeta?.();
+    } catch {
+      /* metadata is best-effort */
+    }
+    if (typeof navigator !== "undefined" && navigator.userAgent) {
+      meta = { userAgent: navigator.userAgent, ...meta };
+    }
+    return buffer.export(meta);
+  }
+
+  function download(filename: string, mime: string, text: string) {
+    try {
+      const blob = new Blob([text], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = doc!.createElement("a");
+      a.href = url;
+      a.download = filename;
+      (doc!.body ?? doc!.documentElement).appendChild(a);
+      a.click();
+      a.remove();
+      // Revoke on the next tick so the download has started.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch {
+      /* download unsupported in this environment — no-op */
+    }
+  }
+
+  function stamp(): string {
+    return new Date().toISOString().replace(/[:.]/g, "-");
+  }
+
+  function downloadJSON() {
+    download(`${exportName}-${stamp()}.json`, "application/json", JSON.stringify(exportData(), null, 2));
+  }
+
+  function downloadCSV() {
+    download(`${exportName}-${stamp()}.csv`, "text/csv", frameProfilerToCsv(exportData()));
+  }
+
   function render() {
     if (root.style.display === "none" || root.classList.contains("collapsed") || !ctx) {
       // Still refresh the cause callout cheaply so the header stays informative.
@@ -216,17 +286,30 @@ export function createFrameProfilerOverlay(
     const stats = buffer.stats();
     updateCause();
 
-    legendEl.innerHTML = FRAME_PHASES.map((p) => ({ p, ms: stats.perPhaseMean[p.key] }))
-      .filter((x) => x.ms > 0.01)
-      .sort((a, b) => b.ms - a.ms)
-      .map(({ p, ms }) => `<span class="pl"><i style="background:${p.color}"></i>${p.label} <b>${ms.toFixed(2)}</b></span>`)
+    // Legend: each phase's window-average and (dim) its window peak, sorted by
+    // peak so the biggest spike contributors lead.
+    legendEl.innerHTML = FRAME_PHASES.map((p) => ({ p, ms: stats.perPhaseMean[p.key], peak: stats.perPhasePeak[p.key] }))
+      .filter((x) => x.peak > 0.01)
+      .sort((a, b) => b.peak - a.peak)
+      .map(
+        ({ p, ms, peak }) =>
+          `<span class="pl"><i style="background:${p.color}"></i>${p.label} <b>${ms.toFixed(2)}</b><span class="pk" title="window peak">▲${peak.toFixed(1)}</span></span>`,
+      )
       .join("");
 
     const latest = buffer.latest();
     let s =
-      `sim <b>${stats.meanMs.toFixed(2)} ms</b> avg · p95 ${stats.p95Ms.toFixed(1)} · max ${stats.maxMs.toFixed(1)} · ` +
+      `sim <b>${stats.meanMs.toFixed(2)} ms</b> avg · p95 ${stats.p95Ms.toFixed(1)} · ` +
       `${stats.spikeCount} spike${stats.spikeCount === 1 ? "" : "s"}>${budgetMs.toFixed(1)}ms`;
     if (latest) s += ` · resim ${latest.resimPasses} · bodies ${latest.rigidBodies}`;
+    // Attributed window peak — the worst frame's total, its cause, and how long
+    // ago, so a spike that has scrolled off-screen stays explained.
+    const worst = stats.worst;
+    if (worst && worst.totalMs > 0) {
+      const wdef = FRAME_PHASES.find((p) => p.key === worst.dominant);
+      const ago = worst.timestamp > 0 ? `, ${((Date.now() - worst.timestamp) / 1000).toFixed(1)}s ago` : "";
+      s += ` · <span style="color:${wdef?.color}">peak <b>${worst.totalMs.toFixed(1)} ms</b> ${wdef?.label}${ago}</span>`;
+    }
     if (measuringOld) {
       let worstOld = 0;
       let worstNew = 0;
@@ -266,5 +349,16 @@ export function createFrameProfilerOverlay(
     root.remove();
   }
 
-  return { buffer, attach, render, setMeasureOld, setVisible, el: root, destroy };
+  return {
+    buffer,
+    attach,
+    render,
+    setMeasureOld,
+    exportData,
+    downloadJSON,
+    downloadCSV,
+    setVisible,
+    el: root,
+    destroy,
+  };
 }

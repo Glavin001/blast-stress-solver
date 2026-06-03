@@ -9,7 +9,9 @@ import {
   FrameProfilerBuffer,
   computeFrameBreakdown,
   drawFrameProfilerChart,
+  frameProfilerToCsv,
   FRAME_PHASES,
+  FRAME_PROFILER_EXPORT_SCHEMA,
   type FrameBreakdown,
 } from "../rapier/frameProfiler";
 import type { CoreProfilerSample } from "../rapier/types";
@@ -102,20 +104,75 @@ describe("FrameProfilerBuffer", () => {
     expect(s.spikeCount).toBe(1); // only the 50ms frame is over 16.67
     expect(s.worst?.frameIndex).toBe(9);
     expect(s.worst?.dominant).toBe("fracture");
+    expect(s.worstIndex).toBe(9); // last (newest) frame in the window
     expect(s.fps).toBeGreaterThan(0);
     expect(s.perPhaseMean.physics).toBeCloseTo(5, 6); // 5ms physics every frame
+    // per-phase peak: fracture peaked at 45ms (the spike), physics at 5ms
+    expect(s.perPhasePeak.fracture).toBe(45);
+    expect(s.perPhasePeak.physics).toBe(5);
   });
 
-  it("clear() empties the buffer and stats are well-defined when empty", () => {
+  it("clear() empties the buffer (incl. raw samples) and stats are well-defined when empty", () => {
     const buf = new FrameProfilerBuffer(8);
     buf.push(sample({ totalMs: 5 }));
     buf.clear();
     expect(buf.frames().length).toBe(0);
+    expect(buf.rawFrames().length).toBe(0);
     expect(buf.latest()).toBeNull();
     const s = buf.stats();
     expect(s.count).toBe(0);
     expect(s.fps).toBe(0);
     expect(s.worst).toBeNull();
+  });
+
+  it("retains raw samples in parallel with breakdowns (for the data dump)", () => {
+    const buf = new FrameProfilerBuffer(3);
+    for (let i = 0; i < 4; i += 1) buf.push(sample({ frameIndex: i, totalMs: 5, bufferedExternalContacts: i }));
+    const raw = buf.rawFrames();
+    expect(raw.length).toBe(3);
+    expect(raw.map((s) => s.frameIndex)).toEqual([1, 2, 3]); // oldest evicted, chronological
+    // raw samples keep fields the grouped breakdown drops (e.g. contact counts)
+    expect((raw[2] as any).bufferedExternalContacts).toBe(3);
+  });
+});
+
+describe("FrameProfilerBuffer.export + CSV", () => {
+  it("produces a self-describing dump: schema, stats, phases, frames, raw samples, meta", () => {
+    const buf = new FrameProfilerBuffer(50, 16.67);
+    buf.push(sample({ frameIndex: 0, totalMs: 6, rapierStepMs: 4, solverUpdateMs: 2, rigidBodies: 10 }));
+    buf.push(sample({ frameIndex: 1, totalMs: 40, fractureMs: 35, rapierStepMs: 5, rigidBodies: 80, resimPasses: 1 }));
+
+    const dump = buf.export({ scenario: "tower-6x12" });
+    expect(dump.schema).toBe(FRAME_PROFILER_EXPORT_SCHEMA);
+    expect(typeof dump.generatedAt).toBe("string");
+    expect(dump.budgetMs).toBeCloseTo(16.67, 2);
+    expect(dump.frameCount).toBe(2);
+    expect(dump.meta).toEqual({ scenario: "tower-6x12" });
+    expect(dump.stats.maxMs).toBe(40);
+    expect(dump.phases.map((p) => p.key)).toEqual(FRAME_PHASES.map((p) => p.key));
+    expect(dump.frames.length).toBe(2);
+    expect(dump.frames[1].dominant).toBe("fracture");
+    // raw samples carry every counter (here: rigidBodies/resimPasses preserved)
+    expect(dump.samples.length).toBe(2);
+    expect((dump.samples[1] as any).rigidBodies).toBe(80);
+    // serializable
+    expect(() => JSON.stringify(dump)).not.toThrow();
+  });
+
+  it("frameProfilerToCsv emits a header + one row per frame with phase columns", () => {
+    const buf = new FrameProfilerBuffer(50);
+    buf.push(sample({ frameIndex: 7, totalMs: 6, rapierStepMs: 4, solverUpdateMs: 2 }));
+    buf.push(sample({ frameIndex: 8, totalMs: 9, fractureMs: 9, splitPlannerMs: 0.1, splitPlannerReferenceMs: 60 }));
+    const csv = frameProfilerToCsv(buf.export());
+    const lines = csv.trim().split("\n");
+    expect(lines.length).toBe(3); // header + 2 rows
+    expect(lines[0]).toContain("frameIndex");
+    expect(lines[0]).toContain("ms_splitPlanner");
+    expect(lines[0]).toContain("projectedOldTotalMs");
+    expect(lines[1].split(",")[0]).toBe("7");
+    // projected-old present only for the frame that had reference timing
+    expect(lines[1].split(",").at(-1)).toBe(""); // frame 7: no A/B
+    expect(Number(lines[2].split(",").at(-1))).toBeCloseTo(9 - 0.1 + 60, 1); // frame 8: 68.9
   });
 });
 

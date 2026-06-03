@@ -22,7 +22,21 @@ import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 // Reusable, self-mounting overlay: streams the core's per-frame profiler into a
 // rolling per-phase breakdown so a dip below 60fps is immediately attributable
 // to a phase (and, via its A/B toggle, compared against the old split planner).
-const profiler = createFrameProfilerOverlay();
+// `getMeta` enriches the ⬇ JSON/CSV data dump with the live scenario + config.
+const profiler = createFrameProfilerOverlay({
+  exportName: 'tower-collapse-profile',
+  getMeta: () => {
+    let bodies: number | undefined;
+    let bonds: number | undefined;
+    try { bodies = coreRef?.getRigidBodyCount(); } catch { /* ignore */ }
+    try { bonds = coreRef?.getActiveBondsCount(); } catch { /* ignore */ }
+    return {
+      demo: 'tower-collapse',
+      config: { tower: { ...CONFIG.tower }, solver: { ...CONFIG.solver }, physics: { ...CONFIG.physics } },
+      live: { bodies, bonds },
+    };
+  },
+});
 
 // ── Config ────────────────────────────────────────────────────
 

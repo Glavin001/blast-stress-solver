@@ -52,11 +52,14 @@ class StubEl {
   get innerHTML() {
     return this._html;
   }
+  href = "";
+  download = "";
   appendChild(c: StubEl) {
     this.children.push(c);
     return c;
   }
   remove() {}
+  click() {}
   addEventListener(type: string, cb: () => void) {
     (this.listeners[type] ??= []).push(cb);
   }
@@ -122,7 +125,7 @@ function installStubDom() {
   };
   (globalThis as any).document = doc;
   (globalThis as any).devicePixelRatio = 1;
-  return { doc, body };
+  return { doc, body, created };
 }
 
 function sample(fields: Partial<Record<keyof CoreProfilerSample, number>>): CoreProfilerSample {
@@ -132,6 +135,7 @@ function sample(fields: Partial<Record<keyof CoreProfilerSample, number>>): Core
 afterEach(() => {
   delete (globalThis as any).document;
   delete (globalThis as any).devicePixelRatio;
+  vi.unstubAllGlobals();
 });
 
 describe("createFrameProfilerOverlay", () => {
@@ -205,5 +209,56 @@ describe("createFrameProfilerOverlay", () => {
     overlay.destroy();
     const last = (core.setProfiler as any).mock.calls.at(-1)[0];
     expect(last).toBeNull(); // setProfiler(null) on destroy
+  });
+
+  it("exportData() returns a dump incl. caller meta + the user agent", () => {
+    installStubDom();
+    vi.stubGlobal("navigator", { userAgent: "test-agent/1.0" });
+    const overlay = createFrameProfilerOverlay({ getMeta: () => ({ scenario: "tower" }) });
+    let cfg: any = null;
+    overlay.attach({ setProfiler: (c: any) => (cfg = c) } as any);
+    cfg.onSample(sample({ frameIndex: 0, totalMs: 6, rapierStepMs: 6 }));
+
+    const dump = overlay.exportData()!;
+    expect(dump.frameCount).toBe(1);
+    expect(dump.frames.length).toBe(1);
+    expect(dump.meta).toMatchObject({ scenario: "tower", userAgent: "test-agent/1.0" });
+  });
+
+  it("downloadJSON() creates a .json anchor whose blob parses to a valid dump", async () => {
+    const { created } = installStubDom();
+    const urlApi = URL as any;
+    const origCreate = urlApi.createObjectURL;
+    const origRevoke = urlApi.revokeObjectURL;
+    let capturedBlob: Blob | null = null;
+    urlApi.createObjectURL = (b: Blob) => {
+      capturedBlob = b;
+      return "blob:stub";
+    };
+    urlApi.revokeObjectURL = () => {};
+
+    try {
+      const overlay = createFrameProfilerOverlay();
+      let cfg: any = null;
+      overlay.attach({ setProfiler: (c: any) => (cfg = c) } as any);
+      cfg.onSample(sample({ frameIndex: 0, totalMs: 7, fractureMs: 7 }));
+
+      overlay.downloadJSON();
+
+      // A download anchor with a .json filename was created.
+      const anchor = created.find((e) => e.tagName === "a");
+      expect(anchor).toBeDefined();
+      expect(anchor!.download).toMatch(/^frame-profile-.*\.json$/);
+
+      // …and its blob is a valid, parseable dump.
+      expect(capturedBlob).not.toBeNull();
+      const parsed = JSON.parse(await (capturedBlob as any).text());
+      expect(parsed.schema).toBe("blast-frame-profiler/v1");
+      expect(parsed.frames.length).toBe(1);
+      expect(parsed.samples.length).toBe(1);
+    } finally {
+      urlApi.createObjectURL = origCreate;
+      urlApi.revokeObjectURL = origRevoke;
+    }
   });
 });
