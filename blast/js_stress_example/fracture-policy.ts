@@ -15,6 +15,7 @@ import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
+import { experimentCoreOverrides, mountExperimentPanel } from "./experiment-flags.js";
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 
 // ── Config ────────────────────────────────────────────────────
@@ -195,6 +196,7 @@ async function initScene() {
       minAngularDamping: 2,
     },
     fracturePolicy: { ...CONFIG.fracturePolicy },
+    ...experimentCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -433,4 +435,5 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
+mountExperimentPanel();
 initScene().then(() => loop());

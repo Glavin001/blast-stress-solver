@@ -19,6 +19,7 @@ import {
   buildScenarioFromFragments,
   buildFoundationFragments,
 } from 'blast-stress-solver/three';
+import { experimentCoreOverrides, mountExperimentPanel } from "./experiment-flags.js";
 import { FRACTURED_WALL_DEMO_CONFIG as CONFIG } from './fractured-demo-config.js';
 
 // ── Config ────────────────────────────────────────────────────
@@ -180,6 +181,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...experimentCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -374,6 +376,7 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
+mountExperimentPanel();
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize fractured wall demo:', err);
   const hint = document.querySelector('.viewport-hint');

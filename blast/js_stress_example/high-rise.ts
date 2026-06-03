@@ -17,6 +17,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
+import { experimentCoreOverrides, mountExperimentPanel } from "./experiment-flags.js";
 
 const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
 
@@ -188,6 +189,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...experimentCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -350,6 +352,7 @@ function onResize() {
 }
 window.addEventListener('resize', onResize);
 
+mountExperimentPanel();
 initScene()
   .then(() => loop())
   .catch((err) => {

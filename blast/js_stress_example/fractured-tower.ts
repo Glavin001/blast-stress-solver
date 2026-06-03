@@ -20,6 +20,7 @@ import {
 } from 'blast-stress-solver/three';
 import { buildFracturedTowerScenario } from 'blast-stress-solver/scenarios';
 import { FRACTURED_TOWER_DEMO_CONFIG as CONFIG } from './fractured-demo-config.js';
+import { experimentCoreOverrides, mountExperimentPanel } from './experiment-flags.js';
 
 // ── Config ────────────────────────────────────────────────────
 
@@ -166,6 +167,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...experimentCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -332,6 +334,7 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ─────────────────────────────────────────────────────
 
+mountExperimentPanel();
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize fractured tower demo:', err);
   const hint = document.querySelector('.viewport-hint');
