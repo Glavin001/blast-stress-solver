@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createSessionRecorder,
   decodeSimRecording,
+  decodeRapierHandle,
   gzipJson,
   BODY_STRIDE,
   type RecordableCore,
@@ -90,7 +91,49 @@ function newChunk(nodeIndex: number, bodyHandle: number | null): ChunkData {
   };
 }
 
+describe('decodeRapierHandle', () => {
+  // rapier3d-compat returns RigidBody.handle as a u64 whose raw bits are read as
+  // a float64, so handle N arrives as the subnormal N * 2^-1074.
+  const encode = (intHandle: number) => intHandle * 5e-324; // 2^-1074
+
+  it('decodes subnormal bit-encoded handles back to integers', () => {
+    expect(decodeRapierHandle(0)).toBe(0);
+    expect(decodeRapierHandle(encode(1))).toBe(1);
+    expect(decodeRapierHandle(encode(37))).toBe(37);
+    expect(decodeRapierHandle(encode(12345))).toBe(12345);
+  });
+
+  it('passes plain integer handles through unchanged', () => {
+    expect(decodeRapierHandle(5)).toBe(5);
+    expect(decodeRapierHandle(2048)).toBe(2048);
+  });
+
+  it('is resilient to non-finite input', () => {
+    expect(decodeRapierHandle(NaN)).toBe(-1);
+    expect(decodeRapierHandle(Infinity)).toBe(-1);
+  });
+});
+
 describe('session recorder', () => {
+  it('records real integer handles even when Rapier bit-encodes them', () => {
+    const fake = makeFakeCore();
+    // Body whose handle is the bit-encoded form of 41 (as rapier3d-compat returns).
+    fake.bodies.push({ handle: 41 * 5e-324, fixed: false, t: { x: 0, y: 0, z: 0 }, r: { x: 0, y: 0, z: 0, w: 1 }, lv: { x: 0, y: 0, z: 0 }, av: { x: 0, y: 0, z: 0 } });
+    fake.chunks.push(newChunk(0, 41 * 5e-324));
+    const rec = createSessionRecorder();
+    rec.attach(fake.core);
+    rec.start();
+    fake.core.step(1 / 60);
+    fake.core.step(1 / 60);
+    rec.stop();
+    const dec = decodeSimRecording(rec.export()!);
+    // The trace row is keyed by the decoded integer handle (41), not 0.
+    expect(dec.bodyInFrame(0, 41)).not.toBeNull();
+    // And a stable body must NOT generate phantom migrate events every frame.
+    expect(rec.export()!.events.filter((e) => e.type === 'migrate')).toHaveLength(0);
+  });
+
+
   it('captures body kinematics columnar and round-trips exactly', () => {
     const fake = makeFakeCore();
     fake.bodies.push(

@@ -55,6 +55,28 @@ export const BODY_LAYOUT = [
   'avz',
 ] as const;
 
+// Rapier's `@dimforge/rapier3d-compat` returns `RigidBody.handle` (a u64) as a
+// JS `number` whose *raw 64-bit pattern* is reinterpreted as a float64 — so
+// handle 1 arrives as the denormal 5e-324 (bits 0x…01), handle 37 as 1.83e-322,
+// etc. Stored naively those underflow Float32 to 0 and truncate Int32 to 0. We
+// reinterpret the bits back into the real integer index (low 32 bits) + any
+// generation (high 32 bits) so the handle is a stable, comparable integer.
+const _handleF64 = new Float64Array(1);
+const _handleU32 = new Uint32Array(_handleF64.buffer); // shares bytes (LE in browsers)
+const MIN_NORMAL_F64 = 2.2250738585072014e-308;
+
+export function decodeRapierHandle(h: number): number {
+  if (typeof h !== 'number' || !Number.isFinite(h)) return -1;
+  if (h === 0) return 0;
+  // Subnormal magnitude ⇒ this is a bit-encoded handle; decode the u64.
+  if (Math.abs(h) < MIN_NORMAL_F64) {
+    _handleF64[0] = h;
+    return _handleU32[0] + _handleU32[1] * 0x1_0000_0000;
+  }
+  // Already a plain integer handle (other Rapier builds / our test stubs).
+  return h;
+}
+
 /** Minimal Rapier body shape we read each frame (avoids a hard Rapier import). */
 type BodyLike = {
   handle: number;
@@ -425,7 +447,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     liveBodies.clear();
     for (let i = 0; i < n; i += 1) {
       const c = chunks[i];
-      const body = c.bodyHandle == null ? -1 : c.bodyHandle;
+      const body = c.bodyHandle == null ? -1 : decodeRapierHandle(c.bodyHandle);
       nodeIndexByChunk[i] = c.nodeIndex;
       initialBodyByChunk[i] = body;
       prevBody[i] = body;
@@ -447,7 +469,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     for (let i = 0; i < n; i += 1) {
       const c = chunks[i];
       const node = nodeIndexByChunk[i];
-      const body = c.bodyHandle == null ? -1 : c.bodyHandle;
+      const body = c.bodyHandle == null ? -1 : decodeRapierHandle(c.bodyHandle);
       if (body >= 0) seenBodies.add(body);
 
       const flags =
@@ -497,7 +519,13 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     let count = 0;
     core.world.forEachRigidBody((body) => {
       if (body.isFixed()) return;
-      bodies.pushBody(body.handle, body.translation(), body.rotation(), body.linvel(), body.angvel());
+      bodies.pushBody(
+        decodeRapierHandle(body.handle),
+        body.translation(),
+        body.rotation(),
+        body.linvel(),
+        body.angvel(),
+      );
       count += 1;
     });
 
