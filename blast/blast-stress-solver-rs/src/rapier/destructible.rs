@@ -27,6 +27,8 @@ use crate::ext_stress_solver::ExtStressSolver;
 use crate::types::*;
 
 use super::body_tracker::{BodyTracker, SplitEditStats};
+#[cfg(any(test, feature = "bench-support"))]
+use super::body_tracker::SplitApplyResult;
 use super::collision_groups::DebrisCollisionMode;
 use super::fracture_policy::FracturePolicy;
 use super::optimization::SleepThresholdOptions;
@@ -405,6 +407,37 @@ impl DestructibleSet {
         self.forces_applied = true;
     }
 
+    /// Bench/test-only: apply a contrived [`SplitEvent`] through the real Rapier apply
+    /// path (`BodyTracker::handle_split`) and return its per-op `SplitEditStats`, *without*
+    /// running the stress solver, a physics step, or resim. This isolates the cost of the
+    /// topology edits themselves (body create/recycle/retire, collider re-parent/insert)
+    /// so it can be profiled at arbitrary scale on a pre-built structure. Never shipped.
+    #[cfg(any(test, feature = "bench-support"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_apply_split(
+        &mut self,
+        event: &SplitEvent,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        island_manager: &mut IslandManager,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        now_secs: f32,
+    ) -> SplitApplyResult {
+        self.tracker.handle_split(
+            event,
+            bodies,
+            colliders,
+            island_manager,
+            impulse_joints,
+            multibody_joints,
+            now_secs,
+            self.small_body_damping,
+            self.sleep_thresholds,
+            self.debris_cleanup.max_colliders_for_debris,
+        )
+    }
+
     /// Enable/disable per-split point-velocity continuity recording. Observability
     /// only — does not change the simulation. Off by default (zero production cost).
     pub fn set_record_split_continuity(&mut self, enabled: bool) {
@@ -699,30 +732,26 @@ impl DestructibleSet {
     fn apply_oriented_gravity(&mut self, bodies: &RigidBodySet) {
         let g = self.gravity;
         let world_g = vector![g.x, g.y, g.z];
-        let actors = self.solver.actors();
-        for actor in &actors {
-            let local = actor
-                .nodes
-                .first()
-                .and_then(|&n| self.tracker.node_body(n))
+        // Only the first node per actor is needed (to find the actor's body orientation),
+        // so use the allocation-light rep collector instead of `actors()`.
+        for (actor_index, first_node) in self.solver.collect_actor_reps() {
+            let local = self
+                .tracker
+                .node_body(first_node)
                 .and_then(|h| bodies.get(h))
                 .map(|body| {
                     let l = body.rotation().inverse_transform_vector(&world_g);
                     Vec3::new(l.x, l.y, l.z)
                 })
                 .unwrap_or(g);
-            self.solver.add_actor_gravity(actor.actor_index, local);
+            self.solver.add_actor_gravity(actor_index, local);
         }
     }
 
     fn apply_excess_forces(&self, bodies: &mut RigidBodySet, dt: f32) {
-        let actors = self.solver.actors();
-        for actor in &actors {
-            if actor.nodes.is_empty() {
-                continue;
-            }
+        for (actor_index, first_node) in self.solver.collect_actor_reps() {
             // Find the body for this actor
-            let body_handle = match self.tracker.node_body(actor.nodes[0]) {
+            let body_handle = match self.tracker.node_body(first_node) {
                 Some(h) => h,
                 None => continue,
             };
@@ -735,7 +764,7 @@ impl DestructibleSet {
             let c = body.center_of_mass();
             let com = Vec3::new(c.x, c.y, c.z);
 
-            if let Some((force, torque)) = self.solver.get_excess_forces(actor.actor_index, com) {
+            if let Some((force, torque)) = self.solver.get_excess_forces(actor_index, com) {
                 let force_mag = force.magnitude_squared();
                 let torque_mag = torque.magnitude_squared();
                 if force_mag > 1.0e-6 || torque_mag > 1.0e-6 {

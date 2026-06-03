@@ -8,6 +8,8 @@ mod resimulation;
 mod split_migrator;
 
 pub use body_tracker::{BodyTracker, SplitContinuityRecord};
+#[cfg(any(test, feature = "bench-support"))]
+pub use body_tracker::{SplitApplyResult, SplitEditStats};
 pub use collision_groups::DebrisCollisionMode;
 pub use destructible::{DestructibleConfig, DestructibleSet, SplitCohort, StepResult};
 pub use fracture_policy::FracturePolicy;
@@ -20,3 +22,5 @@ pub use split_migrator::{
     plan_split_migration, plan_split_migration_with_support, CreateEntry, ExistingBodyState,
     PlannerChildSupport, ReuseEntry, SplitMigrationPlan,
 };
+#[cfg(any(test, feature = "bench-support"))]
+pub use split_migrator::plan_split_migration_reference;

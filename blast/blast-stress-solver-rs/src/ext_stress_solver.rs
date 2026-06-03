@@ -183,6 +183,52 @@ impl ExtStressSolver {
         result
     }
 
+    /// Collect just `(actor_index, first_node_index)` for each actor — a lighter variant
+    /// of [`actors`](Self::actors) for per-frame hot paths (oriented-gravity / excess-force
+    /// application) that need only one representative node per actor. Avoids the per-actor
+    /// `Vec<u32>` allocations `actors()` makes (one allocation per actor, every frame).
+    pub fn collect_actor_reps(&self) -> Vec<(u32, u32)> {
+        let actor_count = self.actor_count();
+        if actor_count == 0 {
+            return Vec::new();
+        }
+        let node_count = self.node_count();
+
+        let mut actor_buffer = vec![
+            ffi::FfiExtStressActor {
+                actor_index: u32::MAX,
+                nodes: std::ptr::null(),
+                node_count: 0,
+            };
+            actor_count as usize
+        ];
+        let mut nodes_buffer = vec![0u32; node_count as usize];
+        let mut out_actor_count = 0u32;
+        let mut out_node_count = 0u32;
+
+        unsafe {
+            ffi::ext_stress_solver_collect_actors(
+                self.handle,
+                actor_buffer.as_mut_ptr(),
+                actor_count,
+                nodes_buffer.as_mut_ptr(),
+                node_count,
+                &mut out_actor_count,
+                &mut out_node_count,
+            );
+        }
+
+        let mut reps = Vec::with_capacity(out_actor_count as usize);
+        for i in 0..out_actor_count as usize {
+            let a = &actor_buffer[i];
+            if !a.nodes.is_null() && a.node_count > 0 {
+                let offset = unsafe { a.nodes.offset_from(nodes_buffer.as_ptr()) } as usize;
+                reps.push((a.actor_index, nodes_buffer[offset]));
+            }
+        }
+        reps
+    }
+
     /// Generate fracture commands for all actors with overstressed bonds.
     pub fn generate_fracture_commands(&self) -> Vec<FractureCommand> {
         let actor_count = self.actor_count();
