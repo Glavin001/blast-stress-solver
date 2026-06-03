@@ -52,6 +52,8 @@ const CONFIG = {
     meteorRadius: 1.2,
     meteorSpeedMin: 50, // each meteor's speed is picked uniformly in [min, max] m/s
     meteorSpeedMax: 70,
+    meteorAngleMin: 0, // incoming angle from vertical, degrees (0 = straight down) in [min, max]
+    meteorAngleMax: 35,
     blastForce: 6, // radial shockwave strength (× per-node mass)
   },
   solver: { gravity: -9.81, materialScale: 1e10 },
@@ -439,15 +441,20 @@ function meteorStorm() {
       y: b.height * (0.4 + rng() * 0.6),
       z: b.cz + (rng() - 0.5) * b.width,
     };
-    const spawn = {
-      x: target.x + (rng() - 0.5) * 36,
-      y: 70 + rng() * 30,
-      z: target.z + (rng() - 0.5) * 36,
-    };
-    const dx = target.x - spawn.x;
-    const dy = target.y - spawn.y;
-    const dz = target.z - spawn.z;
-    const len = Math.hypot(dx, dy, dz) || 1;
+    // Incoming angle, measured from vertical (0° = straight down), picked in [min, max].
+    // Azimuth is random so the storm comes from all sides.
+    const DEG = Math.PI / 180;
+    const aLo = CONFIG.destroy.meteorAngleMin * DEG;
+    const aHi = Math.max(aLo, CONFIG.destroy.meteorAngleMax * DEG);
+    const theta = aLo + rng() * (aHi - aLo);
+    const phi = rng() * Math.PI * 2;
+    const sinT = Math.sin(theta);
+    // Unit vector from the target up-and-out to the spawn point; the velocity is its reverse.
+    const ux = sinT * Math.cos(phi);
+    const uy = Math.cos(theta);
+    const uz = sinT * Math.sin(phi);
+    const dist = 70 + rng() * 30; // how far out (along the incoming ray) the meteor starts
+    const spawn = { x: target.x + ux * dist, y: target.y + uy * dist, z: target.z + uz * dist };
     const lo = CONFIG.destroy.meteorSpeedMin;
     const hi = Math.max(lo, CONFIG.destroy.meteorSpeedMax);
     const speed = lo + rng() * (hi - lo);
@@ -455,7 +462,7 @@ function meteorStorm() {
       at: now + i * interval,
       spawn: {
         position: spawn,
-        velocity: { x: (dx / len) * speed, y: (dy / len) * speed, z: (dz / len) * speed },
+        velocity: { x: -ux * speed, y: -uy * speed, z: -uz * speed },
         radius: CONFIG.destroy.meteorRadius,
         mass: CONFIG.destroy.meteorMass,
         ttl: 6000,
@@ -568,6 +575,8 @@ bindSlider('cfg-meteors', CONFIG.destroy, 'meteors', (v) => v.toFixed(0));
 bindSlider('cfg-meteor-mass', CONFIG.destroy, 'meteorMass', (v) => v.toLocaleString() + ' kg');
 bindSlider('cfg-meteor-speed-min', CONFIG.destroy, 'meteorSpeedMin', (v) => v.toFixed(0) + ' m/s');
 bindSlider('cfg-meteor-speed-max', CONFIG.destroy, 'meteorSpeedMax', (v) => v.toFixed(0) + ' m/s');
+bindSlider('cfg-meteor-angle-min', CONFIG.destroy, 'meteorAngleMin', (v) => v.toFixed(0) + '°');
+bindSlider('cfg-meteor-angle-max', CONFIG.destroy, 'meteorAngleMax', (v) => v.toFixed(0) + '°');
 bindSlider('cfg-blast', CONFIG.destroy, 'blastForce', (v) => v.toFixed(0) + '×');
 
 // Solver
