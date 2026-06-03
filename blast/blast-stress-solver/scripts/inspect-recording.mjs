@@ -90,6 +90,7 @@ function decodeSimRecording(data) {
     frameBodyOffset,
     events: data.events,
     timing,
+    resimLog: data.resimLog ?? [],
     frame,
     bodyInFrame,
   };
@@ -198,8 +199,37 @@ if (has('--perf')) {
       const bodies = t.rigidBodies ? t.rigidBodies[i] : (dec.columns.rigidBodies[i] || 0);
       console.log(`                   ${String(i).padStart(5)}  ${t.totalMs[i].toFixed(2).padStart(6)}   ${dk.padEnd(20)} ${dv.toFixed(2).padStart(7)}   ${String(resim).padStart(6)}    ${bodies}`);
     }
+
+    // ── Resimulation cost ──────────────────────────────────────────────────────
+    const resimMs = t.resimMs, initMs = t.initialPassMs, resimN = t.resimPasses;
+    const inRange = (i) => i >= a && i <= b;
+    if (resimMs) {
+      let totResim = 0, totInit = 0, resimFrames = 0, totPasses = 0;
+      for (let i = a; i <= b && i < nf; i++) {
+        totResim += resimMs[i] || 0; totInit += (initMs ? initMs[i] : 0) || 0;
+        if ((resimN ? resimN[i] : 0) > 0) { resimFrames++; totPasses += resimN[i]; }
+      }
+      console.log(`\n  ── Resimulation ──`);
+      console.log(`  resim cost: ${totResim.toFixed(1)} ms total (${pct(totResim)} of frame time) · base-pass ${totInit.toFixed(1)} ms`);
+      console.log(`  resim fired on ${resimFrames} frames · ${totPasses} resim passes total · ${resimFrames ? (totResim / resimFrames).toFixed(2) : 0} ms per resim frame`);
+
+      // Per-pass detail from the sparse resimLog, worst resim frames first.
+      const log = (dec.resimLog || []).filter((e) => inRange(e.f)).sort((x, y) => passSum(y) - passSum(x)).slice(0, 6);
+      if (log.length) {
+        console.log(`\n  worst resim frames (per-pass: index·totalMs [solver/fracture/bodyCreate]·reasons):`);
+        for (const e of log) {
+          const total = passSum(e).toFixed(2);
+          console.log(`    f${String(e.f).padStart(4)}  Σ${total}ms over ${e.passes.length} passes:`);
+          for (const p of e.passes)
+            console.log(`        pass ${p.index}: ${p.totalMs.toFixed(2)}ms  [solver ${p.solverMs.toFixed(2)} · fracture ${p.fractureMs.toFixed(2)} · bodyCreate ${p.bodyCreateMs.toFixed(2)}]  ${JSON.stringify(p.reasons)}`);
+        }
+      } else if (totPasses > 0) {
+        console.log(`  (per-pass detail not present — recording predates resimLog)`);
+      }
+    }
   }
 }
+function passSum(e) { return e.passes.reduce((s, p) => s + p.totalMs, 0); }
 
 // ── --events ────────────────────────────────────────────────────────────────────
 if (has('--events')) {

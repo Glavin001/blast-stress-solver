@@ -22,6 +22,7 @@ teleports a frame"* — by recording **enough** that the scenario can be analyse
 | **Scalars/frame** | Active bond count, rigid-body count, projectile count, dt, sim time. |
 | **Initial structure** | The full `ScenarioDesc` (nodes, bonds, fractured fragment geometry) + the core config + UI config — the ground truth to rebuild the scene. |
 | **Per-frame timing (full session)** | Every frame's per-phase cost — physics step, stress solve, contacts, fracture (generate/apply), split planning, body/collider edits, snapshots, damage (7 sub-timers), spawn/cleanup — captured for the *whole* recording (not just a rolling window) and aligned 1:1 with the kinematic frames. The leaf phases sum to ~`totalMs`, so you can account for **every millisecond**. Captured by multiplexing onto `core.setProfiler`, so it coexists with the live frame-profiler overlay. |
+| **Resimulation cost** | The aggregate `resimMs` / `resimPasses` per frame (in the timing columns) plus a sparse **per-pass** log for every fracture frame: each pass (0 = base step, 1+ = resim re-steps) with its solver / fracture / bodyCreate cost and the reasons it fired. |
 
 ## Performance
 
@@ -61,7 +62,8 @@ cd blast/blast-stress-solver
 # Summary (frames, body counts, bond Δ, event histogram, scenario size)
 npm run inspect:recording -- ~/Downloads/mini-city-recording-….sim.json.gz
 
-# Performance: where did every millisecond go (per-phase Σ/%, slowest frames)
+# Performance: where did every millisecond go (per-phase Σ/%, slowest frames,
+# resim cost — total + per-fracture-frame per-pass breakdown w/ reasons)
 npm run inspect:recording -- rec.sim.json.gz --perf
 
 # One body's trajectory + speed, flagging suspicious jumps, over a frame range

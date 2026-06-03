@@ -264,7 +264,18 @@ describe('session recorder', () => {
       projectiles: { length: 0 },
       step: () => {
         if (enabled && onSample) {
-          onSample({ totalMs: 5, rapierStepMs: 3, solverUpdateMs: 1.5, contactDrainMs: 0.5, resimPasses: frame % 2, rigidBodies: 1 });
+          // Frame 1 resimulates (2 passes); others just the base pass.
+          const resim = frame === 1;
+          onSample({
+            totalMs: 5, rapierStepMs: 3, solverUpdateMs: 1.5, contactDrainMs: 0.5,
+            resimMs: resim ? 2 : 0, initialPassMs: 3, resimPasses: resim ? 1 : 0, rigidBodies: 1,
+            passes: resim
+              ? [
+                  { index: 0, solverMs: 1, fractureMs: 0.5, bodyCreateMs: 0, totalMs: 3, reasons: ['initial'] },
+                  { index: 1, solverMs: 0.8, fractureMs: 0.4, bodyCreateMs: 0.3, totalMs: 2, reasons: ['resim'] },
+                ]
+              : [{ index: 0, solverMs: 1, fractureMs: 0, bodyCreateMs: 0, totalMs: 3, reasons: ['initial'] }],
+          });
         }
         frame += 1;
       },
@@ -300,6 +311,14 @@ describe('session recorder', () => {
     expect(leaf).toBeCloseTo(dec.timing.totalMs[0]);
     // The overlay (subscribed after) still received every sample (multiplexed).
     expect(overlaySamples.length).toBe(3);
+
+    // Sparse per-pass resim breakdown: only the resim frame (1) is logged.
+    expect(dec.resimLog).toHaveLength(1);
+    expect(dec.resimLog[0].f).toBe(1);
+    expect(dec.resimLog[0].passes.map((p) => p.index)).toEqual([0, 1]);
+    expect(dec.resimLog[0].passes[1].reasons).toEqual(['resim']);
+    // Aggregate resim cost is in the full-session timing columns.
+    expect(Array.from(dec.timing.resimMs)).toEqual([0, 2, 0]);
   });
 
   it('restores wrapped core methods on detach', () => {

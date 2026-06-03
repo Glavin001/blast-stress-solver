@@ -271,6 +271,23 @@ export type SimRecordingExport = {
     fields: readonly string[];
     columns: Record<string, EncodedTypedArray>;
   };
+  /**
+   * Sparse per-frame resim-pass breakdown — one entry only for frames that
+   * resimulated (a fracture frame). Each lists every pass that ran that frame
+   * (index 0 = the base step, 1+ = resim re-steps) with its leaf costs and the
+   * reasons it fired, so the cost of resimulation is fully attributable.
+   */
+  resimLog?: Array<{
+    f: number;
+    passes: Array<{
+      index: number;
+      solverMs: number;
+      fractureMs: number;
+      bodyCreateMs: number;
+      totalMs: number;
+      reasons: string[];
+    }>;
+  }>;
   /** Optional rolling frame-profiler dump (stats + legend) if a profiler export
    *  was linked via {@link SessionRecorderHandle.setProfilerExport}. */
   profiler?: unknown;
@@ -497,6 +514,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
   const columns = new FrameColumns();
   const timing = new TimingColumns();
   let events: SimRecordingEvent[] = [];
+  let resimLog: NonNullable<SimRecordingExport['resimLog']> = [];
   // Latest profiler sample seen this frame (set in the multiplexed onSample,
   // consumed + cleared in captureFrame so timing stays aligned to body frames).
   let lastProfilerSample: ProfilerSampleLike | null = null;
@@ -539,6 +557,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     columns.clear();
     timing.clear();
     events = [];
+    resimLog = [];
     lastProfilerSample = null;
     localFrame = 0;
     simTime = 0;
@@ -647,6 +666,24 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     // Full-session timing: the profiler sample for this frame fired during
     // orig(dt) (just before this); append it (or zeros) so timing stays aligned.
     timing.push(lastProfilerSample);
+    // Sparse per-pass resim breakdown — only when the frame actually resimulated
+    // (more than the base pass), so it's cheap and rare.
+    const passes = lastProfilerSample?.passes as
+      | Array<{ index?: number; solverMs?: number; fractureMs?: number; bodyCreateMs?: number; totalMs?: number; reasons?: string[] }>
+      | undefined;
+    if (Array.isArray(passes) && passes.length > 1) {
+      resimLog.push({
+        f: localFrame,
+        passes: passes.map((p) => ({
+          index: p.index ?? 0,
+          solverMs: p.solverMs ?? 0,
+          fractureMs: p.fractureMs ?? 0,
+          bodyCreateMs: p.bodyCreateMs ?? 0,
+          totalMs: p.totalMs ?? 0,
+          reasons: Array.isArray(p.reasons) ? p.reasons.slice() : [],
+        })),
+      });
+    }
     lastProfilerSample = null;
 
     diffTopology();
@@ -865,6 +902,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
       bodies: encodeTyped(bodies.view().slice()),
       events: events.slice(),
       timing: timingExport,
+      resimLog: resimLog.length > 0 ? resimLog.slice() : undefined,
       profiler,
     };
   }
@@ -907,6 +945,8 @@ export type DecodedSimRecording = {
   /** Full-session per-frame timing columns (decoded), keyed by field name, each
    *  parallel to the frames. Empty object if the recording had no timing stream. */
   timing: Record<string, Float32Array>;
+  /** Sparse per-frame resim-pass breakdown (only fracture/resim frames). */
+  resimLog: NonNullable<SimRecordingExport['resimLog']>;
   /** Return the rows for a frame as `[{handle, px,…}]`-style flat slices. */
   frame(i: number): Float32Array;
   /** Find one body's 14-float row in a frame by Rapier handle, or null. */
@@ -965,6 +1005,7 @@ export function decodeSimRecording(data: SimRecordingExport): DecodedSimRecordin
     frameBodyOffset,
     events: data.events,
     timing,
+    resimLog: data.resimLog ?? [],
     frame,
     bodyInFrame,
   };
