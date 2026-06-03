@@ -27,6 +27,7 @@ import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
+import { experimentCoreOverrides, mountExperimentPanel } from "./experiment-flags.js";
 import { buildFracturedTowerScenario } from 'blast-stress-solver/scenarios';
 
 type Vec3 = { x: number; y: number; z: number };
@@ -59,7 +60,8 @@ const CONFIG = {
     contactForceScale: 30,
   },
   optimization: {
-    smallBodyDampingMode: 'always',
+    // Damp small debris only after it lands ('always' floats falling debris).
+    smallBodyDampingMode: 'afterGroundCollision',
     debrisCleanupMode: 'always',
     debrisTtlMs: 8000,
     maxCollidersForDebris: 2,
@@ -341,6 +343,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...experimentCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -653,6 +656,7 @@ function onResize() {
 }
 window.addEventListener('resize', onResize);
 
+mountExperimentPanel();
 initScene()
   .then(() => loop())
   .catch((err) => {
