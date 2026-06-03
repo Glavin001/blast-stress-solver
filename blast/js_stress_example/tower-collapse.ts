@@ -254,8 +254,8 @@ async function initScene() {
   visualsRef = visuals;
 
   // Point the reusable frame-profiler overlay at this core.
-  profiler.attach(core);
   recorder.attach(core, { scenario, meta: { demo: 'tower-collapse', config: CONFIG } });
+  profiler.attach(core);
 }
 
 // ── Projectile shooting ───────────────────────────────────────

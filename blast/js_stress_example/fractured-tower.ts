@@ -193,8 +193,8 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
 
   coreRef = core;
-  profiler.attach(core);
   recorder.attach(core, { scenario, meta: { demo: 'fractured-tower' } });
+  profiler.attach(core);
   visualsRef = visuals;
 
   if (hint) hint.textContent = 'Click to shoot projectiles';

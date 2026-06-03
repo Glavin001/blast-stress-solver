@@ -18,6 +18,8 @@
  *   --events [type]        List timeline events (optionally filtered by type:
  *                          projectile|force|gravity|migrate|detach|destroy|bodyRemoved).
  *   --range <a> <b>        Limit --body / --events output to frames [a, b].
+ *   --perf                 Per-phase timing breakdown ("where did every ms go") +
+ *                          the worst (slowest) frames and their dominant phase.
  *
  * Examples:
  *   node scripts/inspect-recording.mjs rec.sim.json.gz
@@ -70,6 +72,14 @@ function decodeSimRecording(data) {
     }
     return null;
   };
+  const timing = {};
+  if (data.timing) {
+    for (const f of data.timing.fields) {
+      const enc = data.timing.columns[f];
+      if (enc) timing[f] = decodeTyped(enc);
+    }
+  }
+
   return {
     durationFrames: data.durationFrames,
     durationSeconds: data.durationSeconds,
@@ -79,10 +89,21 @@ function decodeSimRecording(data) {
     bodies,
     frameBodyOffset,
     events: data.events,
+    timing,
     frame,
     bodyInFrame,
   };
 }
+
+// Leaf phases (≈ mutually exclusive — they sum to ~totalMs). Wrapper totals
+// (initialPassMs/resimMs) and counts are intentionally excluded from the sum.
+const LEAF_TIMERS = [
+  'rapierStepMs', 'solverUpdateMs', 'contactDrainMs', 'externalForceMs', 'preStepSweepMs',
+  'fractureMs', 'splitPlannerMs', 'splitQueueMs', 'bodyCreateMs', 'colliderRebuildMs',
+  'rebuildColliderMapMs', 'cleanupDisabledMs', 'snapshotCaptureMs', 'snapshotRestoreMs',
+  'damageTickMs', 'damageReplayMs', 'damagePreviewMs', 'damageRestoreMs', 'damageSnapshotMs',
+  'damagePreDestroyMs', 'damageFlushMs', 'spawnMs', 'projectileCleanupMs',
+];
 
 const argv = process.argv.slice(2);
 if (argv.length === 0 || argv[0].startsWith('--')) {
@@ -133,13 +154,52 @@ console.log(`events      : ${JSON.stringify(hist)}`);
 if (data.scenario) {
   const n = data.scenario.nodes?.length ?? '?';
   const b = data.scenario.bonds?.length ?? '?';
-  console.log(`scenario    : ${n} nodes · ${b} bonds${data.profiler ? ' · +profiler timings' : ''}`);
+  console.log(`scenario    : ${n} nodes · ${b} bonds`);
 }
+const hasTiming = dec.timing && dec.timing.totalMs && dec.timing.totalMs.length === dec.durationFrames;
+console.log(`timing      : ${hasTiming ? `full-session (${dec.timing.totalMs.length} frames) — run with --perf` : 'none'}`);
 
 // ── Range ──────────────────────────────────────────────────────────────────────
 const range = has('--range')
   ? [Number(argv[argv.indexOf('--range') + 1]), Number(argv[argv.indexOf('--range') + 2])]
   : [0, dec.durationFrames - 1];
+
+// ── --perf (where did every millisecond go) ─────────────────────────────────────
+if (has('--perf')) {
+  if (!hasTiming) {
+    console.log('\n(no timing stream in this recording)');
+  } else {
+    const t = dec.timing;
+    const nf = t.totalMs.length;
+    const [a, b] = range;
+    const sum = (arr) => { let s = 0; for (let i = a; i <= b && i < nf; i++) s += arr[i] || 0; return s; };
+    const totalAll = sum(t.totalMs);
+    const cat = LEAF_TIMERS.filter((k) => t[k]).map((k) => ({ k, ms: sum(t[k]) }))
+      .filter((c) => c.ms > 1e-6).sort((x, y) => y.ms - x.ms);
+    const leafSum = cat.reduce((s, c) => s + c.ms, 0);
+    const other = Math.max(0, totalAll - leafSum);
+    const fms = (v) => v.toFixed(1).padStart(9);
+    const pct = (v) => `${(totalAll > 0 ? (100 * v) / totalAll : 0).toFixed(1)}%`.padStart(6);
+    console.log(`\n━━━ Performance breakdown · frames ${a}..${Math.min(b, nf - 1)} ━━━`);
+    console.log(`total sim time: ${totalAll.toFixed(1)} ms over ${b - a + 1} frames · mean ${(totalAll / (b - a + 1)).toFixed(2)} ms/frame`);
+    console.log('\n  phase                    Σ ms     %total   mean ms/frame');
+    for (const c of cat)
+      console.log(`  ${c.k.padEnd(22)} ${fms(c.ms)}  ${pct(c.ms)}   ${(c.ms / (b - a + 1)).toFixed(3)}`);
+    console.log(`  ${'(unaccounted/other)'.padEnd(22)} ${fms(other)}  ${pct(other)}`);
+    console.log(`  accounted by leaf phases: ${(100 * leafSum / totalAll).toFixed(1)}%`);
+
+    // Slowest frames + their dominant phase (the spikes worth investigating).
+    const order = [...Array(nf).keys()].filter((i) => i >= a && i <= b).sort((i, j) => t.totalMs[j] - t.totalMs[i]).slice(0, 10);
+    console.log('\n  slowest frames:  frame  totalMs   dominant phase           resimPasses  bodies');
+    for (const i of order) {
+      let dk = 'other', dv = -1;
+      for (const k of LEAF_TIMERS) if (t[k] && t[k][i] > dv) { dv = t[k][i]; dk = k; }
+      const resim = t.resimPasses ? t.resimPasses[i] : 0;
+      const bodies = t.rigidBodies ? t.rigidBodies[i] : (dec.columns.rigidBodies[i] || 0);
+      console.log(`                   ${String(i).padStart(5)}  ${t.totalMs[i].toFixed(2).padStart(6)}   ${dk.padEnd(20)} ${dv.toFixed(2).padStart(7)}   ${String(resim).padStart(6)}    ${bodies}`);
+    }
+  }
+}
 
 // ── --events ────────────────────────────────────────────────────────────────────
 if (has('--events')) {

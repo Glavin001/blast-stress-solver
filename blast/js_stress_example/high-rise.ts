@@ -212,8 +212,8 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: CONFIG.features.debug });
 
   coreRef = core;
-  profiler.attach(core);
   recorder.attach(core, { scenario, meta: { demo: 'high-rise', config: CONFIG } });
+  profiler.attach(core);
   visualsRef = visuals;
   initialBonds = core.getActiveBondsCount();
   baselineY = avgDynamicY(core);

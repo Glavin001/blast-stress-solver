@@ -237,8 +237,8 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
 
   coreRef = core;
-  profiler.attach(core);
   recorder.attach(core, { scenario, meta: { demo: 'wall-demolition', config: CONFIG } });
+  profiler.attach(core);
   visualsRef = visuals;
 }
 

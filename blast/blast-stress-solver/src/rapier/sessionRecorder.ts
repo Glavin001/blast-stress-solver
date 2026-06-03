@@ -91,6 +91,65 @@ type WorldLike = {
   forEachRigidBody: (cb: (body: BodyLike) => void) => void;
 };
 
+/** A per-frame profiler sample (the core's `CoreProfilerSample`), read loosely so
+ *  we don't couple to its exact shape — we copy whatever numeric `*Ms` / count
+ *  fields are present. */
+type ProfilerSampleLike = Record<string, unknown>;
+type ProfilerConfigLike = {
+  enabled: boolean;
+  onSample?: (s: ProfilerSampleLike) => void;
+  measureReferencePlanner?: boolean;
+};
+
+/**
+ * Per-frame timing fields copied from the core's profiler sample into the
+ * full-session timing stream. These are the leaf phase timers (≈ mutually
+ * exclusive — they sum to ~`totalMs`), the wrapper totals, and a few useful
+ * counts. Captured every frame for the whole recording (unlike the frame-profiler
+ * overlay, which only retains a rolling window).
+ */
+export const TIMING_FIELDS = [
+  'totalMs',
+  // physics + solver
+  'rapierStepMs',
+  'solverUpdateMs',
+  // contacts / forces
+  'contactDrainMs',
+  'externalForceMs',
+  'preStepSweepMs',
+  // fracture (+ sub-phases)
+  'fractureMs',
+  'fractureGenerateMs',
+  'fractureApplyMs',
+  // split planning / topology edits
+  'splitPlannerMs',
+  'splitQueueMs',
+  'bodyCreateMs',
+  'colliderRebuildMs',
+  'rebuildColliderMapMs',
+  'cleanupDisabledMs',
+  // snapshots (resim rollback)
+  'snapshotCaptureMs',
+  'snapshotRestoreMs',
+  // damage subsystem
+  'damageTickMs',
+  'damageReplayMs',
+  'damagePreviewMs',
+  'damageRestoreMs',
+  'damageSnapshotMs',
+  'damagePreDestroyMs',
+  'damageFlushMs',
+  // spawn / cleanup
+  'spawnMs',
+  'projectileCleanupMs',
+  // wrapper totals (contain leaf work — for cross-checking, not summing)
+  'initialPassMs',
+  'resimMs',
+  // counts
+  'resimPasses',
+  'rigidBodies',
+] as const;
+
 /** The slice of the destructible core the recorder reads from / wraps. */
 export type RecordableCore = {
   world: WorldLike;
@@ -104,6 +163,10 @@ export type RecordableCore = {
   enqueueProjectile: (s: ProjectileSpawn) => void;
   applyExternalForce: (nodeIndex: number, worldPoint: Vec3, worldForce: Vec3) => void;
   setGravity: (g: number) => void;
+  /** Optional — when present, the recorder multiplexes onto it to capture the
+   *  full-session per-frame timing stream without disturbing any other consumer
+   *  (e.g. the frame-profiler overlay). */
+  setProfiler?: (config: ProfilerConfigLike | null) => void;
 };
 
 /** Context describing what is being recorded — captured once at `attach`. */
@@ -198,7 +261,18 @@ export type SimRecordingExport = {
    */
   bodies: EncodedTypedArray;
   events: SimRecordingEvent[];
-  /** Optional frame-profiler dump (timings) for the same window, if linked. */
+  /**
+   * Full-session per-frame timing stream — one column per {@link TIMING_FIELDS}
+   * entry, each parallel to the kinematic frames (length === durationFrames). This
+   * is the "where did every millisecond go" data: the leaf phase columns sum to
+   * ~`totalMs` each frame. Present when the core exposed `setProfiler`.
+   */
+  timing?: {
+    fields: readonly string[];
+    columns: Record<string, EncodedTypedArray>;
+  };
+  /** Optional rolling frame-profiler dump (stats + legend) if a profiler export
+   *  was linked via {@link SessionRecorderHandle.setProfilerExport}. */
   profiler?: unknown;
 };
 
@@ -270,6 +344,27 @@ class FrameColumns {
     this.activeBonds.length = 0;
     this.rigidBodies.length = 0;
     this.projectiles.length = 0;
+  }
+}
+
+// One growable column per TIMING_FIELDS entry, appended once per captured frame
+// so they stay parallel to FrameColumns. A frame with no profiler sample pushes 0.
+class TimingColumns {
+  readonly cols: Record<string, number[]> = {};
+  constructor() {
+    for (const f of TIMING_FIELDS) this.cols[f] = [];
+  }
+  push(sample: ProfilerSampleLike | null) {
+    for (const f of TIMING_FIELDS) {
+      const v = sample ? sample[f] : 0;
+      this.cols[f].push(typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    }
+  }
+  clear() {
+    for (const f of TIMING_FIELDS) this.cols[f].length = 0;
+  }
+  get length() {
+    return this.cols[TIMING_FIELDS[0]].length;
   }
 }
 
@@ -400,7 +495,12 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
 
   const bodies = new GrowableF32();
   const columns = new FrameColumns();
+  const timing = new TimingColumns();
   let events: SimRecordingEvent[] = [];
+  // Latest profiler sample seen this frame (set in the multiplexed onSample,
+  // consumed + cleared in captureFrame so timing stays aligned to body frames).
+  let lastProfilerSample: ProfilerSampleLike | null = null;
+  let sawProfiler = false; // any sample ever seen → emit the timing stream on export
 
   let localFrame = 0;
   let simTime = 0;
@@ -423,6 +523,12 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
   let origEnqueue: RecordableCore['enqueueProjectile'] | null = null;
   let origForce: RecordableCore['applyExternalForce'] | null = null;
   let origGravity: RecordableCore['setGravity'] | null = null;
+  let origSetProfiler: RecordableCore['setProfiler'] | null = null;
+  // The profiler config last requested by another consumer (e.g. the overlay), so
+  // we can multiplex our capture onto it and forward samples to it unchanged.
+  let userProfiler: ProfilerConfigLike | null = null;
+  // Re-applies the merged profiler config to the live core (recomputes `enabled`).
+  let reinstallProfiler: (() => void) | null = null;
 
   const FLAG_ACTIVE = 1;
   const FLAG_DETACHED = 2;
@@ -431,7 +537,9 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
   function resetBuffers() {
     bodies.clear();
     columns.clear();
+    timing.clear();
     events = [];
+    lastProfilerSample = null;
     localFrame = 0;
     simTime = 0;
     liveBodies.clear();
@@ -536,6 +644,11 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     columns.rigidBodies.push(core.getRigidBodyCount());
     columns.projectiles.push(core.projectiles.length);
 
+    // Full-session timing: the profiler sample for this frame fired during
+    // orig(dt) (just before this); append it (or zeros) so timing stays aligned.
+    timing.push(lastProfilerSample);
+    lastProfilerSample = null;
+
     diffTopology();
 
     localFrame += 1;
@@ -592,6 +705,36 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
       origGravity!.call(next, g);
     };
 
+    // Multiplex onto setProfiler so we capture the full-session per-frame timing
+    // stream without disturbing any other consumer (the frame-profiler overlay):
+    // every consumer's `onSample` is fanned out to, plus our own capture.
+    if (next.setProfiler) {
+      origSetProfiler = next.setProfiler;
+      const installMerged = () => {
+        // Keep the profiler enabled if another consumer wants it (overlay) or
+        // while we're recording — otherwise off, so idle frames pay nothing.
+        const enabled = (userProfiler?.enabled ?? false) || recording;
+        origSetProfiler!.call(next, {
+          enabled,
+          measureReferencePlanner: userProfiler?.measureReferencePlanner,
+          onSample: (s: ProfilerSampleLike) => {
+            // Stash for captureFrame (keeps timing aligned to body frames).
+            if (recording) {
+              lastProfilerSample = s;
+              sawProfiler = true;
+            }
+            userProfiler?.onSample?.(s);
+          },
+        });
+      };
+      reinstallProfiler = installMerged;
+      next.setProfiler = (cfg: ProfilerConfigLike | null) => {
+        userProfiler = cfg ?? null;
+        installMerged();
+      };
+      installMerged();
+    }
+
     p.__bssRecorderPatched = true;
     patched = p;
   }
@@ -604,10 +747,22 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     if (origGravity) patched.setGravity = origGravity;
     if (origStepEventful && patched.stepEventful) patched.stepEventful = origStepEventful;
     if (origStepSafe && patched.stepSafe) patched.stepSafe = origStepSafe;
+    if (origSetProfiler) {
+      patched.setProfiler = origSetProfiler;
+      // Restore whatever the other consumer last wanted directly on the core.
+      try {
+        origSetProfiler.call(patched, userProfiler);
+      } catch {
+        /* best-effort */
+      }
+    }
     delete patched.__bssRecorderPatched;
     patched = null;
     origStep = origEnqueue = origForce = origGravity = null;
     origStepEventful = origStepSafe = null;
+    origSetProfiler = null;
+    reinstallProfiler = null;
+    userProfiler = null;
   }
 
   function cloneSpawn(s: ProjectileSpawn): ProjectileSpawn {
@@ -635,6 +790,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     resetBuffers();
     snapshotBaseline();
     recording = true;
+    reinstallProfiler?.(); // ensure the profiler is enabled for timing capture
     events.push({ f: 0, t: 0, type: 'start' });
   }
 
@@ -642,11 +798,13 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     if (!recording) return;
     events.push({ f: localFrame, t: simTime, type: 'stop' });
     recording = false;
+    reinstallProfiler?.(); // let the profiler turn back off if nothing else needs it
   }
 
   function estimatedBytes(): number {
-    // Body trace dominates; columns are 6 scalars/frame.
-    return bodies.len * 4 + columns.simTime.length * (8 + 4 + 4 * 4);
+    // Body trace dominates; + scalar columns + the per-frame timing columns.
+    const timingCols = sawProfiler ? TIMING_FIELDS.length * 4 : 0;
+    return bodies.len * 4 + columns.simTime.length * (8 + 4 + 4 * 4 + timingCols);
   }
 
   function buildExport(): SimRecordingExport | null {
@@ -674,6 +832,13 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
       }
     }
 
+    let timingExport: SimRecordingExport['timing'];
+    if (sawProfiler) {
+      const cols: Record<string, EncodedTypedArray> = {};
+      for (const f of TIMING_FIELDS) cols[f] = encodeTyped(Float32Array.from(timing.cols[f]));
+      timingExport = { fields: TIMING_FIELDS as unknown as string[], columns: cols };
+    }
+
     return {
       schema: SIM_RECORDING_SCHEMA,
       generatedAt: new Date().toISOString(),
@@ -699,6 +864,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
       },
       bodies: encodeTyped(bodies.view().slice()),
       events: events.slice(),
+      timing: timingExport,
       profiler,
     };
   }
@@ -738,6 +904,9 @@ export type DecodedSimRecording = {
   /** Float offset (into `bodies`) where each frame's rows begin. */
   frameBodyOffset: Uint32Array;
   events: SimRecordingEvent[];
+  /** Full-session per-frame timing columns (decoded), keyed by field name, each
+   *  parallel to the frames. Empty object if the recording had no timing stream. */
+  timing: Record<string, Float32Array>;
   /** Return the rows for a frame as `[{handle, px,…}]`-style flat slices. */
   frame(i: number): Float32Array;
   /** Find one body's 14-float row in a frame by Rapier handle, or null. */
@@ -778,6 +947,14 @@ export function decodeSimRecording(data: SimRecordingExport): DecodedSimRecordin
     return null;
   };
 
+  const timing: Record<string, Float32Array> = {};
+  if (data.timing) {
+    for (const f of data.timing.fields) {
+      const enc = data.timing.columns[f];
+      if (enc) timing[f] = decodeTyped(enc) as Float32Array;
+    }
+  }
+
   return {
     durationFrames: data.durationFrames,
     durationSeconds: data.durationSeconds,
@@ -787,6 +964,7 @@ export function decodeSimRecording(data: SimRecordingExport): DecodedSimRecordin
     bodies,
     frameBodyOffset,
     events: data.events,
+    timing,
     frame,
     bodyInFrame,
   };

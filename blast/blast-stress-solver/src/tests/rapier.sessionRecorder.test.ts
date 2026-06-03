@@ -246,6 +246,62 @@ describe('session recorder', () => {
     expect(removed).toMatchObject({ body: 1 });
   });
 
+  it('captures a full-session per-frame timing stream via setProfiler multiplex', () => {
+    // Fake core that drives a profiler sample each step (like the real core).
+    const chunks: ChunkData[] = [newChunk(0, 1)];
+    let onSample: ((s: Record<string, unknown>) => void) | undefined;
+    let enabled = false;
+    let frame = 0;
+    const overlaySamples: unknown[] = [];
+    const core: RecordableCore = {
+      world: {
+        forEachRigidBody: (cb) =>
+          cb({ handle: 1, isFixed: () => false, translation: () => ({ x: 0, y: 0, z: 0 }), rotation: () => ({ x: 0, y: 0, z: 0, w: 1 }), linvel: () => ({ x: 0, y: 0, z: 0 }), angvel: () => ({ x: 0, y: 0, z: 0 }) }),
+      },
+      chunks,
+      getActiveBondsCount: () => 1,
+      getRigidBodyCount: () => 1,
+      projectiles: { length: 0 },
+      step: () => {
+        if (enabled && onSample) {
+          onSample({ totalMs: 5, rapierStepMs: 3, solverUpdateMs: 1.5, contactDrainMs: 0.5, resimPasses: frame % 2, rigidBodies: 1 });
+        }
+        frame += 1;
+      },
+      enqueueProjectile: () => {},
+      applyExternalForce: () => {},
+      setGravity: () => {},
+      setProfiler: (cfg) => {
+        enabled = !!cfg?.enabled;
+        onSample = cfg?.onSample;
+      },
+    };
+
+    const rec = createSessionRecorder();
+    rec.attach(core);
+    // Simulate the overlay subscribing AFTER the recorder attached (page order).
+    core.setProfiler!({ enabled: true, onSample: (s) => overlaySamples.push(s) });
+
+    rec.start();
+    core.step(1 / 60);
+    core.step(1 / 60);
+    core.step(1 / 60);
+    rec.stop();
+
+    const data = rec.export()!;
+    expect(data.timing).toBeDefined();
+    const dec = decodeSimRecording(data);
+    // One timing value per frame, aligned to the kinematic frames.
+    expect(dec.timing.totalMs.length).toBe(dec.durationFrames);
+    expect(Array.from(dec.timing.totalMs)).toEqual([5, 5, 5]);
+    expect(Array.from(dec.timing.rapierStepMs)).toEqual([3, 3, 3]);
+    // Leaf phases sum to ~totalMs each frame (the "account for every ms" property).
+    const leaf = dec.timing.rapierStepMs[0] + dec.timing.solverUpdateMs[0] + dec.timing.contactDrainMs[0];
+    expect(leaf).toBeCloseTo(dec.timing.totalMs[0]);
+    // The overlay (subscribed after) still received every sample (multiplexed).
+    expect(overlaySamples.length).toBe(3);
+  });
+
   it('restores wrapped core methods on detach', () => {
     const fake = makeFakeCore();
     const origStep = fake.core.step;
