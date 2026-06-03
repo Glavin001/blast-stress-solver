@@ -32,6 +32,7 @@
     "fractured-bridge.ts",
     "fracture-policy.ts",
     "high-rise.ts",
+    "mini-city.ts",
     "rapier-debug-renderer.js",
     "extBridgeScenario.js",
     "bridge/types.ts",
