@@ -94,35 +94,53 @@ that recomputes each dynamic child's mass properties and shifts its `linvel` by
 (parent-continuous) field at the node points regardless of collider-COM offset. Both tests in
 the matched pair are now passing, blocking regression guards.
 
-### JS reused-fragment path (gap #1b) — OPEN
+### JS reused-fragment velocity (gap #1b) — ✅ FIXED
 
-The "JS already satisfies this" claim above is only true for the **created** child bodies. A
+The "JS already satisfies this" claim above was only true for the **created** child bodies. A
 fracture partitions a parent into one **reused** body (the largest fragment — it keeps the
 parent's Rapier handle and merely *loses* the colliders that migrated to the new children) and
-N **created** bodies. `syncBodyVelocityFromSource` / `recordBodyContinuity` only ever run for
-the *created* targets (`flushColliderMigrations`'s `targetBodiesAffected`; `bodyRestoreProvenance`
-is only set for created bodies). The reused body is never re-derived for its shifted COM.
+N **created** bodies. `syncBodyVelocityFromSource` only ran for the *created* targets, so the
+reused body was never re-derived for its shifted COM. Because Rapier stores `linvel` as the
+velocity *of the centre of mass* and keeps it when `removeCollider` shifts the COM (the recompute
+is even deferred to the next `step`), the reused fragment's velocity field jumped by `ω × ΔCOM`
+on every fracture — the **"big fragment hovers while small debris falls normally"** report (the
+JS high-rise demo). The split-continuity log stayed green (~1e-7) because it structurally never
+observes the reused body.
 
-Because Rapier stores `linvel` as the velocity *of the centre of mass* and keeps it when
-`removeCollider` shifts the COM (the recompute is even deferred to the next `step`), the reused
-fragment's velocity field jumps by `ω × ΔCOM` on every fracture. While a large slab tumbles and
-re-shatters on ground impact this repeatedly perturbs the biggest piece's velocity — the
-"big fragment hovers while small debris falls normally" report. The split-continuity log stays
-green (~1e-7) throughout because it structurally never observes the reused body.
+**Fix:** `reconcileReusedBodyVelocity` in `destructible-core.ts` — after migration, recompute the
+reused body's mass properties and shift its `linvel` by `ω × (newCom − oldCom)`. Applied both in
+`flushColliderMigrations` (non-resim) and on `restoreWorldSnapshot` (resim re-applies the stale
+COM-velocity; `BodySnapshot` now carries `com` so the rollback can re-correct). Guards:
+- `rapier.splitVelocity.mechanism.test.ts` — pure-Rapier, no WASM. Pins the mechanism with exact
+  magnitudes (removeCollider defers the recompute; ω×ΔCOM drift; symmetric-loss zero control;
+  the `linvel += ω × ΔCOM` fix spec; the created-child transfer control).
+- `rapier.splitVelocity.noHover.test.ts` — real pipeline (WASM): a controlled rotating split where
+  the reused fragment's drift drops from ~1.5 m/s to <1e-2, plus cascade guards (no NaN, mass
+  conserved, no gross hover).
 
-This is now covered by:
-- `src/tests/rapier.splitVelocity.mechanism.test.ts` — pure-Rapier, no WASM. Pins the
-  mechanism with exact magnitudes: removeCollider defers the recompute; a spinning body that
-  loses a collider gains `ω × ΔCOM` of point-velocity drift; symmetric loss is the zero control;
-  `linvel += ω × ΔCOM` is the fix spec; the created-child transfer formula is the positive control.
-- `src/tests/rapier.splitVelocity.noHover.test.ts` — real pipeline (WASM). Blocking guards
-  (no NaN, mass conserved, log green but structurally blind to the reused body, no *gross* hover)
-  plus an `it.skip` repro (`[repro] reused fragment preserves point velocity…`) that fails by
-  ~7.5 m/s when un-skipped — the JS analogue of the Rust `#[ignore]` repro lane.
+### Rust reused-fragment resim teleport (gap #1c) — ✅ FIXED
 
-**Fix (JS, when prioritized):** mirror Rust — after `flushColliderMigrations`, also reconcile the
-*reused* body's `linvel` by `ω × (newCom − oldCom)` (recompute its mass properties first, since
-`removeCollider` leaves them stale).
+Distinct symptom seen in the **Rust demo**: when a body fractures *under resimulation*, a large
+fragment "yanks itself inwards" for a frame. The Rust split path RE-CENTERS each child body's
+origin onto its fragment COM (so the velocity fit reference `fit_center` equals the COM, making
+`reconcile_child_velocity_with_com` a no-op). For a **reused** body that moves its existing
+origin and re-derives every retained collider's local offset relative to the *new* origin. The
+demo's resimulation, however, snapshots each body's **origin** *before* the step and `restore()`s
+it *after* a fracture (`BodySnapshots`); restoring the OLD origin onto the NEW offsets places the
+colliders at `old_origin · new_offset` — teleported by the recentering distance, toward the old
+origin (= "inward"). Velocity continuity can't see this; it is a pure position jump.
+
+**Fix:** decouple the velocity-fit reference from the body pose. `ChildTargetState` now carries a
+`fit_center` (the node-model COM, drives `fit_child_motion` + `reconcile_child_velocity_with_com`
+— unchanged, so velocity is identical) separately from `pose`. **Reused** bodies keep their
+inherited origin (no recentering → resim snapshots stay valid → no teleport); only newly
+created/recycled bodies (absent from any snapshot) are recentered. This mirrors the JS pipeline,
+which never recenters. Guards (Rust):
+- `tests/resim_recenter_teleport_test.rs` — mimics the demo's capture→step→restore; the worst
+  chunk teleport drops from ~1.5 m to <1e-3.
+- `tests/split_position_continuity_test.rs` — asserts the new `SplitContinuityRecord.world_position_error`
+  (Rust analogue of the JS `maxChunkWorldPositionError`) stays <1e-3 for recentered multi-node halves,
+  alongside the existing velocity continuity.
 
 ## Physics mechanisms: gravity orientation & momentum transfer
 
@@ -178,11 +196,16 @@ Blast computes this with `getExcessForces`.
    (`reconcile_child_velocity_with_com`: `linvel += ω × (real_com − fit_center)`). The former
    repro `kinematic_invariants_test.rs::split_preserves_point_velocity_for_offset_com_child`
    is now a passing, blocking regression guard.
-   - **1b. JS reused-fragment COM/velocity — ❌ OPEN.** The JS pipeline corrects *created*
-     children but never the *reused* fragment (largest piece, keeps the parent handle, loses
-     colliders), so its velocity field drifts by `ω × ΔCOM` on every fracture ("big fragment
-     hovers" report). Covered by `rapier.splitVelocity.mechanism.test.ts` (blocking) and the
-     `it.skip` repro in `rapier.splitVelocity.noHover.test.ts`. See the section above for the fix.
+   - **1b. JS reused-fragment COM/velocity — ✅ FIXED.** `reconcileReusedBodyVelocity` re-derives
+     the reused fragment's velocity for its shifted COM (in `flushColliderMigrations` and on the
+     resim `restoreWorldSnapshot`). Stops the "big fragment hovers" report. Guards:
+     `rapier.splitVelocity.mechanism.test.ts` + `rapier.splitVelocity.noHover.test.ts`.
+   - **1c. Rust reused-fragment resim teleport — ✅ FIXED.** Recentering a *reused* body's origin
+     made the demo's resim rollback (which restores the pre-split origin) teleport its colliders
+     inward ("fragment yanks itself inwards"). Reused bodies now keep their inherited origin (the
+     velocity fit uses a decoupled `fit_center`, so velocity is unchanged). Guards:
+     `resim_recenter_teleport_test.rs` + `split_position_continuity_test.rs` (new
+     `world_position_error` metric). See the sections above.
 2. **Rust split-planner determinism** — covered for wall + tower at scale
    (`multi_fracture_test.rs::tower_collapse_is_deterministic_at_scale`,
    `scenario_invariants_test.rs::wall_collapse_is_deterministic`); both pass, so the
