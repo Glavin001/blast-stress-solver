@@ -20,7 +20,7 @@ import type {
   FracturePolicy,
 } from './types';
 import { DestructibleDamageSystem, type DamageOptions, type DamageStateSnapshot } from './damage';
-import { planSplitMigration, type PlannerChild, type ExistingBodyState } from './splitMigrator';
+import { planSplitMigration, planSplitMigrationReference, type PlannerChild, type ExistingBodyState } from './splitMigrator';
 import {
   captureDynamicBodySnapshots,
   restoreDynamicBodySnapshots,
@@ -181,8 +181,12 @@ export async function buildDestructibleCore({
   const profiler = {
     enabled: false,
     onSample: null as CoreProfilerConfig['onSample'] | null,
+    measureReferencePlanner: false,
     frameIndex: 0,
   };
+  // Cap A/B reference-planner measurement so a single huge split can't hang the
+  // tab for many seconds with O(N^3) work that is thrown away.
+  const REFERENCE_PLANNER_MAX_CHILDREN = 768;
 
   const createProfilerSample = (dt: number): MutableCoreProfilerSample => ({
     frameIndex: profiler.frameIndex++,
@@ -230,6 +234,7 @@ export async function buildDestructibleCore({
   const setProfiler = (config: CoreProfilerConfig | null) => {
     profiler.enabled = !!(config?.enabled && typeof config.onSample === 'function');
     profiler.onSample = profiler.enabled ? config?.onSample ?? null : null;
+    profiler.measureReferencePlanner = profiler.enabled && !!config?.measureReferencePlanner;
   };
 
   let activeProfilerSample: MutableCoreProfilerSample | null = null;
@@ -1792,6 +1797,23 @@ export async function buildDestructibleCore({
         if (activeProfilerSample) {
           (activeProfilerSample as any).splitPlannerMs =
             ((activeProfilerSample as any).splitPlannerMs ?? 0) + plannerDuration;
+
+          // A/B diagnostic (off by default): time what the old dense-Hungarian
+          // planner would have cost on the same inputs. Result discarded — the
+          // simulation uses `migration` above. Capped to avoid pathological hangs.
+          if (profiler.measureReferencePlanner
+            && plannerChildren.length <= REFERENCE_PLANNER_MAX_CHILDREN) {
+            let refDuration = 0;
+            try {
+              planSplitMigrationReference(
+                [{ handle: parentBodyHandle, nodeIndices: parentNodes, isFixed: parentIsFixed }],
+                plannerChildren,
+                { onDuration: (ms: number) => { refDuration += ms; } },
+              );
+            } catch { /* diagnostic only — never let it affect the frame */ }
+            (activeProfilerSample as any).splitPlannerReferenceMs =
+              ((activeProfilerSample as any).splitPlannerReferenceMs ?? 0) + refDuration;
+          }
         }
 
         for (const reuse of migration.reuse) {

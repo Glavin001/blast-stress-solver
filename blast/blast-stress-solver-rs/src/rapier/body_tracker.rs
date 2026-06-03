@@ -488,7 +488,13 @@ impl BodyTracker {
             child_target_states.insert(entry.child_index, target_state);
         }
 
-        for (child_index, target) in child_targets.iter().map(|(k, v)| (*k, *v)) {
+        // Process children in a deterministic (child-index) order so collider migration
+        // and metadata edits are reproducible, independent of `HashMap` iteration order.
+        let mut ordered_children: Vec<(usize, PlannedBodyTarget)> =
+            child_targets.iter().map(|(k, v)| (*k, *v)).collect();
+        ordered_children.sort_unstable_by_key(|(child_index, _)| *child_index);
+
+        for &(child_index, target) in &ordered_children {
             let child = &event.children[child_index];
             let target_body = target.handle();
             let target_state = *child_target_states
@@ -555,7 +561,7 @@ impl BodyTracker {
 
         // Reconcile each dynamic child's velocity with Rapier's real centre of mass, in a
         // SEPARATE pass after every child's colliders have been migrated (so the COM is final).
-        for (child_index, target) in child_targets.iter().map(|(k, v)| (*k, *v)) {
+        for &(child_index, target) in &ordered_children {
             let fit_center = child_target_states[&child_index].pose.translation.vector;
             self.reconcile_child_velocity_with_com(target.handle(), fit_center, bodies, colliders);
         }
@@ -564,18 +570,17 @@ impl BodyTracker {
         // been migrated — otherwise a reused parent body would still hold a sibling's
         // collider and report a spurious (and nondeterministic) centre of mass.
         if self.record_split_continuity {
-            for (child_index, target) in child_targets.iter().map(|(k, v)| (*k, *v)) {
+            for &(child_index, target) in &ordered_children {
                 let child = &event.children[child_index];
                 self.record_split_child_continuity(target.handle(), child, &planning, bodies, colliders);
             }
         }
 
-        result.cohort_handles = child_targets
-            .values()
-            .map(|target| target.handle())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
+        let mut cohort_handles: Vec<RigidBodyHandle> =
+            ordered_children.iter().map(|(_, target)| target.handle()).collect();
+        cohort_handles.sort_unstable_by_key(|h| h.into_raw_parts());
+        cohort_handles.dedup();
+        result.cohort_handles = cohort_handles;
 
         let reused_handles: HashSet<RigidBodyHandle> = reused_by_body.keys().copied().collect();
         let recycled_handles: HashSet<RigidBodyHandle> = child_targets
@@ -1061,13 +1066,15 @@ impl BodyTracker {
             *body_weights.entry(source.body_handle).or_insert(0.0) +=
                 self.node_masses[node as usize].max(1.0);
         }
-        let Some((&body_handle, _)) = body_weights
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        else {
-            return None;
-        };
-        Some(body_handle)
+        // Pick the heaviest source body, breaking weight ties by lowest handle so the
+        // dominant-body choice (which sets the child's inherited rotation/velocity) is
+        // deterministic rather than dependent on `HashMap` iteration order.
+        let best = body_weights.iter().max_by(|a, b| {
+            a.1.partial_cmp(b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.into_raw_parts().cmp(&a.0.into_raw_parts()))
+        });
+        best.map(|(&handle, _)| handle)
     }
 
     fn fit_child_motion(
@@ -1576,7 +1583,12 @@ impl BodyTracker {
             }
         }
 
-        let parent_bodies: Vec<RigidBodyHandle> = parent_bodies.into_iter().collect();
+        let mut parent_bodies: Vec<RigidBodyHandle> = parent_bodies.into_iter().collect();
+        // Sort for determinism: body recycling/creation order (below) must not depend on
+        // `HashSet` iteration order, otherwise Rapier allocates handles in a nondeterministic
+        // order and its island/contact solver diverges run-to-run (amplified by chaotic
+        // fracture). A stable order makes the whole pipeline reproducible.
+        parent_bodies.sort_unstable_by_key(|h| h.into_raw_parts());
         let parent_states = parent_bodies
             .iter()
             .filter_map(|&handle| {

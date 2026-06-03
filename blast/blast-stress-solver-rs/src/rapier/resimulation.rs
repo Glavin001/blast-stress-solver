@@ -34,26 +34,33 @@ pub struct BodySnapshots {
 
 impl BodySnapshots {
     pub fn capture(set: &RigidBodySet) -> Self {
-        let bodies = set
-            .iter()
-            .filter_map(|(handle, body)| {
-                if body.is_fixed() {
-                    None
-                } else {
-                    Some(BodySnapshot {
-                        handle,
-                        position: *body.position(),
-                        linvel: *body.linvel(),
-                        angvel: *body.angvel(),
-                        linear_damping: body.linear_damping(),
-                        angular_damping: body.angular_damping(),
-                        sleeping: body.is_sleeping(),
-                        enabled: body.is_enabled(),
-                    })
-                }
-            })
-            .collect();
-        Self { bodies }
+        let mut snapshots = Self::default();
+        snapshots.capture_into(set);
+        snapshots
+    }
+
+    /// Refill this snapshot from `set`, reusing the existing buffer. When the (non-fixed)
+    /// body count is stable this performs **no heap allocation** — the resim-friendly way
+    /// to snapshot every frame at scale (thousands of debris bodies), instead of allocating
+    /// a fresh `Vec` via [`capture`](Self::capture) each rollback.
+    pub fn capture_into(&mut self, set: &RigidBodySet) {
+        self.bodies.clear();
+        self.bodies.extend(set.iter().filter_map(|(handle, body)| {
+            if body.is_fixed() {
+                None
+            } else {
+                Some(BodySnapshot {
+                    handle,
+                    position: *body.position(),
+                    linvel: *body.linvel(),
+                    angvel: *body.angvel(),
+                    linear_damping: body.linear_damping(),
+                    angular_damping: body.angular_damping(),
+                    sleeping: body.is_sleeping(),
+                    enabled: body.is_enabled(),
+                })
+            }
+        }));
     }
 
     pub fn restore(&self, set: &mut RigidBodySet) {

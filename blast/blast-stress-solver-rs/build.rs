@@ -173,13 +173,43 @@ fn main() {
 
     // C++17
     build.flag_if_supported("-std=c++17");
-    // Scalar math (no SIMD)
-    build.define("STRESS_SOLVER_FORCE_SCALAR", None);
-    build.define("STRESS_SOLVER_NO_SIMD", None);
-    build.define("STRESS_SOLVER_NO_DEVICE_QUERY", None);
     build.define("NDEBUG", None);
     build.flag_if_supported("-fno-exceptions");
     build.flag_if_supported("-fvisibility=hidden");
+
+    // --- SIMD selection ------------------------------------------------------
+    //
+    // The Blast stress solver ships a hand-written AVX/FMA implementation of the
+    // CGNR inner loop (the `AngLin6`/coupling matrix-vector products that dominate
+    // `solve()`), selected at RUNTIME by a CPUID device query with a scalar
+    // fallback (see `stress.cpp` `s_use_simd`). The upstream build here force-
+    // disabled it on every target, leaving the solver scalar-only.
+    //
+    // We enable the SIMD path on x86/x86_64 native targets: the `__m256`/FMA
+    // intrinsics exist there and AVX is universal on x86_64 (Sandy Bridge, 2011+),
+    // and the runtime device query still picks the scalar kernels if a CPU somehow
+    // lacks AVX/FMA. wasm and non-x86 arches stay scalar (the intrinsics don't
+    // exist). The `force-scalar-solver` feature (or `BLAST_FORCE_SCALAR=1`) forces
+    // the scalar path everywhere — an escape hatch for reproducibility or odd CPUs.
+    println!("cargo:rerun-if-env-changed=BLAST_FORCE_SCALAR");
+    let x86 = matches!(target_arch.as_str(), "x86" | "x86_64");
+    let force_scalar = is_wasm
+        || !x86
+        || env::var_os("CARGO_FEATURE_FORCE_SCALAR_SOLVER").is_some()
+        || env::var_os("BLAST_FORCE_SCALAR").is_some();
+
+    if force_scalar {
+        build.define("STRESS_SOLVER_FORCE_SCALAR", None);
+        build.define("STRESS_SOLVER_NO_SIMD", None);
+        build.define("STRESS_SOLVER_NO_DEVICE_QUERY", None);
+    } else if build.get_compiler().is_like_msvc() {
+        // MSVC: /arch:AVX2 enables 256-bit AVX + FMA3 intrinsics.
+        build.flag("/arch:AVX2");
+    } else {
+        // GCC/Clang: AVX (256-bit) + FMA3 for the `_mm256_*`/`_mm256_fmadd_ps` ops.
+        build.flag("-mavx");
+        build.flag("-mfma");
+    }
 
     build.compile("blast_stress_solver_ffi");
 }
