@@ -55,7 +55,7 @@ const BASE_LIMITS = {
 const G = 9.81;
 const STRESS_MODE = { Max: 0, Compression: 1, Tension: 2, Shear: 3 } as const;
 
-const CONFIG = { loadFactor: 1.0, strength: 1.0, mode: 0, cracksOnly: false };
+const CONFIG = { loadFactor: 4.6, strength: 1.0, mode: 0, cracksOnly: false };
 
 // ── Three.js setup ────────────────────────────────────────────
 const canvas = document.getElementById('demo-canvas') as HTMLCanvasElement;
@@ -120,7 +120,7 @@ function scaledLimits() {
 
 async function initScene() {
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
-  if (hint) hint.textContent = 'Drag "Load" up to crack the beam';
+  if (hint) hint.textContent = 'Beam loaded near its limit (deep red at the root) — nudge Load up to snap it, or down to relieve the cracks';
   const { scenario } = buildCantilever();
   const core = await buildDestructibleCore({
     scenario,
