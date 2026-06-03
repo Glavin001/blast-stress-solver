@@ -716,6 +716,10 @@ export async function buildDestructibleCore({
   let safeFrames = 0;
   let warnedColliderMapEmptyOnce = false;
   let solverGravityEnabled = true;
+  // Opt-in (default off): feed spinning dynamic actors their centrifugal acceleration each frame so
+  // tumbling debris keeps self-stressing, mirroring NVIDIA Blast's centrifugal-on-dynamic default.
+  // Off by default so it never perturbs scenarios tuned without it. Toggle via setSolverCentrifugalEnabled.
+  let solverCentrifugalEnabled = false;
   const damageOptions: Required<DamageOptions & { autoDetachOnDestroy?: boolean; autoCleanupPhysics?: boolean }> = {
     enabled: !!damage?.enabled,
     strengthPerVolume: damage?.strengthPerVolume ?? 10000,
@@ -1250,6 +1254,46 @@ export async function buildDestructibleCore({
         const iy = 2 * qx * qy * gx + qy * qy * gy + 2 * qz * qy * gz + 2 * qw * qz * gx - qz * qz * gy + qw * qw * gy - 2 * qx * qw * gz - qx * qx * gy;
         const iz = 2 * qx * qz * gx + 2 * qy * qz * gy + qz * qz * gz - 2 * qw * qy * gx - qy * qy * gz + 2 * qw * qx * gy - qx * qx * gz + qw * qw * gz;
         solver.addActorGravity(actor.actorIndex, { x: ix, y: iy, z: iz });
+      }
+    }
+
+    // Optionally feed each spinning dynamic actor its centrifugal acceleration so tumbling debris
+    // keeps self-stressing (NVIDIA Blast applies this to dynamic actors by default). The solver
+    // applies `ω × (ω × (nodePos − com))` per node, so we pass the actor's mass-weighted authored
+    // centre of mass and its angular velocity rotated into the actor's local frame. Opt-in.
+    if (solverCentrifugalEnabled) {
+      const solverActors = (solver as unknown as SolverActorsApi).actors?.() ?? [];
+      for (const actor of solverActors) {
+        if (!actor.nodes || actor.nodes.length < 2) continue; // solver ignores single-node actors
+        const entry = actorMap.get(actor.actorIndex);
+        if (!entry) continue;
+        const body = world.getRigidBody(entry.bodyHandle);
+        if (!body || body.isFixed()) continue; // only spinning dynamic actors tumble
+        const w = body.angvel();
+        if (w.x * w.x + w.y * w.y + w.z * w.z < 1e-8) continue; // effectively not spinning
+        // Rotate world angular velocity into the actor's local frame (R⁻¹·ω) — same conjugate
+        // rotation the gravity loop above uses to localize the gravity vector.
+        const rot = body.rotation();
+        const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
+        const wx = w.x, wy = w.y, wz = w.z;
+        const lwx = qw * qw * wx + 2 * qy * qw * wz - 2 * qz * qw * wy + qx * qx * wx + 2 * qy * qx * wy + 2 * qz * qx * wz - qz * qz * wx - qy * qy * wx;
+        const lwy = 2 * qx * qy * wx + qy * qy * wy + 2 * qz * qy * wz + 2 * qw * qz * wx - qz * qz * wy + qw * qw * wy - 2 * qx * qw * wz - qx * qx * wy;
+        const lwz = 2 * qx * qz * wx + 2 * qy * qz * wy + qz * qz * wz - 2 * qw * qy * wx - qy * qy * wz + 2 * qw * qx * wy - qx * qx * wz + qw * qw * wz;
+        // Mass-weighted centre of mass over the actor's nodes, in the authored frame.
+        let cx = 0, cy = 0, cz = 0, totalMass = 0;
+        for (const ni of actor.nodes) {
+          const m = scenario.nodes[ni]?.mass ?? 0;
+          if (m <= 0) continue;
+          const off = chunks[ni]?.baseLocalOffset;
+          if (!off) continue;
+          cx += off.x * m; cy += off.y * m; cz += off.z * m; totalMass += m;
+        }
+        if (totalMass <= 0) continue; // wholly static actor — does not tumble
+        solver.addCentrifugalAcceleration(
+          actor.actorIndex,
+          { x: cx / totalMass, y: cy / totalMass, z: cz / totalMass },
+          { x: lwx, y: lwy, z: lwz }
+        );
       }
     }
 
@@ -2194,6 +2238,10 @@ export async function buildDestructibleCore({
     solverGravityEnabled = v;
   }
 
+  function setSolverCentrifugalEnabled(v: boolean) {
+    solverCentrifugalEnabled = v;
+  }
+
   function getCollisionGroupContext(): CollisionGroupContext {
     return {
       mode: debrisCollisionModeSetting,
@@ -2322,6 +2370,7 @@ export async function buildDestructibleCore({
     stepSafe: wrappedStep,
     setGravity: setGravityFn,
     setSolverGravityEnabled,
+    setSolverCentrifugalEnabled,
     setSingleCollisionMode,
     setDebrisCollisionMode: setDebrisCollisionModeFn,
     getRigidBodyCount,

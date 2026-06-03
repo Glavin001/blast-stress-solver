@@ -286,6 +286,12 @@ export type DestructibleCore = {
   stepSafe: (dtOverride?: number) => void;
   setGravity: (g: number) => void;
   setSolverGravityEnabled: (v: boolean) => void;
+  /**
+   * Enable/disable feeding spinning dynamic actors their centrifugal acceleration each frame so
+   * tumbling debris keeps self-stressing (NVIDIA Blast applies this to dynamic actors by default).
+   * Off by default; opt in when large fragments should secondary-fracture as they rotate.
+   */
+  setSolverCentrifugalEnabled: (v: boolean) => void;
   /** @deprecated Use setDebrisCollisionMode instead */
   setSingleCollisionMode: (mode: SingleCollisionMode) => void;
   setDebrisCollisionMode: (mode: DebrisCollisionMode) => void;
