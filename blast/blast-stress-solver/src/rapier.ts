@@ -4,6 +4,8 @@ export * from './rapier/scenario';
 export * from './rapier/splitMigrator';
 export * from './rapier/frameProfiler';
 export * from './rapier/frameProfilerOverlay';
+export * from './rapier/sessionRecorder';
+export * from './rapier/recordingOverlay';
 export * from './rapier/collisionGroups';
 export * from './rapier/contactBuffer';
 export * from './rapier/contactHelpers';
