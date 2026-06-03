@@ -90,10 +90,26 @@
     <h1>blast-stress-solver</h1>
     <p class="subtitle">
       Interactive demos showcasing the NVIDIA Blast stress solver runtime —
-      physics-based destruction with Rapier &amp; Three.js.
+      physics-based destruction with Rapier &amp; Three.js. Every destruction demo carries a
+      live <strong>⚡ frame-profiler overlay</strong>: a real-time per-phase breakdown of what
+      each frame costs (and what causes a dip below 60&nbsp;fps), with an A/B toggle for the
+      old split planner.
     </p>
 
     <div class="grid">
+      <!-- Performance / benchmarking -->
+      <a class="card" href="./split-planner-bench.html">
+        <div class="card-icon">⚡</div>
+        <h2>Split-Planner Benchmark</h2>
+        <p>
+          Live A/B of the fracture split planner: the shipping connected-component
+          planner vs. the old <code>O(N³)</code> dense Hungarian it replaced. Watch the
+          old planner blow past the 60&nbsp;fps frame budget while the new one stays flat —
+          same optimal assignment, hundreds-to-thousands× faster. Pure CPU, no physics.
+        </p>
+        <span class="tag new">NEW — performance</span>
+      </a>
+
       <!-- New high-level API demos -->
       <a class="card" href="./wall-demolition.html">
         <div class="card-icon">🧱</div>
@@ -111,9 +127,11 @@
         <h2>Tower Collapse</h2>
         <p>
           Tall tower with stress-based fracture. Shoot projectiles or increase gravity
-          to trigger cascading collapse via the packaged runtime.
+          to trigger cascading collapse. Now with a <strong>live frame profiler</strong>:
+          a real-time per-phase breakdown showing exactly what causes each dip below
+          60&nbsp;fps — plus an A/B toggle to overlay the old split planner's cost.
         </p>
-        <span class="tag new">NEW — rapier + three</span>
+        <span class="tag new">NEW — rapier + three + live profiler</span>
       </a>
 
       <a class="card" href="./fractured-wall.html">
