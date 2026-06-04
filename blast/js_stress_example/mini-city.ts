@@ -69,6 +69,9 @@ const CONFIG = {
     debrisCleanupMode: 'always',
     debrisTtlMs: 8000,
     maxCollidersForDebris: 2,
+    // Island-aware solve: solve each disconnected group independently and skip groups that have
+    // settled (no input change + already converged). Off by default; toggled live in the sidebar.
+    islandSolver: false,
   },
   features: { debug: false },
 };
@@ -150,6 +153,8 @@ function updateStatus(core: any) {
   const detached = core.chunks.filter((c: any) => c.detached).length;
   setText('stat-chunks', `${detached} detached`);
   setText('stat-fragments', String(core.chunks.length));
+  const isl = core.getIslandSolverStats?.();
+  setText('stat-islands', isl?.enabled ? `${isl.islandsSkipped}/${isl.islandCount} skipped` : 'off');
 }
 function updatePerf() {
   setText('stat-physics-ms', _physicsMs.toFixed(1) + ' ms');
@@ -430,6 +435,7 @@ async function initScene() {
   });
 
   coreRef = core;
+  core.setIslandSolver?.({ enabled: CONFIG.optimization.islandSolver }); // persist the toggle across rebuilds
   recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -621,6 +627,20 @@ function bindSelect(
     onChange?.(select.value);
   });
 }
+function bindToggle(
+  id: string,
+  obj: Record<string, any>,
+  key: string,
+  onChange?: (v: boolean) => void,
+) {
+  const box = document.getElementById(id) as HTMLInputElement | null;
+  if (!box) return;
+  box.checked = Boolean(obj[key]);
+  box.addEventListener('change', () => {
+    obj[key] = box.checked;
+    onChange?.(box.checked);
+  });
+}
 
 // City (deferred — needs Reset/Rebuild)
 bindSlider('cfg-grid', CONFIG.city, 'grid', (v) => `${v}×${v}`);
@@ -682,6 +702,9 @@ bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 100
     mode: CONFIG.optimization.debrisCleanupMode as any,
     debrisTtlMs: v,
   }),
+);
+bindToggle('cfg-island-solver', CONFIG.optimization, 'islandSolver', (v) =>
+  coreRef?.setIslandSolver?.({ enabled: v }),
 );
 
 // Actions
