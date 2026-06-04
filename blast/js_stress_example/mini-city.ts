@@ -22,7 +22,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import * as pinata from '@dgreenheck/three-pinata';
-import { buildDestructibleCore, createRecordingOverlay } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
@@ -313,11 +313,18 @@ async function buildCity(): Promise<ScenarioDesc> {
 
 // ── Scene lifecycle ───────────────────────────────────────────
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
+// Reusable, self-mounting live frame-profiler overlay (bottom-left): per-phase
+// physics cost + A/B comparison.
+const profiler = createFrameProfilerOverlay();
 // Session recorder — ● Record captures every dynamic body's per-frame
 // position/orientation + linear/angular velocity, every input (clicks, meteor
 // storm, detonation, forces) and every fracture/topology change into a single
-// gzipped bug-report bundle (⬇ Save). Zero allocation on the hot path.
-const recorder = createRecordingOverlay({ exportName: 'mini-city-recording' });
+// gzipped bug-report bundle (⬇ Save). The profiler trace rides along in the
+// bundle. Zero allocation on the hot path.
+const recorder = createRecordingOverlay({
+  exportName: 'mini-city-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let cityGroup: THREE.Group | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
@@ -373,6 +380,7 @@ async function initScene() {
 
   coreRef = core;
   recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
+  profiler.attach(core);
   visualsRef = visuals;
   cityGroup = group;
   initialBonds = core.getActiveBondsCount();
@@ -640,6 +648,7 @@ document.getElementById('btn-debug')?.addEventListener('click', () => {
 const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
+  profiler.render();
   stats.begin();
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();
