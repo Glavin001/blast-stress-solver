@@ -190,6 +190,34 @@ if (has('--perf')) {
     console.log(`  ${'(unaccounted/other)'.padEnd(22)} ${fms(other)}  ${pct(other)}`);
     console.log(`  accounted by leaf phases: ${(100 * leafSum / totalAll).toFixed(1)}%`);
 
+    // ── Solver phase breakdown (sub-phases of solverUpdateMs) ───────────────────
+    // solverUpdateMs is a wrapper: JS gravity fill + JS contact/splash injection
+    // + the WASM CGNR solve. Splitting it tells us whether the next perf effort
+    // belongs in JS (our injection code) or the vendored solver.
+    const solverTotal = sum(t.solverUpdateMs || []);
+    if (solverTotal > 1e-6) {
+      const subDefs = [
+        ['gravity inject (JS)', 'solverGravityInjectMs'],
+        ['contact inject (JS)', 'solverContactInjectMs'],
+        ['CGNR solve   (WASM)', 'solverSolveMs'],
+      ];
+      const haveSub = subDefs.some(([, k]) => t[k]);
+      console.log(`\n  ── Solver phase breakdown (Σ solverUpdateMs ${solverTotal.toFixed(1)} ms) ──`);
+      if (!haveSub) {
+        console.log('  (sub-phase timers not present — recording predates the solver breakdown)');
+      } else {
+        const spct = (v) => `${(solverTotal > 0 ? (100 * v) / solverTotal : 0).toFixed(1)}%`.padStart(6);
+        let subSum = 0;
+        for (const [label, k] of subDefs) {
+          const ms = sum(t[k] || []);
+          subSum += ms;
+          console.log(`  ${label.padEnd(22)} ${fms(ms)}  ${spct(ms)} of solver   ${(ms / (b - a + 1)).toFixed(3)} ms/frame`);
+        }
+        const subOther = Math.max(0, solverTotal - subSum);
+        console.log(`  ${'(predicate/overhead)'.padEnd(22)} ${fms(subOther)}  ${spct(subOther)} of solver`);
+      }
+    }
+
     // Slowest frames + their dominant phase (the spikes worth investigating).
     const order = [...Array(nf).keys()].filter((i) => i >= a && i <= b).sort((i, j) => t.totalMs[j] - t.totalMs[i]).slice(0, 10);
     console.log('\n  slowest frames:  frame  totalMs   dominant phase           resimPasses  bodies');
