@@ -110,9 +110,13 @@ type ProfilerConfigLike = {
  */
 export const TIMING_FIELDS = [
   'totalMs',
-  // physics + solver
+  // physics + solver (solver* sub-phases break down solverUpdateMs: JS gravity
+  // fill, JS contact/splash injection, vs. the WASM CGNR solve)
   'rapierStepMs',
   'solverUpdateMs',
+  'solverGravityInjectMs',
+  'solverContactInjectMs',
+  'solverSolveMs',
   // contacts / forces
   'contactDrainMs',
   'externalForceMs',
