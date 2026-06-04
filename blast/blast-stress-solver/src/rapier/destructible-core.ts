@@ -2124,9 +2124,11 @@ export async function buildDestructibleCore({
     return bondTable.length - removedBondIndices.size;
   }
 
-  function getSolverDebugLines(): Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }> {
+  function getSolverDebugLines(
+    mode: number = 0 /* ExtDebugMode: 0=Max 1=Compression 2=Tension 3=Shear */,
+  ): Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }> {
     try {
-      return (solver as any).fillDebugRender?.({ mode: 0 /* ExtDebugMode.Max */, scale: 1.0 }) ?? [];
+      return (solver as any).fillDebugRender?.({ mode, scale: 1.0 }) ?? [];
     } catch {
       return [];
     }
@@ -2209,6 +2211,7 @@ export async function buildDestructibleCore({
   }
 
   function setGravityFn(g: number) {
+    gravity = g; // also drive the STRESS solver's per-actor gravity (not just Rapier's)
     world.gravity = { x: 0, y: g, z: 0 };
   }
 
