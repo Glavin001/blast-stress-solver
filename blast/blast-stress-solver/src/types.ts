@@ -551,6 +551,15 @@ export interface ExtStressSolver {
   setIslandAware(enabled: boolean): void;
   /** Whether island-aware solving is currently enabled. */
   islandAware(): boolean;
+  /** Enable/disable skipping settled islands (requires islandAware). An island whose
+   *  velocity inputs are unchanged since its last solve and that already converged is not
+   *  re-solved (the solve would be a no-op); its stresses are kept. Any new input (contact,
+   *  wake) re-solves it the same frame. Paused, never evicted. Default: disabled. */
+  setSkipSettled(enabled: boolean): void;
+  /** Whether settled-island skipping is currently enabled. */
+  skipSettled(): boolean;
+  /** Number of settled islands skipped during the last update(). */
+  islandsSkipped(): number;
   /** Snapshot the current actor table (actor index + owned nodes). */
   actors(): Array<{ actorIndex: number; nodes: number[] }>;
   /** Generate fracture commands for the last update. */

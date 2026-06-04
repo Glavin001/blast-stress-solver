@@ -41,6 +41,16 @@ typedef CGNR<AngLin6, AngLin6Ops<Float_Scalar>, BondMatrixS, BondMatrixOpsS<Floa
 typedef CGNR<AngLin6, AngLin6Ops<SIMD_Scalar>, BondMatrixS, BondMatrixOpsS<SIMD_Scalar>, SIMD_Scalar, AngLin6ErrorSq>       CGNR_SIMD;
 
 
+// Bit-exact velocity comparison. A settled island is only skipped when its inputs are *identical*
+// to its last solve, so any change (a new contact, a body waking) differs here and re-solves it
+// that same frame. Used by StressProcessor::solveIslandAware.
+static inline bool angLin6Equal(const AngLin6& a, const AngLin6& b)
+{
+    return a.ang.x == b.ang.x && a.ang.y == b.ang.y && a.ang.z == b.ang.z
+        && a.lin.x == b.lin.x && a.lin.y == b.lin.y && a.lin.z == b.lin.z;
+}
+
+
 /**
  * StressProcessor static members
  */
@@ -76,6 +86,7 @@ StressProcessor::prepare(const SolverNodeS* nodes, uint32_t N_nodes, const Solve
     m_B_scratch.resize(N_nodes);
     m_solver_cache.resize(s_use_simd ? CGNR_SIMD().required_cache_size(N_nodes, N_bonds) : CGNR_SISD().required_cache_size(N_nodes, N_bonds));
     m_can_resume = false;
+    m_skipValid = false;        // topology changed: drop the settled-state baseline so a fresh one is rebuilt
 
     // Calculate bond offsets and length scale
     uint32_t offsets_to_scale = 0;
@@ -316,7 +327,13 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
         m_bondIsland[b] = rootIsland[rep];
     }
 
-    if (islandCount <= 1) return 0;     // single island: caller uses the bit-identical whole-graph path
+    if (islandCount <= 1)
+    {
+        m_skipValid = false;            // whole-graph path runs (no per-island baseline maintained this frame)
+        m_lastIslandsTotal = 0;
+        m_lastIslandsSkipped = 0;
+        return 0;                       // single island: caller uses the bit-identical whole-graph path
+    }
 
     handled = true;
 
@@ -345,6 +362,8 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
     m_localImpulses.resize(N_bonds);
     m_rhs.resize(N_nodes);
     m_B_scratch.resize(N_nodes);
+    m_lastVel.resize(N_nodes);
+    m_nodeConverged.resize(N_nodes, 0);
 
     const float recip_length_scale          = 1.0f / m_length_scale;
     const float recip_mass_scale            = 1.0f / m_mass_scale;
@@ -362,9 +381,13 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
     int  totalIters   = 0;
     bool allConverged = true;
     AngLin6ErrorSq totalErr = { 0.0f, 0.0f };
+    uint32_t skipped = 0;
+    const bool trySkip = params.skipSettled && m_skipValid;
 
-    // ── 5. Per-island: gather a contiguous, island-local sub-system → run the same CGNR/scaling
-    //       as solve() → scatter the bond impulses back to their global positions. ──
+    // ── 5. Per-island: gather a contiguous, island-local sub-system → run the same CGNR/scaling as
+    //       solve() → scatter the bond impulses back. An island whose dynamic nodes' velocities are
+    //       bit-identical to its last solve and that already converged is skipped (its solve would be
+    //       a no-op): its impulses/stresses are kept unchanged. Paused, never evicted. ──
     for (uint32_t k = 0; k < islandCount; ++k)
     {
         const uint32_t bBegin = m_islandBondBegin[k];
@@ -373,21 +396,40 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
         if (localN == 0) continue;
         const uint32_t stamp = k + 1;
 
-        // Gather island-local nodes (renumbered 0..localM), couplings, and warm-start impulses.
+        // Gather island-local nodes (renumbered 0..localM), couplings, and warm-start impulses, and
+        // (when eligible) test settled-state: every DYNAMIC node's velocity unchanged and last solve
+        // converged. Static (zero-mass) nodes are anchors that carry no coupling, so they are ignored.
+        bool skippable = trySkip;
         uint32_t localM = 0;
         for (uint32_t t = bBegin; t < bEnd; ++t)
         {
             const uint32_t b  = m_bondsByIsland[t];
             const uint32_t g0 = C[b].node0;
             const uint32_t g1 = C[b].node1;
-            if (m_g2lStamp[g0] != stamp) { m_g2lStamp[g0] = stamp; m_g2l[g0] = localM; m_l2g[localM] = g0; localI[localM] = sqrt_I_inv[g0]; ++localM; }
-            if (m_g2lStamp[g1] != stamp) { m_g2lStamp[g1] = stamp; m_g2l[g1] = localM; m_l2g[localM] = g1; localI[localM] = sqrt_I_inv[g1]; ++localM; }
+            if (m_g2lStamp[g0] != stamp)
+            {
+                m_g2lStamp[g0] = stamp; m_g2l[g0] = localM; m_l2g[localM] = g0; localI[localM] = sqrt_I_inv[g0]; ++localM;
+                if (skippable && sqrt_I_inv[g0].m > 0.0f && !(m_nodeConverged[g0] && angLin6Equal(velocities[g0], m_lastVel[g0]))) skippable = false;
+            }
+            if (m_g2lStamp[g1] != stamp)
+            {
+                m_g2lStamp[g1] = stamp; m_g2l[g1] = localM; m_l2g[localM] = g1; localI[localM] = sqrt_I_inv[g1]; ++localM;
+                if (skippable && sqrt_I_inv[g1].m > 0.0f && !(m_nodeConverged[g1] && angLin6Equal(velocities[g1], m_lastVel[g1]))) skippable = false;
+            }
             const uint32_t lb = t - bBegin;
             Coupling lc = C[b];
             lc.node0 = m_g2l[g0];
             lc.node1 = m_g2l[g1];
             localC[lb] = lc;
             x[lb] = impulses[b];
+        }
+
+        if (skippable)
+        {
+            // Inputs unchanged and already converged → re-solving is a no-op. Keep this island's bond
+            // impulses (and hence its stresses) exactly as they are; the baseline already matches.
+            ++skipped;
+            continue;
         }
 
         // Warm-start impulse scaling (matches solve()).
@@ -411,7 +453,12 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
             bi.ang = v_i.ang / (-(I_i.I > 0 ? I_i.I : 1.0f));
             bi.lin = (-recip_length_scale / (I_i.m > 0 ? I_i.m : 1.0f)) * v_i.lin;
         }
-        if (bad) { allConverged = false; continue; }
+        if (bad)
+        {
+            allConverged = false;
+            for (uint32_t i = 0; i < localM; ++i) m_nodeConverged[m_l2g[i]] = 0;   // never skip a bad island
+            continue;
+        }
 
         // Island-local bond matrix view over the gathered couplings/inertia.
         BondMatrixS lB;
@@ -433,12 +480,19 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
             impulses[m_bondsByIsland[bBegin + j]] = x[j];
         }
 
+        // Record the settled-state baseline for next frame: the inputs just solved and whether it converged.
+        const uint8_t cv = (r >= 0) ? 1u : 0u;
+        for (uint32_t i = 0; i < localM; ++i) { const uint32_t g = m_l2g[i]; m_lastVel[g] = velocities[g]; m_nodeConverged[g] = cv; }
+
         if (r < 0) { allConverged = false; totalIters += -r; } else { totalIters += r; }
         totalErr.ang += err.ang;
         totalErr.lin += err.lin;
     }
 
-    m_can_resume = false;       // island path does not maintain the hot-resume cache
+    m_can_resume = false;           // island path does not maintain the hot-resume cache
+    m_skipValid = true;             // baseline is current; islands may be skipped next frame
+    m_lastIslandsTotal = islandCount;
+    m_lastIslandsSkipped = skipped;
     if (error_sq) *error_sq = totalErr;
     return allConverged ? totalIters : -totalIters;
 }
@@ -453,6 +507,7 @@ StressProcessor::removeBond(uint32_t bondIndex)
     m_couplings.pop_back();
     --m_B.N;
     m_can_resume = false;
+    m_skipValid = false;        // topology changed: drop the settled-state baseline
 
     return true;
 }

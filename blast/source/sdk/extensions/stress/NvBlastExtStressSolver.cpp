@@ -178,17 +178,21 @@ public:
         m_forceColdStart = true;
     }
 
-    void solve(uint32_t iterationCount, bool warmStart = true, bool islandAware = false)
+    void solve(uint32_t iterationCount, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
         StressProcessor::SolverParams params;
         params.maxIter = iterationCount;
         params.tolerance = 0.001f;
         params.warmStart = warmStart && !m_forceColdStart;
         params.islandAware = islandAware;
+        params.skipSettled = skipSettled;
         m_converged = (m_stressProcessor.solve(m_impulses.data(), m_velocities.data(), params, &m_error_sq) >= 0);
         m_forceColdStart = false;
         m_inputsChanged = false;
     }
+
+    // Number of settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
+    uint32_t getIslandsSkipped() const { return m_stressProcessor.getLastIslandsSkipped(); }
 
     bool calcError(float& linear, float& angular) const
     {
@@ -347,6 +351,12 @@ public:
     uint32_t getIslandCount() const
     {
         return m_islandCount;
+    }
+
+    // Settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
+    uint32_t getIslandsSkipped() const
+    {
+        return m_solver.getIslandsSkipped();
     }
 
     void calcSolverBondStresses(
@@ -546,7 +556,7 @@ public:
         return m_graphReductionLevel;
     }
 
-    void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false)
+    void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
         sync(bonds);
 
@@ -555,7 +565,7 @@ public:
             m_solver.setNodeVelocities(node.solverNode, node.localVel, NvVec3(NvZero));
         }
 
-        m_solver.solve(settings.maxSolverIterationsPerFrame, warmStart, islandAware);
+        m_solver.solve(settings.maxSolverIterationsPerFrame, warmStart, islandAware, skipSettled);
 
         resetVelocities();
 
@@ -758,7 +768,7 @@ private:
     // physically independent islands. Recomputed only on topology change.
     // m_nodeIsland[solverNode] holds the compacted island id (InvalidIndex for
     // static nodes); m_islandCount is the number of dynamic islands. This is the
-    // foundation for solving each island independently and skipping quiescent ones.
+    // foundation for solving each island independently and skipping settled ones.
     uint32_t islandFind(uint32_t x)
     {
         uint32_t r = x;
@@ -1137,6 +1147,21 @@ public:
         return m_islandAware;
     }
 
+    virtual void                            setSkipSettled(bool enabled) override
+    {
+        m_skipSettled = enabled;
+    }
+
+    virtual bool                            getSkipSettled() const override
+    {
+        return m_skipSettled;
+    }
+
+    virtual uint32_t                        getIslandsSkipped() const override
+    {
+        return m_graphProcessor->getIslandsSkipped();
+    }
+
     virtual void                            generateFractureCommands(const NvBlastActor& actor, NvBlastFractureBuffers& commands) override;
     virtual uint32_t                        generateFractureCommandsPerActor(const NvBlastActor** actorBuffer, NvBlastFractureBuffers* commandsBuffer, uint32_t bufferSize) override;
 
@@ -1245,6 +1270,7 @@ private:
     float                                                               m_errorLinear;
     bool                                                                m_converged;
     bool                                                                m_islandAware;
+    bool                                                                m_skipSettled;
     uint32_t                                                            m_framesCount;
     Array<NvBlastBondFractureData>::type                                m_bondFractureBuffer;
     Array<uint8_t>::type                                                m_scratch;
@@ -1272,7 +1298,7 @@ NV_INLINE T* ExtStressSolverImpl::getScratchArray(uint32_t size)
 ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtStressSolverSettings& settings)
     : m_family(family), m_settings(settings), m_isDirty(false), m_reset(false),
     m_errorAngular(std::numeric_limits<float>::max()), m_errorLinear(std::numeric_limits<float>::max()),
-    m_converged(false), m_islandAware(false), m_framesCount(0), m_valid(false)
+    m_converged(false), m_islandAware(false), m_skipSettled(false), m_framesCount(0), m_valid(false)
 {
     // this needs to be called any time settings change, including when they are first set
     inheritSettingsLimits();
@@ -1663,7 +1689,7 @@ void ExtStressSolverImpl::solve()
 {
     NV_SIMD_GUARD;
 
-    m_graphProcessor->solve(m_settings, m_bondHealths, m_bonds, WARM_START && !m_reset, m_islandAware);
+    m_graphProcessor->solve(m_settings, m_bondHealths, m_bonds, WARM_START && !m_reset, m_islandAware, m_skipSettled);
     m_reset = false;
 
     m_converged = m_graphProcessor->calcError(m_errorLinear, m_errorAngular);

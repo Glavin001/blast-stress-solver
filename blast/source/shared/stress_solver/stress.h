@@ -34,7 +34,8 @@ class StressProcessor
 {
 public:
     /** Constructor clears member data. */
-    StressProcessor() : m_mass_scale(0.0f), m_length_scale(0.0f), m_can_resume(false) {}
+    StressProcessor() : m_mass_scale(0.0f), m_length_scale(0.0f), m_can_resume(false),
+        m_skipValid(false), m_lastIslandsSkipped(0), m_lastIslandsTotal(0) {}
 
     /** Parameters controlling the data preparation. */
     struct DataParams
@@ -52,6 +53,9 @@ public:
         bool        islandAware     = false;    // Solve each disconnected component ("island") independently. With <=1 island this falls back to the
                                                 // whole-graph path, so it is bit-identical to the legacy solve; with multiple islands the result matches
                                                 // within solver tolerance (same scaling, same matrix entries; only the CG iteration is partitioned).
+        bool        skipSettled   = false;    // Requires islandAware. Skip any island whose velocity inputs are bit-identical to its last solve and that
+                                                // already converged: the solve would be a no-op (0 iterations), so its bond impulses/stresses are kept. Any
+                                                // input change (new contact, wake) differs the velocity and re-solves that island the same frame. Never evicts.
     };
 
     /**
@@ -102,6 +106,12 @@ public:
      */
     uint32_t    getBondCount() const { return (uint32_t)m_couplings.size(); }
 
+    /** \return number of islands skipped as settled in the last island-aware solve. */
+    uint32_t    getLastIslandsSkipped() const { return m_lastIslandsSkipped; }
+
+    /** \return number of islands processed in the last island-aware solve (0 if the whole-graph path ran). */
+    uint32_t    getLastIslandsTotal() const { return m_lastIslandsTotal; }
+
     /**
      * \return whether or not the solver uses SIMD.  If the device and OS support SSE, AVX, and FMA instruction sets, SIMD is used. 
      */
@@ -141,6 +151,16 @@ protected:
     POD_Buffer<Coupling>    m_localC;           // island-local couplings (node indices renumbered local)
     POD_Buffer<InertiaS>    m_localI;           // island-local recip_sqrt_I
     POD_Buffer<AngLin6>     m_localImpulses;    // island-local impulses (gather in, scatter out)
+
+    // Settled skip state (Stage 3): per-node last-solved velocity + per-node convergence, so an
+    // island whose inputs are bit-identical to its last solve and already converged can be skipped
+    // (the solve would be a no-op). Invalidated on any topology change (prepare/removeBond) and on
+    // the whole-graph fallback, so a fresh baseline is always re-established before any skip.
+    POD_Buffer<AngLin6>     m_lastVel;
+    std::vector<uint8_t>    m_nodeConverged;
+    bool                    m_skipValid;
+    uint32_t                m_lastIslandsSkipped;
+    uint32_t                m_lastIslandsTotal;
 
     static const bool       s_use_simd;
 };

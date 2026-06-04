@@ -1,7 +1,7 @@
 /**
  * Island identity (Stage 2a): the solver partitions its graph into connected
  * components ("islands") that are independent of Blast actors. This is the
- * foundation for solving each island separately and skipping quiescent ones.
+ * foundation for solving each island separately and skipping settled ones.
  *
  * The load-bearing proof: two arms joined ONLY through a shared static (mass=0)
  * ground node are a SINGLE Blast actor (they're connected in the support graph)

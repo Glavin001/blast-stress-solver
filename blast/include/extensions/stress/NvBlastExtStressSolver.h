@@ -275,6 +275,26 @@ public:
     virtual bool                            getIslandAware() const = 0;
 
     /**
+    Enable or disable skipping of settled islands (requires island-aware solving). An island whose
+    velocity inputs are unchanged since its last solve and that already converged is not re-solved (the
+    solve would be a no-op); its impulses/stresses are kept. Any new input (contact, wake) re-solves it
+    the same frame, and topology changes rebuild the baseline first. Paused, never evicted. Default: off.
+
+    \param[in]  enabled     true to skip settled islands.
+    */
+    virtual void                            setSkipSettled(bool enabled) = 0;
+
+    /**
+    \return whether settled-island skipping is currently enabled.
+    */
+    virtual bool                            getSkipSettled() const = 0;
+
+    /**
+    \return the number of settled islands skipped during the last update().
+    */
+    virtual uint32_t                        getIslandsSkipped() const = 0;
+
+    /**
     Generate fracture commands for particular actor.
 
     Calling this function if getOverstressedBondCount() == 0 or actor has no bond doesn't make sense, bondFractureCount will be '0'.

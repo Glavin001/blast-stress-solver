@@ -162,6 +162,12 @@ uint32_t ext_stress_solver_island_count(const ExtStressSolverHandle* handle);
 void ext_stress_solver_set_island_aware(ExtStressSolverHandle* handle, uint8_t enabled);
 uint8_t ext_stress_solver_get_island_aware(const ExtStressSolverHandle* handle);
 
+// Enable/disable skipping of settled islands (requires island-aware). islands_skipped reports the
+// number skipped in the last update.
+void ext_stress_solver_set_skip_settled(ExtStressSolverHandle* handle, uint8_t enabled);
+uint8_t ext_stress_solver_get_skip_settled(const ExtStressSolverHandle* handle);
+uint32_t ext_stress_solver_islands_skipped(const ExtStressSolverHandle* handle);
+
 uint32_t ext_stress_sizeof_ext_node_desc();
 uint32_t ext_stress_sizeof_ext_bond_desc();
 uint32_t ext_stress_sizeof_ext_settings();
