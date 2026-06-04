@@ -65,6 +65,32 @@ export type DebrisCleanupOptions = {
 };
 
 /**
+ * Options for solver eviction — retiring settled/detached debris from the stress
+ * solve so the solver stops spending iterations on inert fragments.
+ *
+ * When a fragment comes to rest as its own rigid body, its internal stress is
+ * static; re-solving it every frame is wasted work. Eviction drops the fragment's
+ * actor (nodes + internal bonds) from the WASM solver while leaving the rigid body
+ * intact as inert debris, so the solver graph shrinks as debris settles instead of
+ * carrying every fragment for the rest of the session.
+ *
+ * Trade-off: an evicted cluster can no longer fracture further, which is why
+ * eviction only fires once a body has actually settled (Rapier-asleep) and is
+ * opt-in (default `mode: 'off'`).
+ */
+export type SolverEvictionOptions = {
+  /** When to evict settled bodies (default: 'off'). `'afterGroundCollision'`
+   *  restricts eviction to bodies that have touched the ground. */
+  mode?: OptimizationMode;
+  /** Only evict bodies with at least this many colliders. Single-collider
+   *  fragments are already excluded from the solve, so the floor is 2 (default: 2). */
+  minColliders?: number;
+  /** Optionally keep larger pieces solvable so they can still fracture on a later
+   *  impact. 0 / undefined = no upper bound — evict any settled body (default: 0). */
+  maxColliders?: number;
+};
+
+/**
  * Controls how fractures are processed per frame — a spectrum from full realism
  * to real-time performance. Each knob has a physical interpretation.
  *
@@ -320,6 +346,10 @@ export type DestructibleCore = {
   setDebrisCleanup?: (opts: DebrisCleanupOptions) => void;
   getDebrisCleanupSettings?: () => DebrisCleanupOptions & { mode: OptimizationMode };
   setMaxCollidersForDebris?: (n: number) => void;
+  // Solver eviction API - retire settled debris from the stress solve
+  setSolverEviction?: (opts: SolverEvictionOptions) => void;
+  getSolverEvictionSettings?: () => SolverEvictionOptions & { mode: OptimizationMode };
+  getSolverEvictionStats?: () => { mode: OptimizationMode; evictedBodies: number; evictedBonds: number };
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

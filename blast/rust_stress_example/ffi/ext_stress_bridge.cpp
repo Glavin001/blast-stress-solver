@@ -565,6 +565,43 @@ ext_stress_solver_add_actor_gravity(ExtStressSolverHandle* handlePtr,
     return 1U;
 }
 
+extern "C" uint8_t
+ext_stress_solver_deactivate_actor(ExtStressSolverHandle* handlePtr, uint32_t actor_index)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0U;
+    }
+
+    auto* entry = findActorByIndex(*handle, actor_index);
+    if (!entry || !entry->actor)
+    {
+        return 0U;
+    }
+
+    const size_t entryIndex = static_cast<size_t>(entry - handle->actors.data());
+
+    // Evict an inert/detached actor from the stress solve without splitting it.
+    //
+    // notifyActorDestroyed removes the actor from the solver's active set and
+    // marks the support graph dirty, so on the next update() its nodes and bonds
+    // are dropped from the CGNR system (the solver stops spending iterations on
+    // it). Unlike apply_fracture_commands, we deliberately do NOT call
+    // NvBlastActorSplit: the NvBlastActor stays intact in the family, so the
+    // caller keeps the corresponding rigid body alive as a single piece of inert
+    // debris. The actor is not re-added (rebuildActorTable only runs at create),
+    // so it will not be re-solved or re-fractured for the rest of the session.
+    handle->solver->notifyActorDestroyed(*entry->actor);
+
+    if (entryIndex < handle->actors.size())
+    {
+        handle->actors.erase(handle->actors.begin() + static_cast<std::ptrdiff_t>(entryIndex));
+    }
+
+    return 1U;
+}
+
 extern "C" void
 ext_stress_solver_update(ExtStressSolverHandle* handlePtr)
 {

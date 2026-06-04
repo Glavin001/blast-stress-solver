@@ -743,6 +743,12 @@ class ExtStressSolver implements ExtStressSolverType {
     return result !== 0;
   }
 
+  deactivateActor(actorIndex: number): boolean {
+    if (!this.handle) return false;
+    const result = this.module.ccall('ext_stress_solver_deactivate_actor', 'number', ['number', 'number'], [this.handle, actorIndex >>> 0]) >>> 0;
+    return result !== 0;
+  }
+
   update(): void { if (!this.handle) return; this.module.ccall('ext_stress_solver_update', null, ['number'], [this.handle]); }
   overstressedBondCount(): number { if (!this.handle) return 0; return this.module.ccall('ext_stress_solver_overstressed_bond_count', 'number', ['number'], [this.handle]) >>> 0; }
 

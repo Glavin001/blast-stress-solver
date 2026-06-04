@@ -16,6 +16,7 @@ import type {
   DebrisCollisionMode,
   SmallBodyDampingOptions,
   DebrisCleanupOptions,
+  SolverEvictionOptions,
   OptimizationMode,
   FracturePolicy,
 } from './types';
@@ -84,6 +85,9 @@ export type BuildDestructibleCoreOptions = {
   sleepMode?: OptimizationMode;
   smallBodyDamping?: SmallBodyDampingOptions;
   debrisCleanup?: DebrisCleanupOptions;
+  /** Retire settled/detached debris from the stress solve so it stops consuming
+   *  solver iterations. Defaults to `mode: 'off'`. */
+  solverEviction?: SolverEvictionOptions;
   /** Controls fracture rate, body creation budget, and dynamic body limits.
    *  All fields default to -1 (unlimited = original behavior). */
   fracturePolicy?: FracturePolicy;
@@ -178,6 +182,7 @@ export async function buildDestructibleCore({
   sleepMode = 'off',
   smallBodyDamping,
   debrisCleanup,
+  solverEviction,
   fracturePolicy,
 }: BuildDestructibleCoreOptions): Promise<DestructibleCore> {
   await RAPIER.init();
@@ -383,6 +388,44 @@ export async function buildDestructibleCore({
     }
     if (typeof opts.maxCollidersForDebris === 'number' && Number.isFinite(opts.maxCollidersForDebris)) {
       debrisCleanupSettings.maxCollidersForDebris = Math.max(1, Math.floor(opts.maxCollidersForDebris));
+    }
+  }
+
+  // ── Solver eviction settings ──
+  // Retire detached, settled clusters from the stress solve. Once a fragment has
+  // come to rest as its own rigid body, its internal stress is static and
+  // re-solving it every frame is wasted work — so we drop its actor (nodes +
+  // bonds) from the WASM solver while leaving the rigid body intact as inert
+  // debris. The solver graph then shrinks as debris settles, instead of carrying
+  // every fragment for the rest of the session. Trade-off: an evicted cluster
+  // can no longer fracture further, so this only fires for bodies that have
+  // settled (Rapier-asleep) and is opt-in (default 'off').
+  const solverEvictionSettings = {
+    mode: (solverEviction?.mode as OptimizationMode) ?? 'off',
+    // Only evict bodies with at least this many colliders. Single-collider
+    // fragments are already excluded from the solve (a 1-node actor is never
+    // active), so the floor is 2.
+    minColliders: Math.max(2, Math.floor(solverEviction?.minColliders ?? 2)),
+    // Optionally keep large pieces solvable so they can still fracture on a
+    // later impact. 0 / undefined = no upper bound (evict any settled body).
+    maxColliders: solverEviction?.maxColliders != null && Number.isFinite(solverEviction.maxColliders)
+      ? Math.max(0, Math.floor(solverEviction.maxColliders))
+      : 0,
+  };
+  // Bodies already retired from the solve (so we never re-process them).
+  const solverEvictedBodies = new Set<number>();
+  let solverEvictedBodiesTotal = 0;
+  let solverEvictedBondsTotal = 0;
+
+  function updateSolverEviction(opts: SolverEvictionOptions) {
+    if (opts.mode != null) {
+      solverEvictionSettings.mode = opts.mode;
+    }
+    if (typeof opts.minColliders === 'number' && Number.isFinite(opts.minColliders)) {
+      solverEvictionSettings.minColliders = Math.max(2, Math.floor(opts.minColliders));
+    }
+    if (typeof opts.maxColliders === 'number' && Number.isFinite(opts.maxColliders)) {
+      solverEvictionSettings.maxColliders = Math.max(0, Math.floor(opts.maxColliders));
     }
   }
 
@@ -1674,6 +1717,9 @@ export async function buildDestructibleCore({
       nodesByBodyHandle.delete(bh);
       debrisCreationTimes.delete(bh);
       bodyRestoreProvenance.delete(bh);
+      // Forget eviction state so a future body reusing this Rapier handle is
+      // re-evaluated rather than skipped as already-evicted.
+      solverEvictedBodies.delete(bh);
     }
     bodiesToRemove.clear();
     stopTiming(t0, 'cleanupDisabledMs');
@@ -1701,6 +1747,68 @@ export async function buildDestructibleCore({
       }
       bodiesToRemove.add(bodyHandle);
       debrisCreationTimes.delete(bodyHandle);
+    }
+  }
+
+  // Retire detached, settled clusters from the stress solve. Runs in the
+  // pre-step sweep. Keeps the rigid body alive (it stays visible/physical) but
+  // drops its actor — nodes and internal bonds — from the WASM solver so
+  // update() stops spending CGNR iterations on inert debris.
+  function processSolverEviction() {
+    if (solverEvictionSettings.mode === 'off') return;
+    if (typeof (solver as unknown as { deactivateActor?: unknown }).deactivateActor !== 'function') return;
+    let evictedThisFrame = 0;
+    for (const [bodyHandle, nodes] of nodesByBodyHandle) {
+      if (solverEvictedBodies.has(bodyHandle)) continue;
+      if (bodyHandle === rootBody.handle || bodyHandle === groundBody.handle) continue;
+      const colliderCount = nodes.size;
+      if (colliderCount < solverEvictionSettings.minColliders) continue;
+      if (solverEvictionSettings.maxColliders > 0 && colliderCount > solverEvictionSettings.maxColliders) continue;
+      if (!shouldApplyOptimization(solverEvictionSettings.mode, bodyHandle)) continue;
+      const body = world.getRigidBody(bodyHandle);
+      if (!body || body.isFixed()) continue;
+      // Only retire bodies that have actually settled. A body still in motion
+      // keeps changing its body-local gravity (and thus its internal stress) as
+      // it tumbles, so re-solving it is not yet wasted work.
+      if (typeof body.isSleeping === 'function' && !body.isSleeping()) continue;
+
+      // Resolve the solver actor(s) owning this body's nodes. After a fracture a
+      // body maps 1:1 to one actor; gather distinct non-root indices defensively.
+      const actorsOnBody = new Set<number>();
+      for (const ni of nodes) {
+        const ai = nodeToActor.get(ni);
+        if (ai != null && ai !== 0) actorsOnBody.add(ai);
+      }
+      let deactivatedAny = false;
+      for (const actorIndex of actorsOnBody) {
+        if (solver.deactivateActor(actorIndex)) deactivatedAny = true;
+      }
+
+      // Mark retired regardless: if the solver had nothing to drop there is no
+      // point re-scanning this body every frame.
+      solverEvictedBodies.add(bodyHandle);
+      if (!deactivatedAny) continue;
+
+      // Keep JS-side bond bookkeeping consistent with the solver: the body's
+      // internal bonds are gone from the solve now (cross-body bonds were
+      // already removed when it detached).
+      for (const ni of nodes) {
+        const bondIdxs = bondsByNode.get(ni);
+        if (!bondIdxs) continue;
+        for (const bi of bondIdxs) {
+          if (removedBondIndices.has(bi)) continue;
+          const b = bondTable[bi];
+          if (nodes.has(b.node0) && nodes.has(b.node1)) {
+            removedBondIndices.add(bi);
+            solverEvictedBondsTotal += 1;
+          }
+        }
+      }
+      solverEvictedBodiesTotal += 1;
+      evictedThisFrame += 1;
+    }
+    if (activeProfilerSample && evictedThisFrame > 0) {
+      (activeProfilerSample as unknown as { solverEvictedBodies?: number }).solverEvictedBodies = evictedThisFrame;
     }
   }
 
@@ -2059,6 +2167,7 @@ export async function buildDestructibleCore({
     processDebrisCleanup();
     processSmallBodyDamping();
     processSleepThresholds();
+    processSolverEviction();
     cleanupDisabledColliders();
     stopTiming(preStepT0, 'preStepSweepMs');
 
@@ -2436,6 +2545,13 @@ export async function buildDestructibleCore({
     hasBodyCollidedWithGround: (bodyHandle: number) => bodiesCollidedWithGround.has(bodyHandle),
     setDebrisCleanup: updateDebrisCleanup,
     getDebrisCleanupSettings: () => ({ ...debrisCleanupSettings }),
+    setSolverEviction: updateSolverEviction,
+    getSolverEvictionSettings: () => ({ ...solverEvictionSettings }),
+    getSolverEvictionStats: () => ({
+      mode: solverEvictionSettings.mode,
+      evictedBodies: solverEvictedBodiesTotal,
+      evictedBonds: solverEvictedBondsTotal,
+    }),
     setMaxCollidersForDebris: (n: number) => {
       debrisCleanupSettings.maxCollidersForDebris = Math.max(1, Math.floor(n));
       applyCollisionGroupsToAllBodies();

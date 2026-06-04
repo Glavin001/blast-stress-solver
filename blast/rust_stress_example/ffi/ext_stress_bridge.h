@@ -97,6 +97,13 @@ uint8_t ext_stress_solver_add_actor_gravity(ExtStressSolverHandle* handle,
                                             uint32_t actor_index,
                                             const StressVec3* local_gravity);
 
+// Remove an actor from the stress solve without splitting it. The actor's nodes
+// and bonds are dropped from the solver on the next update(); the underlying
+// NvBlastActor (and the caller's rigid body) is left intact as inert debris.
+// Returns 1 if the actor was found and deactivated, 0 otherwise.
+uint8_t ext_stress_solver_deactivate_actor(ExtStressSolverHandle* handle,
+                                           uint32_t actor_index);
+
 void ext_stress_solver_update(ExtStressSolverHandle* handle);
 
 uint32_t ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* handle);

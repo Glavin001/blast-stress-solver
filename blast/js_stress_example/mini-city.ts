@@ -69,6 +69,10 @@ const CONFIG = {
     debrisCleanupMode: 'always',
     debrisTtlMs: 8000,
     maxCollidersForDebris: 2,
+    // Retire settled fragments from the stress solve so the solver stops
+    // re-solving inert rubble every frame. Only fires once a body is asleep.
+    solverEvictionMode: 'always',
+    solverEvictionMinColliders: 2,
   },
   features: { debug: false },
 };
@@ -358,6 +362,10 @@ async function initScene() {
       colliderCountThreshold: 3,
       minLinearDamping: 2,
       minAngularDamping: 2,
+    },
+    solverEviction: {
+      mode: CONFIG.optimization.solverEvictionMode as any,
+      minColliders: CONFIG.optimization.solverEvictionMinColliders,
     },
     ...pipelineCoreOverrides(),
   });

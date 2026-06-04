@@ -537,6 +537,14 @@ export interface ExtStressSolver {
    * Passing `{0,0,0}` is a no-op, so skip the call entirely when you do not need to apply per-actor gravity for that frame.
    */
   addActorGravity(actorIndex: number, localGravity?: Vec3): boolean;
+  /**
+   * Evict an actor from the stress solve without splitting it. The actor's nodes
+   * and bonds are dropped from the solver on the next {@link update}, so it no
+   * longer consumes solver iterations. The underlying rigid body is left intact
+   * — use this to retire inert/settled debris that should remain visible but no
+   * longer needs stress simulation. Returns `false` if the actor no longer exists.
+   */
+  deactivateActor(actorIndex: number): boolean;
   /** Run one solver update using previously applied forces/accelerations. */
   update(): void;
   /** Count of bonds currently overstressed beyond elastic limits. */
