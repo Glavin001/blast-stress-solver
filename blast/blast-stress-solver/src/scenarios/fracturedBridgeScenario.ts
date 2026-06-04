@@ -47,7 +47,13 @@ export type FracturedBridgeOptions = {
   fragmentCountPerPost?: number;
   /** Total mass distributed among deck blocks in kg (default: 60000) */
   deckMass?: number;
-  /** Bond detection mode: 'proximity' (default) or 'auto' (WASM triangle-based) */
+  /**
+   * Bond detection mode (default: 'auto').
+   * - 'auto': WASM triangle-based bonding (NvBlast authoring) — correct for the
+   *   irregular Voronoi chunks this scenario produces.
+   * - 'proximity': fast JS AABB/SAT approximation; mis-estimates contacts on
+   *   complex fractured shapes, so it is no longer the default here.
+   */
   bondMode?: 'proximity' | 'auto';
   /** Bond area normalization mode (default: 'perAxis') */
   areaNormalization?: AreaNormalizationMode;
@@ -81,7 +87,7 @@ export async function buildFracturedBridgeScenario(
     fragmentCountPerDeck = 40,
     fragmentCountPerPost = 5,
     deckMass = 60_000,
-    bondMode = 'proximity',
+    bondMode = 'auto',
     areaNormalization = 'perAxis',
     pinata,
     rapier,

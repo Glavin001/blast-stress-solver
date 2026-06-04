@@ -243,6 +243,12 @@ let cityMaxHeight = 24;
 let nodeCentroids: Vec3[] = [];
 let nodeMasses: number[] = [];
 
+// How many distinct fracture patterns to keep per footprint shape. Repeated
+// buildings reuse one of these instead of re-fracturing — a few variants is
+// plenty for the skyline to read as varied (nobody notices two identical
+// towers in a 400-building city). Bump for more variety at higher build cost.
+const VARIANTS_PER_SHAPE = 3;
+
 async function buildCity(): Promise<ScenarioDesc> {
   buildings.length = 0;
   const { grid, street, widthMin, widthMax, minFloors, maxFloors, fragments, seed } =
@@ -257,35 +263,75 @@ async function buildCity(): Promise<ScenarioDesc> {
   let nodeBase = 0;
   cityMaxHeight = 0;
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
+  const total = grid * grid;
+
+  // Fracture is the dominant startup cost (Voronoi tessellation + O(n²) bond
+  // detection per building), and it runs serially on the main thread. But
+  // buildings only vary by (width, floorCount) — a handful of distinct shapes.
+  // So we fracture at most VARIANTS_PER_SHAPE towers per shape and reuse them:
+  // a grid² city does ≤ shapes × VARIANTS fractures regardless of grid size.
+  //
+  // Sharing a cached scenario across instances is safe: mergeScenarios reads it
+  // and emits fresh, offset node/bond objects without mutating the source, and
+  // BatchedMesh.addGeometry copies vertex data, so the shared geometry refs are
+  // never mutated per-instance (and sharing them keeps memory flat for huge
+  // cities).
+  const templateCache = new Map<string, ScenarioDesc[]>();
+  let fractureCount = 0;
+
+  const fractureTower = (width: number, floorCount: number, floorHeight: number) =>
+    buildFracturedTowerScenario({
+      width,
+      depth: width,
+      floorCount,
+      floorHeight,
+      thickness: 0.3,
+      floorThickness: 0.2,
+      columnSize: 0.6,
+      columnsX: 2,
+      columnsZ: 2,
+      fragmentCountPerWall: fragments,
+      fragmentCountPerFloor: fragments,
+      fragmentCountPerColumn: Math.max(2, Math.round(fragments / 2)),
+      deckMass: width * width * floorCount * 320,
+      pinata: pinata as any,
+    });
 
   for (let r = 0; r < grid; r++) {
     for (let c = 0; c < grid; c++) {
-      if (hint) hint.textContent = `Building city… (${r * grid + c + 1}/${grid * grid})`;
-      // Yield to the browser so the progress hint paints.
-      await new Promise((res) => setTimeout(res, 0));
-
+      const idx = r * grid + c;
       const width = Math.round(widthMin + rng() * (widthMax - widthMin));
       const floorCount = minFloors + Math.floor(rng() * (maxFloors - minFloors + 1));
       const floorHeight = 3;
       const height = floorCount * floorHeight;
       cityMaxHeight = Math.max(cityMaxHeight, height);
 
-      const scenario = await buildFracturedTowerScenario({
-        width,
-        depth: width,
-        floorCount,
-        floorHeight,
-        thickness: 0.3,
-        floorThickness: 0.2,
-        columnSize: 0.6,
-        columnsX: 2,
-        columnsZ: 2,
-        fragmentCountPerWall: fragments,
-        fragmentCountPerFloor: fragments,
-        fragmentCountPerColumn: Math.max(2, Math.round(fragments / 2)),
-        deckMass: width * width * floorCount * 320,
-        pinata: pinata as any,
-      });
+      const key = `${width}|${floorCount}`;
+      let variants = templateCache.get(key);
+      if (!variants) {
+        variants = [];
+        templateCache.set(key, variants);
+      }
+
+      let scenario: ScenarioDesc;
+      if (variants.length < VARIANTS_PER_SHAPE) {
+        // Cache miss — pay the fracture cost once, then yield so the browser
+        // paints the progress hint (only the expensive path yields).
+        fractureCount += 1;
+        if (hint) {
+          hint.textContent = `Building city… fracturing towers (${idx + 1}/${total})`;
+        }
+        await new Promise((res) => setTimeout(res, 0));
+        scenario = await fractureTower(width, floorCount, floorHeight);
+        variants.push(scenario);
+      } else {
+        // Cache hit — reuse a fractured tower. Refresh the hint only every so
+        // often; yielding on every cell would cost grid² timer ticks.
+        scenario = variants[(rng() * variants.length) | 0];
+        if (hint && idx % 16 === 0) {
+          hint.textContent = `Assembling city… (${idx + 1}/${total})`;
+        }
+      }
 
       const cx = -half + c * cell;
       const cz = -half + r * cell;
@@ -304,6 +350,11 @@ async function buildCity(): Promise<ScenarioDesc> {
   }
 
   cityRadius = Math.max(40, half + widthMax);
+
+  console.log(
+    `Mini-city: ${total} buildings from ${fractureCount} unique fractures ` +
+      `(${templateCache.size} shapes × ≤${VARIANTS_PER_SHAPE} variants)`,
+  );
 
   const merged = mergeScenarios(parts);
   nodeCentroids = merged.nodes.map((n: any) => ({ ...n.centroid }));
