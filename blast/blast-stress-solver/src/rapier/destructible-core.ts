@@ -204,6 +204,9 @@ export async function buildDestructibleCore({
     rapierStepMs: 0,
     contactDrainMs: 0,
     solverUpdateMs: 0,
+    solverGravityInjectMs: 0,
+    solverContactInjectMs: 0,
+    solverSolveMs: 0,
     damageReplayMs: 0,
     damagePreviewMs: 0,
     damageTickMs: 0,
@@ -1330,6 +1333,7 @@ export async function buildDestructibleCore({
     const solverConverged = typeof solver.converged === 'function' ? solver.converged() : false;
     const shouldSkipSolver = fracturePolicySettings.idleSkip && !hasExternalForces && solverFractureCountdown <= 0 && solverConverged && passIndex === 0 && safeFrames > 2;
 
+    const gravityInjectT0 = startTiming();
     if (!shouldSkipSolver && solverGravityEnabled) {
       const solverApi = solver as unknown as SolverActorsApi;
 
@@ -1396,11 +1400,13 @@ export async function buildDestructibleCore({
         }
       }
     }
+    stopTiming(gravityInjectT0, 'solverGravityInjectMs');
 
     // Inject external contact forces (e.g. projectile impacts) into the stress solver.
     // Converts world-space contact forces into body-local space and applies them
     // to the impacted node plus nearby nodes (splash radius) so that bond stress
     // reflects collision impacts, not just gravity.
+    const contactInjectT0 = startTiming();
     for (const contact of bufferedExternalContacts) {
       if (!contact.totalForceWorld) continue;
       const hitChunk = chunks[contact.nodeIndex];
@@ -1445,9 +1451,12 @@ export async function buildDestructibleCore({
         });
       }
     }
+    stopTiming(contactInjectT0, 'solverContactInjectMs');
 
     if (!shouldSkipSolver) {
+      const solveT0 = startTiming();
       solver.update();
+      stopTiming(solveT0, 'solverSolveMs');
     }
     solverHadExternalForces = hasExternalForces;
     if (solverFractureCountdown > 0) solverFractureCountdown--;
