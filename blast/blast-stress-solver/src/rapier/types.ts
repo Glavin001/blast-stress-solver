@@ -320,6 +320,16 @@ export type DestructibleCore = {
   setDebrisCleanup?: (opts: DebrisCleanupOptions) => void;
   getDebrisCleanupSettings?: () => DebrisCleanupOptions & { mode: OptimizationMode };
   setMaxCollidersForDebris?: (n: number) => void;
+  /** Stage-1 island quiescence measurement: connected components of the live
+   *  solver graph (static nodes as cut points) and the fraction of nodes/bonds
+   *  in islands whose bodies are all Rapier-asleep — the skippable-cost ceiling
+   *  for island-aware solving. Read-only instrumentation; no behavior change. */
+  getIslandQuiescenceStats?: () => {
+    islandsTotal: number; islandsQuiescent: number;
+    totalNodes: number; quiescentNodes: number;
+    totalBonds: number; quiescentBonds: number;
+    quiescentNodeFraction: number; quiescentBondFraction: number;
+  };
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

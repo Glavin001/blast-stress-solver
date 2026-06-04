@@ -155,6 +155,9 @@ float ext_stress_solver_get_angular_error(const ExtStressSolverHandle* handle);
 
 uint8_t ext_stress_solver_converged(const ExtStressSolverHandle* handle);
 
+// Number of connected components (islands) in the solver graph after the last update.
+uint32_t ext_stress_solver_island_count(const ExtStressSolverHandle* handle);
+
 uint32_t ext_stress_sizeof_ext_node_desc();
 uint32_t ext_stress_sizeof_ext_bond_desc();
 uint32_t ext_stress_sizeof_ext_settings();

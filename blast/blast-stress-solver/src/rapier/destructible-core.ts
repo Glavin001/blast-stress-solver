@@ -2196,6 +2196,100 @@ export async function buildDestructibleCore({
     return bondTable.length - removedBondIndices.size;
   }
 
+  // ── Stage 1: island quiescence measurement (read-only instrumentation) ──
+  // Connected components of the ACTIVE bond graph, treating static (mass<=0)
+  // nodes as non-merging CUT POINTS — a shared ground node carries sqrt_I_inv=0
+  // in the solver, so it propagates no stress and two structures sharing only
+  // the ground are physically independent islands. An island is "quiescent" iff
+  // every rigid body it sits on is Rapier-asleep: its inputs (body-local gravity
+  // + contacts) cannot change until something wakes it. This measures the
+  // fraction of the solve that island-aware skipping could avoid, with ZERO
+  // behavior change — it is the GO/NO-GO gate before the C++ refactor.
+  function islandFind(parent: Int32Array, x: number): number {
+    let r = x;
+    while (parent[r] !== r) r = parent[r];
+    while (parent[x] !== r) { const nx = parent[x]; parent[x] = r; x = nx; }
+    return r;
+  }
+
+  // Connected components of the live solver graph, derived from the ACTUAL
+  // fracture topology rather than the JS bond table: two nodes are unioned only
+  // when a bond joins them AND they currently sit on the same rigid body
+  // (`chunk.bodyHandle`). Blast splits bodies exactly along broken bonds, so a
+  // cross-body bond is a broken/severed bond and must not reconnect islands —
+  // this sidesteps the known `removedBondIndices` tracking lag. Static (mass<=0)
+  // nodes are cut points (a shared ground node carries no stress).
+  function rebuildIslandComponents(): Int32Array {
+    const n = chunks.length;
+    const parent = new Int32Array(n);
+    for (let i = 0; i < n; i++) parent[i] = i;
+    for (let bi = 0; bi < bondTable.length; bi++) {
+      const b = bondTable[bi];
+      const c0 = chunks[b.node0]; const c1 = chunks[b.node1];
+      if (!c0 || !c1 || !c0.active || !c1.active) continue;
+      if (c0.bodyHandle == null || c0.bodyHandle !== c1.bodyHandle) continue; // severed / cross-body
+      if ((scenario.nodes[b.node0]?.mass ?? 0) <= 0 || (scenario.nodes[b.node1]?.mass ?? 0) <= 0) continue;
+      const r0 = islandFind(parent, b.node0);
+      const r1 = islandFind(parent, b.node1);
+      if (r0 !== r1) parent[r0] = r1;
+    }
+    return parent;
+  }
+
+  // Skippable-fraction ceiling for island-aware solving. An island is quiescent
+  // iff it sits on a detached dynamic body that is Rapier-asleep — its inputs
+  // can't change until something wakes it. Nodes still on the fixed root (intact
+  // structure) are counted active here (their skip would come from per-island
+  // convergence, not sleep), so this is a LOWER BOUND on the achievable skip.
+  function getIslandQuiescenceStats() {
+    const parent = rebuildIslandComponents();
+    const agg = new Map<number, { nodes: number; bonds: number; body: number | null }>();
+    let totalNodes = 0;
+    for (let ni = 0; ni < chunks.length; ni++) {
+      const chunk = chunks[ni];
+      if (!chunk || !chunk.active || chunk.bodyHandle == null) continue;
+      if ((scenario.nodes[ni]?.mass ?? 0) <= 0) continue;
+      const root = islandFind(parent, ni);
+      let a = agg.get(root);
+      if (!a) { a = { nodes: 0, bonds: 0, body: chunk.bodyHandle }; agg.set(root, a); }
+      a.nodes++;
+      totalNodes++;
+    }
+    let totalBonds = 0;
+    for (let bi = 0; bi < bondTable.length; bi++) {
+      const b = bondTable[bi];
+      const c0 = chunks[b.node0]; const c1 = chunks[b.node1];
+      if (!c0 || !c1 || !c0.active || !c1.active) continue;
+      if (c0.bodyHandle == null || c0.bodyHandle !== c1.bodyHandle) continue;
+      if ((scenario.nodes[b.node0]?.mass ?? 0) <= 0 || (scenario.nodes[b.node1]?.mass ?? 0) <= 0) continue;
+      totalBonds++;
+      const a = agg.get(islandFind(parent, b.node0));
+      if (a) a.bonds++;
+    }
+    let islandsTotal = 0, islandsQuiescent = 0, qNodes = 0, qBonds = 0;
+    for (const a of agg.values()) {
+      islandsTotal++;
+      const bh = a.body;
+      let quiescent = false;
+      if (bh != null && bh !== rootBody.handle && bh !== groundBody.handle) {
+        const body = world.getRigidBody(bh);
+        quiescent = !!body && typeof (body as { isSleeping?: () => boolean }).isSleeping === 'function'
+          && (body as { isSleeping: () => boolean }).isSleeping();
+      }
+      if (quiescent) { islandsQuiescent++; qNodes += a.nodes; qBonds += a.bonds; }
+    }
+    return {
+      islandsTotal,
+      islandsQuiescent,
+      totalNodes,
+      quiescentNodes: qNodes,
+      totalBonds,
+      quiescentBonds: qBonds,
+      quiescentNodeFraction: totalNodes ? qNodes / totalNodes : 0,
+      quiescentBondFraction: totalBonds ? qBonds / totalBonds : 0,
+    };
+  }
+
   function getSolverDebugLines(
     mode: number = 0 /* ExtDebugMode: 0=Max 1=Compression 2=Tension 3=Shear */,
   ): Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }> {
@@ -2423,6 +2517,7 @@ export async function buildDestructibleCore({
     setDebrisCollisionMode: setDebrisCollisionModeFn,
     getRigidBodyCount,
     getActiveBondsCount,
+    getIslandQuiescenceStats,
     getSolverDebugLines,
     getNodeBonds,
     cutBond,

@@ -252,6 +252,15 @@ public:
     virtual uint32_t                        getOverstressedBondCount() const = 0;
 
     /**
+    Number of connected components ("islands") in the solver graph after the last update().
+    Static nodes are treated as cut points, so structures sharing only a static/world node
+    are counted as separate islands. Foundation for island-aware (per-component) solving.
+
+    \return the island count.
+    */
+    virtual uint32_t                        getIslandCount() const = 0;
+
+    /**
     Generate fracture commands for particular actor.
 
     Calling this function if getOverstressedBondCount() == 0 or actor has no bond doesn't make sense, bondFractureCount will be '0'.

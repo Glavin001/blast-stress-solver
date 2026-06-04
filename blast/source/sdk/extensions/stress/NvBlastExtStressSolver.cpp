@@ -270,7 +270,7 @@ public:
     };
 
     SupportGraphProcessor(uint32_t nodeCount, uint32_t maxBondCount) :
-        m_solver(nodeCount, maxBondCount), m_nodesDirty(true), m_bondsDirty(true)
+        m_solver(nodeCount, maxBondCount), m_nodesDirty(true), m_bondsDirty(true), m_islandCount(0)
     {
         m_nodesData.resize(nodeCount);
         m_bondsData.reserve(maxBondCount);
@@ -339,6 +339,13 @@ public:
     uint32_t getOverstressedBondCount() const
     {
         return m_overstressedBondCount;
+    }
+
+    // Number of connected components (islands) in the solver graph, computed in
+    // sync() on topology change. Static (mass<=0) nodes are cut points.
+    uint32_t getIslandCount() const
+    {
+        return m_islandCount;
     }
 
     void calcSolverBondStresses(
@@ -725,6 +732,7 @@ private:
 
     void sync(const NvBlastBond* bonds)
     {
+        const bool resynced = m_nodesDirty || m_bondsDirty;
         if (m_nodesDirty)
         {
             syncNodes(bonds);
@@ -734,8 +742,61 @@ private:
         {
             syncBonds(bonds);
         }
+        if (resynced)
+        {
+            computeIslands();
+        }
 
         CHECK_GRAPH_INTEGRITY;
+    }
+
+    // ── Island partitioning ──
+    // Connected components of the solver graph via union-find over the solver
+    // bonds. Static (mass<=0) nodes carry no coupling (sqrt_I_inv == 0), so they
+    // are CUT POINTS: two structures sharing only a static/world node are
+    // physically independent islands. Recomputed only on topology change.
+    // m_nodeIsland[solverNode] holds the compacted island id (InvalidIndex for
+    // static nodes); m_islandCount is the number of dynamic islands. This is the
+    // foundation for solving each island independently and skipping quiescent ones.
+    uint32_t islandFind(uint32_t x)
+    {
+        uint32_t r = x;
+        while (m_islandParent[r] != r) r = m_islandParent[r];
+        while (m_islandParent[x] != r) { const uint32_t nx = m_islandParent[x]; m_islandParent[x] = r; x = nx; }
+        return r;
+    }
+
+    void computeIslands()
+    {
+        const uint32_t kInvalid = static_cast<uint32_t>(-1);
+        const uint32_t nodeCount = getSolverNodeCount();
+        m_islandParent.resize(nodeCount);
+        for (uint32_t i = 0; i < nodeCount; ++i) m_islandParent[i] = i;
+
+        const uint32_t bondCount = getSolverBondCount();
+        for (uint32_t b = 0; b < bondCount; ++b)
+        {
+            uint32_t n0, n1;
+            getSolverInternalBondNodes(b, n0, n1);
+            if (n0 >= nodeCount || n1 >= nodeCount) continue;
+            // static node = cut point, do not union through it
+            if (m_solverNodesData[n0].mass <= 0.0f || m_solverNodesData[n1].mass <= 0.0f) continue;
+            const uint32_t ra = islandFind(n0), rb = islandFind(n1);
+            if (ra != rb) m_islandParent[ra] = rb;
+        }
+
+        // Compact island ids over dynamic nodes; static nodes get InvalidIndex.
+        m_nodeIsland.resize(nodeCount);
+        m_islandRootId.resize(nodeCount);
+        for (uint32_t i = 0; i < nodeCount; ++i) m_islandRootId[i] = kInvalid;
+        m_islandCount = 0;
+        for (uint32_t i = 0; i < nodeCount; ++i)
+        {
+            if (m_solverNodesData[i].mass <= 0.0f) { m_nodeIsland[i] = kInvalid; continue; }
+            const uint32_t r = islandFind(i);
+            if (m_islandRootId[r] == kInvalid) m_islandRootId[r] = m_islandCount++;
+            m_nodeIsland[i] = m_islandRootId[r];
+        }
     }
 
     void syncNodes(const NvBlastBond* bonds)
@@ -997,6 +1058,12 @@ private:
 
     uint32_t                            m_overstressedBondCount;
 
+    // Island partitioning (connected components of the solver graph)
+    Array<uint32_t>::type               m_islandParent;
+    Array<uint32_t>::type               m_islandRootId;
+    Array<uint32_t>::type               m_nodeIsland;
+    uint32_t                            m_islandCount;
+
     HashMap<BondKey, uint32_t>::type    m_solverBondsMap;
     Array<uint32_t>::type               m_blastBondIndexMap;
 
@@ -1052,6 +1119,11 @@ public:
     virtual uint32_t                        getOverstressedBondCount() const override
     {
         return m_graphProcessor->getOverstressedBondCount();
+    }
+
+    virtual uint32_t                        getIslandCount() const override
+    {
+        return m_graphProcessor->getIslandCount();
     }
 
     virtual void                            generateFractureCommands(const NvBlastActor& actor, NvBlastFractureBuffers& commands) override;

@@ -763,6 +763,13 @@ ext_stress_solver_converged(const ExtStressSolverHandle* handlePtr)
 }
 
 extern "C" uint32_t
+ext_stress_solver_island_count(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getIslandCount() : 0U;
+}
+
+extern "C" uint32_t
 ext_stress_sizeof_ext_node_desc()
 {
     return static_cast<uint32_t>(sizeof(ExtStressNodeDesc));

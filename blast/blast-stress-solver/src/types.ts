@@ -541,6 +541,10 @@ export interface ExtStressSolver {
   update(): void;
   /** Count of bonds currently overstressed beyond elastic limits. */
   overstressedBondCount(): number;
+  /** Number of connected components (islands) in the solver graph after the last
+   *  update. Static nodes are cut points, so structures sharing only a static/world
+   *  node count as separate islands. */
+  islandCount(): number;
   /** Snapshot the current actor table (actor index + owned nodes). */
   actors(): Array<{ actorIndex: number; nodes: number[] }>;
   /** Generate fracture commands for the last update. */

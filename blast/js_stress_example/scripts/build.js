@@ -72,6 +72,7 @@ const exportedFunctions = [
   '_ext_stress_solver_get_linear_error',
   '_ext_stress_solver_get_angular_error',
   '_ext_stress_solver_converged',
+  '_ext_stress_solver_island_count',
   '_ext_stress_sizeof_ext_node_desc',
   '_ext_stress_sizeof_ext_bond_desc',
   '_ext_stress_sizeof_ext_settings',
