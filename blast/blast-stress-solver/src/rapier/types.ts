@@ -301,7 +301,7 @@ export type DestructibleCore = {
   setDebrisCollisionMode: (mode: DebrisCollisionMode) => void;
   getRigidBodyCount: () => number;
   getActiveBondsCount: () => number;
-  getSolverDebugLines: () => Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }>;
+  getSolverDebugLines: (mode?: number) => Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }>;
   // Bond interaction helpers
   getNodeBonds: (nodeIndex: number) => BondRef[];
   cutBond: (bondIndex: number) => boolean;

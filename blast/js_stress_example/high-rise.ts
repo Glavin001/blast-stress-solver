@@ -33,6 +33,14 @@ const CONFIG = {
     // high-rise's stress response is near-bimodal, and a high value lets one hit seed a
     // slow global collapse. Raise it for a more impact-reactive (and collapse-prone) frame.
     contactForceScale: 8,
+    // Stress-solver internals (Blast knobs). These secretly set the fracture THRESHOLD:
+    // - iterations: CG steps/frame. Low = under-converged stress (under-reports → robust
+    //   but physically inaccurate); high = converged true stress (accurate → readily
+    //   cascades) and much costlier. There is a sharp cliff, not a gradient.
+    // - graphReduction: coarsens the support graph; higher = lower peak stress (sparser /
+    //   chunkier cracks, eventually none) and cheaper.
+    iterations: 24,
+    graphReduction: 0,
   },
   physics: { debrisCollisionMode: 'all', friction: 0.25, restitution: 0 },
   optimization: {
@@ -181,7 +189,11 @@ async function initScene() {
     scenario,
     gravity: CONFIG.solver.gravity,
     materialScale: defaults.materialScale,
-    solverSettings: scaledLimits(),
+    solverSettings: {
+      ...scaledLimits(),
+      maxSolverIterationsPerFrame: CONFIG.solver.iterations,
+      graphReductionLevel: CONFIG.solver.graphReduction,
+    },
     friction: CONFIG.physics.friction,
     restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.solver.contactForceScale,
@@ -302,6 +314,8 @@ bindSlider('cfg-proj-speed', CONFIG.projectile, 'speed', (v) => v.toFixed(0) + '
 // Structure / solver
 bindSlider('cfg-strength', CONFIG.solver, 'strength', (v) => v.toFixed(2) + '×');
 bindSlider('cfg-contact-force', CONFIG.solver, 'contactForceScale', (v) => v.toFixed(0));
+bindSlider('cfg-iterations', CONFIG.solver, 'iterations', (v) => v.toFixed(0));
+bindSlider('cfg-graph-reduction', CONFIG.solver, 'graphReduction', (v) => v.toFixed(0));
 bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1) + ' m/s²', (v) => coreRef?.setGravity(v));
 
 // Physics
