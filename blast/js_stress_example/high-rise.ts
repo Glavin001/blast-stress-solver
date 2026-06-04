@@ -15,7 +15,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
 import { experimentCoreOverrides, mountExperimentPanel } from "./experiment-flags.js";
 
@@ -144,6 +144,15 @@ function updatePerf() {
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 // Reusable, self-mounting live frame-profiler overlay (per-phase cost + A/B).
 const profiler = createFrameProfilerOverlay();
+
+// Reusable session recorder — ● Record captures every dynamic body's per-frame
+// position/orientation + linear/angular velocity, every input (projectiles,
+// forces, gravity) and every fracture/topology change into a single gzipped
+// bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
+const recorder = createRecordingOverlay({
+  exportName: 'high-rise-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let rebuilding = false;
@@ -207,6 +216,7 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: CONFIG.features.debug });
 
   coreRef = core;
+  recorder.attach(core, { scenario, meta: { demo: 'high-rise', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
   initialBonds = core.getActiveBondsCount();
@@ -325,6 +335,7 @@ const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
   profiler.render();
+  recorder.render();
   stats.begin();
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();

@@ -22,7 +22,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import * as pinata from '@dgreenheck/three-pinata';
-import { buildDestructibleCore } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
@@ -313,6 +313,11 @@ async function buildCity(): Promise<ScenarioDesc> {
 
 // ── Scene lifecycle ───────────────────────────────────────────
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
+// Session recorder — ● Record captures every dynamic body's per-frame
+// position/orientation + linear/angular velocity, every input (clicks, meteor
+// storm, detonation, forces) and every fracture/topology change into a single
+// gzipped bug-report bundle (⬇ Save). Zero allocation on the hot path.
+const recorder = createRecordingOverlay({ exportName: 'mini-city-recording' });
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let cityGroup: THREE.Group | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
@@ -367,6 +372,7 @@ async function initScene() {
   });
 
   coreRef = core;
+  recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
   visualsRef = visuals;
   cityGroup = group;
   initialBonds = core.getActiveBondsCount();
@@ -656,6 +662,7 @@ function loop() {
     visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true });
     rapierDebug?.update();
     updateStatus(coreRef);
+    recorder.render();
   }
 
   const t1 = performance.now();
