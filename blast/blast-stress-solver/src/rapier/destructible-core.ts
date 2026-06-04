@@ -1313,7 +1313,24 @@ export async function buildDestructibleCore({
     const passT0 = startTiming();
 
     const solverT0 = startTiming();
-    if (solverGravityEnabled) {
+
+    // Skip solver when idle: no external contacts, no recent fractures/topology changes,
+    // solver has converged (no residual error from prior frames), and not a resimulation pass.
+    // Without the convergence check, the solver might skip frames where it hasn't fully
+    // resolved stress in large structures (CGNR may need multiple frames to converge).
+    //
+    // Decide this BEFORE injecting gravity/forces. If we're going to skip the solve this
+    // frame, re-injecting gravity is wasted work — it would never be consumed by an update()
+    // and only perturbs the already-converged residual, so skipping it takes the idle
+    // residual to ~0 (matching Rapier). None of the gravity/force injection below mutates
+    // the predicate's inputs, so hoisting it here is value-identical. The predicate re-arms
+    // automatically the moment activity resumes (a new contact, a non-converged residual, or
+    // an active fracture countdown — all already accounted for here).
+    const hasExternalForces = bufferedExternalContacts.length > 0 || pendingExternalForces.length > 0;
+    const solverConverged = typeof solver.converged === 'function' ? solver.converged() : false;
+    const shouldSkipSolver = fracturePolicySettings.idleSkip && !hasExternalForces && solverFractureCountdown <= 0 && solverConverged && passIndex === 0 && safeFrames > 2;
+
+    if (!shouldSkipSolver && solverGravityEnabled) {
       const solverApi = solver as unknown as SolverActorsApi;
 
       // Refresh the cached actor list only when topology changed (splits). The
@@ -1429,13 +1446,6 @@ export async function buildDestructibleCore({
       }
     }
 
-    // Skip solver when idle: no external contacts, no recent fractures/topology changes,
-    // solver has converged (no residual error from prior frames), and not a resimulation pass.
-    // Without the convergence check, the solver might skip frames where it hasn't fully
-    // resolved stress in large structures (CGNR may need multiple frames to converge).
-    const hasExternalForces = bufferedExternalContacts.length > 0 || pendingExternalForces.length > 0;
-    const solverConverged = typeof solver.converged === 'function' ? solver.converged() : false;
-    const shouldSkipSolver = fracturePolicySettings.idleSkip && !hasExternalForces && solverFractureCountdown <= 0 && solverConverged && passIndex === 0 && safeFrames > 2;
     if (!shouldSkipSolver) {
       solver.update();
     }
