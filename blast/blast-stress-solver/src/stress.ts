@@ -643,6 +643,14 @@ class ExtStressSolver implements ExtStressSolverType {
   _fractureCommandsPtr: number;
   _forcePtr: number;
   _torquePtr: number;
+  /** Persistent WASM-heap scratch buffer holding one quaternion (x,y,z,w) per
+   *  actor slot, indexed by actor index. Used by {@link addAllActorGravity}. */
+  _actorRotPtr: number;
+  /** Number of quaternion slots {@link _actorRotPtr} can hold. */
+  _actorRotCapacity: number;
+  /** Cached presence of the batched-gravity WASM export (older runtimes may
+   *  predate it); resolved lazily on first use. `undefined` = not yet probed. */
+  _batchedGravitySupported?: boolean;
 
   constructor(module: any, memory: ModuleMemory, sizes: RuntimeSizes, description: ExtStressSolverDescription) {
     if (!description) throw new Error('ExtStressSolver description is required');
@@ -687,6 +695,11 @@ class ExtStressSolver implements ExtStressSolverType {
       this._fractureCommandsPtr = memory.alloc(sizes.extFractureCommands);
       this._forcePtr = memory.alloc(sizes.vec3);
       this._torquePtr = memory.alloc(sizes.vec3);
+      // One quaternion (4 floats) per actor slot. Actor (family) indices are
+      // bounded by the support-chunk count, i.e. the node count, so a buffer
+      // sized to nodeCount slots covers every possible actor index.
+      this._actorRotCapacity = Math.max(this.nodeCount, 1);
+      this._actorRotPtr = memory.alloc(this._actorRotCapacity * 4 * 4);
     } finally {
       memory.free(nodesPtr);
       memory.free(bondsPtr);
@@ -703,6 +716,7 @@ class ExtStressSolver implements ExtStressSolverType {
     if (this._fractureCommandsPtr) { this.memory.free(this._fractureCommandsPtr); this._fractureCommandsPtr = 0 as any; }
     if (this._forcePtr) { this.memory.free(this._forcePtr); this._forcePtr = 0 as any; }
     if (this._torquePtr) { this.memory.free(this._torquePtr); this._torquePtr = 0 as any; }
+    if (this._actorRotPtr) { this.memory.free(this._actorRotPtr); this._actorRotPtr = 0 as any; }
   }
 
   setSettings(settings: ExtStressSolverSettings): void {
@@ -741,6 +755,45 @@ class ExtStressSolver implements ExtStressSolverType {
     writeVec3(this.memory.view(), this._forcePtr, localGravity ?? vec3());
     const result = this.module.ccall('ext_stress_solver_add_actor_gravity', 'number', ['number', 'number', 'number'], [this.handle, actorIndex >>> 0, this._forcePtr]) >>> 0;
     return result !== 0;
+  }
+
+  /** True when the underlying WASM runtime exposes the batched-gravity entry
+   *  point. Older runtimes (built before this export was added) return false so
+   *  callers can fall back to {@link addActorGravity}. */
+  supportsBatchedGravity(): boolean {
+    if (this._batchedGravitySupported === undefined) {
+      this._batchedGravitySupported =
+        typeof this.module['_ext_stress_solver_add_all_actor_gravity'] === 'function';
+    }
+    return this._batchedGravitySupported;
+  }
+
+  addAllActorGravity(worldGravity?: Vec3, rotations?: Float32Array, rotationCount?: number): number {
+    if (!this.handle) return 0;
+    if (!this.supportsBatchedGravity()) return -1;
+
+    const g = worldGravity ?? vec3();
+
+    let count = 0;
+    if (rotations && rotations.length >= 4) {
+      count = rotationCount ?? Math.floor(rotations.length / 4);
+      count = Math.min(count, this._actorRotCapacity, Math.floor(rotations.length / 4));
+      if (count > 0) {
+        // Copy the quaternion buffer into the persistent WASM-heap scratch in a
+        // single bulk memcpy (no per-actor FFI crossings). HEAPF32 is re-read
+        // each call so it stays valid across memory growth.
+        const heapF32 = this.module.HEAPF32 as Float32Array;
+        heapF32.set(rotations.subarray(0, count * 4), this._actorRotPtr >>> 2);
+      }
+    }
+
+    const applied = this.module.ccall(
+      'ext_stress_solver_add_all_actor_gravity',
+      'number',
+      ['number', 'number', 'number', 'number', 'number', 'number'],
+      [this.handle, g.x, g.y, g.z, count > 0 ? this._actorRotPtr : 0, count >>> 0],
+    ) >>> 0;
+    return applied;
   }
 
   update(): void { if (!this.handle) return; this.module.ccall('ext_stress_solver_update', null, ['number'], [this.handle]); }
