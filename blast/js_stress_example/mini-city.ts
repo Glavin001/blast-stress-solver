@@ -22,11 +22,12 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import * as pinata from '@dgreenheck/three-pinata';
-import { buildDestructibleCore, createRecordingOverlay } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { buildFracturedTowerScenario } from 'blast-stress-solver/scenarios';
 
 type Vec3 = { x: number; y: number; z: number };
@@ -49,6 +50,10 @@ const CONFIG = {
     meteors: 36,
     meteorMass: 3000,
     meteorRadius: 1.2,
+    meteorSpeedMin: 50, // each meteor's speed is picked uniformly in [min, max] m/s
+    meteorSpeedMax: 70,
+    meteorAngleMin: 0, // incoming angle from vertical, degrees (0 = straight down) in [min, max]
+    meteorAngleMax: 35,
     blastForce: 6, // radial shockwave strength (× per-node mass)
   },
   solver: { gravity: -9.81, materialScale: 1e10 },
@@ -59,7 +64,8 @@ const CONFIG = {
     contactForceScale: 30,
   },
   optimization: {
-    smallBodyDampingMode: 'always',
+    // Damp small debris only after it lands ('always' floats falling debris).
+    smallBodyDampingMode: 'afterGroundCollision',
     debrisCleanupMode: 'always',
     debrisTtlMs: 8000,
     maxCollidersForDebris: 2,
@@ -307,11 +313,18 @@ async function buildCity(): Promise<ScenarioDesc> {
 
 // ── Scene lifecycle ───────────────────────────────────────────
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
+// Reusable, self-mounting live frame-profiler overlay (bottom-left): per-phase
+// physics cost + A/B comparison.
+const profiler = createFrameProfilerOverlay();
 // Session recorder — ● Record captures every dynamic body's per-frame
 // position/orientation + linear/angular velocity, every input (clicks, meteor
 // storm, detonation, forces) and every fracture/topology change into a single
-// gzipped bug-report bundle (⬇ Save). Zero allocation on the hot path.
-const recorder = createRecordingOverlay({ exportName: 'mini-city-recording' });
+// gzipped bug-report bundle (⬇ Save). The profiler trace rides along in the
+// bundle. Zero allocation on the hot path.
+const recorder = createRecordingOverlay({
+  exportName: 'mini-city-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let cityGroup: THREE.Group | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
@@ -346,6 +359,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -366,6 +380,7 @@ async function initScene() {
 
   coreRef = core;
   recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
+  profiler.attach(core);
   visualsRef = visuals;
   cityGroup = group;
   initialBonds = core.getActiveBondsCount();
@@ -440,21 +455,28 @@ function meteorStorm() {
       y: b.height * (0.4 + rng() * 0.6),
       z: b.cz + (rng() - 0.5) * b.width,
     };
-    const spawn = {
-      x: target.x + (rng() - 0.5) * 36,
-      y: 70 + rng() * 30,
-      z: target.z + (rng() - 0.5) * 36,
-    };
-    const dx = target.x - spawn.x;
-    const dy = target.y - spawn.y;
-    const dz = target.z - spawn.z;
-    const len = Math.hypot(dx, dy, dz) || 1;
-    const speed = 50 + rng() * 20;
+    // Incoming angle, measured from vertical (0° = straight down), picked in [min, max].
+    // Azimuth is random so the storm comes from all sides.
+    const DEG = Math.PI / 180;
+    const aLo = CONFIG.destroy.meteorAngleMin * DEG;
+    const aHi = Math.max(aLo, CONFIG.destroy.meteorAngleMax * DEG);
+    const theta = aLo + rng() * (aHi - aLo);
+    const phi = rng() * Math.PI * 2;
+    const sinT = Math.sin(theta);
+    // Unit vector from the target up-and-out to the spawn point; the velocity is its reverse.
+    const ux = sinT * Math.cos(phi);
+    const uy = Math.cos(theta);
+    const uz = sinT * Math.sin(phi);
+    const dist = 70 + rng() * 30; // how far out (along the incoming ray) the meteor starts
+    const spawn = { x: target.x + ux * dist, y: target.y + uy * dist, z: target.z + uz * dist };
+    const lo = CONFIG.destroy.meteorSpeedMin;
+    const hi = Math.max(lo, CONFIG.destroy.meteorSpeedMax);
+    const speed = lo + rng() * (hi - lo);
     barrage.push({
       at: now + i * interval,
       spawn: {
         position: spawn,
-        velocity: { x: (dx / len) * speed, y: (dy / len) * speed, z: (dz / len) * speed },
+        velocity: { x: -ux * speed, y: -uy * speed, z: -uz * speed },
         radius: CONFIG.destroy.meteorRadius,
         mass: CONFIG.destroy.meteorMass,
         ttl: 6000,
@@ -564,6 +586,11 @@ bindSlider('cfg-proj-speed', CONFIG.projectile, 'speed', (v) => v.toFixed(0) + '
 
 // Destruction
 bindSlider('cfg-meteors', CONFIG.destroy, 'meteors', (v) => v.toFixed(0));
+bindSlider('cfg-meteor-mass', CONFIG.destroy, 'meteorMass', (v) => v.toLocaleString() + ' kg');
+bindSlider('cfg-meteor-speed-min', CONFIG.destroy, 'meteorSpeedMin', (v) => v.toFixed(0) + ' m/s');
+bindSlider('cfg-meteor-speed-max', CONFIG.destroy, 'meteorSpeedMax', (v) => v.toFixed(0) + ' m/s');
+bindSlider('cfg-meteor-angle-min', CONFIG.destroy, 'meteorAngleMin', (v) => v.toFixed(0) + '°');
+bindSlider('cfg-meteor-angle-max', CONFIG.destroy, 'meteorAngleMax', (v) => v.toFixed(0) + '°');
 bindSlider('cfg-blast', CONFIG.destroy, 'blastForce', (v) => v.toFixed(0) + '×');
 
 // Solver
@@ -621,6 +648,7 @@ document.getElementById('btn-debug')?.addEventListener('click', () => {
 const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
+  profiler.render();
   stats.begin();
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();
@@ -660,6 +688,7 @@ function onResize() {
 }
 window.addEventListener('resize', onResize);
 
+mountPipelineControls();
 initScene()
   .then(() => loop())
   .catch((err) => {

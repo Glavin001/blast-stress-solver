@@ -19,6 +19,7 @@ import {
   buildScenarioFromFragments,
   buildFoundationFragments,
 } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { FRACTURED_WALL_DEMO_CONFIG as CONFIG } from './fractured-demo-config.js';
 
 // ── Config ────────────────────────────────────────────────────
@@ -189,6 +190,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -385,6 +387,7 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
+mountPipelineControls();
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize fractured wall demo:', err);
   const hint = document.querySelector('.viewport-hint');

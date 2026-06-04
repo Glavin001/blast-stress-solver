@@ -30,7 +30,10 @@ export const FRACTURED_WALL_DEMO_CONFIG = {
     skipSingleBodies: false,
   },
   optimization: {
-    smallBodyDampingMode: 'always',
+    // Damp small debris only AFTER it lands. 'always' also damps it mid-air, which caps a
+    // falling fragment at terminal velocity (~g/damping ≈ 5 m/s) and makes the collapse look
+    // like it floats down in slow motion. See rapier.smallBodyDamping.fall.test.ts.
+    smallBodyDampingMode: 'afterGroundCollision',
     debrisCleanupMode: 'always',
     debrisTtlMs: 10_000,
     maxCollidersForDebris: 2,
@@ -75,7 +78,7 @@ export const FRACTURED_TOWER_DEMO_CONFIG = {
     contactForceScale: 30,
   },
   optimization: {
-    smallBodyDampingMode: 'always',
+    smallBodyDampingMode: 'afterGroundCollision',
     debrisCleanupMode: 'always',
     debrisTtlMs: 10_000,
     maxCollidersForDebris: 2,
@@ -117,7 +120,7 @@ export const FRACTURED_BRIDGE_DEMO_CONFIG = {
     contactForceScale: 30,
   },
   optimization: {
-    smallBodyDampingMode: 'always',
+    smallBodyDampingMode: 'afterGroundCollision',
     debrisCleanupMode: 'always',
     debrisTtlMs: 10_000,
     maxCollidersForDebris: 2,

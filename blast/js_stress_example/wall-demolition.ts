@@ -16,6 +16,7 @@ import {
   RapierDebugRenderer,
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { buildWallScenario } from 'blast-stress-solver/scenarios';
 
 // ── Config ────────────────────────────────────────────────────
@@ -218,6 +219,7 @@ async function initScene() {
       debrisTtlMs: CONFIG.optimization.debrisTtlMs,
       maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
     },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -432,4 +434,5 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
+mountPipelineControls();
 initScene().then(() => loop());

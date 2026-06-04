@@ -70,7 +70,11 @@ export type BuildDestructibleCoreOptions = {
    *  Default 0 = fully decouple impacts from the stress solver (the solver then only
    *  carries gravity / structural load, which redistributes robustly around holes). */
   damageContactStressScale?: number;
-  /** Whether newly created split bodies should enable CCD (default true for compatibility). */
+  /** Whether newly created split bodies should enable CCD. Default **false**: CCD on every
+   *  fragment is expensive (swept tests on hundreds of debris bodies) and, near the debris pile,
+   *  clamps a fast chunk to its first predicted contact each frame — which reads as the big
+   *  chunks "floating"/lagging down while open-air debris falls normally. CCD is kept ON for the
+   *  projectile (which must not tunnel through the structure). Opt back in per-body if needed. */
   fractureBodyCcdEnabled?: boolean;
   /** Whether spawned projectiles should enable CCD (default true). */
   projectileCcdEnabled?: boolean;
@@ -166,7 +170,7 @@ export async function buildDestructibleCore({
   resimulateOnDamageDestroy = !!damage?.enabled,
   contactForceScale = 30,
   damageContactStressScale = 0,
-  fractureBodyCcdEnabled = true,
+  fractureBodyCcdEnabled = false,
   projectileCcdEnabled = true,
   skipSingleBodies = false,
   sleepLinearThreshold = 0.1,
@@ -705,6 +709,15 @@ export async function buildDestructibleCore({
   const snapshotIndex = new Map<number, BodySnapshot>();
   const bodyRestoreProvenance = new Map<number, FractureBodyProvenance>();
   const splitContinuityLog: SplitContinuityRecord[] = [];
+  // Reused (handle-retained) bodies that lost colliders since the last snapshot capture and
+  // therefore need their velocity re-derived for the shifted COM after a resim restore (the
+  // restore re-applies the stale COM-velocity from the snapshot). See reconcileReusedBodyVelocity.
+  const comDirtyReusedBodies = new Set<number>();
+  // Parent bodies that had colliders migrated away to newly-created children this flush. The
+  // parent keeps its handle (it is "reused"/retired) but its COM shifts, so it needs the same
+  // velocity reconciliation as a reused body. Populated by flushPendingBodies (which knows the
+  // inherit-from parent) and consumed by flushColliderMigrations after the colliders move.
+  const bodiesThatLostColliders = new Set<number>();
 
   // ── Sleep threshold tracking ──
   let sleepThresholdsApplied = false; // Track if we've already set thresholds on all bodies
@@ -1081,6 +1094,36 @@ export async function buildDestructibleCore({
     }, true);
   }
 
+  // When a body is REUSED across a split — it keeps its handle and merely loses the
+  // colliders that migrated to its new siblings — its centre of mass shifts. Rapier
+  // stores `linvel` as the velocity of the COM and keeps that value when colliders are
+  // removed, so the body's velocity *field* jumps by `ω × ΔCOM` at every other point
+  // (e.g. its retained chunks). The created-child path is corrected by
+  // `syncBodyVelocityFromSource`; the reused body has no such correction otherwise — that
+  // is the "big fragment hovers / lurches after it fractures" bug (TESTING.md gap #1b).
+  //
+  // `removeCollider` defers the mass-property recompute, so `worldCom()` here still reads
+  // the PRE-removal COM. Capture it, force the recompute, then shift `linvel` by
+  // `ω × (newCom − oldCom)` so the field is preserved at the points that stayed on the
+  // body. Mirrors Rust's `reconcile_child_velocity_with_com`.
+  function reconcileReusedBodyVelocity(body: RapierRigidBody, oldComOverride?: Vec3) {
+    if (body.isFixed()) return;
+    // worldCom() may return a reused buffer, so snapshot the OLD components before any
+    // recompute can mutate it.
+    const oldRaw = oldComOverride ?? body.worldCom();
+    const oldCom = { x: oldRaw.x, y: oldRaw.y, z: oldRaw.z };
+    const recompute = (body as RapierRigidBody & {
+      recomputeMassPropertiesFromColliders?: () => void;
+    }).recomputeMassPropertiesFromColliders;
+    if (typeof recompute === 'function') recompute.call(body);
+    const newCom = body.worldCom();
+    const lever = { x: newCom.x - oldCom.x, y: newCom.y - oldCom.y, z: newCom.z - oldCom.z };
+    if (lever.x * lever.x + lever.y * lever.y + lever.z * lever.z <= 1e-12) return;
+    const correction = cross(body.angvel(), lever);
+    const lv = body.linvel();
+    body.setLinvel({ x: lv.x + correction.x, y: lv.y + correction.y, z: lv.z + correction.z }, true);
+  }
+
   function recordBodyContinuity(
     phase: SplitContinuityRecord['phase'],
     targetBodyHandle: number,
@@ -1190,6 +1233,9 @@ export async function buildDestructibleCore({
   function captureWorldSnapshot() {
     const t0 = startTiming();
     snapshotGeneration += 1;
+    // The fresh snapshot records each body's current COM, so any collider changes are now
+    // "baked in" relative to it; clear the dirty set so only post-capture splits are tracked.
+    comDirtyReusedBodies.clear();
     if (snapshotMode === 'world') {
       savedWorldSnapshot = world.takeSnapshot();
       savedBodySnapshots = null;
@@ -1222,6 +1268,17 @@ export async function buildDestructibleCore({
       }
     } else if (savedBodySnapshots) {
       restoreDynamicBodySnapshots(world, savedBodySnapshots, snapshotPoolSize);
+      // The restore re-applied each reused body's stale COM-velocity (the snapshot stores
+      // linvel at the COM it had with its full collider set). For reused bodies that have
+      // since lost colliders, re-derive the velocity for the shifted COM so they don't
+      // hover/lurch when the re-simulation steps them (gap #1b). Created bodies are handled
+      // by restoreCreatedBodyFromSource below.
+      for (const bodyHandle of comDirtyReusedBodies) {
+        const snap = snapshotIndex.get(bodyHandle);
+        if (!snap) continue; // created after this snapshot -> handled below, not a reused body
+        const body = world.getRigidBody(bodyHandle);
+        if (body) reconcileReusedBodyVelocity(body, snap.com);
+      }
       for (const [bodyHandle, provenance] of bodyRestoreProvenance) {
         if (provenance.createdAtSnapshotGeneration !== snapshotGeneration) continue;
         if (snapshotIndex.has(bodyHandle)) continue;
@@ -1426,6 +1483,10 @@ export async function buildDestructibleCore({
       const newBody = world.createRigidBody(desc);
       const bodyHandle = newBody.handle;
       if (!isSupport && maxDynamicBodies > 0) dynamicBodies++;
+      // The parent keeps its handle but loses this child's colliders -> its COM will shift.
+      // Record it so flushColliderMigrations can reconcile its velocity once the colliders move
+      // (skips the fixed root/ground in the consume loop). See reconcileReusedBodyVelocity.
+      bodiesThatLostColliders.add(inheritFromBodyHandle);
       bodyRestoreProvenance.set(bodyHandle, {
         inheritFromBodyHandle,
         createdAtSnapshotGeneration: snapshotGeneration,
@@ -1568,7 +1629,15 @@ export async function buildDestructibleCore({
       );
     }
 
-    // Clean up source bodies that lost all colliders during migration
+    // Parent/source bodies that lost colliders during migration: either retire them (emptied)
+    // or — for a REUSED fragment that kept some colliders — reconcile its velocity for the
+    // shifted centre of mass so it does not hover/lurch (gap #1b). `bodiesThatLostColliders`
+    // is the reused parent (flushPendingBodies pre-updates chunk.bodyHandle, so the parent does
+    // NOT appear in `sourceBodiesAffected`); the latter still covers in-place collider moves.
+    // `comDirtyReusedBodies` lets the resim restore re-apply the correction (the snapshot
+    // restores the stale COM-velocity).
+    for (const bh of bodiesThatLostColliders) sourceBodiesAffected.add(bh);
+    bodiesThatLostColliders.clear();
     for (const bh of sourceBodiesAffected) {
       if (bh === rootBody.handle || bh === groundBody.handle) continue;
       const body = world.getRigidBody(bh);
@@ -1577,6 +1646,9 @@ export async function buildDestructibleCore({
       const count = typeof rb.numColliders === 'function' ? rb.numColliders() : -1;
       if (count === 0) {
         bodiesToRemove.add(bh);
+      } else if (!body.isFixed()) {
+        comDirtyReusedBodies.add(bh);
+        reconcileReusedBodyVelocity(body);
       }
     }
 

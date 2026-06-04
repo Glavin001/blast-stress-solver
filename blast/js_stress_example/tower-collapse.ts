@@ -16,6 +16,7 @@ import {
   RapierDebugRenderer,
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 
 // ── Live frame profiler ───────────────────────────────────────
@@ -77,7 +78,9 @@ const CONFIG = {
     skipSingleBodies: false,
   },
   optimization: {
-    smallBodyDampingMode: 'always' as string,
+    // Damp small debris only after it lands ('always' floats falling debris — see
+    // rapier.smallBodyDamping.fall.test.ts).
+    smallBodyDampingMode: 'afterGroundCollision' as string,
     debrisCleanupMode: 'always' as string,
     debrisTtlMs: 10000,
     maxCollidersForDebris: 2,
@@ -232,6 +235,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -445,4 +449,5 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
+mountPipelineControls();
 initScene().then(() => loop());

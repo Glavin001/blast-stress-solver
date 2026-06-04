@@ -17,6 +17,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 
 const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
 
@@ -43,7 +44,9 @@ const CONFIG = {
   },
   physics: { debrisCollisionMode: 'all', friction: 0.25, restitution: 0 },
   optimization: {
-    smallBodyDampingMode: 'always',
+    // Damp small debris only after it lands; 'always' also damps it mid-air (caps the fall at
+    // ~g/damping ≈ 5 m/s → "floaty" collapse). See rapier.smallBodyDamping.fall.test.ts.
+    smallBodyDampingMode: 'afterGroundCollision',
     debrisCleanupMode: 'always',
     debrisTtlMs: 10000,
     maxCollidersForDebris: 3,
@@ -207,6 +210,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -373,6 +377,7 @@ function onResize() {
 }
 window.addEventListener('resize', onResize);
 
+mountPipelineControls();
 initScene()
   .then(() => loop())
   .catch((err) => {

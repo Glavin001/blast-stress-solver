@@ -80,7 +80,15 @@ impl PlannedBodyTarget {
 
 #[derive(Clone, Copy)]
 struct ChildTargetState {
+    /// The pose to actually set on the body. For a REUSED body this is its inherited (current)
+    /// pose — it is deliberately NOT recentered, so a resim snapshot of its origin stays valid
+    /// and a rollback cannot teleport it ("fragment yanks inwards"). For created bodies it is the
+    /// recentered pose.
     pose: Isometry<Real>,
+    /// The fragment's node-model centre of mass — the reference point the velocity fit and the
+    /// COM reconciliation use. Kept separate from `pose` so the reused body's velocity stays
+    /// correct (identical to the recentered behavior) even though its origin is left in place.
+    fit_center: Vec3,
     linvel: Vector<Real>,
     angvel: Vector<Real>,
     should_sleep: bool,
@@ -143,6 +151,11 @@ pub struct SplitContinuityRecord {
     pub parent_point_velocity: Vec3,
     /// Child body's velocity at the same world point, post-split.
     pub child_point_velocity: Vec3,
+    /// `‖child_world_centroid − parent_world_centroid‖`: how far the node's world position moved
+    /// across the split edit itself (recentering + collider re-offset), measured at the split
+    /// instant with no integration in between. Non-zero = a teleport — the "fragment jumped on
+    /// fracture" symptom — which the velocity metric cannot see.
+    pub world_position_error: f32,
     /// Whether all measured child velocity components are finite (no NaN/Inf).
     pub finite: bool,
 }
@@ -433,8 +446,9 @@ impl BodyTracker {
         for entry in &plan.reuse {
             let child = &event.children[entry.child_index];
             let child_has_support = child.nodes.iter().any(|n| self.support_nodes.contains(n));
+            // reuse = true => keep the inherited origin (no recentering); see ChildTargetState.
             let (target_state, child_pose_ms, velocity_fit_ms) =
-                self.compute_child_target_state(child, &planning, child_has_support);
+                self.compute_child_target_state(child, &planning, child_has_support, true);
             result.stats.child_pose_ms += child_pose_ms;
             result.stats.velocity_fit_ms += velocity_fit_ms;
             let flipped =
@@ -453,8 +467,9 @@ impl BodyTracker {
         for entry in &plan.create {
             let child = &event.children[entry.child_index];
             let child_has_support = child.nodes.iter().any(|n| self.support_nodes.contains(n));
+            // reuse = false => a fresh body, safe to recenter onto its COM.
             let (target_state, child_pose_ms, velocity_fit_ms) =
-                self.compute_child_target_state(child, &planning, child_has_support);
+                self.compute_child_target_state(child, &planning, child_has_support, false);
             result.stats.child_pose_ms += child_pose_ms;
             result.stats.velocity_fit_ms += velocity_fit_ms;
 
@@ -562,7 +577,8 @@ impl BodyTracker {
         // Reconcile each dynamic child's velocity with Rapier's real centre of mass, in a
         // SEPARATE pass after every child's colliders have been migrated (so the COM is final).
         for &(child_index, target) in &ordered_children {
-            let fit_center = child_target_states[&child_index].pose.translation.vector;
+            let fc = child_target_states[&child_index].fit_center;
+            let fit_center = vector![fc.x, fc.y, fc.z];
             self.reconcile_child_velocity_with_com(target.handle(), fit_center, bodies, colliders);
         }
 
@@ -945,9 +961,21 @@ impl BodyTracker {
         child: &SplitChild,
         planning: &SplitPlanningData,
         has_support: bool,
+        reuse: bool,
     ) -> (ChildTargetState, f32, f32) {
         let pose_started_at = Instant::now();
-        let pose = if self.split_child_recentering_enabled {
+        // `fit_center` is the fragment's node-model COM — the reference the velocity fit and the
+        // COM reconciliation use. It is computed the same way regardless of reuse, so the velocity
+        // result is identical to the recentered behavior.
+        let fit_center = if has_support {
+            self.child_world_centroid(child, planning)
+        } else {
+            self.child_world_center_of_mass(child, planning)
+        };
+        // The body pose: recenter only NEWLY created/recycled bodies (they are absent from any
+        // resim snapshot). A REUSED body keeps its inherited origin so resim rollback can't
+        // teleport it; its velocity is still reconciled to the real COM via `fit_center` below.
+        let pose = if self.split_child_recentering_enabled && !reuse {
             self.compute_child_target_pose(child, planning, has_support)
         } else {
             self.inherited_child_target_pose(child, planning)
@@ -955,7 +983,7 @@ impl BodyTracker {
         let child_pose_ms = pose_started_at.elapsed().as_secs_f64() as f32 * 1_000.0;
         let velocity_fit_started_at = Instant::now();
         let (linvel, angvel, should_sleep) = if self.split_child_velocity_fit_enabled {
-            self.fit_child_motion(child, planning, has_support, &pose)
+            self.fit_child_motion(child, planning, has_support, fit_center)
         } else {
             self.inherited_child_motion(child, planning, has_support)
         };
@@ -963,6 +991,7 @@ impl BodyTracker {
         (
             ChildTargetState {
                 pose,
+                fit_center,
                 linvel,
                 angvel,
                 should_sleep,
@@ -1082,14 +1111,13 @@ impl BodyTracker {
         child: &SplitChild,
         planning: &SplitPlanningData,
         has_support: bool,
-        target_pose: &Isometry<Real>,
+        fit_center: Vec3,
     ) -> (Vector<Real>, Vector<Real>, bool) {
         if has_support {
             return (Vector::zeros(), Vector::zeros(), false);
         }
 
-        let t = target_pose.translation.vector;
-        let child_com = Vec3::new(t.x, t.y, t.z);
+        let child_com = fit_center;
         let mut all_sleeping = true;
         let mut samples: Vec<(Vec3, Vec3, f32)> = Vec::new();
         let mut source_weights: HashMap<RigidBodyHandle, f32> = HashMap::new();
@@ -1330,13 +1358,26 @@ impl BodyTracker {
             let cv = body.velocity_at_point(&p);
             let child_v = Vec3::new(cv.x, cv.y, cv.z);
             let parent_v = source.world_velocity;
-            let finite = child_v.x.is_finite() && child_v.y.is_finite() && child_v.z.is_finite();
+            // Where the node actually sits now, on its (possibly recentered) child body.
+            let local = self.node_local_offsets[node as usize];
+            let cw = body
+                .position()
+                .transform_point(&point![local.x, local.y, local.z]);
+            let child_world = Vec3::new(cw.x, cw.y, cw.z);
+            let world_position_error = (child_world - source.world_centroid).magnitude();
+            let finite = child_v.x.is_finite()
+                && child_v.y.is_finite()
+                && child_v.z.is_finite()
+                && child_world.x.is_finite()
+                && child_world.y.is_finite()
+                && child_world.z.is_finite();
             self.split_continuity.push(SplitContinuityRecord {
                 target_body,
                 node_index: node,
                 point_velocity_error: (child_v - parent_v).magnitude(),
                 parent_point_velocity: parent_v,
                 child_point_velocity: child_v,
+                world_position_error,
                 finite,
             });
         }
