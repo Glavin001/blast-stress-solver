@@ -1021,6 +1021,8 @@ class ExtStressSolver implements ExtStressSolverType {
 
   converged() { if (!this.handle) return false; return this.module.ccall('ext_stress_solver_converged', 'number', ['number'], [this.handle]) !== 0; }
   islandCount(): number { if (!this.handle) return 0; return this.module.ccall('ext_stress_solver_island_count', 'number', ['number'], [this.handle]) >>> 0; }
+  setIslandAware(enabled: boolean) { if (!this.handle) return; this.module.ccall('ext_stress_solver_set_island_aware', null, ['number', 'number'], [this.handle, enabled ? 1 : 0]); }
+  islandAware(): boolean { if (!this.handle) return false; return this.module.ccall('ext_stress_solver_get_island_aware', 'number', ['number'], [this.handle]) !== 0; }
 }
 
 function writeNode(view: DataView, base: number, node: { com?: Vec3; mass?: number; inertia?: number }) {

@@ -49,6 +49,9 @@ public:
         uint32_t    maxIter         = 0;        // The maximum number of iterations.  If 0, use CGNR for default value.
         float       tolerance       = 1.e-6f;   // The relative tolerance threshold for convergence.  Iteration will stop when this is reached.
         bool        warmStart       = false;    // Whether or not to use the solve function's 'impulses' parameter as a starting input vector.
+        bool        islandAware     = false;    // Solve each disconnected component ("island") independently. With <=1 island this falls back to the
+                                                // whole-graph path, so it is bit-identical to the legacy solve; with multiple islands the result matches
+                                                // within solver tolerance (same scaling, same matrix entries; only the CG iteration is partitioned).
     };
 
     /**
@@ -105,6 +108,18 @@ public:
     static bool usingSIMD() { return s_use_simd; }
 
 protected:
+    /**
+     * Solve each disconnected component ("island") of the stress network independently, by gathering
+     * each island's bonds/nodes into a contiguous sub-system, running the same CGNR/scaling as solve(),
+     * and scattering the bond impulses back. The numeric kernels are unchanged; only the iteration is
+     * partitioned. Static (zero-mass) nodes carry no coupling and act as cut points between islands.
+     *
+     * \param[out]  handled  Set to false when there is at most one island (the caller should then use
+     *                       the whole-graph path, which is bit-identical to the legacy solve).
+     * \return iteration count summed over islands (>=0 if every island converged, otherwise negative).
+     */
+    int         solveIslandAware(AngLin6* impulses, const AngLin6* velocities, const SolverParams& params, AngLin6ErrorSq* error_sq, bool& handled);
+
     float                   m_mass_scale;
     float                   m_length_scale;
     POD_Buffer<InertiaS>    m_recip_sqrt_I;
@@ -114,6 +129,18 @@ protected:
     POD_Buffer<AngLin6>     m_B_scratch;
     POD_Buffer<AngLin6>     m_solver_cache;
     bool                    m_can_resume;
+
+    // Island-aware solve scratch (only sized/used when SolverParams::islandAware and there is >1 island)
+    std::vector<uint32_t>   m_uf;               // union-find parent over nodes
+    std::vector<uint32_t>   m_bondIsland;       // bond -> island id
+    std::vector<uint32_t>   m_islandBondBegin;  // CSR-style start offset per island (size islandCount+1)
+    std::vector<uint32_t>   m_bondsByIsland;    // bond indices grouped contiguously by island
+    std::vector<uint32_t>   m_g2l;              // global node -> island-local node index
+    std::vector<uint32_t>   m_g2lStamp;         // version stamp so m_g2l can be reused without clearing
+    std::vector<uint32_t>   m_l2g;              // island-local node index -> global node
+    POD_Buffer<Coupling>    m_localC;           // island-local couplings (node indices renumbered local)
+    POD_Buffer<InertiaS>    m_localI;           // island-local recip_sqrt_I
+    POD_Buffer<AngLin6>     m_localImpulses;    // island-local impulses (gather in, scatter out)
 
     static const bool       s_use_simd;
 };

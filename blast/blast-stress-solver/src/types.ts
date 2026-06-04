@@ -545,6 +545,12 @@ export interface ExtStressSolver {
    *  update. Static nodes are cut points, so structures sharing only a static/world
    *  node count as separate islands. */
   islandCount(): number;
+  /** Enable/disable island-aware solving: solve each disconnected component
+   *  independently. Single-island results are identical to the whole-graph solve;
+   *  multi-island results match within solver tolerance. Default: disabled. */
+  setIslandAware(enabled: boolean): void;
+  /** Whether island-aware solving is currently enabled. */
+  islandAware(): boolean;
   /** Snapshot the current actor table (actor index + owned nodes). */
   actors(): Array<{ actorIndex: number; nodes: number[] }>;
   /** Generate fracture commands for the last update. */

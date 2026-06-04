@@ -261,6 +261,20 @@ public:
     virtual uint32_t                        getIslandCount() const = 0;
 
     /**
+    Enable or disable island-aware solving: each disconnected component ("island") is solved
+    independently. With a single island this is identical to the default whole-graph solve;
+    with multiple islands the result matches within solver tolerance. Default: disabled.
+
+    \param[in]  enabled     true to solve per-island, false for the whole-graph solve.
+    */
+    virtual void                            setIslandAware(bool enabled) = 0;
+
+    /**
+    \return whether island-aware solving is currently enabled.
+    */
+    virtual bool                            getIslandAware() const = 0;
+
+    /**
     Generate fracture commands for particular actor.
 
     Calling this function if getOverstressedBondCount() == 0 or actor has no bond doesn't make sense, bondFractureCount will be '0'.
