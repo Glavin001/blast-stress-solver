@@ -16,7 +16,7 @@ import {
   RapierDebugRenderer,
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
-import { experimentCoreOverrides, mountExperimentPanel } from "./experiment-flags.js";
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 
 // ── Live frame profiler ───────────────────────────────────────
@@ -235,7 +235,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
-    ...experimentCoreOverrides(),
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -449,5 +449,5 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
-mountExperimentPanel();
+mountPipelineControls();
 initScene().then(() => loop());

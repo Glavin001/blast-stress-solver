@@ -17,7 +17,7 @@ import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
-import { experimentCoreOverrides, mountExperimentPanel } from "./experiment-flags.js";
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { buildFracturedBridgeScenario } from 'blast-stress-solver/scenarios';
 import { FRACTURED_BRIDGE_DEMO_CONFIG as CONFIG } from './fractured-demo-config.js';
 
@@ -169,7 +169,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
-    ...experimentCoreOverrides(),
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -339,7 +339,7 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ─────────────────────────────────────────────────────
 
-mountExperimentPanel();
+mountPipelineControls();
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize fractured bridge demo:', err);
   const hint = document.querySelector('.viewport-hint');
