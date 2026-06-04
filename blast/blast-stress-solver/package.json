@@ -58,6 +58,7 @@
     "postbuild:ts": "npm run generate:high-rise",
     "generate:high-rise": "node ./scripts/export-high-rise.mjs",
     "generate:brick-building-pack": "node ./scripts/generate-brick-building-scene-pack.mjs",
+    "inspect:recording": "node scripts/inspect-recording.mjs",
     "bench": "node scripts/bench.mjs",
     "bench:small": "node scripts/bench.mjs --small",
     "bench:large": "node scripts/bench.mjs --large",
