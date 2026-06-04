@@ -127,12 +127,38 @@ describe('session recorder', () => {
     fake.core.step(1 / 60);
     rec.stop();
     const dec = decodeSimRecording(rec.export()!);
-    // The trace row is keyed by the decoded integer handle (41), not 0.
-    expect(dec.bodyInFrame(0, 41)).not.toBeNull();
+    // The body is keyed by a dense session id (0) whose handleTable entry is the
+    // decoded raw handle (41) — not the underflowed 0.
+    expect(dec.bodyInFrame(0, 0)).not.toBeNull();
+    expect(Array.from(dec.handleTable)).toEqual([41]);
     // And a stable body must NOT generate phantom migrate events every frame.
     expect(rec.export()!.events.filter((e) => e.type === 'migrate')).toHaveLength(0);
   });
 
+
+  it('does not fabricate migrations for handles with a generation (high 32 bits)', () => {
+    // Rapier reuses a body index with an incremented generation → the decoded raw
+    // handle is 2^32 + index (e.g. 4294967298), which overflows Int32/Float32.
+    const rawHandle = 4294967298; // 2^32 + 2
+    const bitEncoded = new Float64Array(new BigUint64Array([BigInt(rawHandle)]).buffer)[0];
+    const fake = makeFakeCore();
+    fake.bodies.push({ handle: bitEncoded, fixed: false, t: { x: 0, y: 0, z: 0 }, r: { x: 0, y: 0, z: 0, w: 1 }, lv: { x: 0, y: 0, z: 0 }, av: { x: 0, y: 0, z: 0 } });
+    fake.chunks.push(newChunk(0, bitEncoded));
+
+    const rec = createSessionRecorder();
+    rec.attach(fake.core);
+    rec.start();
+    for (let i = 0; i < 20; i += 1) fake.core.step(1 / 60); // body is stable the whole time
+    rec.stop();
+
+    const data = rec.export()!;
+    // Previously this produced one phantom "migrate" per frame (~19). Now: none.
+    expect(data.events.filter((e) => e.type === 'migrate')).toHaveLength(0);
+    const dec = decodeSimRecording(data);
+    // The raw handle is recoverable, exactly, via the handle table.
+    expect(Array.from(dec.handleTable)).toEqual([rawHandle]);
+    expect(dec.bodyInFrame(0, 0)).not.toBeNull();
+  });
 
   it('captures body kinematics columnar and round-trips exactly', () => {
     const fake = makeFakeCore();
@@ -163,9 +189,11 @@ describe('session recorder', () => {
     expect(Array.from(dec.columns.bodyCount)).toEqual([1, 1]);
     expect(dec.bodies.length).toBe(2 * BODY_STRIDE);
 
-    const f1 = dec.bodyInFrame(1, 5);
+    // Body 5 → dense session id 0 (handleTable maps it back to the raw handle 5).
+    expect(Array.from(dec.handleTable)).toEqual([5]);
+    const f1 = dec.bodyInFrame(1, 0);
     expect(f1).not.toBeNull();
-    expect(f1![0]).toBe(5); // handle
+    expect(f1![0]).toBe(0); // session id
     expect(f1![1]).toBeCloseTo(4); // px
     expect(f1![2]).toBeCloseTo(5);
     expect(f1![3]).toBeCloseTo(6);
@@ -173,7 +201,7 @@ describe('session recorder', () => {
     expect(f1![9]).toBeCloseTo(-1); // lvy
 
     // Frame 0 still has the original position.
-    const f0 = dec.bodyInFrame(0, 5)!;
+    const f0 = dec.bodyInFrame(0, 0)!;
     expect(f0![1]).toBeCloseTo(1);
   });
 
@@ -236,14 +264,17 @@ describe('session recorder', () => {
     rec.stop();
     const data = rec.export()!;
 
+    // Handles are interned to dense session ids: raw 1 → id 0, raw 2 → id 1.
+    const dec = decodeSimRecording(data);
+    expect(Array.from(dec.handleTable)).toEqual([1, 2]);
     const migrate = data.events.find((e) => e.type === 'migrate');
-    expect(migrate).toMatchObject({ node: 1, from: 1, to: 2, f: 1 });
+    expect(migrate).toMatchObject({ node: 1, from: 0, to: 1, f: 1 });
     const detach = data.events.find((e) => e.type === 'detach');
     expect(detach).toMatchObject({ node: 1, f: 1 });
     const destroy = data.events.find((e) => e.type === 'destroy');
     expect(destroy).toMatchObject({ node: 0, f: 2 });
     const removed = data.events.find((e) => e.type === 'bodyRemoved');
-    expect(removed).toMatchObject({ body: 1 });
+    expect(removed).toMatchObject({ body: 0 });
   });
 
   it('captures a full-session per-frame timing stream via setProfiler multiplex', () => {

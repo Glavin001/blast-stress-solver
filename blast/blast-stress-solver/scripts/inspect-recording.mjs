@@ -91,6 +91,7 @@ function decodeSimRecording(data) {
     events: data.events,
     timing,
     resimLog: data.resimLog ?? [],
+    handleTable: data.handleTable ? decodeTyped(data.handleTable) : new Float64Array(0),
     frame,
     bodyInFrame,
   };
@@ -247,7 +248,8 @@ if (has('--events')) {
 if (has('--body')) {
   const handle = Number(opt('--body'));
   const stride = dec.bodyStride;
-  console.log(`\n━━━ Body handle ${handle} — trajectory frames ${range[0]}..${range[1]} ━━━`);
+  const raw = dec.handleTable && dec.handleTable[handle] != null ? dec.handleTable[handle] : '?';
+  console.log(`\n━━━ Body id ${handle} (raw rapier handle ${raw}) — trajectory frames ${range[0]}..${range[1]} ━━━`);
   console.log('  frame    t(s)        pos(x,y,z)                 |linvel|  |angvel|');
   let prev = null;
   for (let f = range[0]; f <= range[1] && f < dec.durationFrames; f += 1) {

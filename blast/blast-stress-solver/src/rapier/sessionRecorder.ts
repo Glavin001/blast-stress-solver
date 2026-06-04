@@ -243,6 +243,15 @@ export type SimRecordingExport = {
   nodeIndices: EncodedTypedArray;
   bodyStride: number;
   bodyLayout: readonly string[];
+  /**
+   * Maps the dense session body-id used in the `bodies` handle column and the
+   * topology events back to the raw (decoded) Rapier handle. Index = session id,
+   * value = raw handle. Interning keeps ids small so they stay exact in the
+   * Float32 trace and Int32 diff state — raw Rapier handles can carry a
+   * generation in the high 32 bits (e.g. 2³²+2 after index reuse), which would
+   * otherwise overflow/round and fabricate per-frame "migrations".
+   */
+  handleTable: EncodedTypedArray;
   /** Per-frame columnar scalars (all parallel, length === durationFrames). */
   columns: {
     /** Accumulated simulation time (s). */
@@ -513,6 +522,21 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
   const bodies = new GrowableF32();
   const columns = new FrameColumns();
   const timing = new TimingColumns();
+  // Intern raw (decoded) Rapier handles → small dense session ids, so the id is
+  // exact in the Float32 trace and the Int32 topology-diff state even when the raw
+  // handle carries a generation in its high 32 bits. handleList[id] = raw handle.
+  const handleIds = new Map<number, number>();
+  let handleList: number[] = [];
+  const internHandle = (raw: number): number => {
+    if (raw < 0) return -1;
+    let id = handleIds.get(raw);
+    if (id === undefined) {
+      id = handleList.length;
+      handleIds.set(raw, id);
+      handleList.push(raw);
+    }
+    return id;
+  };
   let events: SimRecordingEvent[] = [];
   let resimLog: NonNullable<SimRecordingExport['resimLog']> = [];
   // Latest profiler sample seen this frame (set in the multiplexed onSample,
@@ -558,6 +582,8 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     timing.clear();
     events = [];
     resimLog = [];
+    handleIds.clear();
+    handleList = [];
     lastProfilerSample = null;
     localFrame = 0;
     simTime = 0;
@@ -574,7 +600,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     liveBodies.clear();
     for (let i = 0; i < n; i += 1) {
       const c = chunks[i];
-      const body = c.bodyHandle == null ? -1 : decodeRapierHandle(c.bodyHandle);
+      const body = c.bodyHandle == null ? -1 : internHandle(decodeRapierHandle(c.bodyHandle));
       nodeIndexByChunk[i] = c.nodeIndex;
       initialBodyByChunk[i] = body;
       prevBody[i] = body;
@@ -596,7 +622,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     for (let i = 0; i < n; i += 1) {
       const c = chunks[i];
       const node = nodeIndexByChunk[i];
-      const body = c.bodyHandle == null ? -1 : decodeRapierHandle(c.bodyHandle);
+      const body = c.bodyHandle == null ? -1 : internHandle(decodeRapierHandle(c.bodyHandle));
       if (body >= 0) seenBodies.add(body);
 
       const flags =
@@ -647,7 +673,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     core.world.forEachRigidBody((body) => {
       if (body.isFixed()) return;
       bodies.pushBody(
-        decodeRapierHandle(body.handle),
+        internHandle(decodeRapierHandle(body.handle)),
         body.translation(),
         body.rotation(),
         body.linvel(),
@@ -891,6 +917,7 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
       nodeIndices: encodeTyped(nodeIndexByChunk),
       bodyStride: BODY_STRIDE,
       bodyLayout: BODY_LAYOUT,
+      handleTable: encodeTyped(Float64Array.from(handleList)),
       columns: {
         simTime: encodeTyped(Float64Array.from(columns.simTime)),
         dt: encodeTyped(Float32Array.from(columns.dt)),
@@ -930,6 +957,8 @@ export type DecodedSimRecording = {
   durationSeconds: number;
   bodyStride: number;
   bodyLayout: readonly string[];
+  /** Dense session body-id → raw Rapier handle (see SimRecordingExport). */
+  handleTable: Float64Array;
   columns: {
     simTime: Float64Array;
     dt: Float32Array;
@@ -1000,6 +1029,7 @@ export function decodeSimRecording(data: SimRecordingExport): DecodedSimRecordin
     durationSeconds: data.durationSeconds,
     bodyStride: stride,
     bodyLayout: data.bodyLayout,
+    handleTable: (data.handleTable ? decodeTyped(data.handleTable) : new Float64Array(0)) as Float64Array,
     columns,
     bodies,
     frameBodyOffset,
