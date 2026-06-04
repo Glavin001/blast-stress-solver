@@ -330,6 +330,13 @@ export type DestructibleCore = {
     totalBonds: number; settledBonds: number;
     settledNodeFraction: number; settledBondFraction: number;
   };
+  /** Stage-4 island-aware solving: solve each disconnected component independently and
+   *  skip components that have settled (inputs unchanged since their last solve + already
+   *  converged). Observationally identical to the whole-graph solve; a settled component
+   *  re-solves the same frame its load changes (paused, never frozen). Off by default. */
+  setIslandSolver?: (opts: { enabled?: boolean; skipSettled?: boolean }) => void;
+  /** Current island-solver settings plus the last update's island count and skipped count. */
+  getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

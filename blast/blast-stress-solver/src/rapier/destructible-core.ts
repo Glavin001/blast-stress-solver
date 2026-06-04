@@ -436,7 +436,23 @@ export async function buildDestructibleCore({
     console.warn('[Core] no supports (nodes with mass=0) found in scenario', scenario);
   }
 
+  // Island-aware solving (Stage 4 integration). Off by default so existing behavior is unchanged.
+  // When enabled, the stress solve runs per disconnected component ("island") and skips components
+  // that have settled — their velocity inputs are unchanged since the last solve and they already
+  // converged, so re-solving is a no-op. This is observationally identical to the whole-graph solve
+  // but far cheaper for large, partially-active worlds. A settled component re-solves the same frame
+  // its load changes (a new contact, or a neighbour waking shifts its input), so it is paused, never
+  // frozen or evicted: anything settled can always be loaded and fractured again.
+  let islandSolverEnabled = false;
+  let islandSolverSkipSettled = true;
+
   const solver = runtime.createExtSolver({ nodes, bonds, settings: scaledSettings });
+
+  function applyIslandSolverSettings() {
+    solver.setIslandAware?.(islandSolverEnabled);
+    solver.setSkipSettled?.(islandSolverEnabled && islandSolverSkipSettled);
+  }
+  applyIslandSolverSettings();
 
   const bondTable: Array<{ index:number; node0:number; node1:number; centroid:Vec3; normal:Vec3; area:number }> = scenario.bonds.map((b, i) => ({ index: i, node0: b.node0, node1: b.node1, centroid: b.centroid, normal: b.normal, area: b.area }));
   const bondsByNode = new Map<number, number[]>();
@@ -2385,6 +2401,22 @@ export async function buildDestructibleCore({
     solverGravityEnabled = v;
   }
 
+  // Enable/disable island-aware solving and settled-island skipping at runtime (Stage 4).
+  function setIslandSolver(opts: { enabled?: boolean; skipSettled?: boolean }) {
+    if (opts.enabled != null) islandSolverEnabled = !!opts.enabled;
+    if (opts.skipSettled != null) islandSolverSkipSettled = !!opts.skipSettled;
+    applyIslandSolverSettings();
+  }
+
+  function getIslandSolverStats() {
+    return {
+      enabled: islandSolverEnabled,
+      skipSettled: islandSolverSkipSettled,
+      islandCount: solver.islandCount?.() ?? 0,
+      islandsSkipped: solver.islandsSkipped?.() ?? 0,
+    };
+  }
+
   function getCollisionGroupContext(): CollisionGroupContext {
     return {
       mode: debrisCollisionModeSetting,
@@ -2518,6 +2550,8 @@ export async function buildDestructibleCore({
     getRigidBodyCount,
     getActiveBondsCount,
     getIslandSettledStats,
+    setIslandSolver,
+    getIslandSolverStats,
     getSolverDebugLines,
     getNodeBonds,
     cutBond,
