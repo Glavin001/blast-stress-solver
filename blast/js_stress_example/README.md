@@ -106,17 +106,23 @@ panel (or press `V`). Controls:
 | Arrow keys / mouse | Look (mouse needs pointer lock — click once to grab it) |
 | `Space` | Jump |
 | Left click | Shoot the current weapon |
-| `1` / `2` / `Q` | Ball projectile / Sticky explosive / cycle |
+| `1` / `2` / `3` / `Q` | Ball / Sticky explosive / Grenade / cycle weapon |
 | `F` | Detonate all placed sticky charges |
 | `V` | Toggle first-person mode |
 | `Esc` | Release the mouse |
+
+A **Headlamp** toggle (on by default) mounts a light on the camera so wherever
+you stand and look is lit, independent of the demo's fixed scene lights.
 
 **Weapons** (usable in first-person *or* the default orbit view):
 
 1. **Ball projectile** — the demo's existing click-to-shoot ball.
 2. **Sticky-explosive launcher** — fires a charge that sticks where it first
    touches (walls, support pillars, debris — it even rides bodies that move).
-   Place as many as you like, then press `F` to detonate them all at once. Each
-   blast applies an outward radial force within an adjustable radius, seeding
-   stress into the bond graph so the structure actually comes apart. Blast
-   radius/force and charge speed are tunable in the panel.
+   Place as many as you like, then press `F` to detonate them all at once.
+3. **Grenade launcher** — fires a charge that explodes the instant it touches
+   anything, no detonate step.
+
+Each blast applies an outward radial force within an adjustable radius, seeding
+stress into the bond graph so the structure actually comes apart. Blast
+radius/force and charge speed are tunable in the panel.

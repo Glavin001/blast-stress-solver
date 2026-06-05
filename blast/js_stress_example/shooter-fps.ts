@@ -67,7 +67,7 @@ export type ShooterHandle = {
   detonateAll: () => void;
 };
 
-export type ShootMode = 'ball' | 'sticky';
+export type ShootMode = 'ball' | 'sticky' | 'grenade';
 
 type Vec3 = { x: number; y: number; z: number };
 
@@ -79,6 +79,8 @@ type StickyExplosive = {
   flying: boolean;
   stuck: boolean;
   exploded: boolean;
+  /** Grenade behaviour: explode the instant it touches something, no detonate step. */
+  explodeOnContact: boolean;
   spawnTime: number;
   radius: number;
   /** Body the charge stuck to (so it follows moving pillars). null = world-pinned. */
@@ -109,6 +111,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   const cfg = {
     fps: false,
     mode: 'ball' as ShootMode,
+    headlamp: true, // camera-mounted light so the view is always lit
     walkSpeed: 9, // m/s
     jumpSpeed: 7, // m/s
     gravity: 20, // m/s² (snappier than real g for a responsive walker)
@@ -140,7 +143,18 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   const _move = new THREE.Vector3();
   const _v = new THREE.Vector3();
   const _v2 = new THREE.Vector3();
+  const _look = new THREE.Vector3();
   const UP = new THREE.Vector3(0, 1, 0);
+
+  // ── Camera headlamp ─────────────────────────────────────────────
+  // A spotlight that tracks the camera each frame (position + aim), so wherever
+  // you stand and look is lit — independent of the demo's fixed scene lights and
+  // of the core (survives Reset). decay=0 keeps far structures lit too.
+  const headlamp = new THREE.SpotLight(0xfff2e0, 2.6, 0, Math.PI / 4, 0.4, 0);
+  headlamp.castShadow = false;
+  headlamp.visible = cfg.headlamp;
+  scene.add(headlamp);
+  scene.add(headlamp.target);
 
   // ── Overlay UI (crosshair + status badge) ───────────────────────
   const viewport = (canvas.parentElement as HTMLElement | null) ?? document.body;
@@ -155,6 +169,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
 
   // ── Sidebar controls (injected like pipeline-controls) ──────────
   let fpsCheckbox: HTMLInputElement | null = null;
+  let headlampCheckbox: HTMLInputElement | null = null;
   let modeSelect: HTMLSelectElement | null = null;
   let armedCountEl: HTMLElement | null = null;
 
@@ -171,10 +186,14 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       '<span class="toggle-text">First-person mode' +
       '<small>WASD walk · arrows / mouse look · Space jump · click shoots. ' +
       'Press <b>V</b> to toggle.</small></span></label>' +
+      '<label class="toggle-row"><input type="checkbox" id="cfg-headlamp" checked />' +
+      '<span class="toggle-text">Headlamp' +
+      '<small>Camera-mounted light — always lights wherever you are and look.</small></span></label>' +
       '<div class="config-row"><label class="config-label" for="cfg-shoot-mode">Weapon</label>' +
       '<select id="cfg-shoot-mode" class="config-select">' +
       '<option value="ball">① Ball projectile</option>' +
       '<option value="sticky">② Sticky explosive</option>' +
+      '<option value="grenade">③ Grenade (explode on contact)</option>' +
       '</select></div>' +
       '<div class="config-row"><span class="config-label">Armed charges</span>' +
       '<span class="config-value" id="cfg-armed">0</span></div>' +
@@ -196,11 +215,18 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     else sidebar.insertBefore(section, sidebar.firstChild);
 
     fpsCheckbox = section.querySelector('#cfg-fps');
+    headlampCheckbox = section.querySelector('#cfg-headlamp');
     modeSelect = section.querySelector('#cfg-shoot-mode');
     armedCountEl = section.querySelector('#cfg-armed');
 
     fpsCheckbox!.checked = cfg.fps;
     fpsCheckbox!.addEventListener('change', () => setFpsEnabled(fpsCheckbox!.checked));
+
+    headlampCheckbox!.checked = cfg.headlamp;
+    headlampCheckbox!.addEventListener('change', () => {
+      cfg.headlamp = headlampCheckbox!.checked;
+      headlamp.visible = cfg.headlamp;
+    });
 
     modeSelect!.value = cfg.mode;
     modeSelect!.addEventListener('change', () => setMode(modeSelect!.value as ShootMode));
@@ -233,11 +259,13 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
 
   function refreshUi() {
     if (fpsCheckbox) fpsCheckbox.checked = cfg.fps;
+    if (headlampCheckbox) headlampCheckbox.checked = cfg.headlamp;
     if (modeSelect) modeSelect.value = cfg.mode;
     const armed = countArmed();
     if (armedCountEl) armedCountEl.textContent = String(armed);
     crosshair.style.display = cfg.fps ? 'block' : 'none';
-    const modeLabel = cfg.mode === 'ball' ? '① Ball' : '② Sticky explosive';
+    const modeLabel =
+      cfg.mode === 'ball' ? '① Ball' : cfg.mode === 'sticky' ? '② Sticky explosive' : '③ Grenade';
     const fpsLabel = cfg.fps ? (pointerLocked ? 'on' : 'on — click to look') : 'off';
     badge.innerHTML =
       `<span class="shooter-badge-mode">${modeLabel}</span>` +
@@ -255,8 +283,9 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     cfg.mode = mode;
     refreshUi();
   }
+  const MODE_ORDER: ShootMode[] = ['ball', 'sticky', 'grenade'];
   function cycleMode() {
-    setMode(cfg.mode === 'ball' ? 'sticky' : 'ball');
+    setMode(MODE_ORDER[(MODE_ORDER.indexOf(cfg.mode) + 1) % MODE_ORDER.length]);
   }
 
   function setFpsEnabled(on: boolean) {
@@ -304,7 +333,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       else { aimDirection(ndcX, ndcY, _v); shootBall(core, _v); }
     } else {
       aimDirection(ndcX, ndcY, _v);
-      shootSticky(core, _v);
+      shootCharge(core, _v, cfg.mode === 'grenade');
     }
   }
 
@@ -320,7 +349,9 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     });
   }
 
-  function shootSticky(core: DestructibleCore, dir: THREE.Vector3) {
+  // Launch a thrown charge. `explodeOnContact` => grenade (blows up the instant
+  // it touches anything); otherwise it's a sticky charge that waits for detonate.
+  function shootCharge(core: DestructibleCore, dir: THREE.Vector3, explodeOnContact: boolean) {
     const world = core.world as RAPIER.World;
     const r = cfg.sticky.radius;
     // Spawn just ahead of the eye so the charge never starts inside the camera.
@@ -341,7 +372,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       .setRestitution(0.0);
     const collider = world.createCollider(colDesc, body);
 
-    const mesh = makeStickyMesh(r);
+    const mesh = makeChargeMesh(r, explodeOnContact);
     mesh.position.set(ox, oy, oz);
     scene.add(mesh);
 
@@ -352,6 +383,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       flying: true,
       stuck: false,
       exploded: false,
+      explodeOnContact,
       spawnTime: performance.now(),
       radius: r,
       attachBodyHandle: null,
@@ -361,11 +393,12 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     });
   }
 
-  function makeStickyMesh(r: number): THREE.Mesh {
+  function makeChargeMesh(r: number, grenade: boolean): THREE.Mesh {
+    const color = grenade ? 0xffa022 : 0xff2a2a; // grenade = orange, sticky = red
     const geo = new THREE.SphereGeometry(r, 18, 14);
     const mat = new THREE.MeshStandardMaterial({
-      color: 0xff2a2a,
-      emissive: 0xff2a2a,
+      color,
+      emissive: color,
       emissiveIntensity: 0.6,
       roughness: 0.5,
       metalness: 0.1,
@@ -420,7 +453,15 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
         // Fallback: it has come to rest on something (e.g. a soft ground landing).
         const lv = body.linvel();
         const slow = lv.x * lv.x + lv.y * lv.y + lv.z * lv.z < 0.5;
-        if (!hit && slow && now - s.spawnTime > 250) {
+        const settled = slow && now - s.spawnTime > 250;
+
+        if ((hit || settled) && s.explodeOnContact) {
+          // Grenade: blow up the instant it first touches anything.
+          explodeCharge(core, s, body);
+          removeSticky(s);
+          stickies.splice(i, 1);
+          refreshUi();
+        } else if (!hit && settled) {
           stickInPlace(s, body);
         } else if (hit) {
           stickToBody(s, body, hit, hitIsFixed);
@@ -500,6 +541,19 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       any = true;
     }
     if (any) refreshUi();
+  }
+
+  // Blow up a single in-flight charge (grenade) at its current position.
+  function explodeCharge(core: DestructibleCore, s: StickyExplosive, body: RAPIER.RigidBody) {
+    const t = body.translation();
+    s.worldPos.set(t.x, t.y, t.z);
+    try { (core.world as RAPIER.World).removeRigidBody(body); } catch { /* ignore */ }
+    s.bodyHandle = null;
+    s.colliderHandle = null;
+    s.flying = false;
+    s.exploded = true;
+    explodeAt(core, s.worldPos);
+    spawnShockwave(s.worldPos, cfg.blast.radius);
   }
 
   function explodeAt(core: DestructibleCore, center: THREE.Vector3) {
@@ -678,6 +732,14 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     if (core) updateStickies(core);
     updateTransient(now);
 
+    // Headlamp rides the camera (FPS and orbit alike), aiming where you look.
+    headlamp.visible = cfg.headlamp;
+    if (cfg.headlamp) {
+      headlamp.position.copy(camera.position);
+      _look.set(0, 0, -1).applyQuaternion(camera.quaternion);
+      headlamp.target.position.copy(camera.position).add(_look);
+    }
+
     // Keep the armed-count + pulse readouts live.
     if (armedCountEl) {
       const n = countArmed();
@@ -749,6 +811,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     switch (e.code) {
       case 'Digit1': setMode('ball'); return;
       case 'Digit2': setMode('sticky'); return;
+      case 'Digit3': setMode('grenade'); return;
       case 'KeyQ': cycleMode(); return;
       case 'KeyF': detonateAll(); return;
       case 'KeyV': setFpsEnabled(!cfg.fps); return;
