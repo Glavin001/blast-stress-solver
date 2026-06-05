@@ -108,28 +108,33 @@ const enableProfiling = process.env.EMCC_PROFILING === '1';
 // ext_stress_solver_update), at the cost of ~20s extra link time. Disable with
 // EMCC_NO_LTO=1 if iterating locally and only the JS bridge changed.
 const enableLTO = process.env.EMCC_NO_LTO !== '1';
-// Opt-in for one of the two SIMD kernel paths.  Both flip
-// StressProcessor::s_use_simd to true and route through AngLin6Ops<__m128>
-// in anglin6.h / coupling.h / inertia.h; the difference is the underlying
-// implementation.
+// SIMD kernel-path selection for the WASM solver.
 //
-//   EMCC_USE_SIMD=1       — native AVX intrinsics (__m256, _mm256_*).
-//                           emscripten 3.1.68+ lowers these to two
-//                           wasm-simd128 ops + struct bookkeeping.  Measured
-//                           +24% on the mini-city replay vs the scalar
-//                           autovec default (PR #37).
-//   EMCC_USE_WASM_SIMD=1  — direct wasm_simd128 intrinsics (v128_t,
-//                           wasm_f32x4_*).  Same math as the AVX path with
-//                           the per-op `__m256` wrapper round-trips removed.
-//                           Should match the AVX win at scale and avoid its
-//                           per-op tax at small scale.
+// Default (no env vars set): the direct wasm_simd128 hand-port — `AngLin6Ops`
+// / `CouplingMatrixOps` / `InertiaMatrixOps` specializations from anglin6.h /
+// coupling.h / inertia.h compiled with `STRESS_SOLVER_WASM_SIMD_DIRECT`,
+// flipping `StressProcessor::s_use_simd` to true at runtime.  Measured ~24%
+// solver speedup on the mini-city replay vs the scalar autovec, ~34% mean /
+// ~49% worst-frame on the destruction bench.  All 408 vitest tests pass.
 //
-// If both are set, EMCC_USE_WASM_SIMD wins (it's strictly the better-codegen
-// variant of the same algorithm).  Neither set → scalar AngLin6Ops<float>,
-// autovectorized by `-O3 -msimd128`.
-const enableSimd = process.env.EMCC_USE_SIMD === '1';
-const enableWasmSimd = process.env.EMCC_USE_WASM_SIMD === '1';
-const enableAnySimd = enableSimd || enableWasmSimd;
+// **Kill switch** — `EMCC_NO_SIMD=1` reverts to the scalar `AngLin6Ops<float>`
+// path that shipped on main.  Same algorithm, same numeric output (within the
+// solver tolerance the test suite already exercises).  Use this if a future
+// upstream WASM-SIMD bug shows up, or to A/B with the no-SIMD baseline.
+//
+// AVX alternative — `EMCC_USE_SIMD=1` (and `EMCC_NO_SIMD` unset) selects the
+// `__m256` AVX-intrinsic path from PR #37 instead of v128.  Kept available
+// for fallback and for parity-testing against the native (x86) Rust crate,
+// which uses the same `__m256` kernels.  Tied with v128 on steady-state mean,
+// slightly slower on the worst-case frame.
+//
+// Precedence: NO_SIMD > USE_WASM_SIMD > USE_SIMD > default (v128).
+const disableSimd = process.env.EMCC_NO_SIMD === '1';
+const explicitWasmSimd = process.env.EMCC_USE_WASM_SIMD === '1';
+const explicitAvx = process.env.EMCC_USE_SIMD === '1';
+const enableAvx = !disableSimd && !explicitWasmSimd && explicitAvx;
+const enableWasmSimd = !disableSimd && !enableAvx;
+const enableAnySimd = !disableSimd;
 
 // The TS bridge in blast-stress-solver/src/stress.ts reaches for
 // Module.HEAPU8 / HEAPU32 / HEAPF32 (it rebuilds the DataView after every

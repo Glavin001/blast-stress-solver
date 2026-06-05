@@ -122,6 +122,61 @@ jobs:
         run: npm run test:split
         continue-on-error: true
 
+  test-scalar-fallback:
+    # Build + test under EMCC_NO_SIMD=1 — the scalar opt-out path that PR #40 added
+    # alongside the new v128-default SIMD path.  Confirms the kill switch keeps producing
+    # a working WASM with byte-equivalent (within solver tolerance) behavior to main.
+    # Lightweight: rebuilds the WASM with the scalar flag, runs the invariant + parity
+    # tests only (not the full soak; the SIMD path already covers that in the Test job).
+    name: Test (scalar fallback, EMCC_NO_SIMD=1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.0
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Install blast-stress-solver dependencies
+        working-directory: blast/blast-stress-solver
+        run: npm install --ignore-scripts
+
+      - name: Install js_stress_example dependencies
+        working-directory: blast/js_stress_example
+        run: npm install
+
+      - name: Build WASM + JS (scalar fallback)
+        working-directory: blast/js_stress_example
+        env:
+          EMCC_NO_SIMD: '1'
+        run: npm run build
+
+      - name: Build blast-stress-solver package (scalar fallback)
+        working-directory: blast/blast-stress-solver
+        env:
+          EMCC_NO_SIMD: '1'
+        run: npm run build
+
+      - name: Run invariant + kernel tests (scalar fallback, blocking)
+        working-directory: blast/blast-stress-solver
+        env:
+          EMCC_NO_SIMD: '1'
+        run: npm run test:invariants
+
+      - name: Run SIMD parity test (asserts s_use_simd reflects EMCC_NO_SIMD)
+        working-directory: blast/blast-stress-solver
+        env:
+          EMCC_NO_SIMD: '1'
+        run: npx vitest run src/tests/simd.parity.test.ts
+
   rust-tests:
     # Rust library tests, including the Tier-0 kernel property tests (motion_fit) and
     # the Tier-1 kinematic invariants (point-velocity continuity, no-NaN, mass

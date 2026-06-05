@@ -1,34 +1,36 @@
 /**
  * SIMD-vs-scalar parity gate for the WASM CGNR solver.
  *
- * Build via `EMCC_USE_SIMD=1 npm run build` and the WASM compiles `anglin6.h`'s
- * `__m128`/`__m256` specializations through emscripten's native AVX intrinsic
- * lowering (256-bit ops emulated as two wasm-simd128 ops, since emcc 3.1.68
- * landed AVX support).  FMA still needs a `(mul + add)` macro override in
- * `simd/simd.h` because baseline wasm-simd128 has no hardware FMA — same
- * arithmetic semantics the scalar autovec path produces.
+ * As of PR #40 the WASM build defaults to the direct wasm-simd128 hand-port
+ * of `AngLin6Ops` / `CouplingMatrixOps` / `InertiaMatrixOps` (see anglin6.h
+ * / coupling.h / inertia.h).  The kill switch is `EMCC_NO_SIMD=1`, which
+ * compiles the scalar `AngLin6Ops<float>` path that clang autovectorizes
+ * with `-O3 -msimd128` — same algorithm as on main, byte-equivalent
+ * behavior modulo compiler codegen differences.
  *
- * Without `EMCC_USE_SIMD=1` the build ships the scalar `AngLin6Ops<float>`
- * path that clang autovectorizes with `-O3 -msimd128`.  In our measured
- * scenario the scalar path is currently faster (the AVX kernels eat more
- * load/store traffic per AngLin6 op than the autovec produces from the
- * compact scalar source), so it stays the default.
+ * `EMCC_USE_SIMD=1` (without `EMCC_NO_SIMD`) selects the AVX-intrinsic
+ * variant from PR #37 instead of v128.  Tied at scale, slower on the
+ * worst-case frame; kept for fallback and Rust-crate parity.
  *
- * This file is the safety gate either way.  It pins:
- *   1. That the `s_use_simd` flag inside `StressProcessor` reflects the
- *      build (so a misconfigured EMCC_USE_SIMD silently shipping the wrong
- *      WASM surfaces at test time, not in production).
+ * This file is the safety gate for the build-flag wiring.  It pins:
+ *   1. That `StressProcessor::s_use_simd` reflects the build flag, so a
+ *      misconfigured env var silently shipping the wrong WASM surfaces at
+ *      test time, not in production.
  *   2. That a deterministic gravity scenario converges with a tight
- *      residual on both paths.  The whole 406-test suite passes under both
- *      builds, but a dedicated check against an absolute number means a
- *      future kernel change that drifts the SIMD path away from scalar
+ *      residual on every kernel path.  The whole 408-test suite passes on
+ *      both, but a dedicated check against an absolute number means a
+ *      future kernel change that drifts SIMD output away from scalar
  *      shows up here as a small, reviewable diff instead of an unrelated
  *      end-to-end test cascading.
  */
 import { describe, it, expect } from 'vitest';
 import type * as Runtime from '..';
 
-const EXPECT_SIMD = process.env.EMCC_USE_SIMD === '1' || process.env.EMCC_USE_WASM_SIMD === '1';
+// The WASM solver ships with SIMD on by default (v128 hand-port, PR #40).
+// `EMCC_NO_SIMD=1` is the kill-switch that reverts to the scalar path.
+// Mirror that exactly here so the parity test fails loudly if the build
+// flag and the runtime flag disagree.
+const EXPECT_SIMD = process.env.EMCC_NO_SIMD !== '1';
 
 async function loadRuntime(): Promise<typeof Runtime> {
   return (await import('../../dist/index.js')) as typeof Runtime;
