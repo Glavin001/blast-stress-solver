@@ -295,6 +295,12 @@ public:
     virtual uint32_t                        getIslandsSkipped() const = 0;
 
     /**
+    \return the number of islands the last update partitioned the graph into for the per-island solve
+    (0 unless island-aware solving ran with >1 island). islandsSkipped is always <= this.
+    */
+    virtual uint32_t                        getIslandsTotal() const = 0;
+
+    /**
     Generate fracture commands for particular actor.
 
     Calling this function if getOverstressedBondCount() == 0 or actor has no bond doesn't make sense, bondFractureCount will be '0'.

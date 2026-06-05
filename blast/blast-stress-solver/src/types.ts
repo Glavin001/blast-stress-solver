@@ -582,6 +582,9 @@ export interface ExtStressSolver {
   skipSettled(): boolean;
   /** Number of settled islands skipped during the last update(). */
   islandsSkipped(): number;
+  /** Islands the last update partitioned the graph into for the per-island solve
+   *  (islandsSkipped <= this; 0 unless island-aware solving ran with >1 island). */
+  islandsTotal(): number;
   /** Snapshot the current actor table (actor index + owned nodes). */
   actors(): Array<{ actorIndex: number; nodes: number[] }>;
   /** Generate fracture commands for the last update. */

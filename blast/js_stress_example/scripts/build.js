@@ -79,6 +79,7 @@ const exportedFunctions = [
   '_ext_stress_solver_set_skip_settled',
   '_ext_stress_solver_get_skip_settled',
   '_ext_stress_solver_islands_skipped',
+  '_ext_stress_solver_islands_total',
   '_ext_stress_sizeof_ext_node_desc',
   '_ext_stress_sizeof_ext_bond_desc',
   '_ext_stress_sizeof_ext_settings',

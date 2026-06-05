@@ -186,6 +186,8 @@ uint8_t ext_stress_solver_get_island_aware(const ExtStressSolverHandle* handle);
 void ext_stress_solver_set_skip_settled(ExtStressSolverHandle* handle, uint8_t enabled);
 uint8_t ext_stress_solver_get_skip_settled(const ExtStressSolverHandle* handle);
 uint32_t ext_stress_solver_islands_skipped(const ExtStressSolverHandle* handle);
+// Islands the last update partitioned the graph into for the per-island solve (islands_skipped <= this).
+uint32_t ext_stress_solver_islands_total(const ExtStressSolverHandle* handle);
 
 uint32_t ext_stress_sizeof_ext_node_desc();
 uint32_t ext_stress_sizeof_ext_bond_desc();

@@ -193,6 +193,7 @@ public:
 
     // Number of settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
     uint32_t getIslandsSkipped() const { return m_stressProcessor.getLastIslandsSkipped(); }
+    uint32_t getIslandsTotal() const { return m_stressProcessor.getLastIslandsTotal(); }
 
     bool calcError(float& linear, float& angular) const
     {
@@ -357,6 +358,11 @@ public:
     uint32_t getIslandsSkipped() const
     {
         return m_solver.getIslandsSkipped();
+    }
+
+    uint32_t getIslandsTotal() const
+    {
+        return m_solver.getIslandsTotal();
     }
 
     void calcSolverBondStresses(
@@ -1160,6 +1166,11 @@ public:
     virtual uint32_t                        getIslandsSkipped() const override
     {
         return m_graphProcessor->getIslandsSkipped();
+    }
+
+    virtual uint32_t                        getIslandsTotal() const override
+    {
+        return m_graphProcessor->getIslandsTotal();
     }
 
     virtual void                            generateFractureCommands(const NvBlastActor& actor, NvBlastFractureBuffers& commands) override;

@@ -866,6 +866,13 @@ ext_stress_solver_islands_skipped(const ExtStressSolverHandle* handlePtr)
 }
 
 extern "C" uint32_t
+ext_stress_solver_islands_total(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getIslandsTotal() : 0U;
+}
+
+extern "C" uint32_t
 ext_stress_sizeof_ext_node_desc()
 {
     return static_cast<uint32_t>(sizeof(ExtStressNodeDesc));

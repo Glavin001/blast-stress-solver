@@ -2534,10 +2534,15 @@ export async function buildDestructibleCore({
   }
 
   function getIslandSolverStats() {
+    // Prefer the count the per-island solve actually used this frame (fresh, and always
+    // >= islandsSkipped). It is 0 when island-aware solving didn't run (off, or a single
+    // island fell back to the whole-graph path), so fall back to the always-available
+    // partition stat — which only refreshes on a topology resync — for fragmentation.
+    const solveTotal = solver.islandsTotal?.() ?? 0;
     return {
       enabled: islandSolverEnabled,
       skipSettled: islandSolverSkipSettled,
-      islandCount: solver.islandCount?.() ?? 0,
+      islandCount: solveTotal > 0 ? solveTotal : (solver.islandCount?.() ?? 0),
       islandsSkipped: solver.islandsSkipped?.() ?? 0,
     };
   }
