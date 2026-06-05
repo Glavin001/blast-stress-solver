@@ -1,2 +1,5 @@
 dist/
 *.tgz
+
+# stress-city.mjs writes a transient esbuild bundle here (cleaned up on exit)
+.stress-city-*/

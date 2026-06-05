@@ -63,6 +63,10 @@
     "bench:small": "node scripts/bench.mjs --small",
     "bench:large": "node scripts/bench.mjs --large",
     "bench:split-planner": "node scripts/bench-split-planner.mjs",
+    "stress": "node scripts/stress-city.mjs",
+    "stress:medium": "node scripts/stress-city.mjs --medium",
+    "stress:large": "node scripts/stress-city.mjs --large",
+    "stress:json": "node scripts/stress-city.mjs --json",
     "sweep:high-rise": "node scripts/sweep-high-rise.mjs"
   },
   "devDependencies": {
