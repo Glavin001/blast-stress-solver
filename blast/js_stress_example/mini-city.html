@@ -202,7 +202,9 @@
             <input type="range" id="cfg-debris-ttl" class="config-slider" min="1000" max="30000" step="500" value="8000" />
             <span class="config-value"><span id="cfg-debris-ttl-value">8.0s</span></span>
           </div>
-          <label class="toggle-row"><input type="checkbox" id="cfg-island-solver" /> Island solver &mdash; skip settled groups &#9733;</label>
+          <label class="toggle-row"><input type="checkbox" id="cfg-island-solver" />
+            <span class="toggle-text">Island solver &#9733;
+              <small>Solve each disconnected group on its own and skip ones that have settled &mdash; same result, less work.</small></span></label>
         </section>
 
         <!-- Actions -->
