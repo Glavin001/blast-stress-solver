@@ -670,6 +670,30 @@ ext_stress_solver_add_actor_gravity(ExtStressSolverHandle* handlePtr,
     return 1U;
 }
 
+extern "C" uint8_t
+ext_stress_solver_add_centrifugal_acceleration(ExtStressSolverHandle* handlePtr,
+                                               uint32_t actor_index,
+                                               const StressVec3* local_center_mass,
+                                               const StressVec3* local_angular_velocity)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0U;
+    }
+
+    auto* entry = findActorByIndex(*handle, actor_index);
+    if (!entry || !entry->actor)
+    {
+        return 0U;
+    }
+
+    const NvcVec3 centerMass = local_center_mass ? toNvcVec3(*local_center_mass) : NvcVec3{0.0f, 0.0f, 0.0f};
+    const NvcVec3 angularVelocity =
+        local_angular_velocity ? toNvcVec3(*local_angular_velocity) : NvcVec3{0.0f, 0.0f, 0.0f};
+    return handle->solver->addCentrifugalAcceleration(*entry->actor, centerMass, angularVelocity) ? 1U : 0U;
+}
+
 extern "C" uint32_t
 ext_stress_solver_add_all_actor_gravity(ExtStressSolverHandle* handlePtr,
                                         float world_gravity_x,

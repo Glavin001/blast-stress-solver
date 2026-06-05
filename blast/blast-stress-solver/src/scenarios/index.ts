@@ -26,3 +26,9 @@ export {
   DRYWALL_DENSITY,
 } from './highRiseScenario';
 export type { HighRiseOptions, HighRiseMultipliers } from './highRiseScenario';
+
+export {
+  buildSpinningBeamsScenario,
+  DEFAULT_SPINNING_BEAMS_OPTIONS,
+} from './spinningBeamsScenario';
+export type { SpinningBeamsOptions } from './spinningBeamsScenario';

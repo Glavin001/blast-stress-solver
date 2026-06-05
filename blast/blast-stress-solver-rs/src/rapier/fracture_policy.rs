@@ -20,6 +20,12 @@ pub struct FracturePolicy {
     /// sound source of fragment momentum (it re-resolves the real contact against the fractured
     /// pieces); enable this only as an alternative when you are NOT resimulating.
     pub apply_excess_forces: bool,
+    /// Opt-in: each frame, feed every spinning dynamic actor its centrifugal acceleration
+    /// (`ω × (ω × r)`) so tumbling debris keeps accumulating stress and can secondary-fracture —
+    /// mirroring NVIDIA Blast's default of applying gravity to static actors and centrifugal
+    /// force to dynamic ones. Default: **false** so it never perturbs scenarios tuned without it;
+    /// enable it for large free-flying fragments that should break apart as they rotate.
+    pub apply_centrifugal: bool,
 }
 
 impl Default for FracturePolicy {
@@ -32,6 +38,7 @@ impl Default for FracturePolicy {
             min_child_node_count: 1,
             idle_skip: true,
             apply_excess_forces: false,
+            apply_centrifugal: false,
         }
     }
 }
