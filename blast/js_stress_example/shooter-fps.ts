@@ -101,6 +101,19 @@ type Transient = {
 
 const DEFAULT_BALL: BallParams = { radius: 0.35, mass: 1000, speed: 25 };
 
+// Peak solver force (Newtons) per unit of blast "strength", injected into the
+// stress solver so blasts overstress bonds and break the intact structure — the
+// same load path projectile impacts use. Tuned to the ~1e10 material scale the
+// destruction demos use; the Blast force slider scales it up/down.
+const BLAST_SOLVER_FORCE = 8e5;
+
+type BlastField = {
+  cx: number; cy: number; cz: number;
+  radius: number; up: number;
+  solverForce: number; kick: number;
+  frames: number; total: number; solverFrames: number;
+};
+
 export function mountShooter(opts: ShooterOptions): ShooterHandle {
   const { canvas, camera, controls, scene, getCore } = opts;
   const getBallParams = opts.getBallParams ?? (() => DEFAULT_BALL);
@@ -125,6 +138,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   let lastCore: DestructibleCore | null = null;
   const stickies: StickyExplosive[] = [];
   const transient: Transient[] = [];
+  const blastFields: BlastField[] = [];
   const keys = new Set<string>();
   let yaw = 0;
   let pitch = 0;
@@ -148,6 +162,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   const _ray = new THREE.Raycaster();
   const _ndc = new THREE.Vector2();
   const _q = new THREE.Quaternion();
+  const _qinv = new THREE.Quaternion();
   const _e = new THREE.Euler(0, 0, 0, 'YXZ');
   const _fwd = new THREE.Vector3();
   const _right = new THREE.Vector3();
@@ -625,77 +640,92 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     spawnShockwave(s.worldPos, cfg.blast.radius);
   }
 
-  function explodeAt(core: DestructibleCore, center: THREE.Vector3) {
-    const world = core.world as RAPIER.World;
-    const radius = cfg.blast.radius;
-    const accel = cfg.blast.strength * 9.81; // peak acceleration at the centre
-    const up = cfg.blast.up;
-
-    // Per-body node counts → approximate per-node mass for an even blast.
-    const nodeCount = new Map<number, number>();
-    for (const c of core.chunks) {
-      if (c.active && c.bodyHandle != null && !c.destroyed) {
-        nodeCount.set(c.bodyHandle, (nodeCount.get(c.bodyHandle) ?? 0) + 1);
-      }
-    }
-    const chunkBodies = new Set<number>();
-
-    // 1) Fracture pass — push every live chunk outward via the stress solver.
-    for (const chunk of core.chunks) {
-      if (!chunk.active || chunk.destroyed || chunk.bodyHandle == null) continue;
-      const body = world.getRigidBody(chunk.bodyHandle);
-      if (!body || body.isFixed()) continue;
-      chunkBodies.add(chunk.bodyHandle);
-
-      const t = body.translation();
-      const r = body.rotation();
-      _q.set(r.x, r.y, r.z, r.w);
-      _v.set(chunk.baseLocalOffset.x, chunk.baseLocalOffset.y, chunk.baseLocalOffset.z).applyQuaternion(_q);
-      const wx = t.x + _v.x;
-      const wy = t.y + _v.y;
-      const wz = t.z + _v.z;
-
-      const dx = wx - center.x;
-      const dy = wy - center.y;
-      const dz = wz - center.z;
-      const dist = Math.hypot(dx, dy, dz);
-      if (dist > radius) continue;
-      const falloff = 1 - dist / radius;
-      const inv = dist > 1e-4 ? 1 / dist : 0;
-      const nx = dist > 1e-4 ? dx * inv : 0;
-      const ny = dist > 1e-4 ? dy * inv : 1;
-      const nz = dist > 1e-4 ? dz * inv : 0;
-
-      const perNode = Math.max(1, body.mass() / (nodeCount.get(chunk.bodyHandle) ?? 1));
-      const mag = perNode * accel * falloff;
-      core.applyExternalForce(
-        chunk.nodeIndex,
-        { x: wx, y: wy, z: wz },
-        { x: nx * mag, y: ny * mag + perNode * accel * up * falloff, z: nz * mag },
-      );
-    }
-
-    // 2) Kinetic pass — fling loose bodies (projectiles, in-flight charges)
-    //    that aren't part of the chunk graph, for extra spectacle.
-    const kick = Math.min(cfg.blast.strength, 60) * 0.45; // peak Δv at the centre
-    world.forEachRigidBody((body: RAPIER.RigidBody) => {
-      if (body.isFixed()) return;
-      const h = body.handle;
-      if (chunkBodies.has(h)) return;
-      const t = body.translation();
-      const dx = t.x - center.x;
-      const dy = t.y - center.y;
-      const dz = t.z - center.z;
-      const dist = Math.hypot(dx, dy, dz);
-      if (dist > radius) return;
-      const falloff = 1 - dist / radius;
-      const inv = dist > 1e-4 ? 1 / dist : 0;
-      const nx = dist > 1e-4 ? dx * inv : 0;
-      const ny = dist > 1e-4 ? dy * inv : 1;
-      const nz = dist > 1e-4 ? dz * inv : 0;
-      const j = body.mass() * kick * falloff;
-      body.applyImpulse({ x: nx * j, y: (ny + up) * j, z: nz * j }, true);
+  // Register a blast at `center`. The actual work runs over the next few frames
+  // in updateBlastFields(): intact chunks live on the *fixed* root/actor bodies,
+  // so a Rapier force does nothing to them — fracturing them requires feeding the
+  // load into the stress solver (the same path projectile impacts use). The blast
+  // also flings the resulting dynamic pieces (and any loose debris) kinetically.
+  function explodeAt(_core: DestructibleCore, center: THREE.Vector3) {
+    blastFields.push({
+      cx: center.x,
+      cy: center.y,
+      cz: center.z,
+      radius: cfg.blast.radius,
+      up: cfg.blast.up,
+      solverForce: cfg.blast.strength * BLAST_SOLVER_FORCE, // peak Newtons at centre
+      kick: Math.min(cfg.blast.strength, 80) * 0.6, // peak Δv (m/s) at centre
+      frames: 6,
+      total: 6,
+      solverFrames: 3, // sustain the fracture load for a few frames to propagate collapse
     });
+  }
+
+  // Drive active blast fields: seed bond stress (fracture) + impulse loose pieces.
+  function updateBlastFields(core: DestructibleCore) {
+    if (!blastFields.length) return;
+    const world = core.world as RAPIER.World;
+    const solver = core.solver;
+    for (let i = blastFields.length - 1; i >= 0; i--) {
+      const f = blastFields[i];
+      const injectSolver = f.total - f.frames < f.solverFrames;
+
+      // Fracture pass: inject an outward load into the stress solver for every
+      // live chunk in range — works on intact (fixed-body) chunks too, which is
+      // what actually breaks the grey structure apart.
+      if (injectSolver) {
+        for (const chunk of core.chunks) {
+          if (!chunk.active || chunk.destroyed || chunk.bodyHandle == null) continue;
+          const body = world.getRigidBody(chunk.bodyHandle);
+          if (!body) continue;
+          const t = body.translation();
+          const r = body.rotation();
+          _q.set(r.x, r.y, r.z, r.w);
+          _v.set(chunk.baseLocalOffset.x, chunk.baseLocalOffset.y, chunk.baseLocalOffset.z).applyQuaternion(_q);
+          const dx = t.x + _v.x - f.cx;
+          const dy = t.y + _v.y - f.cy;
+          const dz = t.z + _v.z - f.cz;
+          const dist = Math.hypot(dx, dy, dz);
+          if (dist > f.radius) continue;
+          const falloff = 1 - dist / f.radius;
+          const inv = dist > 1e-4 ? 1 / dist : 0;
+          const nx = dist > 1e-4 ? dx * inv : 0;
+          const ny = dist > 1e-4 ? dy * inv : 1;
+          const nz = dist > 1e-4 ? dz * inv : 0;
+          const mag = f.solverForce * falloff;
+          // World-space outward force (+ up bias) rotated into the body's local frame.
+          _v2.set(nx * mag, ny * mag + mag * f.up, nz * mag);
+          _qinv.copy(_q).conjugate();
+          _v2.applyQuaternion(_qinv);
+          try {
+            solver.addForce(chunk.nodeIndex, chunk.baseLocalOffset, { x: _v2.x, y: _v2.y, z: _v2.z });
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Kinetic pass: fling every dynamic body in range (loose debris + pieces
+      // that just broke off). Spread over the field's lifetime so freshly-detached
+      // chunks still catch some of the blast.
+      const perFrame = f.kick / f.total;
+      world.forEachRigidBody((body: RAPIER.RigidBody) => {
+        if (!body.isDynamic()) return; // skip fixed + the kinematic player capsule
+        const t = body.translation();
+        const dx = t.x - f.cx;
+        const dy = t.y - f.cy;
+        const dz = t.z - f.cz;
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist > f.radius) return;
+        const falloff = 1 - dist / f.radius;
+        const inv = dist > 1e-4 ? 1 / dist : 0;
+        const nx = dist > 1e-4 ? dx * inv : 0;
+        const ny = dist > 1e-4 ? dy * inv : 1;
+        const nz = dist > 1e-4 ? dz * inv : 0;
+        const j = body.mass() * perFrame * falloff;
+        body.applyImpulse({ x: nx * j, y: (ny + f.up) * j, z: nz * j }, true);
+      });
+
+      f.frames -= 1;
+      if (f.frames <= 0) blastFields.splice(i, 1);
+    }
   }
 
   // ── Shockwave VFX ───────────────────────────────────────────────
@@ -813,6 +843,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
 
     if (cfg.fps) updateCamera(dt);
     if (core) updateStickies(core);
+    if (core) updateBlastFields(core);
     updateTransient(now);
 
     // Headlamp rides the camera (FPS and orbit alike), aiming where you look.
@@ -837,6 +868,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     charCollider = null;
     charController = null;
     charCore = null;
+    blastFields.length = 0;
     for (const s of stickies) removeSticky(s);
     stickies.length = 0;
     for (const fx of transient) {
