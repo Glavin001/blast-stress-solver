@@ -146,3 +146,70 @@ fn batched_forces_empty_is_noop() {
     );
     assert!((untouched.linear_error() - empty.linear_error()).abs() <= 1e-6);
 }
+
+/// Exercises the O(1) input-node -> actor lookup specifically across a topology
+/// change: fracture the structure into multiple actors (which invalidates the
+/// lookup index), then inject forces by input-node index. The index must rebuild
+/// and map each node to its *new* owning actor — so batched injection must still
+/// match per-call injection after the split.
+#[test]
+fn batched_forces_match_per_call_after_fracture() {
+    let (nodes, bonds) = triangle();
+    let cfg = SolverSettings {
+        compression_elastic_limit: 0.001,
+        compression_fatal_limit: 0.002,
+        tension_elastic_limit: 0.001,
+        tension_fatal_limit: 0.002,
+        shear_elastic_limit: 0.001,
+        shear_fatal_limit: 0.002,
+        ..SolverSettings::default()
+    };
+
+    // Fracture into multiple actors, then clear accumulated state so the test
+    // injection below is what drives stress. apply_fracture_commands + reset both
+    // mark the actor index dirty, so the first force lookup rebuilds it.
+    fn fracture(s: &mut ExtStressSolver) {
+        s.add_gravity(Vec3::new(0.0, -500.0, 0.0));
+        s.update();
+        let cmds = s.generate_fracture_commands();
+        if !cmds.is_empty() {
+            s.apply_fracture_commands(&cmds);
+        }
+        s.reset();
+    }
+
+    let mut per_call = ExtStressSolver::new(&nodes, &bonds, &cfg).unwrap();
+    fracture(&mut per_call);
+    let mut batched = ExtStressSolver::new(&nodes, &bonds, &cfg).unwrap();
+    fracture(&mut batched);
+    assert_eq!(
+        per_call.actor_count(),
+        batched.actor_count(),
+        "both solvers must reach the same post-fracture topology"
+    );
+
+    let (idx, pos, force) = force_set();
+    for i in 0..idx.len() {
+        per_call.add_force(
+            idx[i],
+            Vec3::new(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]),
+            Vec3::new(force[i * 3], force[i * 3 + 1], force[i * 3 + 2]),
+            ForceMode::Force,
+        );
+    }
+    per_call.update();
+    batched.add_all_forces(&idx, &pos, &force, ForceMode::Force);
+    batched.update();
+
+    assert_eq!(
+        per_call.overstressed_bond_count(),
+        batched.overstressed_bond_count(),
+        "post-fracture overstressed bond count must match"
+    );
+    assert!(
+        (per_call.linear_error() - batched.linear_error()).abs() <= 1e-6,
+        "post-fracture linear error must match: per-call={} batched={}",
+        per_call.linear_error(),
+        batched.linear_error(),
+    );
+}
