@@ -160,6 +160,8 @@ export type RecordableCore = {
   chunks: ChunkData[];
   getActiveBondsCount: () => number;
   getRigidBodyCount: () => number;
+  /** Optional island-aware solver stats (Stage 4); recorded per frame when present. */
+  getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
   projectiles: { length: number };
   step: (dt?: number) => void;
   stepEventful?: (dt?: number) => void;
@@ -267,6 +269,10 @@ export type SimRecordingExport = {
     activeBonds: EncodedTypedArray;
     rigidBodies: EncodedTypedArray;
     projectiles: EncodedTypedArray;
+    /** Connected components ("islands") in the solver graph this frame (Stage 2a partition). */
+    islandCount: EncodedTypedArray;
+    /** Islands skipped as settled this frame (0 unless island-aware skipping is enabled). */
+    islandsSkipped: EncodedTypedArray;
   };
   /**
    * The flat body trace: `Σ bodyCount` rows of {@link BODY_STRIDE} floats. The
@@ -367,6 +373,8 @@ class FrameColumns {
   activeBonds: number[] = [];
   rigidBodies: number[] = [];
   projectiles: number[] = [];
+  islandCount: number[] = [];
+  islandsSkipped: number[] = [];
   clear() {
     this.simTime.length = 0;
     this.dt.length = 0;
@@ -374,6 +382,8 @@ class FrameColumns {
     this.activeBonds.length = 0;
     this.rigidBodies.length = 0;
     this.projectiles.length = 0;
+    this.islandCount.length = 0;
+    this.islandsSkipped.length = 0;
   }
 }
 
@@ -692,6 +702,9 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
     columns.activeBonds.push(core.getActiveBondsCount());
     columns.rigidBodies.push(core.getRigidBodyCount());
     columns.projectiles.push(core.projectiles.length);
+    const islandStats = core.getIslandSolverStats?.();
+    columns.islandCount.push(islandStats ? islandStats.islandCount : 0);
+    columns.islandsSkipped.push(islandStats ? islandStats.islandsSkipped : 0);
 
     // Full-session timing: the profiler sample for this frame fired during
     // orig(dt) (just before this); append it (or zeros) so timing stays aligned.
@@ -929,6 +942,8 @@ export function createSessionRecorder(options: SessionRecorderOptions = {}): Ses
         activeBonds: encodeTyped(Uint32Array.from(columns.activeBonds)),
         rigidBodies: encodeTyped(Uint32Array.from(columns.rigidBodies)),
         projectiles: encodeTyped(Uint32Array.from(columns.projectiles)),
+        islandCount: encodeTyped(Uint32Array.from(columns.islandCount)),
+        islandsSkipped: encodeTyped(Uint32Array.from(columns.islandsSkipped)),
       },
       bodies: encodeTyped(bodies.view().slice()),
       events: events.slice(),
@@ -970,6 +985,8 @@ export type DecodedSimRecording = {
     activeBonds: Uint32Array;
     rigidBodies: Uint32Array;
     projectiles: Uint32Array;
+    islandCount: Uint32Array;
+    islandsSkipped: Uint32Array;
   };
   bodies: Float32Array;
   /** Float offset (into `bodies`) where each frame's rows begin. */
@@ -995,6 +1012,9 @@ export function decodeSimRecording(data: SimRecordingExport): DecodedSimRecordin
     activeBonds: decodeTyped(data.columns.activeBonds) as Uint32Array,
     rigidBodies: decodeTyped(data.columns.rigidBodies) as Uint32Array,
     projectiles: decodeTyped(data.columns.projectiles) as Uint32Array,
+    // Backward-compatible: recordings made before island instrumentation lack these columns.
+    islandCount: (data.columns.islandCount ? decodeTyped(data.columns.islandCount) : new Uint32Array(data.durationFrames || 0)) as Uint32Array,
+    islandsSkipped: (data.columns.islandsSkipped ? decodeTyped(data.columns.islandsSkipped) : new Uint32Array(data.durationFrames || 0)) as Uint32Array,
   };
   const bodies = decodeTyped(data.bodies) as Float32Array;
   const stride = data.bodyStride;

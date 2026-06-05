@@ -563,6 +563,28 @@ export interface ExtStressSolver {
   update(): void;
   /** Count of bonds currently overstressed beyond elastic limits. */
   overstressedBondCount(): number;
+  /** Number of connected components (islands) in the solver graph after the last
+   *  update. Static nodes are cut points, so structures sharing only a static/world
+   *  node count as separate islands. */
+  islandCount(): number;
+  /** Enable/disable island-aware solving: solve each disconnected component
+   *  independently. Single-island results are identical to the whole-graph solve;
+   *  multi-island results match within solver tolerance. Default: disabled. */
+  setIslandAware(enabled: boolean): void;
+  /** Whether island-aware solving is currently enabled. */
+  islandAware(): boolean;
+  /** Enable/disable skipping settled islands (requires islandAware). An island whose
+   *  velocity inputs are unchanged since its last solve and that already converged is not
+   *  re-solved (the solve would be a no-op); its stresses are kept. Any new input (contact,
+   *  wake) re-solves it the same frame. Paused, never evicted. Default: disabled. */
+  setSkipSettled(enabled: boolean): void;
+  /** Whether settled-island skipping is currently enabled. */
+  skipSettled(): boolean;
+  /** Number of settled islands skipped during the last update(). */
+  islandsSkipped(): number;
+  /** Islands the last update partitioned the graph into for the per-island solve
+   *  (islandsSkipped <= this; 0 unless island-aware solving ran with >1 island). */
+  islandsTotal(): number;
   /** Snapshot the current actor table (actor index + owned nodes). */
   actors(): Array<{ actorIndex: number; nodes: number[] }>;
   /** Generate fracture commands for the last update. */

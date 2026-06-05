@@ -338,6 +338,23 @@ export type DestructibleCore = {
   setDebrisCleanup?: (opts: DebrisCleanupOptions) => void;
   getDebrisCleanupSettings?: () => DebrisCleanupOptions & { mode: OptimizationMode };
   setMaxCollidersForDebris?: (n: number) => void;
+  /** Stage-1 island settled-state measurement: connected components of the live
+   *  solver graph (static nodes as cut points) and the fraction of nodes/bonds
+   *  in islands whose bodies are all Rapier-asleep — the skippable-cost ceiling
+   *  for island-aware solving. Read-only instrumentation; no behavior change. */
+  getIslandSettledStats?: () => {
+    islandsTotal: number; islandsSettled: number;
+    totalNodes: number; settledNodes: number;
+    totalBonds: number; settledBonds: number;
+    settledNodeFraction: number; settledBondFraction: number;
+  };
+  /** Stage-4 island-aware solving: solve each disconnected component independently and
+   *  skip components that have settled (inputs unchanged since their last solve + already
+   *  converged). Observationally identical to the whole-graph solve; a settled component
+   *  re-solves the same frame its load changes (paused, never frozen). Off by default. */
+  setIslandSolver?: (opts: { enabled?: boolean; skipSettled?: boolean }) => void;
+  /** Current island-solver settings plus the last update's island count and skipped count. */
+  getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

@@ -252,6 +252,55 @@ public:
     virtual uint32_t                        getOverstressedBondCount() const = 0;
 
     /**
+    Number of connected components ("islands") in the solver graph after the last update().
+    Static nodes are treated as cut points, so structures sharing only a static/world node
+    are counted as separate islands. Foundation for island-aware (per-component) solving.
+
+    \return the island count.
+    */
+    virtual uint32_t                        getIslandCount() const = 0;
+
+    /**
+    Enable or disable island-aware solving: each disconnected component ("island") is solved
+    independently. With a single island this is identical to the default whole-graph solve;
+    with multiple islands the result matches within solver tolerance. Default: disabled.
+
+    \param[in]  enabled     true to solve per-island, false for the whole-graph solve.
+    */
+    virtual void                            setIslandAware(bool enabled) = 0;
+
+    /**
+    \return whether island-aware solving is currently enabled.
+    */
+    virtual bool                            getIslandAware() const = 0;
+
+    /**
+    Enable or disable skipping of settled islands (requires island-aware solving). An island whose
+    velocity inputs are unchanged since its last solve and that already converged is not re-solved (the
+    solve would be a no-op); its impulses/stresses are kept. Any new input (contact, wake) re-solves it
+    the same frame, and topology changes rebuild the baseline first. Paused, never evicted. Default: off.
+
+    \param[in]  enabled     true to skip settled islands.
+    */
+    virtual void                            setSkipSettled(bool enabled) = 0;
+
+    /**
+    \return whether settled-island skipping is currently enabled.
+    */
+    virtual bool                            getSkipSettled() const = 0;
+
+    /**
+    \return the number of settled islands skipped during the last update().
+    */
+    virtual uint32_t                        getIslandsSkipped() const = 0;
+
+    /**
+    \return the number of islands the last update partitioned the graph into for the per-island solve
+    (0 unless island-aware solving ran with >1 island). islandsSkipped is always <= this.
+    */
+    virtual uint32_t                        getIslandsTotal() const = 0;
+
+    /**
     Generate fracture commands for particular actor.
 
     Calling this function if getOverstressedBondCount() == 0 or actor has no bond doesn't make sense, bondFractureCount will be '0'.

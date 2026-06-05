@@ -444,7 +444,23 @@ export async function buildDestructibleCore({
     console.warn('[Core] no supports (nodes with mass=0) found in scenario', scenario);
   }
 
+  // Island-aware solving (Stage 4 integration). Off by default so existing behavior is unchanged.
+  // When enabled, the stress solve runs per disconnected component ("island") and skips components
+  // that have settled — their velocity inputs are unchanged since the last solve and they already
+  // converged, so re-solving is a no-op. This is observationally identical to the whole-graph solve
+  // but far cheaper for large, partially-active worlds. A settled component re-solves the same frame
+  // its load changes (a new contact, or a neighbour waking shifts its input), so it is paused, never
+  // frozen or evicted: anything settled can always be loaded and fractured again.
+  let islandSolverEnabled = false;
+  let islandSolverSkipSettled = true;
+
   const solver = runtime.createExtSolver({ nodes, bonds, settings: scaledSettings });
+
+  function applyIslandSolverSettings() {
+    solver.setIslandAware?.(islandSolverEnabled);
+    solver.setSkipSettled?.(islandSolverEnabled && islandSolverSkipSettled);
+  }
+  applyIslandSolverSettings();
 
   const bondTable: Array<{ index:number; node0:number; node1:number; centroid:Vec3; normal:Vec3; area:number }> = scenario.bonds.map((b, i) => ({ index: i, node0: b.node0, node1: b.node1, centroid: b.centroid, normal: b.normal, area: b.area }));
   const bondsByNode = new Map<number, number[]>();
@@ -2321,6 +2337,100 @@ export async function buildDestructibleCore({
     return bondTable.length - removedBondIndices.size;
   }
 
+  // ── Stage 1: island settled-state measurement (read-only instrumentation) ──
+  // Connected components of the ACTIVE bond graph, treating static (mass<=0)
+  // nodes as non-merging CUT POINTS — a shared ground node carries sqrt_I_inv=0
+  // in the solver, so it propagates no stress and two structures sharing only
+  // the ground are physically independent islands. An island is "settled" iff
+  // every rigid body it sits on is Rapier-asleep: its inputs (body-local gravity
+  // + contacts) cannot change until something wakes it. This measures the
+  // fraction of the solve that island-aware skipping could avoid, with ZERO
+  // behavior change — it is the GO/NO-GO gate before the C++ refactor.
+  function islandFind(parent: Int32Array, x: number): number {
+    let r = x;
+    while (parent[r] !== r) r = parent[r];
+    while (parent[x] !== r) { const nx = parent[x]; parent[x] = r; x = nx; }
+    return r;
+  }
+
+  // Connected components of the live solver graph, derived from the ACTUAL
+  // fracture topology rather than the JS bond table: two nodes are unioned only
+  // when a bond joins them AND they currently sit on the same rigid body
+  // (`chunk.bodyHandle`). Blast splits bodies exactly along broken bonds, so a
+  // cross-body bond is a broken/severed bond and must not reconnect islands —
+  // this sidesteps the known `removedBondIndices` tracking lag. Static (mass<=0)
+  // nodes are cut points (a shared ground node carries no stress).
+  function rebuildIslandComponents(): Int32Array {
+    const n = chunks.length;
+    const parent = new Int32Array(n);
+    for (let i = 0; i < n; i++) parent[i] = i;
+    for (let bi = 0; bi < bondTable.length; bi++) {
+      const b = bondTable[bi];
+      const c0 = chunks[b.node0]; const c1 = chunks[b.node1];
+      if (!c0 || !c1 || !c0.active || !c1.active) continue;
+      if (c0.bodyHandle == null || c0.bodyHandle !== c1.bodyHandle) continue; // severed / cross-body
+      if ((scenario.nodes[b.node0]?.mass ?? 0) <= 0 || (scenario.nodes[b.node1]?.mass ?? 0) <= 0) continue;
+      const r0 = islandFind(parent, b.node0);
+      const r1 = islandFind(parent, b.node1);
+      if (r0 !== r1) parent[r0] = r1;
+    }
+    return parent;
+  }
+
+  // Skippable-fraction ceiling for island-aware solving. An island is settled
+  // iff it sits on a detached dynamic body that is Rapier-asleep — its inputs
+  // can't change until something wakes it. Nodes still on the fixed root (intact
+  // structure) are counted active here (their skip would come from per-island
+  // convergence, not sleep), so this is a LOWER BOUND on the achievable skip.
+  function getIslandSettledStats() {
+    const parent = rebuildIslandComponents();
+    const agg = new Map<number, { nodes: number; bonds: number; body: number | null }>();
+    let totalNodes = 0;
+    for (let ni = 0; ni < chunks.length; ni++) {
+      const chunk = chunks[ni];
+      if (!chunk || !chunk.active || chunk.bodyHandle == null) continue;
+      if ((scenario.nodes[ni]?.mass ?? 0) <= 0) continue;
+      const root = islandFind(parent, ni);
+      let a = agg.get(root);
+      if (!a) { a = { nodes: 0, bonds: 0, body: chunk.bodyHandle }; agg.set(root, a); }
+      a.nodes++;
+      totalNodes++;
+    }
+    let totalBonds = 0;
+    for (let bi = 0; bi < bondTable.length; bi++) {
+      const b = bondTable[bi];
+      const c0 = chunks[b.node0]; const c1 = chunks[b.node1];
+      if (!c0 || !c1 || !c0.active || !c1.active) continue;
+      if (c0.bodyHandle == null || c0.bodyHandle !== c1.bodyHandle) continue;
+      if ((scenario.nodes[b.node0]?.mass ?? 0) <= 0 || (scenario.nodes[b.node1]?.mass ?? 0) <= 0) continue;
+      totalBonds++;
+      const a = agg.get(islandFind(parent, b.node0));
+      if (a) a.bonds++;
+    }
+    let islandsTotal = 0, islandsSettled = 0, qNodes = 0, qBonds = 0;
+    for (const a of agg.values()) {
+      islandsTotal++;
+      const bh = a.body;
+      let settled = false;
+      if (bh != null && bh !== rootBody.handle && bh !== groundBody.handle) {
+        const body = world.getRigidBody(bh);
+        settled = !!body && typeof (body as { isSleeping?: () => boolean }).isSleeping === 'function'
+          && (body as { isSleeping: () => boolean }).isSleeping();
+      }
+      if (settled) { islandsSettled++; qNodes += a.nodes; qBonds += a.bonds; }
+    }
+    return {
+      islandsTotal,
+      islandsSettled,
+      totalNodes,
+      settledNodes: qNodes,
+      totalBonds,
+      settledBonds: qBonds,
+      settledNodeFraction: totalNodes ? qNodes / totalNodes : 0,
+      settledBondFraction: totalBonds ? qBonds / totalBonds : 0,
+    };
+  }
+
   function getSolverDebugLines(
     mode: number = 0 /* ExtDebugMode: 0=Max 1=Compression 2=Tension 3=Shear */,
   ): Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }> {
@@ -2414,6 +2524,27 @@ export async function buildDestructibleCore({
 
   function setSolverGravityEnabled(v: boolean) {
     solverGravityEnabled = v;
+  }
+
+  // Enable/disable island-aware solving and settled-island skipping at runtime (Stage 4).
+  function setIslandSolver(opts: { enabled?: boolean; skipSettled?: boolean }) {
+    if (opts.enabled != null) islandSolverEnabled = !!opts.enabled;
+    if (opts.skipSettled != null) islandSolverSkipSettled = !!opts.skipSettled;
+    applyIslandSolverSettings();
+  }
+
+  function getIslandSolverStats() {
+    // Prefer the count the per-island solve actually used this frame (fresh, and always
+    // >= islandsSkipped). It is 0 when island-aware solving didn't run (off, or a single
+    // island fell back to the whole-graph path), so fall back to the always-available
+    // partition stat — which only refreshes on a topology resync — for fragmentation.
+    const solveTotal = solver.islandsTotal?.() ?? 0;
+    return {
+      enabled: islandSolverEnabled,
+      skipSettled: islandSolverSkipSettled,
+      islandCount: solveTotal > 0 ? solveTotal : (solver.islandCount?.() ?? 0),
+      islandsSkipped: solver.islandsSkipped?.() ?? 0,
+    };
   }
 
   function getCollisionGroupContext(): CollisionGroupContext {
@@ -2548,6 +2679,9 @@ export async function buildDestructibleCore({
     setDebrisCollisionMode: setDebrisCollisionModeFn,
     getRigidBodyCount,
     getActiveBondsCount,
+    getIslandSettledStats,
+    setIslandSolver,
+    getIslandSolverStats,
     getSolverDebugLines,
     getNodeBonds,
     cutBond,

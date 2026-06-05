@@ -818,6 +818,61 @@ ext_stress_solver_converged(const ExtStressSolverHandle* handlePtr)
 }
 
 extern "C" uint32_t
+ext_stress_solver_island_count(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getIslandCount() : 0U;
+}
+
+extern "C" void
+ext_stress_solver_set_island_aware(ExtStressSolverHandle* handlePtr, uint8_t enabled)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setIslandAware(enabled != 0);
+    }
+}
+
+extern "C" uint8_t
+ext_stress_solver_get_island_aware(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver && handle->solver->getIslandAware()) ? 1U : 0U;
+}
+
+extern "C" void
+ext_stress_solver_set_skip_settled(ExtStressSolverHandle* handlePtr, uint8_t enabled)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setSkipSettled(enabled != 0);
+    }
+}
+
+extern "C" uint8_t
+ext_stress_solver_get_skip_settled(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver && handle->solver->getSkipSettled()) ? 1U : 0U;
+}
+
+extern "C" uint32_t
+ext_stress_solver_islands_skipped(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getIslandsSkipped() : 0U;
+}
+
+extern "C" uint32_t
+ext_stress_solver_islands_total(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getIslandsTotal() : 0U;
+}
+
+extern "C" uint32_t
 ext_stress_sizeof_ext_node_desc()
 {
     return static_cast<uint32_t>(sizeof(ExtStressNodeDesc));

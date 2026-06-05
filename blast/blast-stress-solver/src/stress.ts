@@ -49,15 +49,25 @@ const isNode = typeof process !== 'undefined' && (process as any).release?.name 
  * Lazily import the Emscripten factory appropriate to the environment.
  * In Node we import the CommonJS build; otherwise the ESM build is used.
  */
-const moduleFactoryPromise: Promise<any> = (async () => {
-  if (isNode) {
-    const factoryModule: any = await import('./stress_solver.cjs');
-    return (factoryModule as any).default ?? factoryModule;
+// Created lazily on first use (not at module load) so that merely importing this module — e.g. for a
+// type or a pure helper — never starts a dynamic import that could reject before anything awaits it.
+// Tying creation to the awaiting call site guarantees the rejection always has a handler (otherwise a
+// src-path build, where the .cjs lives in dist/, produces an intermittent unhandled rejection).
+let moduleFactoryPromise: Promise<any> | undefined;
+function loadModuleFactory(): Promise<any> {
+  if (!moduleFactoryPromise) {
+    moduleFactoryPromise = (async () => {
+      if (isNode) {
+        const factoryModule: any = await import('./stress_solver.cjs');
+        return (factoryModule as any).default ?? factoryModule;
+      }
+      // Use a browser-safe variant that avoids importing Node's 'module'
+      const factoryModule: any = await import('./stress_solver.browser.mjs');
+      return (factoryModule as any).default ?? factoryModule;
+    })();
   }
-  // Use a browser-safe variant that avoids importing Node's 'module'
-  const factoryModule: any = await import('./stress_solver.browser.mjs');
-  return (factoryModule as any).default ?? factoryModule;
-})();
+  return moduleFactoryPromise;
+}
 
 // Resolve colocated artifacts statically per environment to aid bundlers
 // Node/CJS path uses __dirname; browser/ESM uses import.meta.url
@@ -215,7 +225,7 @@ export async function loadStressSolver({ module: moduleOptions }: LoadStressSolv
     fileURLToPathFn = (urlModule as any).fileURLToPath as (u: URL) => string;
   }
 
-  const factory = await moduleFactoryPromise;
+  const factory = await loadModuleFactory();
   const options: Record<string, any> = { ...(moduleOptions ?? {}) };
   if (!options.locateFile) {
     options.locateFile = (p: string) => {
@@ -1073,6 +1083,13 @@ class ExtStressSolver implements ExtStressSolverType {
   }
 
   converged() { if (!this.handle) return false; return this.module.ccall('ext_stress_solver_converged', 'number', ['number'], [this.handle]) !== 0; }
+  islandCount(): number { if (!this.handle) return 0; return this.module.ccall('ext_stress_solver_island_count', 'number', ['number'], [this.handle]) >>> 0; }
+  setIslandAware(enabled: boolean) { if (!this.handle) return; this.module.ccall('ext_stress_solver_set_island_aware', null, ['number', 'number'], [this.handle, enabled ? 1 : 0]); }
+  islandAware(): boolean { if (!this.handle) return false; return this.module.ccall('ext_stress_solver_get_island_aware', 'number', ['number'], [this.handle]) !== 0; }
+  setSkipSettled(enabled: boolean) { if (!this.handle) return; this.module.ccall('ext_stress_solver_set_skip_settled', null, ['number', 'number'], [this.handle, enabled ? 1 : 0]); }
+  skipSettled(): boolean { if (!this.handle) return false; return this.module.ccall('ext_stress_solver_get_skip_settled', 'number', ['number'], [this.handle]) !== 0; }
+  islandsSkipped(): number { if (!this.handle) return 0; return this.module.ccall('ext_stress_solver_islands_skipped', 'number', ['number'], [this.handle]) >>> 0; }
+  islandsTotal(): number { if (!this.handle) return 0; return this.module.ccall('ext_stress_solver_islands_total', 'number', ['number'], [this.handle]) >>> 0; }
 }
 
 function writeNode(view: DataView, base: number, node: { com?: Vec3; mass?: number; inertia?: number }) {
