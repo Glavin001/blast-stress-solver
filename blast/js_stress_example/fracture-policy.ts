@@ -16,6 +16,7 @@ import {
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountShooter } from './shooter-fps.js';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 
 // ── Config ────────────────────────────────────────────────────
@@ -161,6 +162,7 @@ const recorder = createRecordingOverlay({
   getProfilerExport: () => profiler.exportData(),
 });
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
+let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
 
@@ -231,34 +233,8 @@ async function initScene() {
 }
 
 // ── Projectile shooting ───────────────────────────────────────
-
-function shootProjectile(ndcX: number, ndcY: number) {
-  const core = coreRef;
-  if (!core) return;
-
-  const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
-  const dir = raycaster.ray.direction.clone().normalize();
-
-  core.enqueueProjectile({
-    position: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
-    velocity: {
-      x: dir.x * CONFIG.projectile.speed,
-      y: dir.y * CONFIG.projectile.speed,
-      z: dir.z * CONFIG.projectile.speed,
-    },
-    radius: CONFIG.projectile.radius,
-    mass: CONFIG.projectile.mass,
-    ttl: 8000,
-  });
-}
-
-canvas.addEventListener('click', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  shootProjectile(ndcX, ndcY);
-});
+// Shooting (ball + sticky-explosive modes) and the first-person camera are
+// handled by the shared shooter module, mounted during boot below.
 
 // ── UI wiring ─────────────────────────────────────────────────
 
@@ -430,6 +406,7 @@ function loop() {
     updateStatus(coreRef, stepMs);
   }
 
+  shooter?.update();
   renderer.render(scene, camera);
 }
 
@@ -447,4 +424,12 @@ window.addEventListener('resize', onResize);
 // ── Boot ──────────────────────────────────────────────────────
 
 mountPipelineControls();
+shooter = mountShooter({
+  canvas,
+  camera,
+  controls,
+  scene,
+  getCore: () => coreRef,
+  getBallParams: () => CONFIG.projectile,
+});
 initScene().then(() => loop());

@@ -18,6 +18,7 @@ import Stats from 'three/addons/libs/stats.module.js';
 import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountShooter } from './shooter-fps.js';
 
 const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
 
@@ -162,6 +163,7 @@ const recorder = createRecordingOverlay({
   getProfilerExport: () => profiler.exportData(),
 });
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
+let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let rebuilding = false;
 
@@ -272,12 +274,8 @@ function shootProjectile(ndcX: number, ndcY: number) {
   });
 }
 
-canvas.addEventListener('click', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  shootProjectile(ndcX, ndcY);
-});
+// Clicks are routed through the shared shooter module (mounted at boot), which
+// delegates ball-mode shots back to `shootProjectile` via its `shootBall` hook.
 
 // ── Control panel wiring ──────────────────────────────────────
 function bindSlider(
@@ -363,6 +361,8 @@ function loop() {
     updateStatus(coreRef);
   }
 
+  shooter?.update();
+
   const t1 = performance.now();
   renderer.render(scene, camera);
   _renderMs += ((performance.now() - t1) - _renderMs) * EMA;
@@ -378,6 +378,15 @@ function onResize() {
 window.addEventListener('resize', onResize);
 
 mountPipelineControls();
+shooter = mountShooter({
+  canvas,
+  camera,
+  controls,
+  scene,
+  getCore: () => coreRef,
+  getBallParams: () => CONFIG.projectile,
+  shootBall: shootProjectile,
+});
 initScene()
   .then(() => loop())
   .catch((err) => {

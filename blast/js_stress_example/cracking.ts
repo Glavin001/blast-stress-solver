@@ -16,6 +16,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { buildDestructibleCore } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle } from 'blast-stress-solver/three';
+import { mountShooter } from './shooter-fps.js';
 
 // ── Cantilever scenario ───────────────────────────────────────
 const BEAM = { length: 8, height: 3, mass: 80 };
@@ -109,6 +110,7 @@ function setText(id: string, v: string) { const el = document.getElementById(id)
 // ── Scene lifecycle ───────────────────────────────────────────
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
+let shooter: ReturnType<typeof mountShooter> | null = null;
 let rebuilding = false;
 let initialBonds = 0;
 
@@ -166,10 +168,8 @@ function shoot(ndcX: number, ndcY: number) {
     radius: 0.35, mass: 400, ttl: 2500,
   });
 }
-canvas.addEventListener('click', (e) => {
-  const r = canvas.getBoundingClientRect();
-  shoot(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
-});
+// Clicks are routed through the shared shooter module (mounted at boot), which
+// delegates ball-mode shots back to `shoot` via its `shootBall` hook.
 
 // ── Controls ──────────────────────────────────────────────────
 function bindSlider(id: string, get: () => number, set: (v: number) => void, fmt: (v: number) => string, onInput?: (v: number) => void) {
@@ -222,6 +222,7 @@ function loop() {
     visualsRef.update({ debug: false, updateBVH: false, updateProjectiles: true });
     updateCracks();
   }
+  shooter?.update();
   renderer.render(scene, camera);
 }
 
@@ -232,6 +233,14 @@ function onResize() {
 }
 window.addEventListener('resize', onResize);
 
+shooter = mountShooter({
+  canvas,
+  camera,
+  controls,
+  scene,
+  getCore: () => coreRef,
+  shootBall: shoot,
+});
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize cracking demo:', err);
   const hint = document.querySelector('.viewport-hint');
