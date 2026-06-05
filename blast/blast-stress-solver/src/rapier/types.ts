@@ -205,7 +205,25 @@ export type CoreProfilerSample = {
   dt: number;
   rapierStepMs: number;
   contactDrainMs: number;
+  /**
+   * Wrapper timer for the whole stress-solver phase. Historically an
+   * unattributable blob: it bundles the per-actor gravity fill (Rapier
+   * rotation round-trips), the external-contact/splash force injection, and
+   * the actual CGNR solve in WASM. The three `solver*Ms` fields below break it
+   * down so a regression can be pinned to JS injection (our code) vs. the
+   * vendored solver. They sum to ≈`solverUpdateMs` (minus negligible
+   * predicate/bookkeeping overhead).
+   */
   solverUpdateMs: number;
+  /** Sub-phase of `solverUpdateMs`: per-actor gravity fill into the solver
+   *  (Rapier `getRigidBody`/`rotation` round-trips, then the gravity FFI). */
+  solverGravityInjectMs: number;
+  /** Sub-phase of `solverUpdateMs`: external contact / splash force injection
+   *  (force rotation into body-local space + spatial-grid neighbour splash). */
+  solverContactInjectMs: number;
+  /** Sub-phase of `solverUpdateMs`: the actual `solver.update()` CGNR solve in
+   *  WASM (whole-graph; cost tracks bond count, not body count). */
+  solverSolveMs: number;
   damageReplayMs: number;
   damagePreviewMs: number;
   damageTickMs: number;
