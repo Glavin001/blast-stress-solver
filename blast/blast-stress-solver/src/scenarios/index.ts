@@ -18,6 +18,7 @@ export type { FracturedBridgeOptions } from './fracturedBridgeScenario';
 
 export {
   buildHighRiseScenario,
+  buildHighRiseScenarioAsync,
   DEFAULT_HIGH_RISE_OPTIONS,
   HIGH_RISE_BOND_MULTIPLIERS,
   DEFAULT_HIGH_RISE_MULTIPLIERS,

@@ -15,15 +15,37 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
+import * as pinata from '@dgreenheck/three-pinata';
 import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
-import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
+import { createDestructibleThreeBundle, RapierDebugRenderer, setPinataModule } from 'blast-stress-solver/three';
+import { buildHighRiseScenario, buildHighRiseScenarioAsync, type HighRiseOptions } from 'blast-stress-solver/scenarios';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { mountShooter } from './shooter-fps.js';
 
+// The scene defaults (camera, material limits, contact-damage tuning) still come from
+// the shared scene-pack JSON so the web and Rust demos agree; the *geometry* is now
+// rebuilt live from the Building controls instead of using the pack's baked scenario.
 const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
+
+// Pre-register three-pinata so the synchronous Voronoi fracturer resolves in the
+// browser ESM environment (bare-specifier dynamic imports don't resolve there).
+setPinataModule(pinata as any);
 
 // ── Mutable demo config (driven by the control panel) ──────────
 const CONFIG = {
+  // Building geometry — rebuilt live (apply via Reset). Defaults mirror
+  // DEFAULT_HIGH_RISE_OPTIONS so the live build matches the baked scene pack.
+  building: {
+    floorCount: 9,
+    floorHeight: 3.2,
+    width: 18,
+    depth: 14,
+    columnsX: 4,
+    columnsZ: 3,
+    // Voronoi-fracture the drywall infill walls (auto-bonded via WASM) instead of
+    // the regular box grid. Heavier to build, but the walls shatter realistically.
+    fractureWalls: false,
+  },
   projectile: { radius: 0.6, mass: 2500, speed: 45 },
   solver: {
     gravity: -9.81,
@@ -172,9 +194,27 @@ async function initScene() {
   if (hint) hint.textContent = 'Loading high-rise...';
 
   const pack = await loadScenePackFromUrl(SCENE_URL);
-  const { scenario, defaults } = pack;
+  const { defaults } = pack;
   baseLimits = (defaults.solverSettings as Record<string, number>) ?? {};
   packDamage = (defaults.damage as Record<string, unknown>) ?? {};
+
+  // Build the high-rise geometry live from the Building controls (the pack's baked
+  // scenario is ignored). Slab divisions scale with the footprint so bigger buildings
+  // keep ~3 m floor tiles instead of a few giant slabs.
+  const b = CONFIG.building;
+  const opts: HighRiseOptions = {
+    floorCount: b.floorCount,
+    floorHeight: b.floorHeight,
+    width: b.width,
+    depth: b.depth,
+    columnsX: b.columnsX,
+    columnsZ: b.columnsZ,
+    slabDivX: Math.max(4, Math.round(b.width / 3)),
+    slabDivZ: Math.max(3, Math.round(b.depth / 3)),
+  };
+  const scenario = b.fractureWalls
+    ? await buildHighRiseScenarioAsync({ ...opts, fractureInfill: true, bondMode: 'auto', pinata: pinata as any })
+    : buildHighRiseScenario(opts);
 
   controls.target.set(defaults.camera.target.x, defaults.camera.target.y, defaults.camera.target.z);
   controls.update();
@@ -274,6 +314,23 @@ function bindSelect(id: string, obj: Record<string, any>, key: string, onChange?
   select.value = String(obj[key]);
   select.addEventListener('change', () => { obj[key] = select.value; onChange?.(select.value); });
 }
+
+// Building geometry (deferred — apply on Reset). These rebuild the whole structure.
+bindSlider('cfg-floors', CONFIG.building, 'floorCount', (v) => v.toFixed(0));
+bindSlider('cfg-floor-height', CONFIG.building, 'floorHeight', (v) => v.toFixed(1) + ' m');
+bindSlider('cfg-width', CONFIG.building, 'width', (v) => v.toFixed(0) + ' m');
+bindSlider('cfg-depth', CONFIG.building, 'depth', (v) => v.toFixed(0) + ' m');
+bindSlider('cfg-columns-x', CONFIG.building, 'columnsX', (v) => v.toFixed(0));
+bindSlider('cfg-columns-z', CONFIG.building, 'columnsZ', (v) => v.toFixed(0));
+
+// Fracture-walls toggle: switches the drywall infill from boxes to Voronoi shards
+// (auto-bonded via WASM). Rebuilds immediately so the change is visible at once.
+const optFracture = document.getElementById('cfg-fracture-walls') as HTMLInputElement | null;
+if (optFracture) optFracture.checked = CONFIG.building.fractureWalls;
+optFracture?.addEventListener('change', () => {
+  CONFIG.building.fractureWalls = !!optFracture.checked;
+  void rebuild();
+});
 
 // Projectile (read live at shoot time)
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
