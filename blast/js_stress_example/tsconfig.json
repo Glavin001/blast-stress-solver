@@ -26,6 +26,7 @@
     "stress.js",
     "split-bridge-stress.ts",
     "shooter-fps.ts",
+    "demo-shell.ts",
     "wall-demolition.ts",
     "tower-collapse.ts",
     "fractured-wall.ts",

@@ -39,7 +39,7 @@ const CONFIG = {
   projectile: {
     radius: 0.35,
     mass: 1_000,
-    speed: 20,
+    speed: 36,
   },
   solver: {
     gravity: -9.81,
@@ -54,7 +54,7 @@ const CONFIG = {
   },
   optimization: {
     smallBodyDampingMode: 'off' as string,
-    debrisCleanupMode: 'always' as string,
+    debrisCleanupMode: 'afterGroundCollision' as string,
     debrisTtlMs: 8000,
     maxCollidersForDebris: 2,
   },
@@ -160,6 +160,7 @@ const profiler = createFrameProfilerOverlay();
 // forces, gravity) and every fracture/topology change into a single gzipped
 // bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
 const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
   exportName: 'wall-demolition-recording',
   getProfilerExport: () => profiler.exportData(),
 });

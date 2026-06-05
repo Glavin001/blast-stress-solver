@@ -125,6 +125,7 @@ const profiler = createFrameProfilerOverlay();
 // forces, gravity) and every fracture/topology change into a single gzipped
 // bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
 const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
   exportName: 'fractured-wall-recording',
   getProfilerExport: () => profiler.exportData(),
 });

@@ -46,7 +46,7 @@ const CONFIG = {
     fragments: 5, // Voronoi fragments per wall (floors/columns scale from this)
     seed: 7,
   },
-  projectile: { radius: 0.6, mass: 1500, speed: 35 },
+  projectile: { radius: 0.6, mass: 1500, speed: 60 },
   destroy: {
     meteors: 36,
     meteorMass: 3000,
@@ -59,20 +59,20 @@ const CONFIG = {
   },
   solver: { gravity: -9.81, materialScale: 1e10 },
   physics: {
-    debrisCollisionMode: 'noDebrisPairs',
+    debrisCollisionMode: 'all',
     friction: 0.25,
     restitution: 0,
     contactForceScale: 30,
   },
   optimization: {
-    // Damp small debris only after it lands ('always' floats falling debris).
-    smallBodyDampingMode: 'afterGroundCollision',
-    debrisCleanupMode: 'always',
+    // Damping defaults to off; 'afterGroundCollision' would damp small debris only after it lands ('always' floats falling debris).
+    smallBodyDampingMode: 'off',
+    debrisCleanupMode: 'afterGroundCollision',
     debrisTtlMs: 8000,
     maxCollidersForDebris: 2,
     // Island-aware solve: solve each disconnected group independently and skip groups that have
-    // settled (no input change + already converged). Off by default; toggled live in the sidebar.
-    islandSolver: false,
+    // settled (no input change + already converged). On by default; toggled live in the sidebar.
+    islandSolver: true,
   },
   features: { debug: false },
 };
@@ -379,6 +379,7 @@ const profiler = createFrameProfilerOverlay();
 // gzipped bug-report bundle (⬇ Save). The profiler trace rides along in the
 // bundle. Zero allocation on the hot path.
 const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
   exportName: 'mini-city-recording',
   getProfilerExport: () => profiler.exportData(),
 });

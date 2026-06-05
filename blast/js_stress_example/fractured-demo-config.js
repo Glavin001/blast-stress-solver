@@ -15,7 +15,7 @@ export const FRACTURED_WALL_DEMO_CONFIG = {
   projectile: {
     radius: 0.35,
     mass: 1_000,
-    speed: 20,
+    speed: 36,
     ttlMs: 6_000,
   },
   solver: {
@@ -30,11 +30,10 @@ export const FRACTURED_WALL_DEMO_CONFIG = {
     skipSingleBodies: false,
   },
   optimization: {
-    // Damp small debris only AFTER it lands. 'always' also damps it mid-air, which caps a
-    // falling fragment at terminal velocity (~g/damping ≈ 5 m/s) and makes the collapse look
-    // like it floats down in slow motion. See rapier.smallBodyDamping.fall.test.ts.
-    smallBodyDampingMode: 'afterGroundCollision',
-    debrisCleanupMode: 'always',
+    smallBodyDampingMode: 'off',
+    // Keep debris around until it lands, then retire it ('always' can also retire
+    // it mid-air). See rapier.smallBodyDamping.fall.test.ts for the falling case.
+    debrisCleanupMode: 'afterGroundCollision',
     debrisTtlMs: 10_000,
     maxCollidersForDebris: 2,
   },
@@ -64,7 +63,7 @@ export const FRACTURED_TOWER_DEMO_CONFIG = {
   projectile: {
     radius: 0.5,
     mass: 1_000,
-    speed: 25,
+    speed: 45,
     ttlMs: 8_000,
   },
   solver: {
@@ -72,14 +71,14 @@ export const FRACTURED_TOWER_DEMO_CONFIG = {
     materialScale: 1e10,
   },
   physics: {
-    debrisCollisionMode: 'noDebrisPairs',
+    debrisCollisionMode: 'all',
     friction: 0.25,
     restitution: 0.0,
     contactForceScale: 30,
   },
   optimization: {
-    smallBodyDampingMode: 'afterGroundCollision',
-    debrisCleanupMode: 'always',
+    smallBodyDampingMode: 'off',
+    debrisCleanupMode: 'afterGroundCollision',
     debrisTtlMs: 10_000,
     maxCollidersForDebris: 2,
   },
@@ -106,7 +105,7 @@ export const FRACTURED_BRIDGE_DEMO_CONFIG = {
   projectile: {
     radius: 0.4,
     mass: 1_000,
-    speed: 20,
+    speed: 36,
     ttlMs: 6_000,
   },
   solver: {
@@ -120,8 +119,8 @@ export const FRACTURED_BRIDGE_DEMO_CONFIG = {
     contactForceScale: 30,
   },
   optimization: {
-    smallBodyDampingMode: 'afterGroundCollision',
-    debrisCleanupMode: 'always',
+    smallBodyDampingMode: 'off',
+    debrisCleanupMode: 'afterGroundCollision',
     debrisTtlMs: 10_000,
     maxCollidersForDebris: 2,
   },

@@ -24,7 +24,7 @@ const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
 
 // ── Mutable demo config (driven by the control panel) ──────────
 const CONFIG = {
-  projectile: { radius: 0.6, mass: 2500, speed: 25 },
+  projectile: { radius: 0.6, mass: 2500, speed: 45 },
   solver: {
     gravity: -9.81,
     // Multiplier on the pack's concrete stress limits: >1 = stronger / harder to break,
@@ -45,10 +45,10 @@ const CONFIG = {
   },
   physics: { debrisCollisionMode: 'all', friction: 0.25, restitution: 0 },
   optimization: {
-    // Damp small debris only after it lands; 'always' also damps it mid-air (caps the fall at
+    // Damping defaults to off; 'afterGroundCollision' would damp small debris only after it lands; 'always' also damps it mid-air (caps the fall at
     // ~g/damping ≈ 5 m/s → "floaty" collapse). See rapier.smallBodyDamping.fall.test.ts.
-    smallBodyDampingMode: 'afterGroundCollision',
-    debrisCleanupMode: 'always',
+    smallBodyDampingMode: 'off',
+    debrisCleanupMode: 'afterGroundCollision',
     debrisTtlMs: 10000,
     maxCollidersForDebris: 3,
   },
@@ -156,6 +156,7 @@ const profiler = createFrameProfilerOverlay();
 // forces, gravity) and every fracture/topology change into a single gzipped
 // bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
 const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
   exportName: 'high-rise-recording',
   getProfilerExport: () => profiler.exportData(),
 });
