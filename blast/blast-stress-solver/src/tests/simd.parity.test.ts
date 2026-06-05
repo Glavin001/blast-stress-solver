@@ -28,7 +28,7 @@
 import { describe, it, expect } from 'vitest';
 import type * as Runtime from '..';
 
-const EXPECT_SIMD = process.env.EMCC_USE_SIMD === '1';
+const EXPECT_SIMD = process.env.EMCC_USE_SIMD === '1' || process.env.EMCC_USE_WASM_SIMD === '1';
 
 async function loadRuntime(): Promise<typeof Runtime> {
   return (await import('../../dist/index.js')) as typeof Runtime;

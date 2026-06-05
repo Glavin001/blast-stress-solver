@@ -108,16 +108,28 @@ const enableProfiling = process.env.EMCC_PROFILING === '1';
 // ext_stress_solver_update), at the cost of ~20s extra link time. Disable with
 // EMCC_NO_LTO=1 if iterating locally and only the JS bridge changed.
 const enableLTO = process.env.EMCC_NO_LTO !== '1';
-// Opt-in for the native AVX path. emscripten ≥ 3.1.68 lowers __m256 /
-// _mm256_* down to two wasm-simd128 ops, so the vendored AngLin6 kernels in
-// anglin6.h / coupling.h / inertia.h compile directly with -mavx — no simde,
-// no rewriting.  BUT in the measured large-tower scenario the AVX path runs
-// ~5× slower on the solver hot loop than the scalar AngLin6Ops<float> path
-// (which clang already autovectorizes to f32x4 ops under -O3 -msimd128), so
-// the default is OFF.  Toggle with EMCC_USE_SIMD=1 to A/B; see PR description
-// for analysis.  When emscripten ships native FMA (relaxed-simd or a future
-// hardware ext) the AVX path should overtake the scalar autovec.
+// Opt-in for one of the two SIMD kernel paths.  Both flip
+// StressProcessor::s_use_simd to true and route through AngLin6Ops<__m128>
+// in anglin6.h / coupling.h / inertia.h; the difference is the underlying
+// implementation.
+//
+//   EMCC_USE_SIMD=1       — native AVX intrinsics (__m256, _mm256_*).
+//                           emscripten 3.1.68+ lowers these to two
+//                           wasm-simd128 ops + struct bookkeeping.  Measured
+//                           +24% on the mini-city replay vs the scalar
+//                           autovec default (PR #37).
+//   EMCC_USE_WASM_SIMD=1  — direct wasm_simd128 intrinsics (v128_t,
+//                           wasm_f32x4_*).  Same math as the AVX path with
+//                           the per-op `__m256` wrapper round-trips removed.
+//                           Should match the AVX win at scale and avoid its
+//                           per-op tax at small scale.
+//
+// If both are set, EMCC_USE_WASM_SIMD wins (it's strictly the better-codegen
+// variant of the same algorithm).  Neither set → scalar AngLin6Ops<float>,
+// autovectorized by `-O3 -msimd128`.
 const enableSimd = process.env.EMCC_USE_SIMD === '1';
+const enableWasmSimd = process.env.EMCC_USE_WASM_SIMD === '1';
+const enableAnySimd = enableSimd || enableWasmSimd;
 
 // The TS bridge in blast-stress-solver/src/stress.ts reaches for
 // Module.HEAPU8 / HEAPU32 / HEAPF32 (it rebuilds the DataView after every
@@ -177,15 +189,16 @@ const commonArgs = [
   '-I' + sdkStressDir,
   '-I' + sdkAuthoringDir,
   '-I' + sdkAuthoringCommonDir,
-  ...(enableSimd
+  ...(enableAnySimd
     ? [
         // SIMD path: leave STRESS_SOLVER_NO_SIMD off so anglin6.h /
-        // coupling.h / inertia.h's __m128 specializations (which reach for
-        // __m256 inside — the AngLin6 type holds 8 floats) compile through
-        // emscripten's native AVX intrinsic lowering. The scalar path is
-        // still available as AngLin6Ops<Float_Scalar>; we just flip
-        // s_use_simd via the __wasm__ branch in stress.cpp so the runtime
-        // picks the CGNR_SIMD typedef.
+        // coupling.h / inertia.h's __m128 specializations compile, then
+        // pick the implementation flavor:
+        //   STRESS_SOLVER_WASM_SIMD_DIRECT — direct wasm_simd128 (preferred
+        //     when EMCC_USE_WASM_SIMD=1, takes precedence over the AVX path).
+        //   (neither define) — the vendored __m256/_mm_* AVX implementation,
+        //     emulated by emcc on top of wasm-simd128.
+        ...(enableWasmSimd ? ['-DSTRESS_SOLVER_WASM_SIMD_DIRECT=1'] : []),
       ]
     : [
         // Scalar path (default): force AngLin6Ops<Float_Scalar> at runtime
@@ -206,7 +219,14 @@ const commonArgs = [
   // use; emscripten 3.1.68+ lowers each AVX op to two wasm-simd128 ops.
   '-msimd128',
   '-msse4.2',
-  ...(enableSimd ? ['-mavx'] : []),
+  // -mavx is needed by the AVX (`__m256`) implementation path, including the
+  // common `_mm_load1_ps` / `_mm256_load_ps` etc. used outside the
+  // specializations.  The direct-v128 path doesn't strictly need it (it uses
+  // wasm_simd128 intrinsics), but the surrounding scalar `__m128` helpers in
+  // simd.h still require SSE-level intrinsics, which `-msimd128 -msse4.2`
+  // already cover.  Adding `-mavx` for both SIMD paths keeps the build
+  // matrix simple.
+  ...(enableAnySimd ? ['-mavx'] : []),
   // Whole-program / no-runtime-overhead settings. The C++ here doesn't throw,
   // doesn't use RTTI, doesn't longjmp, doesn't touch a filesystem, and only
   // uses fprintf(stderr, ...) for one warning (which emcc still satisfies

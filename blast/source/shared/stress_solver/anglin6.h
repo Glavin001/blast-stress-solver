@@ -160,8 +160,152 @@ struct AngLin6Ops
 
 
 #if !defined(STRESS_SOLVER_NO_SIMD)
+#if defined(STRESS_SOLVER_WASM_SIMD_DIRECT)
 /**
- * SIMD AngLin6 operations.
+ * Direct wasm-simd128 AngLin6 operations.
+ *
+ * Mirrors the AVX specialization below, but written against `<wasm_simd128.h>`
+ * straight rather than through `__m256` (which emscripten emulates as two
+ * `__m128` halves + struct bookkeeping when targeting wasm).  Each AngLin6 is
+ * 32 bytes — exactly two v128 — so the natural representation is
+ * `(v128 ang_part, v128 lin_part)` with the trailing pad in lane 3.
+ *
+ * The Scalar template parameter stays as `__m128` for source compatibility
+ * with the CGNR template; on emcc native AVX targets `__m128` and `v128_t`
+ * are layout-compatible (both are 16-byte 4×f32 vectors), and the explicit
+ * bitcasts here are no-ops at codegen time.
+ *
+ * Why this exists alongside the `STRESS_SOLVER_WASM_SIMD` path: the
+ * AVX-intrinsic path through `__m256` was measured at +24% over scalar on
+ * the mini-city replay, but it pays a per-op wrapper tax that hurts at
+ * smaller scales.  Direct v128 should match at scale and not regress at
+ * small scale — same work, less bookkeeping.
+ */
+#include <wasm_simd128.h>
+
+template<>
+struct AngLin6Ops<__m128>
+{
+    /** r = x + y */
+    inline void
+    add(AngLin6& r, const AngLin6& x, const AngLin6& y)
+    {
+        v128_t xa = wasm_v128_load(&x.ang.x), xl = wasm_v128_load(&x.lin.x);
+        v128_t ya = wasm_v128_load(&y.ang.x), yl = wasm_v128_load(&y.lin.x);
+        wasm_v128_store(&r.ang.x, wasm_f32x4_add(xa, ya));
+        wasm_v128_store(&r.lin.x, wasm_f32x4_add(xl, yl));
+    }
+
+    /** r = x - y */
+    inline void
+    sub(AngLin6& r, const AngLin6& x, const AngLin6& y)
+    {
+        v128_t xa = wasm_v128_load(&x.ang.x), xl = wasm_v128_load(&x.lin.x);
+        v128_t ya = wasm_v128_load(&y.ang.x), yl = wasm_v128_load(&y.lin.x);
+        wasm_v128_store(&r.ang.x, wasm_f32x4_sub(xa, ya));
+        wasm_v128_store(&r.lin.x, wasm_f32x4_sub(xl, yl));
+    }
+
+    /** r = c*x + y (c is splatted across the 4 lanes of a v128) */
+    inline void
+    madd(AngLin6& r, __m128 c, const AngLin6& x, const AngLin6& y)
+    {
+        v128_t cv = (v128_t)c;
+        v128_t xa = wasm_v128_load(&x.ang.x), xl = wasm_v128_load(&x.lin.x);
+        v128_t ya = wasm_v128_load(&y.ang.x), yl = wasm_v128_load(&y.lin.x);
+        wasm_v128_store(&r.ang.x, wasm_f32x4_add(wasm_f32x4_mul(cv, xa), ya));
+        wasm_v128_store(&r.lin.x, wasm_f32x4_add(wasm_f32x4_mul(cv, xl), yl));
+    }
+
+    /** r = -c*x + y = y - c*x */
+    inline void
+    nmadd(AngLin6& r, __m128 c, const AngLin6& x, const AngLin6& y)
+    {
+        v128_t cv = (v128_t)c;
+        v128_t xa = wasm_v128_load(&x.ang.x), xl = wasm_v128_load(&x.lin.x);
+        v128_t ya = wasm_v128_load(&y.ang.x), yl = wasm_v128_load(&y.lin.x);
+        wasm_v128_store(&r.ang.x, wasm_f32x4_sub(ya, wasm_f32x4_mul(cv, xa)));
+        wasm_v128_store(&r.lin.x, wasm_f32x4_sub(yl, wasm_f32x4_mul(cv, xl)));
+    }
+
+    inline  void vadd(AngLin6* r, const AngLin6* x, const AngLin6* y, uint32_t N)               { while (N--) add(*r++, *x++, *y++); }
+    inline  void vsub(AngLin6* r, const AngLin6* x, const AngLin6* y, uint32_t N)               { while (N--) sub(*r++, *x++, *y++); }
+    inline  void vmadd(AngLin6* r, __m128 c, const AngLin6* x, const AngLin6* y, uint32_t N)    { while (N--) madd(*r++, c, *x++, *y++); }
+    inline  void vnmadd(AngLin6* r, __m128 c, const AngLin6* x, const AngLin6* y, uint32_t N)   { while (N--) nmadd(*r++, c, *x++, *y++); }
+
+    /** dot(v, w, N) = sum_i (v[i].ang . w[i].ang + v[i].lin . w[i].lin),
+     *  returned in lane 0 of the result (the CGNR code uses it as a Scalar). */
+    inline __m128
+    dot(const AngLin6* v, const AngLin6* w, uint32_t N)
+    {
+        v128_t acc = wasm_f32x4_splat(0.0f);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            v128_t va = wasm_v128_load(&v[i].ang.x), vl = wasm_v128_load(&v[i].lin.x);
+            v128_t wa = wasm_v128_load(&w[i].ang.x), wl = wasm_v128_load(&w[i].lin.x);
+            // Mask off lane 3 (struct pad) so it doesn't contribute. Doing it via
+            // `replace_lane` instead of `wasm_v128_and` keeps the inner loop a clean
+            // mul/replace/add sequence the JIT folds tightly.
+            v128_t pa = wasm_f32x4_replace_lane(wasm_f32x4_mul(va, wa), 3, 0.0f);
+            v128_t pl = wasm_f32x4_replace_lane(wasm_f32x4_mul(vl, wl), 3, 0.0f);
+            acc = wasm_f32x4_add(acc, wasm_f32x4_add(pa, pl));
+        }
+        return (__m128)horizontalSum(acc);
+    }
+
+    inline __m128
+    length_sq(const AngLin6* v, uint32_t N)
+    {
+        v128_t acc = wasm_f32x4_splat(0.0f);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            v128_t va = wasm_v128_load(&v[i].ang.x), vl = wasm_v128_load(&v[i].lin.x);
+            v128_t pa = wasm_f32x4_replace_lane(wasm_f32x4_mul(va, va), 3, 0.0f);
+            v128_t pl = wasm_f32x4_replace_lane(wasm_f32x4_mul(vl, vl), 3, 0.0f);
+            acc = wasm_f32x4_add(acc, wasm_f32x4_add(pa, pl));
+        }
+        return (__m128)horizontalSum(acc);
+    }
+
+    /** Same |v|^2 split into ang_sq and lin_sq; keep separate accumulators. */
+    inline __m128
+    calculate_error(AngLin6ErrorSq& error_sq, const AngLin6* v, uint32_t N)
+    {
+        v128_t acc_a = wasm_f32x4_splat(0.0f), acc_l = wasm_f32x4_splat(0.0f);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            v128_t va = wasm_v128_load(&v[i].ang.x), vl = wasm_v128_load(&v[i].lin.x);
+            v128_t pa = wasm_f32x4_replace_lane(wasm_f32x4_mul(va, va), 3, 0.0f);
+            v128_t pl = wasm_f32x4_replace_lane(wasm_f32x4_mul(vl, vl), 3, 0.0f);
+            acc_a = wasm_f32x4_add(acc_a, pa);
+            acc_l = wasm_f32x4_add(acc_l, pl);
+        }
+        const float ang_sq = horizontalSumScalar(acc_a);
+        const float lin_sq = horizontalSumScalar(acc_l);
+        error_sq.ang = ang_sq;
+        error_sq.lin = lin_sq;
+        return (__m128)wasm_f32x4_splat(ang_sq + lin_sq);
+    }
+
+private:
+    /** Sum the 4 lanes of a v128, broadcast the result across all 4 lanes. */
+    static inline v128_t horizontalSum(v128_t v)
+    {
+        v128_t hi = wasm_i32x4_shuffle(v, v, 2, 3, 0, 1);
+        v128_t s1 = wasm_f32x4_add(v, hi);
+        v128_t hi2 = wasm_i32x4_shuffle(s1, s1, 1, 0, 3, 2);
+        return wasm_f32x4_add(s1, hi2);
+    }
+    /** Sum the 4 lanes of a v128 and return as scalar. */
+    static inline float horizontalSumScalar(v128_t v)
+    {
+        v128_t s = horizontalSum(v);
+        return wasm_f32x4_extract_lane(s, 0);
+    }
+};
+#else
+/**
+ * SIMD AngLin6 operations (x86 AVX or emscripten's AVX intrinsic emulation).
  */
 template<>
 struct AngLin6Ops<__m128>
@@ -291,4 +435,5 @@ struct AngLin6Ops<__m128>
         return _mm_add_ps(_ang_sq, _lin_sq);
     }
 };
+#endif // STRESS_SOLVER_WASM_SIMD_DIRECT
 #endif // !STRESS_SOLVER_NO_SIMD
