@@ -2867,6 +2867,23 @@ export async function buildDestructibleCore({
     splitContinuityLog.length = 0;
   };
 
+  // Test/debug accessor: surfaces the precomputed static splash adjacency (per node,
+  // the same-radius neighbours and their quadratic falloff weights) so the precompute
+  // can be validated against an independent spatial computation.
+  (core as DestructibleCore & {
+    __debugSplashAdjacency?: () => { radius: number; perNode: Array<Array<{ node: number; weight: number }>> };
+  }).__debugSplashAdjacency = () => {
+    const perNode: Array<Array<{ node: number; weight: number }>> = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const list: Array<{ node: number; weight: number }> = [];
+      for (let k = splashAdjStart[i]; k < splashAdjStart[i + 1]; k++) {
+        list.push({ node: splashAdjNode[k], weight: splashAdjWeight[k] });
+      }
+      perNode.push(list);
+    }
+    return { radius: SPLASH_RADIUS, perNode };
+  };
+
   return core;
 }
 
