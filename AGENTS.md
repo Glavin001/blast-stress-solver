@@ -2,6 +2,8 @@
 
 ## Cursor Cloud specific instructions
 
+In Cursor Cloud VMs the repository is checked out at **`/workspace`** (substitute for `/home/user/PhysX` in the commands below).
+
 ### Project overview
 
 This is the NVIDIA PhysX monorepo containing PhysX, Blast, and Flow SDKs. The active development focus is on:
@@ -23,6 +25,7 @@ This is the NVIDIA PhysX monorepo containing PhysX, Blast, and Flow SDKs. The ac
   source /opt/emsdk/emsdk_env.sh
   ```
   The `~/.bashrc` should source it automatically. Verify with `emcc --version`.
+- If `/opt/emsdk` was cloned with `sudo`, fix ownership before `./emsdk install`: `sudo chown -R "$(whoami)" /opt/emsdk`.
 
 ### First-time setup
 
