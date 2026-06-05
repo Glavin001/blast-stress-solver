@@ -75,6 +75,10 @@ const CONFIG = {
     // Island-aware solve: solve each disconnected group independently and skip groups that have
     // settled (no input change + already converged). On by default; toggled live in the sidebar.
     islandSolver: true,
+    // Lazy intact colliders: intact buildings keep their per-fragment colliders disabled (out of
+    // the broadphase) until a mover is about to hit them, then enable just-in-time. Huge idle win
+    // on big cities; identical while intact and on approach. On by default; toggled live.
+    lazyIntactColliders: true,
   },
   features: { debug: false },
 };
@@ -158,6 +162,8 @@ function updateStatus(core: any) {
   setText('stat-fragments', String(core.chunks.length));
   const isl = core.getIslandSolverStats?.();
   setText('stat-islands', isl?.enabled ? `${isl.islandsSkipped}/${isl.islandCount} skipped` : 'off');
+  const lz = core.getLazyColliderStats?.();
+  setText('stat-lazy', lz?.enabled ? `${lz.dormantCount} dormant / ${lz.explodedCount} hit` : 'off');
 }
 function updatePerf() {
   setText('stat-physics-ms', _physicsMs.toFixed(1) + ' ms');
@@ -422,6 +428,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    lazyIntactColliders: CONFIG.optimization.lazyIntactColliders,
     ...pipelineCoreOverrides(),
   });
 
@@ -443,6 +450,7 @@ async function initScene() {
 
   coreRef = core;
   core.setIslandSolver?.({ enabled: CONFIG.optimization.islandSolver }); // persist the toggle across rebuilds
+  core.setLazyIntactColliders?.(CONFIG.optimization.lazyIntactColliders);
   recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -695,6 +703,9 @@ bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 100
 );
 bindToggle('cfg-island-solver', CONFIG.optimization, 'islandSolver', (v) =>
   coreRef?.setIslandSolver?.({ enabled: v }),
+);
+bindToggle('cfg-lazy-colliders', CONFIG.optimization, 'lazyIntactColliders', (v) =>
+  coreRef?.setLazyIntactColliders?.(v),
 );
 
 // Actions

@@ -377,6 +377,11 @@ export type DestructibleCore = {
   setIslandSolver?: (opts: { enabled?: boolean; skipSettled?: boolean }) => void;
   /** Current island-solver settings plus the last update's island count and skipped count. */
   getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
+  /** Toggle collision-dormant intact buildings at runtime (off ⇒ materialize all per-fragment
+   *  colliders; on ⇒ collapse still-intact buildings back to proxy hulls). */
+  setLazyIntactColliders?: (enabled: boolean) => void;
+  /** Lazy-collider status: how many buildings are dormant (proxy) vs exploded (per-fragment). */
+  getLazyColliderStats?: () => { enabled: boolean; buildingCount: number; dormantCount: number; explodedCount: number };
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

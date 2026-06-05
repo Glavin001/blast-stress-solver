@@ -215,6 +215,9 @@
           <label class="toggle-row"><input type="checkbox" id="cfg-island-solver" checked />
             <span class="toggle-text">Island solver &#9733;
               <small>Solve each disconnected group on its own and skip ones that have settled &mdash; same result, less work.</small></span></label>
+          <label class="toggle-row"><input type="checkbox" id="cfg-lazy-colliders" checked />
+            <span class="toggle-text">Lazy intact colliders &#9733;
+              <small>Intact buildings keep their per-fragment colliders disabled until a projectile/debris is about to hit them &mdash; huge idle physics win on big cities. Identical while intact &amp; on approach.</small></span></label>
         </section>
 
         <!-- Actions -->
@@ -233,6 +236,7 @@
             <div class="status-item"><span class="status-label">Projectiles</span><span class="status-value" id="stat-projectiles">0</span></div>
             <div class="status-item"><span class="status-label">Chunks</span><span class="status-value" id="stat-chunks">0</span></div>
             <div class="status-item"><span class="status-label">Islands</span><span class="status-value" id="stat-islands">off</span></div>
+            <div class="status-item"><span class="status-label">Buildings</span><span class="status-value" id="stat-lazy">off</span></div>
           </div>
         </section>
 

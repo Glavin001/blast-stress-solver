@@ -97,6 +97,15 @@ export type BuildDestructibleCoreOptions = {
   /** Controls fracture rate, body creation budget, and dynamic body limits.
    *  All fields default to -1 (unlimited = original behavior). */
   fracturePolicy?: FracturePolicy;
+  /** Collision-dormant intact buildings. When on, each disconnected component ("building") of
+   *  the initial bond graph is represented by ONE cheap convex-hull *proxy* collider on the
+   *  fixed root instead of one collider per fragment. The proxy is a tripwire only: when a mover
+   *  touches it, the world is rolled back (reusing the fracture-resim snapshot), the building is
+   *  "exploded" into its real per-fragment colliders, and the step is re-run — so the impact is
+   *  resolved on real geometry, same frame, with the exact Rapier contact fed to the stress
+   *  solver. Massively cuts the idle broadphase cost (≈1 collider/building vs 1/fragment).
+   *  Requires (and implies) resimulateOnFracture. Default false. */
+  lazyIntactColliders?: boolean;
 };
 
 const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV !== 'production' : true;
@@ -200,6 +209,7 @@ export async function buildDestructibleCore({
   smallBodyDamping,
   debrisCleanup,
   fracturePolicy,
+  lazyIntactColliders = false,
 }: BuildDestructibleCoreOptions): Promise<DestructibleCore> {
   await RAPIER.init();
   const runtime = await loadStressSolver();
@@ -628,12 +638,36 @@ export async function buildDestructibleCore({
     return desc;
   }
 
+  // ── Lazy intact buildings (collision-dormant) ──
+  // When on, an intact building (a connected component of the initial bond graph) carries ONE
+  // cheap convex-hull proxy collider on the fixed root instead of one collider per fragment.
+  let lazyIntactCollidersEnabled = !!lazyIntactColliders;
+  type IntactBuilding = { id: number; nodeIndices: number[]; aabbMin: Vec3; aabbMax: Vec3; exploded: boolean };
+  const intactBuildings: IntactBuilding[] = [];
+  const buildingOfNode = new Int32Array(scenario.nodes.length).fill(-1);
+
+  // Create a single per-fragment collider for `chunk` on the fixed root — the real (intact/
+  // exploded) collision representation. Shared by the eager init path and by explodeBuilding().
+  function createIntactFragmentCollider(chunk: ChunkData) {
+    const nodeIndex = chunk.nodeIndex;
+    const halfX = Math.max(0.05, chunk.size.x * 0.5);
+    const halfY = Math.max(0.05, chunk.size.y * 0.5);
+    const halfZ = Math.max(0.05, chunk.size.z * 0.5);
+    const desc = buildColliderDescForNode({ nodeIndex, halfX, halfY, halfZ, isSupport: chunk.isSupport })
+      .setMass(scenario.nodes[nodeIndex]?.mass ?? 1)
+      .setTranslation(chunk.localOffset.x, chunk.localOffset.y, chunk.localOffset.z)
+      .setFriction(friction)
+      .setRestitution(restitution)
+      .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
+      .setContactForceEventThreshold(0.0);
+    const col = world.createCollider(desc, rootBody);
+    chunk.colliderHandle = col.handle;
+    colliderToNode.set(col.handle, nodeIndex);
+    activeContactColliders.add(col.handle);
+  }
+
   scenario.nodes.forEach((node, nodeIndex) => {
     const size = nodeSize(nodeIndex, scenario);
-    const halfX = Math.max(0.05, size.x * 0.5);
-    const halfY = Math.max(0.05, size.y * 0.5);
-    const halfZ = Math.max(0.05, size.z * 0.5);
-
     const nodeMass = node.mass ?? 1;
     const isSupport = nodeMass === 0;
     const chunk: ChunkData = {
@@ -648,20 +682,16 @@ export async function buildDestructibleCore({
       detached: false,
     };
 
-    const desc = buildColliderDescForNode({ nodeIndex, halfX, halfY, halfZ, isSupport })
-      .setMass(nodeMass)
-      .setTranslation(chunk.localOffset.x, chunk.localOffset.y, chunk.localOffset.z)
-      .setFriction(friction)
-      .setRestitution(restitution)
-      .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
-      .setContactForceEventThreshold(0.0);
-    const col = world.createCollider(desc, rootBody);
-    chunk.colliderHandle = col.handle;
-    colliderToNode.set(col.handle, nodeIndex);
-    activeContactColliders.add(col.handle);
+    // Always create the real per-fragment collider (identical handles/order to the eager path, so
+    // an exploded building's contacts solve bit-for-bit the same). In lazy mode these are then
+    // DISABLED (excluded from the broadphase — far cheaper) and a sensor proxy stands in until the
+    // building is hit, at which point the real colliders are simply re-enabled.
+    createIntactFragmentCollider(chunk);
     registerNodeBodyLink(nodeIndex, chunk.bodyHandle);
     chunks.push(chunk);
   });
+
+  if (lazyIntactCollidersEnabled) buildIntactBuildings();
 
   if (isDev) {
     try {
@@ -2192,6 +2222,16 @@ export async function buildDestructibleCore({
     // is where the cached actor list (used by the batched gravity path) must be
     // invalidated.
     if (splitEvents.length > 0) solverActorsDirty = true;
+    // Safety net (lazy intact colliders): if a building fractures from a non-contact cause (e.g.
+    // gravity) while still dormant, materialize its real colliders first so the split has
+    // colliders to migrate. Idempotent — the contact path has usually already exploded it.
+    if (lazyIntactCollidersEnabled && splitEvents.length > 0) {
+      for (const split of splitEvents) {
+        for (const child of split.children) {
+          if (child.nodes && child.nodes.length) ensureBuildingExplodedForNode(child.nodes[0]);
+        }
+      }
+    }
     for (const split of splitEvents) {
       const parentActorIndex = split.parentActorIndex;
       const parentEntry = actorMap.get(parentActorIndex);
@@ -2423,6 +2463,181 @@ export async function buildDestructibleCore({
     return false;
   }
 
+  // ── Lazy intact building proxies + just-in-time explode ──
+
+  // Compute a building's world-space AABB from its fragments' AABBs (static while intact). Used as
+  // the conservative enclosing volume for the predictive enable test: every fragment's real
+  // collider (a convex hull) fits inside its fragment AABB, so the building AABB encloses all of
+  // them — a mover cannot touch any real collider without first overlapping the building AABB.
+  function computeBuildingAabb(building: IntactBuilding) {
+    let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const ni of building.nodeIndices) {
+      const c = chunks[ni];
+      if (!c) continue;
+      const ox = c.localOffset.x, oy = c.localOffset.y, oz = c.localOffset.z;
+      const hx = Math.max(0.05, c.size.x * 0.5), hy = Math.max(0.05, c.size.y * 0.5), hz = Math.max(0.05, c.size.z * 0.5);
+      if (ox - hx < minX) minX = ox - hx; if (oy - hy < minY) minY = oy - hy; if (oz - hz < minZ) minZ = oz - hz;
+      if (ox + hx > maxX) maxX = ox + hx; if (oy + hy > maxY) maxY = oy + hy; if (oz + hz > maxZ) maxZ = oz + hz;
+    }
+    building.aabbMin = { x: minX, y: minY, z: minZ };
+    building.aabbMax = { x: maxX, y: maxY, z: maxZ };
+  }
+
+  // Group nodes into buildings = connected components of the initial bond graph (supports
+  // included, so a foundation keeps its tower as one physical building). Computed once and reused.
+  function ensureBuildingGroups() {
+    if (intactBuildings.length > 0) return;
+    const n = scenario.nodes.length;
+    const parent = new Int32Array(n);
+    for (let i = 0; i < n; i++) parent[i] = i;
+    const find = (x: number): number => {
+      let r = x; while (parent[r] !== r) r = parent[r];
+      while (parent[x] !== r) { const nx = parent[x]; parent[x] = r; x = nx; }
+      return r;
+    };
+    for (const b of scenario.bonds) {
+      const r0 = find(b.node0), r1 = find(b.node1);
+      if (r0 !== r1) parent[r0] = r1;
+    }
+    const rootToBuilding = new Map<number, IntactBuilding>();
+    for (let i = 0; i < n; i++) {
+      const r = find(i);
+      let bld = rootToBuilding.get(r);
+      if (!bld) {
+        bld = { id: intactBuildings.length, nodeIndices: [], aabbMin: { x: 0, y: 0, z: 0 }, aabbMax: { x: 0, y: 0, z: 0 }, exploded: false };
+        rootToBuilding.set(r, bld);
+        intactBuildings.push(bld);
+      }
+      bld.nodeIndices.push(i);
+      buildingOfNode[i] = bld.id;
+    }
+    for (const bld of intactBuildings) computeBuildingAabb(bld);
+  }
+
+  // Enable/disable a building's real per-fragment colliders that still sit on the fixed root.
+  // Disabling removes them from the broadphase (cheap) without destroying them, so their handles
+  // — and thus the contact-solve order — are preserved for an output-identical explode.
+  function setBuildingCollidersEnabled(bld: IntactBuilding, enabled: boolean) {
+    for (const ni of bld.nodeIndices) {
+      const c = chunks[ni];
+      if (!c || c.colliderHandle == null || c.bodyHandle !== rootBody.handle) continue;
+      const col = world.getCollider(c.colliderHandle);
+      if (col) col.setEnabled(enabled);
+    }
+  }
+
+  function buildIntactBuildings() {
+    ensureBuildingGroups();
+    for (const bld of intactBuildings) setBuildingCollidersEnabled(bld, false); // dormant: colliders off
+  }
+
+  // Convert a still-fully-intact building back to a dormant proxy (used by the live toggle).
+  // A building with any detached/destroyed/migrated chunk can't be re-merged, so it stays eager.
+  function dormantizeBuilding(bld: IntactBuilding) {
+    for (const ni of bld.nodeIndices) {
+      const c = chunks[ni];
+      if (!c || !c.active || c.destroyed || c.bodyHandle !== rootBody.handle) { bld.exploded = true; return; }
+    }
+    setBuildingCollidersEnabled(bld, false);
+    bld.exploded = false;
+  }
+
+  function setLazyIntactColliders(enabled: boolean) {
+    if (!!enabled === lazyIntactCollidersEnabled) return;
+    lazyIntactCollidersEnabled = !!enabled;
+    if (!lazyIntactCollidersEnabled) {
+      // → eager: enable every building's real colliders now.
+      for (const bld of intactBuildings) explodeBuilding(bld.id);
+    } else {
+      // → lazy: disable still-intact buildings' colliders (they re-enable on approach).
+      ensureBuildingGroups();
+      for (const bld of intactBuildings) dormantizeBuilding(bld);
+    }
+    rebuildColliderToNodeMap();
+  }
+
+  function getLazyColliderStats() {
+    let dormant = 0, exploded = 0;
+    for (const bld of intactBuildings) { if (bld.exploded) exploded++; else dormant++; }
+    return {
+      enabled: lazyIntactCollidersEnabled,
+      buildingCount: intactBuildings.length,
+      dormantCount: dormant,
+      explodedCount: exploded,
+    };
+  }
+
+  // Re-enable a building's real per-fragment colliders (idempotent). The colliders already exist
+  // (created at init, just disabled), so re-enabling preserves their handles and the contact-solve
+  // order — and because no extra (proxy) colliders ever exist, the world the solver sees is
+  // bit-for-bit the eager world. Enabling a building no mover touches is a physics no-op.
+  function explodeBuilding(buildingId: number) {
+    const bld = intactBuildings[buildingId];
+    if (!bld || bld.exploded) return;
+    setBuildingCollidersEnabled(bld, true);
+    bld.exploded = true;
+  }
+
+  // Explode the building owning `nodeIndex` if it is still dormant (a no-op otherwise).
+  function ensureBuildingExplodedForNode(nodeIndex: number) {
+    if (!lazyIntactCollidersEnabled) return;
+    const id = buildingOfNode[nodeIndex];
+    if (id >= 0 && !intactBuildings[id]?.exploded) explodeBuilding(id);
+  }
+
+  // Predictive enable pass — runs BEFORE world.step. Any dormant building whose AABB is overlapped
+  // by a mover's swept bounding box (current → predicted-next position, padded by radius + skin) is
+  // exploded (its real colliders enabled) so the upcoming step resolves the impact on real geometry.
+  // Conservative by construction: a mover cannot reach a building's real colliders (all inside the
+  // building AABB) without its swept box overlapping that AABB first, so we never miss. A false
+  // positive (enabling a building the mover ends up missing) is a physics no-op, so output is
+  // bit-identical to eager either way — there is no probe, rollback, or extra collider.
+  const PREDICTIVE_SKIN = 1.0; // metres of slack beyond radius + one step of travel
+  function aabbOverlapsBuilding(bld: IntactBuilding, mnx: number, mny: number, mnz: number, mxx: number, mxy: number, mxz: number): boolean {
+    return mxx >= bld.aabbMin.x && mnx <= bld.aabbMax.x
+      && mxy >= bld.aabbMin.y && mny <= bld.aabbMax.y
+      && mxz >= bld.aabbMin.z && mnz <= bld.aabbMax.z;
+  }
+  function considerMoverForExplode(px: number, py: number, pz: number, vx: number, vy: number, vz: number, dt: number, radius: number) {
+    // Swept box from current to predicted-next centre, padded by radius + skin (covers gravity/CCD).
+    const ex = Math.abs(vx) * dt + radius + PREDICTIVE_SKIN;
+    const ey = Math.abs(vy) * dt + radius + PREDICTIVE_SKIN;
+    const ez = Math.abs(vz) * dt + radius + PREDICTIVE_SKIN;
+    const nx = px + vx * dt, ny = py + vy * dt, nz = pz + vz * dt;
+    const mnx = Math.min(px, nx) - ex, mny = Math.min(py, ny) - ey, mnz = Math.min(pz, nz) - ez;
+    const mxx = Math.max(px, nx) + ex, mxy = Math.max(py, ny) + ey, mxz = Math.max(pz, nz) + ez;
+    for (const bld of intactBuildings) {
+      if (bld.exploded) continue;
+      if (aabbOverlapsBuilding(bld, mnx, mny, mnz, mxx, mxy, mxz)) explodeBuilding(bld.id);
+    }
+  }
+  function predictiveExplodePass(dt: number) {
+    if (!lazyIntactCollidersEnabled || intactBuildings.length === 0) return;
+    let anyDormant = false;
+    for (const b of intactBuildings) if (!b.exploded) { anyDormant = true; break; }
+    if (!anyDormant) return;
+    // Projectiles.
+    for (const p of projectiles) {
+      const body = world.getRigidBody(p.bodyHandle);
+      if (!body) continue;
+      const t = body.translation(), v = body.linvel();
+      considerMoverForExplode(t.x, t.y, t.z, v.x, v.y, v.z, dt, p.radius ?? 0.5);
+    }
+    // Awake dynamic debris bodies (skip the fixed root, ground, and sleeping bodies).
+    for (const bh of nodesByBodyHandle.keys()) {
+      if (bh === rootBody.handle) continue;
+      const body = world.getRigidBody(bh);
+      if (!body || body.isFixed()) continue;
+      if (typeof (body as any).isSleeping === 'function' && (body as any).isSleeping()) continue;
+      const t = body.translation(), v = body.linvel();
+      // Radius bound = largest fragment half-diagonal on this body.
+      let r = 0.5;
+      const set = nodesByBodyHandle.get(bh);
+      if (set) for (const ni of set) { const c = chunks[ni]; if (c) r = Math.max(r, Math.hypot(c.size.x, c.size.y, c.size.z) * 0.5); }
+      considerMoverForExplode(t.x, t.y, t.z, v.x, v.y, v.z, dt, r);
+    }
+  }
+
   let lastStepDt = readWorldDt();
 
   function step(dt: number) {
@@ -2447,6 +2662,11 @@ export async function buildDestructibleCore({
 
     applyExternalForcesFromBuffer();
     spawnPendingProjectiles();
+
+    // Lazy intact colliders: enable the real colliders of any dormant building a mover is about to
+    // reach, BEFORE the step — so the impact resolves on real geometry, identically to the eager
+    // world (no proxy, no probe, no rollback).
+    predictiveExplodePass(clampedDt);
 
     if (resimulateOnFracture) {
       captureWorldSnapshot();
@@ -2961,6 +3181,8 @@ export async function buildDestructibleCore({
     getIslandSettledStats,
     setIslandSolver,
     getIslandSolverStats,
+    setLazyIntactColliders,
+    getLazyColliderStats,
     getSolverDebugLines,
     getNodeBonds,
     cutBond,

@@ -20,6 +20,7 @@ import { buildTowerScenario } from '../dist/scenarios.js';
 const GRID = Number(process.argv[2] ?? 10);
 const FLOORS = Number(process.argv[3] ?? 3);
 const ISLAND = (process.argv[4] ?? 'on') !== 'off';
+const LAZY = (process.argv[5] ?? 'off') !== 'off';
 const STREET = 9;
 const WIDTH = 8;
 
@@ -69,7 +70,7 @@ function mean(a) { return a.reduce((s, v) => s + v, 0) / Math.max(1, a.length); 
 async function main() {
   const { merged, perBuildingNodes, perBuildingBonds } = await buildCity();
   const buildings = GRID * GRID;
-  console.log(`\n=== Idle city bench: ${GRID}×${GRID} = ${buildings} buildings, ${FLOORS} floors, island=${ISLAND ? 'ON' : 'OFF'} ===`);
+  console.log(`\n=== Idle city bench: ${GRID}×${GRID} = ${buildings} buildings, ${FLOORS} floors, island=${ISLAND ? 'ON' : 'OFF'}, lazy=${LAZY ? 'ON' : 'OFF'} ===`);
   console.log(`scenario: ${merged.nodes.length} nodes, ${merged.bonds.length} bonds (${perBuildingNodes} nodes / ${perBuildingBonds} bonds per building)`);
 
   // Profiler capture
@@ -85,12 +86,16 @@ async function main() {
     damage: { enabled: false },
     smallBodyDamping: { mode: 'off' },
     debrisCleanup: { mode: 'afterGroundCollision', debrisTtlMs: 8000, maxCollidersForDebris: 2 },
+    lazyIntactColliders: LAZY,
   });
   core.setIslandSolver?.({ enabled: ISLAND });
   core.setProfiler?.({ enabled: true, onSample: (s) => { sample = s; } });
 
   const bodies = core.getRigidBodyCount();
-  console.log(`rapier: ${bodies} rigid bodies (expect ~2: one fixed city root + ground), ${merged.nodes.length} colliders`);
+  const colliderCount = (() => { try { return core.world.colliders.len(); } catch { return -1; } })();
+  const lz = core.getLazyColliderStats?.();
+  console.log(`rapier: ${bodies} rigid bodies, ${colliderCount} world colliders` +
+    (lz ? `  | lazy=${lz.enabled} buildings=${lz.buildingCount} dormant=${lz.dormantCount} exploded=${lz.explodedCount}` : ''));
 
   const dt = 1 / 60;
   // Settle
