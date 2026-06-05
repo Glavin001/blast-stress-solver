@@ -688,8 +688,14 @@ export async function buildDestructibleCore({
   // cells never collide for any realistic local chunk offset.
   const SPLASH_KEY_STRIDE = 1 << 17; // 131072
   const SPLASH_KEY_OFFSET = 1 << 16; // 65536 (half-range, recentres negatives)
-  // Map from packed integer grid key to array of node indices
-  const splashGrid = new Map<number, number[]>();
+  // Per-body spatial grid: bodyHandle -> (packed cell key -> chunk indices).
+  // Keying by body (not one global grid) means a same-body splash query only
+  // visits that body's chunks. This matters after fracturing: baseLocalOffset is
+  // the original asset-space centroid, so fragments that split off keep offsets in
+  // the same cells — a single global grid forces every query to scan (then discard)
+  // every other fragment's chunks sharing those cells (O(all originally-nearby
+  // chunks) per contact). Per-body buckets make it O(same-body nearby chunks).
+  const splashGrid = new Map<number, Map<number, number[]>>();
   let splashGridDirty = true; // rebuild on first use and after splits
 
   function splashCellKey(ix: number, iy: number, iz: number): number {
@@ -711,10 +717,14 @@ export async function buildDestructibleCore({
     splashGrid.clear();
     for (let ci = 0; ci < chunks.length; ci++) {
       const c = chunks[ci];
-      if (!c || !c.active) continue;
+      // Chunks without a body can never be a same-body splash neighbour (the query
+      // filters by bodyHandle), so they are omitted from the grid entirely.
+      if (!c || !c.active || c.bodyHandle == null) continue;
+      let bodyGrid = splashGrid.get(c.bodyHandle);
+      if (!bodyGrid) { bodyGrid = new Map<number, number[]>(); splashGrid.set(c.bodyHandle, bodyGrid); }
       const key = splashGridKey(c.baseLocalOffset.x, c.baseLocalOffset.y, c.baseLocalOffset.z);
-      let bucket = splashGrid.get(key);
-      if (!bucket) { bucket = []; splashGrid.set(key, bucket); }
+      let bucket = bodyGrid.get(key);
+      if (!bucket) { bucket = []; bodyGrid.set(key, bucket); }
       bucket.push(ci);
     }
     splashGridDirty = false;
@@ -725,6 +735,8 @@ export async function buildDestructibleCore({
 
   function collectSplashNeighbors(px: number, py: number, pz: number, radius: number, bodyHandle: number): number[] {
     splashResult.length = 0;
+    const bodyGrid = splashGrid.get(bodyHandle);
+    if (!bodyGrid) return splashResult; // no active chunks for this body
     const r2 = radius * radius;
     const minIx = Math.floor((px - radius) * SPLASH_INV_CELL);
     const maxIx = Math.floor((px + radius) * SPLASH_INV_CELL);
@@ -735,11 +747,13 @@ export async function buildDestructibleCore({
     for (let ix = minIx; ix <= maxIx; ix++) {
       for (let iy = minIy; iy <= maxIy; iy++) {
         for (let iz = minIz; iz <= maxIz; iz++) {
-          const bucket = splashGrid.get(splashCellKey(ix, iy, iz));
+          const bucket = bodyGrid.get(splashCellKey(ix, iy, iz));
           if (!bucket) continue;
           for (let bi = 0; bi < bucket.length; bi++) {
             const ci = bucket[bi];
             const c = chunks[ci];
+            // Bucket is already same-body; the bodyHandle guard stays as a cheap
+            // safety net and keeps results byte-identical to the global-grid path.
             if (!c || !c.active || c.bodyHandle !== bodyHandle) continue;
             const dx = c.baseLocalOffset.x - px;
             const dy = c.baseLocalOffset.y - py;
