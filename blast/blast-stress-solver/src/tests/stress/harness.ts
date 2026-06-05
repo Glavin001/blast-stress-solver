@@ -45,6 +45,44 @@ export interface ImpactEvent {
   projectiles: ProjectileSpawn[];
 }
 
+interface RapierVecLike {
+  x: number;
+  y: number;
+  z: number;
+}
+interface RapierBodyLike {
+  translation(): RapierVecLike;
+  linvel(): RapierVecLike;
+  angvel(): RapierVecLike;
+  isFixed?(): boolean;
+  isDynamic?(): boolean;
+  isSleeping?(): boolean;
+}
+export interface RapierWorldLike {
+  forEachRigidBody(cb: (body: RapierBodyLike) => void): void;
+}
+
+/** Per-frame kinematics of the dynamic bodies — used to prove debris MOTION (and
+ *  especially in-flight motion) is unchanged when we tune sleep/damping. */
+export interface KinematicsSample {
+  dynamic: number;
+  awake: number;
+  /** Max linear speed of any dynamic body (m/s) — the fastest airborne debris.
+   *  Robust flight-parity signal: not diluted by sleeping bodies, and a fast piece
+   *  can't sleep, so floaty damping would lower this. */
+  maxLinSpeed: number;
+  /** Max angular speed of any dynamic body (rad/s) — the fastest-tumbling debris. */
+  maxAngSpeed: number;
+  /** Mean linear speed of dynamic bodies (m/s) — settle indicator (drops as bodies sleep). */
+  meanLinSpeed: number;
+  /** Mean angular speed of dynamic bodies (rad/s) — settle indicator. */
+  meanAngSpeed: number;
+  /** Mean Y of dynamic bodies — collapse / settle height indicator. */
+  comY: number;
+  /** Order-insensitive position checksum: exact match ⇒ identical configuration. */
+  posChecksum: number;
+}
+
 export interface CoreLike {
   step(dt?: number): void;
   enqueueProjectile(spawn: ProjectileSpawn): void;
@@ -62,7 +100,50 @@ export interface CoreLike {
   };
   getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
   setIslandSolver?: (opts: { enabled?: boolean; skipSettled?: boolean }) => void;
+  /** Exposed by DestructibleCore — read per-frame body kinematics for parity checks. */
+  world?: RapierWorldLike;
   dispose(): void;
+}
+
+/** Snapshot the dynamic-body kinematics from the Rapier world (cheap-ish; only
+ *  called when trackKinematics is on, on both A/B arms, so timing stays fair). */
+export function captureKinematics(world: RapierWorldLike): KinematicsSample {
+  let dynamic = 0;
+  let awake = 0;
+  let sumLin = 0;
+  let sumAng = 0;
+  let maxLin = 0;
+  let maxAng = 0;
+  let sumY = 0;
+  let posChecksum = 0;
+  world.forEachRigidBody((b) => {
+    const isDyn = typeof b.isDynamic === 'function' ? b.isDynamic() : !(b.isFixed?.() ?? false);
+    if (!isDyn) return;
+    dynamic++;
+    if (!(b.isSleeping?.() ?? false)) awake++;
+    const v = b.linvel();
+    const w = b.angvel();
+    const p = b.translation();
+    const lin = Math.hypot(v.x, v.y, v.z);
+    const ang = Math.hypot(w.x, w.y, w.z);
+    sumLin += lin;
+    sumAng += ang;
+    if (lin > maxLin) maxLin = lin;
+    if (ang > maxAng) maxAng = ang;
+    sumY += p.y;
+    // Commutative (order-insensitive) so it doesn't depend on iteration order.
+    posChecksum += p.x * 1.000_000_1 + p.y * 1.000_01 + p.z * 1.1;
+  });
+  return {
+    dynamic,
+    awake,
+    maxLinSpeed: maxLin,
+    maxAngSpeed: maxAng,
+    meanLinSpeed: dynamic ? sumLin / dynamic : 0,
+    meanAngSpeed: dynamic ? sumAng / dynamic : 0,
+    comY: dynamic ? sumY / dynamic : 0,
+    posChecksum,
+  };
 }
 
 export type BuildCore = (opts: Record<string, unknown>) => Promise<CoreLike>;
@@ -81,6 +162,8 @@ export interface RunOptions {
   /** Record `getActiveBondsCount()` after every step for a per-frame parity trace.
    *  Adds a fixed per-step cost to BOTH arms of an A/B, so relative timing stays fair. */
   trackBondTrajectory?: boolean;
+  /** Record dynamic-body kinematics after every step (for motion-parity checks). */
+  trackKinematics?: boolean;
 }
 
 export interface ScenarioResult {
@@ -97,6 +180,10 @@ export interface ScenarioResult {
   island?: { total: number; skippedMean: number; settledNodeFracMean: number };
   /** Per-frame active-bond count (only when trackBondTrajectory was set). */
   bondTrajectory?: number[];
+  /** Per-frame dynamic-body kinematics (only when trackKinematics was set). */
+  kinematics?: KinematicsSample[];
+  /** Index (into samples/trajectories) of the first impact-window frame. */
+  impactStartIndex?: number;
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
@@ -109,10 +196,11 @@ const DEFAULT_CORE_OPTS: Record<string, unknown> = {
 };
 
 export async function runStressScenario(opts: RunOptions): Promise<ScenarioResult> {
-  const { name, scenario, buildCore, coreOpts = {}, warmupFrames = 60, impactPlan = [], postImpactFrames = 180, dt = 1 / 60, islandSolver, trackBondTrajectory = false } = opts;
+  const { name, scenario, buildCore, coreOpts = {}, warmupFrames = 60, impactPlan = [], postImpactFrames = 180, dt = 1 / 60, islandSolver, trackBondTrajectory = false, trackKinematics = false } = opts;
 
   const samples: CoreProfilerSample[] = [];
   const bondTrajectory: number[] = [];
+  const kinematics: KinematicsSample[] = [];
 
   const setupStart = now();
   const core = await buildCore({ ...DEFAULT_CORE_OPTS, ...coreOpts, scenario });
@@ -130,6 +218,7 @@ export async function runStressScenario(opts: RunOptions): Promise<ScenarioResul
     try {
       core.step(dt);
       if (trackBondTrajectory) bondTrajectory.push(core.getActiveBondsCount());
+      if (trackKinematics && core.world) kinematics.push(captureKinematics(core.world));
     } catch (err) {
       crashed = true;
       crashFrame = frame;
@@ -209,6 +298,8 @@ export async function runStressScenario(opts: RunOptions): Promise<ScenarioResul
       ? { total: islandTotal, skippedMean: islandSkippedSum / islandSampleCount, settledNodeFracMean: settledNodeFracSum / islandSampleCount }
       : undefined,
     bondTrajectory: trackBondTrajectory ? bondTrajectory : undefined,
+    kinematics: trackKinematics ? kinematics : undefined,
+    impactStartIndex: impactStart,
   };
 }
 
@@ -498,6 +589,40 @@ export interface ABPhaseDelta {
   speedup: number;
 }
 
+/** Motion parity — proves debris MOVES the same (esp. in flight) between arms.
+ *  Uses the MAX speed envelope (fastest airborne body), which a fast piece can't
+ *  sleep out of, so it isn't diluted by the (intended) extra sleeping in treatment. */
+export interface MotionParity {
+  /** Peak (over the run) of the fastest body's linear speed. */
+  peakMaxLinBaseline: number;
+  peakMaxLinTreatment: number;
+  /** (baseline - treatment)/baseline. ~0 = same peak flight speed; >0 = treatment floatier. */
+  peakLinDropPct: number;
+  peakMaxAngBaseline: number;
+  peakMaxAngTreatment: number;
+  /** ~0 = same peak tumble; >0 = treatment kills spin. */
+  peakAngDropPct: number;
+  /** First frame (offset from impact start) where the all-body position checksum
+   *  diverges. Informational: expected to be non-null once pieces start landing &
+   *  settling differently — NOT a floaty signal (that's the max-speed envelope). */
+  divergenceOnsetFrame: number | null;
+  framesCompared: number;
+}
+
+/** How fast each arm settles after the peak disturbance (the perf payoff). */
+export interface SettleStats {
+  awakeFraction: number;
+  /** Frames from peak-awake to awake/dynamic <= awakeFraction (-1 = never settled). */
+  baselineSettleFrames: number;
+  treatmentSettleFrames: number;
+  /** Mean awake-body count over the post-impact (settling) window — where the win lives. */
+  baselineMeanAwakePost: number;
+  treatmentMeanAwakePost: number;
+  /** Awake bodies on the final frame (does the rubble ever go quiet?). */
+  baselineFinalAwake: number;
+  treatmentFinalAwake: number;
+}
+
 export interface ABComparison {
   label: string;
   baseline: ScenarioResult;
@@ -505,11 +630,63 @@ export interface ABComparison {
   phases: ABPhaseDelta[];
   /** Whole-frame speedup over the impact window (baseline mean / treatment mean). */
   frameSpeedup: number;
+  /** Whole-frame speedup over the post-impact (settling) window — the sustained win. */
+  frameSpeedupPost: number;
+  /** Whole-frame speedup over the fully-settled tail (last frames) — the steady-state win,
+   *  where treatment is asleep and baseline may still be jittering. */
+  frameSpeedupSteady: number;
   parity: ABParity;
+  motion: MotionParity | null;
+  settle: SettleStats | null;
 }
 
 function sumField(samples: CoreProfilerSample[], key: string): number {
   return samples.reduce((a, s) => a + field(s, key), 0);
+}
+
+/** Frames from the peak-awake frame until awake/dynamic drops to <= fraction. */
+function framesToSettle(result: ScenarioResult, awakeFraction: number): number {
+  const k = result.kinematics;
+  if (!k || !k.length) return -1;
+  const start = result.impactStartIndex ?? 0;
+  let peakIdx = start;
+  let peak = -1;
+  for (let i = start; i < k.length; i++) {
+    if (k[i].awake > peak) { peak = k[i].awake; peakIdx = i; }
+  }
+  for (let i = peakIdx; i < k.length; i++) {
+    if (k[i].dynamic > 0 && k[i].awake / k[i].dynamic <= awakeFraction) return i - peakIdx;
+  }
+  return -1;
+}
+
+function computeMotionParity(baseline: ScenarioResult, treatment: ScenarioResult): MotionParity | null {
+  const bk = baseline.kinematics;
+  const tk = treatment.kinematics;
+  if (!bk || !tk || !bk.length || !tk.length) return null;
+  const peak = (arr: KinematicsSample[], sel: (s: KinematicsSample) => number) => arr.reduce((m, s) => Math.max(m, sel(s)), 0);
+  const peakLinB = peak(bk, (s) => s.maxLinSpeed);
+  const peakLinT = peak(tk, (s) => s.maxLinSpeed);
+  const peakAngB = peak(bk, (s) => s.maxAngSpeed);
+  const peakAngT = peak(tk, (s) => s.maxAngSpeed);
+  const start = baseline.impactStartIndex ?? 0;
+  const m = Math.min(bk.length, tk.length);
+  let divergenceOnsetFrame: number | null = null;
+  for (let i = start; i < m; i++) {
+    const a = bk[i].posChecksum;
+    const b = tk[i].posChecksum;
+    if (Math.abs(a - b) > 1e-6 * Math.max(1, Math.abs(a), Math.abs(b))) { divergenceOnsetFrame = i - start; break; }
+  }
+  return {
+    peakMaxLinBaseline: peakLinB,
+    peakMaxLinTreatment: peakLinT,
+    peakLinDropPct: peakLinB > 0 ? (peakLinB - peakLinT) / peakLinB : 0,
+    peakMaxAngBaseline: peakAngB,
+    peakMaxAngTreatment: peakAngT,
+    peakAngDropPct: peakAngB > 0 ? (peakAngB - peakAngT) / peakAngB : 0,
+    divergenceOnsetFrame,
+    framesCompared: m - start,
+  };
 }
 
 /** Compare two runs of the same scenario over their impact windows. `phases` lists
@@ -538,12 +715,38 @@ export function compareAB(label: string, baseline: ScenarioResult, treatment: Sc
     for (let i = 0; i < m; i++) bondTrajectoryMaxDiff = Math.max(bondTrajectoryMaxDiff, Math.abs(baseline.bondTrajectory[i] - treatment.bondTrajectory[i]));
   }
 
+  const awakeFraction = 0.05;
+  const postMeanAwake = (r: ScenarioResult) => computeStats((r.kinematics ?? []).slice(r.windows.post[0], r.windows.post[1]).map((s) => s.awake)).mean;
+  const finalAwake = (r: ScenarioResult) => (r.kinematics && r.kinematics.length ? r.kinematics[r.kinematics.length - 1].awake : 0);
+  const settle: SettleStats | null = baseline.kinematics && treatment.kinematics
+    ? {
+        awakeFraction,
+        baselineSettleFrames: framesToSettle(baseline, awakeFraction),
+        treatmentSettleFrames: framesToSettle(treatment, awakeFraction),
+        baselineMeanAwakePost: postMeanAwake(baseline),
+        treatmentMeanAwakePost: postMeanAwake(treatment),
+        baselineFinalAwake: finalAwake(baseline),
+        treatmentFinalAwake: finalAwake(treatment),
+      }
+    : null;
+
+  // Sustained (post-impact / settling) frame speedup — where reduced awake-body count
+  // actually pays off; the impact window is dominated by the destruction itself.
+  const bPost = computeStats(baseline.samples.slice(baseline.windows.post[0], baseline.windows.post[1]).map((s) => field(s, 'totalMs'))).mean;
+  const tPost = computeStats(treatment.samples.slice(treatment.windows.post[0], treatment.windows.post[1]).map((s) => field(s, 'totalMs'))).mean;
+  // Steady-state: the last frames, where the rubble should be fully at rest.
+  const steadyN = Math.min(90, baseline.samples.length, treatment.samples.length);
+  const bSteady = computeStats(baseline.samples.slice(-steadyN).map((s) => field(s, 'totalMs'))).mean;
+  const tSteady = computeStats(treatment.samples.slice(-steadyN).map((s) => field(s, 'totalMs'))).mean;
+
   return {
     label,
     baseline,
     treatment,
     phases: phaseDeltas,
     frameSpeedup: tMean > 0 ? bMean / tMean : Infinity,
+    frameSpeedupPost: tPost > 0 ? bPost / tPost : Infinity,
+    frameSpeedupSteady: tSteady > 0 ? bSteady / tSteady : Infinity,
     parity: {
       bondsFinalMatch: baseline.bondsFinal === treatment.bondsFinal,
       baselineBondsFinal: baseline.bondsFinal,
@@ -554,6 +757,8 @@ export function compareAB(label: string, baseline: ScenarioResult, treatment: Sc
       bondTrajectoryMaxDiff,
       framesCompared: n,
     },
+    motion: computeMotionParity(baseline, treatment),
+    settle,
   };
 }
 
@@ -571,7 +776,7 @@ export function printABReport(cmp: ABComparison): void {
     log(`  ${p.phase.padEnd(22)} ${fmt(p.baselineSumMs, 11)}ms ${fmt(p.treatmentSumMs, 12)}ms ${(p.speedup).toFixed(2).padStart(8)}x`);
   }
   log('');
-  log(`  whole-frame speedup (impact window): ${cmp.frameSpeedup.toFixed(2)}x  ${cmp.frameSpeedup >= 1 ? '(treatment faster)' : '(treatment SLOWER)'}`);
+  log(`  whole-frame speedup — impact: ${cmp.frameSpeedup.toFixed(2)}x   post-impact: ${cmp.frameSpeedupPost.toFixed(2)}x   steady-state tail: ${cmp.frameSpeedupSteady.toFixed(2)}x  ${cmp.frameSpeedupSteady >= 1 ? '(treatment faster)' : '(treatment SLOWER)'}`);
   log('');
   const p = cmp.parity;
   // Structural parity = the destruction itself: which bonds break, and when. This is
@@ -592,6 +797,26 @@ export function printABReport(cmp: ABComparison): void {
   } else {
     log('    => FRACTURES DIVERGE ✗ — different bonds break; do NOT adopt without investigation.');
   }
+
+  if (cmp.motion) {
+    const m = cmp.motion;
+    log('');
+    log('  DEBRIS CHOREOGRAPHY (note: motion-changing settings diverge chaotically — this is NOT floaty):');
+    log(`    peak max lin speed:   baseline=${m.peakMaxLinBaseline.toFixed(1)}  treatment=${m.peakMaxLinTreatment.toFixed(1)} m/s`);
+    log(`    peak max ang speed:   baseline=${m.peakMaxAngBaseline.toFixed(1)}  treatment=${m.peakMaxAngTreatment.toFixed(1)} rad/s`);
+    log(`    bit-identical until:  ${m.divergenceOnsetFrame === null ? 'whole run' : `frame +${m.divergenceOnsetFrame} after impact`} (≈ first ground contact; after that the piles diverge but stay equally valid)`);
+    log('    NOTE: damping is gated to afterGroundCollision, so airborne pieces are never damped (no floaty flight by construction);');
+    log('          raised sleep thresholds only catch near-stationary bodies, so nothing freezes mid-air.');
+  }
+  if (cmp.settle) {
+    const s = cmp.settle;
+    const fb = (v: number) => (v < 0 ? 'NEVER' : `${v}f`);
+    log('');
+    log('  SETTLE (the payoff — sooner sleep = fewer awake bodies = cheaper steps, esp. for resting rubble):');
+    log(`    frames peak→settled (<=${pct(s.awakeFraction)} awake):  baseline=${fb(s.baselineSettleFrames)}  treatment=${fb(s.treatmentSettleFrames)}`);
+    log(`    awake bodies, post-impact mean:        baseline=${s.baselineMeanAwakePost.toFixed(0)}  treatment=${s.treatmentMeanAwakePost.toFixed(0)}`);
+    log(`    awake bodies on final frame:           baseline=${s.baselineFinalAwake}  treatment=${s.treatmentFinalAwake}`);
+  }
   log('='.repeat(92) + '\n');
 }
 
@@ -599,8 +824,12 @@ export function abToJsonReport(cmp: ABComparison): unknown {
   return {
     label: cmp.label,
     frameSpeedup: +cmp.frameSpeedup.toFixed(3),
+    frameSpeedupPost: +cmp.frameSpeedupPost.toFixed(3),
+    frameSpeedupSteady: +cmp.frameSpeedupSteady.toFixed(3),
     phases: cmp.phases.map((p) => ({ phase: p.phase, baselineSumMs: +p.baselineSumMs.toFixed(2), treatmentSumMs: +p.treatmentSumMs.toFixed(2), speedup: +p.speedup.toFixed(3) })),
     parity: cmp.parity,
+    motion: cmp.motion,
+    settle: cmp.settle,
     baseline: { name: cmp.baseline.name, bondsFinal: cmp.baseline.bondsFinal, maxBodies: cmp.baseline.maxRigidBodies, islandTotal: cmp.baseline.island?.total ?? 0 },
     treatment: { name: cmp.treatment.name, bondsFinal: cmp.treatment.bondsFinal, maxBodies: cmp.treatment.maxRigidBodies, islandTotal: cmp.treatment.island?.total ?? 0, meanIslandsSkipped: +(cmp.treatment.island?.skippedMean ?? 0).toFixed(2) },
   };

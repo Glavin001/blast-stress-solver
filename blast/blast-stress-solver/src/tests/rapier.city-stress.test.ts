@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { composeScenarios } from './stress/composeScenarios';
 import { buildCityScenario, CITY_SCENARIOS, CITY_SCENARIO_NAMES, mulberry32 } from './stress/cityScenario';
 import { runStressScenario, printReport, printABReport, type BuildCore, type ScenarioResult } from './stress/harness';
-import { runIslandAB } from './stress/runSuite';
+import { runIslandAB, runSleepDampingAB } from './stress/runSuite';
 import { buildTowerScenario } from '../scenarios/towerScenario';
 import { buildWallScenario } from '../scenarios/wallScenario';
 
@@ -160,6 +160,25 @@ describe.skipIf(!runtimeAvailable)('City destruction stress (requires WASM build
     // Driven by skipping ~40% of islands' solve work, so robust despite timing noise.
     const solve = cmp.phases.find((p) => p.phase === 'solverSolveMs');
     expect(solve?.speedup ?? 0).toBeGreaterThan(1.3);
+  }, 180_000);
+
+  it('sleep + afterGroundCollision damping settles rubble without floaty flight (cascade)', async () => {
+    await load();
+    const cmp = await runSleepDampingAB({ buildCore: buildDestructibleCore, tier: 'small', scenario: 'cascade', treatment: 'recommended' });
+    printABReport(cmp);
+
+    // The payoff: treatment ends at least as asleep as baseline (rubble actually sleeps).
+    expect(cmp.settle).not.toBeNull();
+    expect(cmp.settle!.treatmentFinalAwake).toBeLessThanOrEqual(cmp.settle!.baselineFinalAwake);
+
+    // Flight is not floaty: the fastest airborne debris still reaches a comparable peak
+    // linear speed (damping is post-landing only). Generous bound — debris choreography
+    // diverges chaotically after first landing, so this is a sanity bound, not parity.
+    expect(cmp.motion).not.toBeNull();
+    expect(cmp.motion!.peakMaxLinTreatment).toBeGreaterThan(0.5 * cmp.motion!.peakMaxLinBaseline);
+
+    // Steady-state (settled tail) must not be slower — that's the whole point.
+    expect(cmp.frameSpeedupSteady).toBeGreaterThan(0.9);
   }, 180_000);
 
   afterAll(() => {

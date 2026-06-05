@@ -46,6 +46,10 @@ const asJson = has('--json');
 const outFile = get('--out', null);
 // A/B the island-aware skip-settled solve vs the default whole-graph solve.
 const abIsland = has('--ab-island');
+// A/B engine-default settling vs tuned sleep-thresholds + post-landing damping.
+const abSleep = has('--ab-sleep');
+const treatment = get('--treatment', 'recommended');
+const postFrames = get('--post', null);
 
 // ── bundle the pure-TS suite (engine injected; three/rapier externalized) ─────
 const entry = resolve(here, '../src/tests/stress/runSuite.ts');
@@ -80,7 +84,7 @@ try {
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }
-const { runSuite, runIslandAB, printReport, toJsonReport, printABReport, abToJsonReport } = suite;
+const { runSuite, runIslandAB, runSleepDampingAB, printReport, toJsonReport, printABReport, abToJsonReport } = suite;
 
 // ── engine from dist (ESM build resolves the WASM URL cleanly in Node) ─────────
 const { buildDestructibleCore } = await import(resolve(distDir, 'rapier.js'));
@@ -92,15 +96,27 @@ if (asJson) {
   console.debug = () => {};
 }
 
-if (abIsland) {
-  const cmp = await runIslandAB({
-    buildCore: buildDestructibleCore,
-    tier,
-    scenario: only[0] || 'manyIslands',
-    onProgress: (label) => {
-      if (!asJson) console.error(`  ${label} ...`);
-    },
-  });
+if (abIsland || abSleep) {
+  const cmp = abSleep
+    ? await runSleepDampingAB({
+        buildCore: buildDestructibleCore,
+        tier,
+        scenario: only[0] || 'cascade',
+        treatment,
+        postImpactFrames: postFrames != null ? Number(postFrames) : undefined,
+        onProgress: (label) => {
+          if (!asJson) console.error(`  ${label} ...`);
+        },
+      })
+    : await runIslandAB({
+        buildCore: buildDestructibleCore,
+        tier,
+        scenario: only[0] || 'manyIslands',
+        postImpactFrames: postFrames != null ? Number(postFrames) : undefined,
+        onProgress: (label) => {
+          if (!asJson) console.error(`  ${label} ...`);
+        },
+      });
   console.debug = origDebug;
   console.warn = origWarn;
   if (!asJson || outFile) printABReport(cmp);
