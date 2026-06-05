@@ -97,15 +97,17 @@ a first-person shooter layer (`shooter-fps.ts`, mounted the same way as
 `pipeline-controls.ts`). Serve them with `npm run serve` and open
 `demo-index.html`.
 
-Enable it from the **First-Person Shooter** section in each demo's right-hand
-panel (or press `V`). Controls:
+Movement uses a **Rapier kinematic character controller** — a capsule that
+collides with floors, structures and debris, so you can walk over rubble and
+clamber on top of things. Enable it from the **First-Person Shooter** section in
+each demo's right-hand panel (or press `V`). Controls:
 
 | Input | Action |
 | --- | --- |
-| `W` `A` `S` `D` | Walk |
+| `W` `A` `S` `D` | Walk (collides with the world; climbs small debris/steps) |
 | Arrow keys / mouse | Look (mouse needs pointer lock — click once to grab it) |
-| `Space` | Jump |
-| Left click | Shoot the current weapon |
+| `Space` (hold) | Jetpack — push straight up; fly high to get on top of things |
+| Left click | Shoot the current weapon (from the camera) |
 | `1` / `2` / `3` / `Q` | Ball / Sticky explosive / Grenade / cycle weapon |
 | `F` | Detonate all placed sticky charges |
 | `V` | Toggle first-person mode |

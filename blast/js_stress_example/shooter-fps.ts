@@ -105,7 +105,6 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   const { canvas, camera, controls, scene, getCore } = opts;
   const getBallParams = opts.getBallParams ?? (() => DEFAULT_BALL);
   const floorY = opts.floorY ?? 0;
-  const eyeHeight = opts.eyeHeight ?? 1.7;
 
   // ── Tunable state (mutated by the sidebar) ──────────────────────
   const cfg = {
@@ -113,8 +112,9 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     mode: 'ball' as ShootMode,
     headlamp: true, // camera-mounted light so the view is always lit
     walkSpeed: 9, // m/s
-    jumpSpeed: 7, // m/s
-    gravity: 20, // m/s² (snappier than real g for a responsive walker)
+    jetUpSpeed: 10, // m/s — jetpack rise while Space is held (hold to fly up)
+    fallGravity: 16, // m/s² downward acceleration when not thrusting
+    maxFall: 35, // m/s terminal fall speed
     keyLookSpeed: 1.9, // rad/s for arrow-key look
     mouseSensitivity: 0.0022, // rad / pixel
     sticky: { radius: 0.28, mass: 60, speed: 44, ttl: 30 },
@@ -132,6 +132,17 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   let grounded = true;
   let pointerLocked = false;
   let lastT = performance.now();
+
+  // ── Rapier kinematic character controller (the FPS body) ────────
+  // A capsule that physically collides with floors, debris and structures, so
+  // you can walk on rubble and clamber on top of things. Created in the core's
+  // world when first-person mode turns on; recreated after a Reset (new world).
+  const CAPSULE = { halfHeight: 0.6, radius: 0.35 };
+  const EYE_ABOVE_CENTER = CAPSULE.halfHeight + CAPSULE.radius + 0.05; // eye ≈ capsule top
+  let charBody: RAPIER.RigidBody | null = null;
+  let charCollider: RAPIER.Collider | null = null;
+  let charController: RAPIER.KinematicCharacterController | null = null;
+  let charCore: DestructibleCore | null = null; // world the character lives in
 
   // Scratch objects (avoid per-frame allocation on the hot path).
   const _ray = new THREE.Raycaster();
@@ -184,8 +195,8 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       '<h2 class="section-title">🎮 First-Person Shooter</h2>' +
       '<label class="toggle-row"><input type="checkbox" id="cfg-fps" />' +
       '<span class="toggle-text">First-person mode' +
-      '<small>WASD walk · arrows / mouse look · Space jump · click shoots. ' +
-      'Press <b>V</b> to toggle.</small></span></label>' +
+      '<small>WASD walk · arrows / mouse look · hold Space = jetpack (fly up) · ' +
+      'click shoots. Walk on debris &amp; floors. Press <b>V</b> to toggle.</small></span></label>' +
       '<label class="toggle-row"><input type="checkbox" id="cfg-headlamp" checked />' +
       '<span class="toggle-text">Headlamp' +
       '<small>Camera-mounted light — always lights wherever you are and look.</small></span></label>' +
@@ -296,26 +307,80 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     cfg.fps = on;
     if (on) {
       controls.enabled = false;
-      // Drop in at ground level near where the orbit camera was looking, facing
-      // the structure — so toggling on doesn't disorient or bury the camera.
-      const target = controls.target.clone();
-      _v.set(camera.position.x - target.x, 0, camera.position.z - target.z);
-      let dist = _v.length();
-      if (dist < 1e-3) _v.set(0, 0, 1), (dist = 1);
-      _v.normalize();
-      dist = Math.min(Math.max(dist, 8), 45);
-      camera.position.set(target.x + _v.x * dist, floorY + eyeHeight, target.z + _v.z * dist);
-      camera.lookAt(target.x, floorY + eyeHeight, target.z);
+      // Face the structure (yaw from the current orbit view). The character body
+      // spawns near here and drives the camera from then on.
+      camera.lookAt(controls.target);
       _e.setFromQuaternion(camera.quaternion, 'YXZ');
       yaw = _e.y;
       pitch = 0;
       velY = 0;
-      grounded = true;
+      grounded = false;
+      const core = getCore();
+      if (core) ensureCharacter(core);
     } else {
+      destroyCharacter(true);
       controls.enabled = true;
       if (pointerLocked && document.pointerLockElement === canvas) document.exitPointerLock();
     }
     refreshUi();
+  }
+
+  // Ground-level spawn near where the orbit camera was looking.
+  function spawnPoint(): { x: number; y: number; z: number } {
+    const target = controls.target;
+    _v.set(camera.position.x - target.x, 0, camera.position.z - target.z);
+    let dist = _v.length();
+    if (dist < 1e-3) _v.set(0, 0, 1), (dist = 1);
+    _v.normalize();
+    dist = Math.min(Math.max(dist, 8), 45);
+    return {
+      x: target.x + _v.x * dist,
+      y: floorY + CAPSULE.halfHeight + CAPSULE.radius + 0.3,
+      z: target.z + _v.z * dist,
+    };
+  }
+
+  function ensureCharacter(core: DestructibleCore) {
+    if (charBody && charCore === core) return;
+    if (charCore !== core) {
+      // Refs belong to a stale (disposed) world after a Reset — drop them.
+      charBody = null;
+      charCollider = null;
+      charController = null;
+      charCore = null;
+    }
+    const world = core.world as RAPIER.World;
+    const s = spawnPoint();
+    charBody = world.createRigidBody(
+      RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(s.x, s.y, s.z),
+    );
+    charCollider = world.createCollider(
+      RAPIER.ColliderDesc.capsule(CAPSULE.halfHeight, CAPSULE.radius),
+      charBody,
+    );
+    const ctrl = world.createCharacterController(0.02);
+    ctrl.enableAutostep(0.5, 0.2, true); // climb small debris / steps
+    ctrl.enableSnapToGround(0.5); // stay glued to surfaces walking down
+    ctrl.setApplyImpulsesToDynamicBodies(true); // shove loose debris around
+    ctrl.setCharacterMass(80);
+    ctrl.setMaxSlopeClimbAngle((50 * Math.PI) / 180);
+    ctrl.setMinSlopeSlideAngle((40 * Math.PI) / 180);
+    charController = ctrl;
+    charCore = core;
+    velY = 0;
+    grounded = false;
+  }
+
+  function destroyCharacter(removeFromWorld: boolean) {
+    if (removeFromWorld && charCore) {
+      const world = charCore.world as RAPIER.World;
+      try { if (charController) world.removeCharacterController(charController); } catch { /* ignore */ }
+      try { if (charBody) world.removeRigidBody(charBody); } catch { /* ignore */ }
+    }
+    charBody = null;
+    charCollider = null;
+    charController = null;
+    charCore = null;
   }
 
   // ── Shooting ────────────────────────────────────────────────────
@@ -354,10 +419,13 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   function shootCharge(core: DestructibleCore, dir: THREE.Vector3, explodeOnContact: boolean) {
     const world = core.world as RAPIER.World;
     const r = cfg.sticky.radius;
-    // Spawn just ahead of the eye so the charge never starts inside the camera.
-    const ox = camera.position.x + dir.x * (r + 0.4);
-    const oy = camera.position.y + dir.y * (r + 0.4);
-    const oz = camera.position.z + dir.z * (r + 0.4);
+    // Spawn essentially at the camera (tiny offset only) so the charge starts
+    // from the eye and doesn't skip over objects right in front of you. The
+    // character capsule is excluded from contact below so it can't self-trigger.
+    const off = r + 0.05;
+    const ox = camera.position.x + dir.x * off;
+    const oy = camera.position.y + dir.y * off;
+    const oz = camera.position.z + dir.z * off;
     const speed = cfg.sticky.speed;
 
     const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
@@ -444,7 +512,8 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
           world.contactPairsWith(col, (other: RAPIER.Collider) => {
             if (hit) return;
             const pb = other.parent();
-            if (pb && pb.handle !== body.handle) {
+            // Ignore the charge's own body and the player's character capsule.
+            if (pb && pb.handle !== body.handle && (!charBody || pb.handle !== charBody.handle)) {
               hit = pb;
               hitIsFixed = pb.isFixed();
             }
@@ -671,7 +740,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     }
   }
 
-  // ── FPS camera ──────────────────────────────────────────────────
+  // ── FPS camera (driven by the Rapier kinematic character controller) ──
   function updateCamera(dt: number) {
     // Arrow-key look (complements mouse look; works without pointer lock).
     if (keys.has('ArrowLeft')) yaw += cfg.keyLookSpeed * dt;
@@ -683,7 +752,13 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     _e.set(pitch, yaw, 0, 'YXZ');
     camera.quaternion.setFromEuler(_e);
 
-    // Horizontal forward / right from the current orientation.
+    const core = getCore();
+    if (!core) return; // no world yet (e.g. mid-rebuild)
+    ensureCharacter(core);
+    if (!charBody || !charCollider || !charController) return;
+    const world = core.world as RAPIER.World;
+
+    // Horizontal move direction (yaw-relative, on the ground plane).
     _fwd.set(0, 0, -1).applyQuaternion(camera.quaternion);
     _fwd.y = 0;
     if (_fwd.lengthSq() < 1e-6) _fwd.set(0, 0, -1);
@@ -695,24 +770,32 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     if (keys.has('KeyS')) _move.sub(_fwd);
     if (keys.has('KeyD')) _move.add(_right);
     if (keys.has('KeyA')) _move.sub(_right);
-    if (_move.lengthSq() > 1e-6) {
-      _move.normalize().multiplyScalar(cfg.walkSpeed * dt);
-      camera.position.add(_move);
+    if (_move.lengthSq() > 1e-6) _move.normalize().multiplyScalar(cfg.walkSpeed);
+
+    // Vertical: Space is a jetpack (hold to rise); otherwise gravity pulls you
+    // down until the controller reports you're standing on something.
+    let dy: number;
+    if (keys.has('Space')) {
+      velY = cfg.jetUpSpeed;
+      dy = velY * dt;
+    } else if (grounded) {
+      velY = 0;
+      dy = -0.1; // small downward bias keeps snap-to-ground engaged
+    } else {
+      velY = Math.max(velY - cfg.fallGravity * dt, -cfg.maxFall);
+      dy = velY * dt;
     }
 
-    // Gravity + jump.
-    if (keys.has('Space') && grounded) {
-      velY = cfg.jumpSpeed;
-      grounded = false;
-    }
-    velY -= cfg.gravity * dt;
-    camera.position.y += velY * dt;
-    const floor = floorY + eyeHeight;
-    if (camera.position.y <= floor) {
-      camera.position.y = floor;
-      velY = 0;
-      grounded = true;
-    }
+    // Resolve the desired motion against the world (slides, steps, lands).
+    charController.computeColliderMovement(charCollider, { x: _move.x * dt, y: dy, z: _move.z * dt });
+    grounded = charController.computedGrounded();
+    const corr = charController.computedMovement();
+    const p = charBody.translation();
+    const nx = p.x + corr.x;
+    const ny = p.y + corr.y;
+    const nz = p.z + corr.z;
+    charBody.setNextKinematicTranslation({ x: nx, y: ny, z: nz });
+    camera.position.set(nx, ny + EYE_ABOVE_CENTER, nz);
   }
 
   // ── Per-frame entry point ───────────────────────────────────────
@@ -748,6 +831,12 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   }
 
   function handleCoreSwap() {
+    // The old world (and our character body) is gone; drop refs without touching
+    // it. updateCamera re-creates the character in the new world if FPS is on.
+    charBody = null;
+    charCollider = null;
+    charController = null;
+    charCore = null;
     for (const s of stickies) removeSticky(s);
     stickies.length = 0;
     for (const fx of transient) {
