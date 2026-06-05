@@ -32,7 +32,19 @@
 #include "NsBasicTemplates.h"
 #include "NvIntrinsics.h"
 
-#if NV_LINUX || NV_ANDROID || (NV_IOS && !NV_A64) || NV_OSX || NV_PS3 || NV_PSP2 || NV_WIIU
+#if defined(__EMSCRIPTEN__) || defined(__wasm__) || NV_WASM
+// WebAssembly builds — libc++ dropped the `tr1/type_traits` shim a long
+// time ago, so pull in modern `<type_traits>` and alias `is_pod` into the
+// `std::tr1` namespace for the rest of this TU.
+#include <type_traits>
+namespace std
+{
+namespace tr1
+{
+using std::is_pod;
+}
+}
+#elif NV_LINUX || NV_ANDROID || (NV_IOS && !NV_A64) || NV_OSX || NV_PS3 || NV_PSP2 || NV_WIIU
 #include <tr1/type_traits>
 #elif NV_WINRT || NV_XBOXONE || (NV_IOS && NV_A64) || NV_WIN64 || NV_X360 || NV_WIN32 || NV_PS4
 #include <type_traits>

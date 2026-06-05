@@ -87,10 +87,31 @@ constexpr std::pair<const char*, uint32_t> sInstructionSetLookup[] =
 };
 
 
-#if NV_WINDOWS_FAMILY
+#if defined(STRESS_SOLVER_NO_DEVICE_QUERY)
+inline void cpuid(int cpui[4], int /*fn*/)
+{
+    cpui[0] = cpui[1] = cpui[2] = cpui[3] = 0;
+}
+
+inline bool os_supports_avx_restore()
+{
+    return false;
+}
+#elif NV_WINDOWS_FAMILY
 #include <intrin.h> // for __cpuidex
 inline void cpuid(int cpui[4], int fn) { __cpuidex(cpui, fn, 0); }
 inline bool os_supports_avx_restore() { return ((uint32_t)_xgetbv(0) & 6) == 6; }
+#else
+#if defined(__EMSCRIPTEN__)
+inline void cpuid(int cpui[4], int /*fn*/)
+{
+    cpui[0] = cpui[1] = cpui[2] = cpui[3] = 0;
+}
+
+inline bool os_supports_avx_restore()
+{
+    return false;
+}
 #else
 #include <cpuid.h> // for __cpuid_count
 inline void cpuid(int cpui[4], int fn) { __cpuid_count(fn, 0, cpui[0], cpui[1], cpui[2], cpui[3]); }
@@ -100,6 +121,7 @@ inline bool os_supports_avx_restore()
     __asm__("xgetbv" : "=a" (xcr0) : "c" (0) : "%edx");
     return (xcr0 & 6) == 6;
 }
+#endif
 #endif
 
 static bool

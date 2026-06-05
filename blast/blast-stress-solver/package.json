@@ -1,0 +1,95 @@
+{
+  "name": "blast-stress-solver",
+  "version": "0.3.1",
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "browser": "./dist/index.js",
+      "node": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    },
+    "./stress_solver.wasm": "./dist/stress_solver.wasm",
+    "./stress_solver.mjs": {
+      "browser": "./dist/stress_solver.mjs",
+      "node": "./dist/stress_solver.cjs",
+      "default": "./dist/stress_solver.mjs"
+    },
+    "./rapier": {
+      "types": "./dist/rapier.d.ts",
+      "browser": "./dist/rapier.js",
+      "node": "./dist/rapier.cjs",
+      "default": "./dist/rapier.js"
+    },
+    "./three": {
+      "types": "./dist/three.d.ts",
+      "browser": "./dist/three.js",
+      "node": "./dist/three.cjs",
+      "default": "./dist/three.js"
+    },
+    "./scenarios": {
+      "types": "./dist/scenarios.d.ts",
+      "browser": "./dist/scenarios.js",
+      "node": "./dist/scenarios.cjs",
+      "default": "./dist/scenarios.js"
+    }
+  },
+  "files": [
+    "dist/**",
+    "README.md",
+    "LICENSE",
+    "docs/**",
+    "examples/**"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "prebuild": "node ./scripts/prebuild-runtime.js",
+    "build": "npm run build:ts && node ./scripts/copy-dist.js",
+    "prepare": "npm run build",
+    "test": "npm run build && vitest run",
+    "test:invariants": "vitest run src/tests/kernels.proptest.test.ts src/tests/highRise.scenario.test.ts src/tests/rapier.invariants.test.ts src/tests/rapier.resim-continuity.test.ts src/tests/rapier.splitVelocity.mechanism.test.ts src/tests/rapier.splitVelocity.noHover.test.ts src/tests/rapier.smallBodyDamping.fall.test.ts src/tests/rapier.contactStability.mechanism.test.ts src/tests/rapier.ccd.test.ts src/tests/rapier.splitMigrator.test.ts src/tests/rapier.headless-scenarios.test.ts src/tests/solver-mechanisms.test.ts src/tests/stress.gravity.test.ts src/tests/bondStress.parity.test.ts src/tests/stressLimits.boundary.test.ts src/tests/damage.invariants.test.ts",
+    "test:soak": "vitest run",
+    "build:ts": "tsup --config tsup.config.ts",
+    "postbuild:ts": "npm run generate:high-rise",
+    "generate:high-rise": "node ./scripts/export-high-rise.mjs",
+    "generate:brick-building-pack": "node ./scripts/generate-brick-building-scene-pack.mjs",
+    "inspect:recording": "node scripts/inspect-recording.mjs",
+    "bench": "node scripts/bench.mjs",
+    "bench:small": "node scripts/bench.mjs --small",
+    "bench:large": "node scripts/bench.mjs --large",
+    "bench:split-planner": "node scripts/bench-split-planner.mjs",
+    "sweep:high-rise": "node scripts/sweep-high-rise.mjs"
+  },
+  "devDependencies": {
+    "@dgreenheck/three-pinata": "^2.0.1",
+    "@dimforge/rapier3d-compat": "^0.19.2",
+    "@types/node": "^20.11.0",
+    "@types/three": "^0.181.0",
+    "fast-check": "^3.23.1",
+    "three": "^0.181.1",
+    "tsup": "^8.0.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "peerDependencies": {
+    "@dgreenheck/three-pinata": ">=0.6.0",
+    "@dimforge/rapier3d-compat": ">=0.19.0",
+    "three": ">=0.181.0"
+  },
+  "peerDependenciesMeta": {
+    "@dimforge/rapier3d-compat": {
+      "optional": true
+    },
+    "@dgreenheck/three-pinata": {
+      "optional": true
+    },
+    "three": {
+      "optional": true
+    }
+  }
+}

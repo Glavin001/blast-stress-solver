@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>High-Rise Demolition — blast-stress-solver Demo</title>
+    <link rel="stylesheet" href="./styles/demo-common.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three/build/three.module.js",
+          "three/addons/": "/vendor/three/examples/jsm/",
+          "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs",
+          "blast-stress-solver": "/vendor/blast-stress-solver/index.js",
+          "blast-stress-solver/rapier": "/vendor/blast-stress-solver/rapier.js",
+          "blast-stress-solver/three": "/vendor/blast-stress-solver/three.js",
+          "blast-stress-solver/scenarios": "/vendor/blast-stress-solver/scenarios.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="viewport">
+        <canvas id="demo-canvas"></canvas>
+        <div class="viewport-hint">Loading high-rise...</div>
+      </section>
+
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
+        <span class="icon-open">&#9776;</span>
+        <span class="icon-close">&#10005;</span>
+      </button>
+      <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+      <aside class="sidebar" id="sidebar">
+        <header>
+          <a href="./demo-index.html" class="back-link">&larr; All Demos</a>
+          <h1>&#127970; High-Rise Demolition</h1>
+          <p>
+            Mid-rise reinforced-concrete apartment, loaded from the same shared scene-pack
+            JSON the Rust demo uses. Click the building to throw the wrecking ball, then tune
+            the projectile, material strength, gravity and physics below. Destruction is
+            stress-solver driven; the per-chunk <em>Custom damage system</em> is off by default.
+          </p>
+        </header>
+
+        <div class="control-actions">
+          <button id="btn-reset" class="button button-primary">&orarr; Reset / Retry</button>
+        </div>
+
+        <!-- Projectile (live at next throw) -->
+        <section class="config-section">
+          <h2 class="section-title">Projectile</h2>
+          <div class="config-row">
+            <span class="config-label">Radius</span>
+            <input type="range" class="config-slider" id="cfg-proj-radius" min="0.2" max="2.0" step="0.05" value="0.6" />
+            <span class="config-value" id="cfg-proj-radius-value">0.60 m</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Mass</span>
+            <input type="range" class="config-slider" id="cfg-proj-mass" min="200" max="10000" step="100" value="2500" />
+            <span class="config-value" id="cfg-proj-mass-value">2,500 kg</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Speed</span>
+            <input type="range" class="config-slider" id="cfg-proj-speed" min="4" max="40" step="1" value="8" />
+            <span class="config-value" id="cfg-proj-speed-value">8 m/s</span>
+          </div>
+        </section>
+
+        <!-- Structure / material (Reset to apply) -->
+        <section class="config-section">
+          <h2 class="section-title">Structure (Reset to apply)</h2>
+          <div class="config-row">
+            <span class="config-label">Strength</span>
+            <input type="range" class="config-slider" id="cfg-strength" min="0.25" max="4" step="0.05" value="1" />
+            <span class="config-value" id="cfg-strength-value">1.00&times;</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Impact&rarr;stress</span>
+            <input type="range" class="config-slider" id="cfg-contact-force" min="1" max="60" step="1" value="8" />
+            <span class="config-value" id="cfg-contact-force-value">8</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Solver iters</span>
+            <input type="range" class="config-slider" id="cfg-iterations" min="4" max="150" step="2" value="24" />
+            <span class="config-value" id="cfg-iterations-value">24</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Graph reduce</span>
+            <input type="range" class="config-slider" id="cfg-graph-reduction" min="0" max="5" step="1" value="0" />
+            <span class="config-value" id="cfg-graph-reduction-value">0</span>
+          </div>
+        </section>
+
+        <!-- Solver -->
+        <section class="config-section">
+          <h2 class="section-title">Solver <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <span class="config-label">Gravity &#9733;</span>
+            <input type="range" class="config-slider" id="cfg-gravity" min="-30" max="0" step="0.5" value="-9.81" />
+            <span class="config-value" id="cfg-gravity-value">-9.8 m/s&sup2;</span>
+          </div>
+        </section>
+
+        <!-- Physics -->
+        <section class="config-section">
+          <h2 class="section-title">Physics <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <span class="config-label">Debris Collision &#9733;</span>
+            <select id="cfg-debris-collision" class="config-select">
+              <option value="all" selected>All (full collisions)</option>
+              <option value="noDebrisPairs">No debris pairs</option>
+              <option value="debrisGroundOnly">Debris &harr; ground only</option>
+              <option value="debrisNone">Debris: none</option>
+            </select>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Friction</span>
+            <input type="range" class="config-slider" id="cfg-friction" min="0" max="2" step="0.05" value="0.25" />
+            <span class="config-value" id="cfg-friction-value">0.25</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Restitution</span>
+            <input type="range" class="config-slider" id="cfg-restitution" min="0" max="1" step="0.05" value="0" />
+            <span class="config-value" id="cfg-restitution-value">0.00</span>
+          </div>
+        </section>
+
+        <!-- Optimization (live) -->
+        <section class="config-section">
+          <h2 class="section-title">Optimization <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <span class="config-label">Small Body Damping &#9733;</span>
+            <select id="cfg-damping-mode" class="config-select">
+              <option value="off">Off</option>
+              <option value="always" selected>Always</option>
+              <option value="afterGroundCollision">After ground hit</option>
+            </select>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Debris Cleanup &#9733;</span>
+            <select id="cfg-cleanup-mode" class="config-select">
+              <option value="off">Off</option>
+              <option value="always" selected>Always</option>
+              <option value="afterGroundCollision">After ground hit</option>
+            </select>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Debris TTL &#9733;</span>
+            <input type="range" class="config-slider" id="cfg-debris-ttl" min="1000" max="30000" step="500" value="10000" />
+            <span class="config-value" id="cfg-debris-ttl-value">10.0s</span>
+          </div>
+        </section>
+
+        <!-- Features -->
+        <section class="config-section">
+          <h2 class="section-title">Features</h2>
+          <label class="toggle-row">
+            <input type="checkbox" id="opt-damage" />
+            <span class="toggle-text">
+              Custom damage system
+              <small>Per-chunk health/splash. Off by default (it can over-soften the frame). Toggling rebuilds the scene.</small>
+            </span>
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="opt-debug" />
+            <span class="toggle-text">
+              Debug wireframe
+              <small>Show Rapier colliders &amp; bond lines</small>
+            </span>
+          </label>
+        </section>
+
+        <!-- Status -->
+        <section class="status-panel">
+          <h2>Simulation</h2>
+          <div class="status-grid">
+            <div class="status-item"><span class="status-label">Bodies</span><span class="status-value" id="stat-bodies">0</span></div>
+            <div class="status-item"><span class="status-label">Bonds</span><span class="status-value" id="stat-bonds">0</span></div>
+            <div class="status-item"><span class="status-label">Fragments</span><span class="status-value" id="stat-fragments">0</span></div>
+            <div class="status-item"><span class="status-label">Projectiles</span><span class="status-value" id="stat-projectiles">0</span></div>
+            <div class="status-item"><span class="status-label">Chunks</span><span class="status-value" id="stat-chunks">0</span></div>
+            <div class="status-item"><span class="status-label">Settle</span><span class="status-value" id="stat-settle">0.00 m</span></div>
+          </div>
+        </section>
+
+        <!-- Performance -->
+        <section class="status-panel">
+          <h2>Performance</h2>
+          <div class="status-grid">
+            <div class="status-item"><span class="status-label">Physics</span><span class="status-value" id="stat-physics-ms">&mdash; ms</span></div>
+            <div class="status-item"><span class="status-label">Render</span><span class="status-value" id="stat-render-ms">&mdash; ms</span></div>
+            <div class="status-item"><span class="status-label">Draw Calls</span><span class="status-value" id="stat-draw-calls">0</span></div>
+            <div class="status-item"><span class="status-label">Triangles</span><span class="status-value" id="stat-triangles">0</span></div>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <script>
+      (function () {
+        var toggle = document.getElementById('sidebar-toggle');
+        var sidebar = document.getElementById('sidebar');
+        var backdrop = document.getElementById('sidebar-backdrop');
+        var layout = document.querySelector('.layout');
+        var mql = window.matchMedia('(max-width: 768px)');
+        function isMobile() { return mql.matches; }
+        function close() { toggle.classList.remove('active'); if (isMobile()) { sidebar.classList.remove('open'); backdrop.classList.remove('visible'); } else { layout.classList.add('sidebar-hidden'); } }
+        function open() { toggle.classList.add('active'); if (isMobile()) { sidebar.classList.add('open'); backdrop.classList.add('visible'); } else { layout.classList.remove('sidebar-hidden'); } }
+        function isOpen() { return isMobile() ? sidebar.classList.contains('open') : !layout.classList.contains('sidebar-hidden'); }
+        toggle.addEventListener('click', function () { if (isOpen()) close(); else open(); });
+        backdrop.addEventListener('click', close);
+        if (!isMobile()) toggle.classList.add('active');
+      })();
+    </script>
+    <script type="module" src="./dist/high-rise.js"></script>
+  </body>
+</html>

@@ -1,0 +1,70 @@
+[package]
+name = "blast-stress-solver"
+version = "0.1.1"
+publish = false
+edition = "2021"
+readme = "README.md"
+repository = "https://github.com/Glavin001/PhysX"
+homepage = "https://github.com/Glavin001/PhysX"
+documentation = "https://docs.rs/blast-stress-solver"
+license = "BSD-3-Clause"
+description = "Blast stress solver for destructible structures, with optional Rapier3D integration"
+links = "blast_stress_solver_ffi"
+
+[features]
+default = []
+rapier = ["dep:rapier3d"]
+# Force the scalar stress-solver kernels even on x86/x86_64 (the build otherwise
+# enables the AVX/FMA path with a runtime CPUID fallback). Useful for reproducible
+# cross-platform numerics or CPUs without AVX.
+force-scalar-solver = []
+# Pre-built scenario builders + JSON scene loader (the loader needs serde/serde_json).
+scenarios = ["dep:serde", "dep:serde_json"]
+# Reusable benchmarking/profiling harness (`src/bench_harness.rs`) shared by the
+# criterion benches, the `frame_profile` example, and the perf-regression test.
+# Off by default and never shipped in a release.
+bench-support = ["rapier", "scenarios"]
+# Opt-in regression tests for the `wasm32-unknown-unknown` build. These
+# shell out to `cargo` to build a fixture cdylib under
+# `tests/wasm_smoke/fixture/`, then inspect the resulting .wasm for
+# stray `env.*` / `wasi_snapshot_preview1.*` imports. Enable with
+# `cargo test -p blast-stress-solver --features wasm-smoke`. Requires the
+# `wasm32-unknown-unknown` target and a wasi C++ toolchain
+# (e.g. `libc++-18-dev-wasm32`) to be installed on the host.
+wasm-smoke = []
+
+[dependencies]
+rapier3d = { version = "0.30", default-features = false, features = ["dim3", "f32"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+rapier3d = { version = "0.30", default-features = false, features = ["dim3", "f32"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasmparser = "0.224"
+proptest = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "destruction"
+harness = false
+required-features = ["bench-support"]
+
+# Per-frame spike/percentile profiler over a full destruction timeline.
+[[example]]
+name = "frame_profile"
+required-features = ["bench-support"]
+
+# Apply-path micro-profiler: cost of the Rapier topology edits a split triggers.
+[[example]]
+name = "apply_profile"
+required-features = ["bench-support"]
+
+# Raw-Rapier per-call cost profiler (marginal cost incl. the deferred step work).
+[[example]]
+name = "rapier_cost_profile"
+required-features = ["bench-support"]

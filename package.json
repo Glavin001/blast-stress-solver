@@ -1,0 +1,24 @@
+{
+  "name": "physx",
+  "version": "1.0.0",
+  "description": "Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.",
+  "main": "index.js",
+  "scripts": {
+    "start": "npm run demo",
+    "demo": "npm run check:demos && npm run build:demos && npm run serve:demos",
+    "check:demos": "node scripts/check-demo-env.mjs",
+    "setup:demos": "npm install && npm --prefix blast/blast-stress-solver install --ignore-scripts && npm --prefix blast/js_stress_example install",
+    "build:demos": "npm --prefix blast/blast-stress-solver run build && npm --prefix blast/js_stress_example run build:web",
+    "export:rust-scenes": "node scripts/export-rust-scenes.mjs",
+    "serve:demos": "node scripts/serve-demo.mjs",
+    "build:profiling": "EMCC_PROFILING=1 npm --prefix blast/blast-stress-solver run build && npm --prefix blast/js_stress_example run build:web",
+    "test:bridge": "npm --prefix blast/js_stress_example run test"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.19.1",
+    "lil-gui": "^0.20.0",
+    "three": "^0.180.0"
+  }
+}

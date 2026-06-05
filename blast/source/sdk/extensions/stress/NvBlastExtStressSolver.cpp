@@ -43,6 +43,7 @@
 #include "simd/simd_device_query.h"
 
 #include <algorithm>
+#include <cmath>
 
 #define USE_SCALAR_IMPL 0
 #define WARM_START 1
@@ -177,16 +178,22 @@ public:
         m_forceColdStart = true;
     }
 
-    void solve(uint32_t iterationCount, bool warmStart = true)
+    void solve(uint32_t iterationCount, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
         StressProcessor::SolverParams params;
         params.maxIter = iterationCount;
         params.tolerance = 0.001f;
         params.warmStart = warmStart && !m_forceColdStart;
+        params.islandAware = islandAware;
+        params.skipSettled = skipSettled;
         m_converged = (m_stressProcessor.solve(m_impulses.data(), m_velocities.data(), params, &m_error_sq) >= 0);
         m_forceColdStart = false;
         m_inputsChanged = false;
     }
+
+    // Number of settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
+    uint32_t getIslandsSkipped() const { return m_stressProcessor.getLastIslandsSkipped(); }
+    uint32_t getIslandsTotal() const { return m_stressProcessor.getLastIslandsTotal(); }
 
     bool calcError(float& linear, float& angular) const
     {
@@ -269,7 +276,7 @@ public:
     };
 
     SupportGraphProcessor(uint32_t nodeCount, uint32_t maxBondCount) :
-        m_solver(nodeCount, maxBondCount), m_nodesDirty(true), m_bondsDirty(true)
+        m_solver(nodeCount, maxBondCount), m_nodesDirty(true), m_bondsDirty(true), m_islandCount(0)
     {
         m_nodesData.resize(nodeCount);
         m_bondsData.reserve(maxBondCount);
@@ -340,6 +347,24 @@ public:
         return m_overstressedBondCount;
     }
 
+    // Number of connected components (islands) in the solver graph, computed in
+    // sync() on topology change. Static (mass<=0) nodes are cut points.
+    uint32_t getIslandCount() const
+    {
+        return m_islandCount;
+    }
+
+    // Settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
+    uint32_t getIslandsSkipped() const
+    {
+        return m_solver.getIslandsSkipped();
+    }
+
+    uint32_t getIslandsTotal() const
+    {
+        return m_solver.getIslandsTotal();
+    }
+
     void calcSolverBondStresses(
         uint32_t bondIdx, float bondArea, float nodeDist, const nvidia::NvVec3& bondNormal,
         float& stressNormal, float& stressShear) const
@@ -372,7 +397,7 @@ public:
         const float twistContribution = twist * 2.0f / nodeDist;
         stressShear += twistContribution;
         const float bendContribution = bend * 2.0f / nodeDist;
-        stressNormal += copysignf(bendContribution, stressNormal);
+        stressNormal += std::copysign(bendContribution, stressNormal);
     }
 
     float mapStressToRange(float stress, float elasticLimit, float fatalLimit) const
@@ -537,16 +562,16 @@ public:
         return m_graphReductionLevel;
     }
 
-    void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true)
+    void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
-        sync(bonds);
+        sync(bonds, islandAware);
 
         for (const NodeData& node : m_nodesData)
         {
             m_solver.setNodeVelocities(node.solverNode, node.localVel, NvVec3(NvZero));
         }
 
-        m_solver.solve(settings.maxSolverIterationsPerFrame, warmStart);
+        m_solver.solve(settings.maxSolverIterationsPerFrame, warmStart, islandAware, skipSettled);
 
         resetVelocities();
 
@@ -608,7 +633,11 @@ private:
     {
         m_overstressedBondCount = 0;
 
-        Array<uint32_t>::type bondIndicesToRemove;
+        // Reuse a persistent scratch buffer instead of allocating one every solve.
+        // NsArray::clear() keeps capacity, so reserve() only allocates on the first call
+        // (or when the bond count grows); this loop runs every frame the solver is active.
+        Array<uint32_t>::type& bondIndicesToRemove = m_bondIndicesToRemove;
+        bondIndicesToRemove.clear();
         bondIndicesToRemove.reserve(getBondCount());
         for (uint32_t i = 0; i < m_solverBondsData.size(); ++i)
         {
@@ -633,7 +662,7 @@ private:
 
                     // Align normal(s) with node displacement, so that compressive/tensile distinction is correct
                     const nvidia::NvVec3 assetBondNormal(blastBond.normal[0], blastBond.normal[1], blastBond.normal[2]);
-                    const nvidia::NvVec3 blastBondNormal = std::copysignf(1.0f, assetBondNormal.dot(nodeDisp))*assetBondNormal;
+                    const nvidia::NvVec3 blastBondNormal = std::copysign(1.0f, assetBondNormal.dot(nodeDisp))*assetBondNormal;
 
                     const nvidia::NvVec3 blastBondCentroid(blastBond.centroid[0], blastBond.centroid[1], blastBond.centroid[2]);
 
@@ -718,8 +747,9 @@ private:
         }
     }
 
-    void sync(const NvBlastBond* bonds)
+    void sync(const NvBlastBond* bonds, bool islandAware)
     {
+        const bool resynced = m_nodesDirty || m_bondsDirty;
         if (m_nodesDirty)
         {
             syncNodes(bonds);
@@ -729,8 +759,64 @@ private:
         {
             syncBonds(bonds);
         }
+        // Island partitioning only feeds the islandCount stat — the solve never reads it — so it is
+        // only computed when island-aware solving is enabled. This keeps flag-off truly zero-cost
+        // (no per-resync union-find when island solving is off).
+        if (resynced && islandAware)
+        {
+            computeIslands();
+        }
 
         CHECK_GRAPH_INTEGRITY;
+    }
+
+    // ── Island partitioning ──
+    // Connected components of the solver graph via union-find over the solver
+    // bonds. Static (mass<=0) nodes carry no coupling (sqrt_I_inv == 0), so they
+    // are CUT POINTS: two structures sharing only a static/world node are
+    // physically independent islands. Recomputed only on topology change.
+    // m_nodeIsland[solverNode] holds the compacted island id (InvalidIndex for
+    // static nodes); m_islandCount is the number of dynamic islands. This is the
+    // foundation for solving each island independently and skipping settled ones.
+    uint32_t islandFind(uint32_t x)
+    {
+        uint32_t r = x;
+        while (m_islandParent[r] != r) r = m_islandParent[r];
+        while (m_islandParent[x] != r) { const uint32_t nx = m_islandParent[x]; m_islandParent[x] = r; x = nx; }
+        return r;
+    }
+
+    void computeIslands()
+    {
+        const uint32_t kInvalid = static_cast<uint32_t>(-1);
+        const uint32_t nodeCount = getSolverNodeCount();
+        m_islandParent.resize(nodeCount);
+        for (uint32_t i = 0; i < nodeCount; ++i) m_islandParent[i] = i;
+
+        const uint32_t bondCount = getSolverBondCount();
+        for (uint32_t b = 0; b < bondCount; ++b)
+        {
+            uint32_t n0, n1;
+            getSolverInternalBondNodes(b, n0, n1);
+            if (n0 >= nodeCount || n1 >= nodeCount) continue;
+            // static node = cut point, do not union through it
+            if (m_solverNodesData[n0].mass <= 0.0f || m_solverNodesData[n1].mass <= 0.0f) continue;
+            const uint32_t ra = islandFind(n0), rb = islandFind(n1);
+            if (ra != rb) m_islandParent[ra] = rb;
+        }
+
+        // Compact island ids over dynamic nodes; static nodes get InvalidIndex.
+        m_nodeIsland.resize(nodeCount);
+        m_islandRootId.resize(nodeCount);
+        for (uint32_t i = 0; i < nodeCount; ++i) m_islandRootId[i] = kInvalid;
+        m_islandCount = 0;
+        for (uint32_t i = 0; i < nodeCount; ++i)
+        {
+            if (m_solverNodesData[i].mass <= 0.0f) { m_nodeIsland[i] = kInvalid; continue; }
+            const uint32_t r = islandFind(i);
+            if (m_islandRootId[r] == kInvalid) m_islandRootId[r] = m_islandCount++;
+            m_nodeIsland[i] = m_islandRootId[r];
+        }
     }
 
     void syncNodes(const NvBlastBond* bonds)
@@ -889,7 +975,7 @@ private:
             bond.centroid = *(NvVec3*)bonds[bond.blastBondIndex].centroid;
 
             // fix normal direction to point from node0 to node1
-            bond.normal *= std::copysignf(1.0f, bond.normal.dot(node1.localPos - node1.localPos));
+            bond.normal *= std::copysign(1.0f, bond.normal.dot(node1.localPos - node0.localPos));
 
             if (node0.solverNode == node1.solverNode)
                 continue; // skip (internal)
@@ -992,11 +1078,20 @@ private:
 
     uint32_t                            m_overstressedBondCount;
 
+    // Island partitioning (connected components of the solver graph)
+    Array<uint32_t>::type               m_islandParent;
+    Array<uint32_t>::type               m_islandRootId;
+    Array<uint32_t>::type               m_nodeIsland;
+    uint32_t                            m_islandCount;
+
     HashMap<BondKey, uint32_t>::type    m_solverBondsMap;
     Array<uint32_t>::type               m_blastBondIndexMap;
 
     Array<BondData>::type               m_bondsData;
     Array<NodeData>::type               m_nodesData;
+
+    // Persistent scratch for updateBondStress() so it doesn't heap-allocate per solve.
+    Array<uint32_t>::type               m_bondIndicesToRemove;
 };
 
 
@@ -1044,6 +1139,41 @@ public:
     virtual uint32_t                        getOverstressedBondCount() const override
     {
         return m_graphProcessor->getOverstressedBondCount();
+    }
+
+    virtual uint32_t                        getIslandCount() const override
+    {
+        return m_graphProcessor->getIslandCount();
+    }
+
+    virtual void                            setIslandAware(bool enabled) override
+    {
+        m_islandAware = enabled;
+    }
+
+    virtual bool                            getIslandAware() const override
+    {
+        return m_islandAware;
+    }
+
+    virtual void                            setSkipSettled(bool enabled) override
+    {
+        m_skipSettled = enabled;
+    }
+
+    virtual bool                            getSkipSettled() const override
+    {
+        return m_skipSettled;
+    }
+
+    virtual uint32_t                        getIslandsSkipped() const override
+    {
+        return m_graphProcessor->getIslandsSkipped();
+    }
+
+    virtual uint32_t                        getIslandsTotal() const override
+    {
+        return m_graphProcessor->getIslandsTotal();
     }
 
     virtual void                            generateFractureCommands(const NvBlastActor& actor, NvBlastFractureBuffers& commands) override;
@@ -1153,6 +1283,8 @@ private:
     float                                                               m_errorAngular;
     float                                                               m_errorLinear;
     bool                                                                m_converged;
+    bool                                                                m_islandAware;
+    bool                                                                m_skipSettled;
     uint32_t                                                            m_framesCount;
     Array<NvBlastBondFractureData>::type                                m_bondFractureBuffer;
     Array<uint8_t>::type                                                m_scratch;
@@ -1180,7 +1312,7 @@ NV_INLINE T* ExtStressSolverImpl::getScratchArray(uint32_t size)
 ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtStressSolverSettings& settings)
     : m_family(family), m_settings(settings), m_isDirty(false), m_reset(false),
     m_errorAngular(std::numeric_limits<float>::max()), m_errorLinear(std::numeric_limits<float>::max()),
-    m_converged(false), m_framesCount(0), m_valid(false)
+    m_converged(false), m_islandAware(false), m_skipSettled(false), m_framesCount(0), m_valid(false)
 {
     // this needs to be called any time settings change, including when they are first set
     inheritSettingsLimits();
@@ -1351,7 +1483,7 @@ bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& co
             NVBLAST_ASSERT(blastBondIndex == bondData.blastBondIndex);
             uint32_t node0, node1;
             m_graphProcessor->getSolverInternalBondNodes(internalBondIndex, node0, node1);
-            NVBLAST_ASSERT(bondData.node0 == internalBondData.node0 && bondData.node1 == internalBondData.node1);
+            NVBLAST_ASSERT(bondData.node0 == node0 && bondData.node1 == node1);
 
             // accumulators for forces just from this bond
             nvidia::NvVec3 nvLinearPressure(0.0f);
@@ -1571,7 +1703,7 @@ void ExtStressSolverImpl::solve()
 {
     NV_SIMD_GUARD;
 
-    m_graphProcessor->solve(m_settings, m_bondHealths, m_bonds, WARM_START && !m_reset);
+    m_graphProcessor->solve(m_settings, m_bondHealths, m_bonds, WARM_START && !m_reset, m_islandAware, m_skipSettled);
     m_reset = false;
 
     m_converged = m_graphProcessor->calcError(m_errorLinear, m_errorAngular);
