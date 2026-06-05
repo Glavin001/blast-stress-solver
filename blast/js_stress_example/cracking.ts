@@ -225,7 +225,7 @@ shooter = mountShooter({
   controls,
   scene,
   getCore: () => coreRef,
-  getBallParams: () => ({ radius: 0.35, mass: 400, speed: 22 }),
+  getBallParams: () => ({ radius: 0.35, mass: 400, speed: 40 }),
 });
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize cracking demo:', err);
