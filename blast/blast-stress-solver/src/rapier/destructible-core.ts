@@ -59,6 +59,16 @@ export type BuildDestructibleCoreOptions = {
    * `perBody` is the default and recommended mode.
    * `world` is retained for compatibility but is not the preferred path. */
   snapshotMode?: 'perBody' | 'world';
+  /** Skip the resim snapshot re-capture taken between the rollback-restore and the
+   *  resim `world.step()` on the **final** allowed resim pass. That capture only
+   *  exists to be restored by a *subsequent* resim pass; on the last pass — which
+   *  is *every* fracture frame when `maxResimulationPasses === 1` (the default,
+   *  production resim path) — nothing ever restores it, so it is dead work
+   *  (~0.8 ms/fracture frame). Output is unchanged: the skipped snapshot is only
+   *  read by a later pass that does not run. Default **true**. Set false for the
+   *  legacy always-capture behaviour (the output-equivalence A/B test pins both
+   *  paths to identical trajectories; also an emergency rollback switch). */
+  deferRedundantResimSnapshot?: boolean;
   onWorldReplaced?: (newWorld: RAPIER.World) => void;
   resimulateOnDamageDestroy?: boolean;
   /** Scale factor for contact forces fed into the stress solver (default 30).
@@ -176,6 +186,7 @@ export async function buildDestructibleCore({
   resimulateOnFracture = true,
   maxResimulationPasses = 1,
   snapshotMode = 'perBody',
+  deferRedundantResimSnapshot = true,
   onWorldReplaced,
   resimulateOnDamageDestroy = !!damage?.enabled,
   contactForceScale = 30,
@@ -2430,7 +2441,13 @@ export async function buildDestructibleCore({
         const resimT0 = startTiming();
         if (resimulateOnFracture) {
           restoreWorldSnapshot();
-          captureWorldSnapshot();
+          // The re-capture here is only consumed by a *subsequent* pass's restore
+          // (the next loop iteration). On the final allowed pass none follows, so
+          // skip it — dead work on every fracture frame when maxResim === 1. The
+          // snapshot is otherwise unread, so output is identical (proven by the
+          // deferRedundantResimSnapshot A/B in rapier.resim-perf.test.ts).
+          const willResimAgain = resimCount + 1 < maxResim;
+          if (!deferRedundantResimSnapshot || willResimAgain) captureWorldSnapshot();
           const rapierResimT0 = startTiming();
           world.step(eventQueue);
           stopTiming(rapierResimT0, 'rapierStepMs');

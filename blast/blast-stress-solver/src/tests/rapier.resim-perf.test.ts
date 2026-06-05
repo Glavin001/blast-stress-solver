@@ -286,6 +286,45 @@ describe.skipIf(!runtimeAvailable)('Resim / rapier perf levers (requires WASM bu
       expect(d.maxPosDelta).toBe(0);
       expect(d.maxQuatDelta).toBe(0);
     }, 60_000);
+
+    it('deferRedundantResimSnapshot optimization is output-neutral AND cheaper', async () => {
+      await loadModules();
+      // Lever #2: at maxResimulationPasses=1 (the production resim path) the snapshot
+      // re-capture between the rollback and the resim world.step() is never restored,
+      // so skipping it must change nothing about the simulation — only the cost.
+      const mk = () => buildTowerScenario({ side: 6, stories: 12, totalMass: 5000 });
+      const plan = centerHit(6, 45000);
+      const frames = 120;
+
+      const optimized = await runScenario(mk(), { deferRedundantResimSnapshot: true }, { frames, plan });
+      const legacy = await runScenario(mk(), { deferRedundantResimSnapshot: false }, { frames, plan });
+
+      // ── Faithful: byte-identical trajectories (this is the whole point). ──
+      const d = compareTrajectories(optimized.trajectory, legacy.trajectory);
+      expect(d.topologyDivergeFrame).toBe(-1);
+      expect(d.maxPosDelta).toBe(0);
+      expect(d.maxQuatDelta).toBe(0);
+
+      // The optimization must have actually engaged: a fracture → a resim frame.
+      const resimFrames = optimized.samples.filter((s) => (s.resimPasses ?? 0) > 0).length;
+      expect(resimFrames).toBeGreaterThan(0);
+
+      // ── Cheaper: fewer/cheaper snapshot captures on resim frames. ──
+      // Legacy captures twice per resim frame (pre-step + dead re-capture);
+      // optimized captures once. Compare snapshot-capture wall-clock on resim frames.
+      const capOn = (run: RunResult) =>
+        run.samples.filter((s) => (s.resimPasses ?? 0) > 0)
+          .reduce((a, s) => a + (s.snapshotCaptureMs ?? 0), 0);
+      const optCap = capOn(optimized);
+      const legCap = capOn(legacy);
+      console.log('\n  [Lever #2: defer redundant resim snapshot]');
+      console.log(`    resim frames: ${resimFrames}   trajectory divergence: ${d.maxPosDelta} m (identical)`);
+      console.log(`    snapshotCapture on resim frames: optimized ${optCap.toFixed(2)}ms vs legacy ${legCap.toFixed(2)}ms ` +
+        `(${legCap > 0 ? ((1 - optCap / legCap) * 100).toFixed(0) : '0'}% less)`);
+      // Optimized does strictly less snapshot work (allow equality only if the
+      // capture timer is below the clock's resolution on a tiny scene).
+      expect(optCap).toBeLessThanOrEqual(legCap);
+    }, 90_000);
   });
 
   // ── B. Resim cost lever (quantify the "second physics pass") ────────────────
