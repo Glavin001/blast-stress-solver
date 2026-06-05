@@ -90,6 +90,19 @@ void ext_stress_solver_add_force(ExtStressSolverHandle* handle,
                                  const StressVec3* local_force,
                                  uint32_t mode);
 
+// Batched external-force injection. Applies `count` forces in a single FFI
+// crossing, mirroring ext_stress_solver_add_force for each entry. The parallel
+// arrays are laid out as: node_indices[i] -> input node index; local_positions
+// and local_forces -> flat [x, y, z] triples (offset 3*i). `mode` is shared by
+// all entries. Null position/force arrays are treated as all-zero. Returns the
+// number of entries processed.
+uint32_t ext_stress_solver_add_all_forces(ExtStressSolverHandle* handle,
+                                          const uint32_t* node_indices,
+                                          const float* local_positions,
+                                          const float* local_forces,
+                                          uint32_t count,
+                                          uint32_t mode);
+
 void ext_stress_solver_add_gravity(ExtStressSolverHandle* handle,
                                    const StressVec3* local_gravity);
 

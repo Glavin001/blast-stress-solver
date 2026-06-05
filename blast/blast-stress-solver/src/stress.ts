@@ -661,6 +661,17 @@ class ExtStressSolver implements ExtStressSolverType {
   /** Cached presence of the batched-gravity WASM export (older runtimes may
    *  predate it); resolved lazily on first use. `undefined` = not yet probed. */
   _batchedGravitySupported?: boolean;
+  /** Persistent WASM-heap scratch buffers for {@link addAllForces}: one u32 node
+   *  index plus two xyz float triples (position, force) per slot. Grown on
+   *  demand so a whole frame's contact forces cross the FFI boundary once. */
+  _forceBatchIdxPtr = 0;
+  _forceBatchPosPtr = 0;
+  _forceBatchVecPtr = 0;
+  /** Number of force slots the batch scratch buffers can hold (0 = unallocated). */
+  _forceBatchCapacity = 0;
+  /** Cached presence of the batched-force WASM export; resolved lazily on first
+   *  use. `undefined` = not yet probed. */
+  _batchedForcesSupported?: boolean;
 
   constructor(module: any, memory: ModuleMemory, sizes: RuntimeSizes, description: ExtStressSolverDescription) {
     if (!description) throw new Error('ExtStressSolver description is required');
@@ -727,6 +738,10 @@ class ExtStressSolver implements ExtStressSolverType {
     if (this._forcePtr) { this.memory.free(this._forcePtr); this._forcePtr = 0 as any; }
     if (this._torquePtr) { this.memory.free(this._torquePtr); this._torquePtr = 0 as any; }
     if (this._actorRotPtr) { this.memory.free(this._actorRotPtr); this._actorRotPtr = 0 as any; }
+    if (this._forceBatchIdxPtr) { this.memory.free(this._forceBatchIdxPtr); this._forceBatchIdxPtr = 0; }
+    if (this._forceBatchPosPtr) { this.memory.free(this._forceBatchPosPtr); this._forceBatchPosPtr = 0; }
+    if (this._forceBatchVecPtr) { this.memory.free(this._forceBatchVecPtr); this._forceBatchVecPtr = 0; }
+    this._forceBatchCapacity = 0;
   }
 
   setSettings(settings: ExtStressSolverSettings): void {
@@ -804,6 +819,59 @@ class ExtStressSolver implements ExtStressSolverType {
       [this.handle, g.x, g.y, g.z, count > 0 ? this._actorRotPtr : 0, count >>> 0],
     ) >>> 0;
     return applied;
+  }
+
+  /** True when the underlying WASM runtime exposes the batched-force entry point
+   *  ({@link addAllForces}). Older runtimes (built before this export was added)
+   *  return false so callers can fall back to per-call {@link addForce}. */
+  supportsBatchedForces(): boolean {
+    if (this._batchedForcesSupported === undefined) {
+      this._batchedForcesSupported =
+        typeof this.module['_ext_stress_solver_add_all_forces'] === 'function';
+    }
+    return this._batchedForcesSupported;
+  }
+
+  /** Grow the batch scratch buffers so they can hold at least `slots` forces. */
+  private _ensureForceBatchCapacity(slots: number): void {
+    if (slots <= this._forceBatchCapacity) return;
+    // Geometric growth keeps reallocation rare across frames.
+    let cap = this._forceBatchCapacity > 0 ? this._forceBatchCapacity : 64;
+    while (cap < slots) cap *= 2;
+    if (this._forceBatchIdxPtr) this.memory.free(this._forceBatchIdxPtr);
+    if (this._forceBatchPosPtr) this.memory.free(this._forceBatchPosPtr);
+    if (this._forceBatchVecPtr) this.memory.free(this._forceBatchVecPtr);
+    this._forceBatchIdxPtr = this.memory.alloc(cap * 4); // u32 per slot
+    this._forceBatchPosPtr = this.memory.alloc(cap * 3 * 4); // xyz f32 per slot
+    this._forceBatchVecPtr = this.memory.alloc(cap * 3 * 4);
+    this._forceBatchCapacity = cap;
+  }
+
+  /** Apply many external forces in a single FFI crossing, mirroring
+   *  {@link addForce} for each entry. `nodeIndices[i]` receives the force at
+   *  `positions[3i..3i+3]` with vector `forces[3i..3i+3]` (body-local). All
+   *  entries share `mode`. Returns the number of forces submitted, or `-1` when
+   *  the runtime predates the batched export (caller should fall back). */
+  addAllForces(nodeIndices: Uint32Array, positions: Float32Array, forces: Float32Array, count: number, mode: ExtForceModeValue = ExtForceMode.Force): number {
+    if (!this.handle) return 0;
+    if (!this.supportsBatchedForces()) return -1;
+    const n = Math.min(count >>> 0, nodeIndices.length, Math.floor(positions.length / 3), Math.floor(forces.length / 3));
+    if (n <= 0) return 0;
+
+    this._ensureForceBatchCapacity(n);
+    // Bulk-copy the three parallel arrays into the persistent WASM heap scratch
+    // (re-reading the heap views each call so they stay valid across growth).
+    (this.module.HEAPU32 as Uint32Array).set(nodeIndices.subarray(0, n), this._forceBatchIdxPtr >>> 2);
+    const heapF32 = this.module.HEAPF32 as Float32Array;
+    heapF32.set(positions.subarray(0, n * 3), this._forceBatchPosPtr >>> 2);
+    heapF32.set(forces.subarray(0, n * 3), this._forceBatchVecPtr >>> 2);
+
+    return this.module.ccall(
+      'ext_stress_solver_add_all_forces',
+      'number',
+      ['number', 'number', 'number', 'number', 'number', 'number'],
+      [this.handle, this._forceBatchIdxPtr, this._forceBatchPosPtr, this._forceBatchVecPtr, n >>> 0, mode >>> 0],
+    ) >>> 0;
   }
 
   update(): void { if (!this.handle) return; this.module.ccall('ext_stress_solver_update', null, ['number'], [this.handle]); }

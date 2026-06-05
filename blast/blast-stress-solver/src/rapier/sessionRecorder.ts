@@ -116,6 +116,13 @@ export const TIMING_FIELDS = [
   'solverUpdateMs',
   'solverGravityInjectMs',
   'solverContactInjectMs',
+  // contactInject* break solverContactInjectMs into resolve (Rapier round-trips +
+  // force rotation), splash-grid rebuild, splash neighbour search, and submit
+  // (the WASM addForce FFI + C++ per-force work). They sum to solverContactInjectMs.
+  'contactInjectResolveMs',
+  'contactInjectGridMs',
+  'contactInjectSplashMs',
+  'contactInjectSubmitMs',
   'solverSolveMs',
   // contacts / forces
   'contactDrainMs',
