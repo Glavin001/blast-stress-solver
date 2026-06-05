@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, mkdirSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -107,6 +107,24 @@ const enableProfiling = process.env.EMCC_PROFILING === '1';
 // ext_stress_solver_update), at the cost of ~20s extra link time. Disable with
 // EMCC_NO_LTO=1 if iterating locally and only the JS bridge changed.
 const enableLTO = process.env.EMCC_NO_LTO !== '1';
+// Opt-in for the experimental simde-routed AVX path. Off by default — the
+// scalar CGNR + clang autovec (`-O3 -msimd128`) is what every shipped tests
+// has run against. Enable with `EMCC_USE_SIMD=1` to build the alternate path
+// (anglin6.h / coupling.h / inertia.h `<__m128>` specializations compiled with
+// `__m256` intrinsics rerouted to wasm-simd128 via simde + an FMA macro
+// override).  Build only — selecting the SIMD path at runtime is the
+// `s_use_simd` flag in stress.cpp, which is true when this define is set.
+const enableSimd = process.env.EMCC_USE_SIMD === '1';
+const simdeIncludeDir = resolve(blastRoot, 'deps/simde');
+
+if (enableSimd && !existsSync(resolve(simdeIncludeDir, 'simde/x86/avx.h'))) {
+  console.error(
+    '[blast-stress-solver] EMCC_USE_SIMD=1 requires the simde submodule. ' +
+      `Headers not found under ${simdeIncludeDir}. Run:\n` +
+      '  git submodule update --init --recursive blast/deps/simde'
+  );
+  process.exit(1);
+}
 
 // EXPORTED_RUNTIME_METHODS only covers JS helpers — HEAPU8/HEAPU32/HEAPF32 are
 // auto-attached to Module by emscripten's runtime when ALLOW_MEMORY_GROWTH=1
@@ -160,8 +178,24 @@ const commonArgs = [
   '-I' + sdkStressDir,
   '-I' + sdkAuthoringDir,
   '-I' + sdkAuthoringCommonDir,
-  '-DSTRESS_SOLVER_FORCE_SCALAR=1',
-  '-DSTRESS_SOLVER_NO_SIMD=1',
+  ...(enableSimd
+    ? [
+        // SIMD path: compile the vendored __m256 AngLin6 kernels via simde →
+        // wasm-simd128. STRESS_SOLVER_WASM_SIMD turns on the simde branch in
+        // simd/simd.h (which redefines _mm{_256_,}fmadd_ps to v128 macros) and
+        // flips StressProcessor::s_use_simd to true so the runtime picks the
+        // CGNR_SIMD code path instead of CGNR_SISD.
+        '-I' + simdeIncludeDir,
+        '-DSTRESS_SOLVER_WASM_SIMD=1',
+      ]
+    : [
+        // Scalar path (default): the __m256 specialization in anglin6.h /
+        // coupling.h / inertia.h won't compile under emscripten (no native
+        // __m256 / _mm_fmadd_ps), so gate it off and let the autovectorizer
+        // do its job on the scalar AngLin6Ops<float> path.
+        '-DSTRESS_SOLVER_FORCE_SCALAR=1',
+        '-DSTRESS_SOLVER_NO_SIMD=1',
+      ]),
   '-D__linux__=1',
   '-D__arm__=1',
   '-DCOMPILE_VECTOR_INTRINSICS=0',
@@ -170,9 +204,10 @@ const commonArgs = [
   '-O3',
   // -msimd128 enables WASM SIMD auto-vectorization for the scalar math loops in
   // anglin6.h / inertia.h / coupling.h (the SISD AngLin6Ops path; the vendored
-  // __m256 specializations are gated off behind STRESS_SOLVER_NO_SIMD because
-  // emscripten 3.1.51 has no __m256/_mm_fmadd_ps). -msse4.2 widens the intrinsic
-  // pool clang can fuse loads/shuffles into when vectorizing the same scalar code.
+  // __m256 specializations are normally gated off behind STRESS_SOLVER_NO_SIMD
+  // because emscripten 3.1.51 has no __m256/_mm_fmadd_ps).  When EMCC_USE_SIMD=1
+  // we instead route them through simde, which expands them to v128 ops.
+  // -msse4.2 widens the intrinsic pool clang can fuse loads/shuffles into.
   '-msimd128',
   '-msse4.2',
   // Whole-program / no-runtime-overhead settings. The C++ here doesn't throw,

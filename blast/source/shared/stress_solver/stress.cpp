@@ -58,6 +58,12 @@ static inline bool angLin6Equal(const AngLin6& a, const AngLin6& b)
 #if defined(STRESS_SOLVER_FORCE_SCALAR)
 const bool
 StressProcessor::s_use_simd = false;
+#elif defined(STRESS_SOLVER_WASM_SIMD)
+// WASM build with simde-routed AVX kernels: wasm-simd128 is required by the
+// runtime (we always pass -msimd128) and there is no device feature to probe
+// from inside the sandbox, so SIMD is unconditionally on for this configuration.
+const bool
+StressProcessor::s_use_simd = true;
 #elif defined(STRESS_SOLVER_NO_DEVICE_QUERY)
 const bool
 StressProcessor::s_use_simd = false;
