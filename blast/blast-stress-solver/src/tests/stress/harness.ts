@@ -61,6 +61,7 @@ export interface CoreLike {
     settledBondFraction: number;
   };
   getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
+  setIslandSolver?: (opts: { enabled?: boolean; skipSettled?: boolean }) => void;
   dispose(): void;
 }
 
@@ -75,6 +76,11 @@ export interface RunOptions {
   impactPlan?: ImpactEvent[];
   postImpactFrames?: number;
   dt?: number;
+  /** Apply `core.setIslandSolver(...)` right after build (A/B the island-aware solve). */
+  islandSolver?: { enabled?: boolean; skipSettled?: boolean };
+  /** Record `getActiveBondsCount()` after every step for a per-frame parity trace.
+   *  Adds a fixed per-step cost to BOTH arms of an A/B, so relative timing stays fair. */
+  trackBondTrajectory?: boolean;
 }
 
 export interface ScenarioResult {
@@ -89,6 +95,8 @@ export interface ScenarioResult {
   samples: CoreProfilerSample[];
   windows: { warmup: [number, number]; impact: [number, number]; post: [number, number] };
   island?: { total: number; skippedMean: number; settledNodeFracMean: number };
+  /** Per-frame active-bond count (only when trackBondTrajectory was set). */
+  bondTrajectory?: number[];
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
@@ -101,14 +109,16 @@ const DEFAULT_CORE_OPTS: Record<string, unknown> = {
 };
 
 export async function runStressScenario(opts: RunOptions): Promise<ScenarioResult> {
-  const { name, scenario, buildCore, coreOpts = {}, warmupFrames = 60, impactPlan = [], postImpactFrames = 180, dt = 1 / 60 } = opts;
+  const { name, scenario, buildCore, coreOpts = {}, warmupFrames = 60, impactPlan = [], postImpactFrames = 180, dt = 1 / 60, islandSolver, trackBondTrajectory = false } = opts;
 
   const samples: CoreProfilerSample[] = [];
+  const bondTrajectory: number[] = [];
 
   const setupStart = now();
   const core = await buildCore({ ...DEFAULT_CORE_OPTS, ...coreOpts, scenario });
   const setupMs = now() - setupStart;
 
+  if (islandSolver) core.setIslandSolver?.(islandSolver);
   core.setProfiler({ enabled: true, onSample: (s) => samples.push(s) });
 
   const bondsInitial = core.getActiveBondsCount();
@@ -119,6 +129,7 @@ export async function runStressScenario(opts: RunOptions): Promise<ScenarioResul
     if (crashed) return;
     try {
       core.step(dt);
+      if (trackBondTrajectory) bondTrajectory.push(core.getActiveBondsCount());
     } catch (err) {
       crashed = true;
       crashFrame = frame;
@@ -197,6 +208,7 @@ export async function runStressScenario(opts: RunOptions): Promise<ScenarioResul
     island: islandSampleCount
       ? { total: islandTotal, skippedMean: islandSkippedSum / islandSampleCount, settledNodeFracMean: settledNodeFracSum / islandSampleCount }
       : undefined,
+    bondTrajectory: trackBondTrajectory ? bondTrajectory : undefined,
   };
 }
 
@@ -350,6 +362,20 @@ export function printReport(results: ScenarioResult[]): void {
       const cells = rank.scalingByBodies.map((b) => `${b.bodiesAtLeast}+:${b.meanTotalMs.toFixed(1)}ms(${b.frames}f)`).join('  ');
       log(`  frame cost vs bodies: ${cells}`);
     }
+    // rapierStepMs context: what is Rapier actually stepping?
+    const rs = rapierStepContext(win.length ? win : r.samples);
+    if (rs.meanAwake > 0 || rs.meanColliders > 0) {
+      log(`  rapierStep context: awake bodies mean=${rs.meanAwake.toFixed(0)} (max ${rs.maxAwake})  colliders mean=${rs.meanColliders.toFixed(0)}`);
+      if (rs.stepByAwake.length > 1) {
+        const cells = rs.stepByAwake.map((b) => `${b.awakeAtLeast}+:${b.meanStepMs.toFixed(2)}ms(${b.frames}f)`).join('  ');
+        log(`  rapierStepMs vs awake bodies: ${cells}`);
+      }
+    }
+    // Island-aware solve activity (only when the island solver ran).
+    const ia = islandActivity(win.length ? win : r.samples);
+    if (ia) {
+      log(`  island solve: total=${ia.meanTotal.toFixed(0)}  solved/frame=${ia.meanSolved.toFixed(1)}  skipped/frame=${ia.meanSkipped.toFixed(1)} (${pct(ia.meanTotal > 0 ? ia.meanSkipped / ia.meanTotal : 0)} skipped)`);
+    }
   }
 
   // Cross-scenario summary.
@@ -366,13 +392,62 @@ export function printReport(results: ScenarioResult[]): void {
   log('='.repeat(92) + '\n');
 }
 
+// ── rapierStepMs / island context (drivers of the two dominant phases) ────────
+export interface RapierStepContext {
+  meanAwake: number;
+  maxAwake: number;
+  meanColliders: number;
+  /** Mean rapierStepMs bucketed by awake-body count — reveals whether the Rapier
+   *  step cost tracks awake bodies (=> sleeping/damping helps) more than total. */
+  stepByAwake: Array<{ awakeAtLeast: number; frames: number; meanStepMs: number }>;
+}
+
+export function rapierStepContext(samples: CoreProfilerSample[]): RapierStepContext {
+  const awake = samples.map((s) => (s as { rapierAwakeBodyCount?: number }).rapierAwakeBodyCount ?? 0);
+  const colliders = samples.map((s) => (s as { rapierColliderCount?: number }).rapierColliderCount ?? 0);
+  const buckets = [0, 25, 50, 100, 200, 400, 800, 1600];
+  const stepByAwake = buckets
+    .map((threshold, i) => {
+      const next = buckets[i + 1] ?? Infinity;
+      const inBucket = samples.filter((s) => {
+        const a = (s as { rapierAwakeBodyCount?: number }).rapierAwakeBodyCount ?? 0;
+        return a >= threshold && a < next;
+      });
+      return { awakeAtLeast: threshold, frames: inBucket.length, meanStepMs: computeStats(inBucket.map((s) => field(s, 'rapierStepMs'))).mean };
+    })
+    .filter((b) => b.frames > 0);
+  const awakeStats = computeStats(awake);
+  return { meanAwake: awakeStats.mean, maxAwake: awakeStats.max, meanColliders: computeStats(colliders).mean, stepByAwake };
+}
+
+export interface IslandActivity {
+  meanTotal: number;
+  meanSolved: number;
+  meanSkipped: number;
+}
+
+/** Per-frame island-solve activity from the profiler (only populated when the
+ *  island solver was enabled). Returns null otherwise. */
+export function islandActivity(samples: CoreProfilerSample[]): IslandActivity | null {
+  const withIsland = samples.filter((s) => (s as { islandSolveTotal?: number }).islandSolveTotal != null);
+  if (!withIsland.length) return null;
+  return {
+    meanTotal: computeStats(withIsland.map((s) => (s as { islandSolveTotal?: number }).islandSolveTotal ?? 0)).mean,
+    meanSolved: computeStats(withIsland.map((s) => (s as { islandSolveCount?: number }).islandSolveCount ?? 0)).mean,
+    meanSkipped: computeStats(withIsland.map((s) => (s as { islandsSkipped?: number }).islandsSkipped ?? 0)).mean,
+  };
+}
+
 // ── Machine-readable report ───────────────────────────────────────────────────
 export function toJsonReport(results: ScenarioResult[]): unknown {
   return {
     generatedAt: new Date().toISOString(),
     scenarios: results.map((r) => {
       const win = impactSamples(r);
-      const rank = rankPhases(win.length ? win : r.samples);
+      const samplesForReport = win.length ? win : r.samples;
+      const rank = rankPhases(samplesForReport);
+      const rs = rapierStepContext(samplesForReport);
+      const ia = islandActivity(samplesForReport);
       return {
         name: r.name,
         nodeCount: r.nodeCount,
@@ -392,9 +467,142 @@ export function toJsonReport(results: ScenarioResult[]): unknown {
           ranked: rank.ranked.map((p) => ({ phase: p.phase, share: +p.share.toFixed(4), sumMs: +p.sum.toFixed(2), meanMs: +p.mean.toFixed(4), p95Ms: +p.p95.toFixed(4), maxMs: +p.max.toFixed(3) })),
           resim: { initialPassSumMs: +rank.initialPassMs.sum.toFixed(2), resimSumMs: +rank.resimMs.sum.toFixed(2) },
           scalingByBodies: rank.scalingByBodies.map((b) => ({ ...b, meanTotalMs: +b.meanTotalMs.toFixed(3) })),
+          rapierStep: { meanAwakeBodies: +rs.meanAwake.toFixed(1), maxAwakeBodies: rs.maxAwake, meanColliders: +rs.meanColliders.toFixed(1), stepByAwake: rs.stepByAwake.map((b) => ({ ...b, meanStepMs: +b.meanStepMs.toFixed(3) })) },
+          islandActivity: ia ? { meanTotal: +ia.meanTotal.toFixed(1), meanSolved: +ia.meanSolved.toFixed(1), meanSkipped: +ia.meanSkipped.toFixed(1) } : null,
         },
       };
     }),
+  };
+}
+
+// ── A/B comparison (e.g. island-aware solve on vs off) ────────────────────────
+export interface ABParity {
+  /** Exact match of the final active-bond count (the strongest single signal). */
+  bondsFinalMatch: boolean;
+  baselineBondsFinal: number;
+  treatmentBondsFinal: number;
+  baselineMaxBodies: number;
+  treatmentMaxBodies: number;
+  /** Max |Δ| in rigid-body count per frame across the full run (0 = identical path). */
+  bodyTrajectoryMaxDiff: number;
+  /** Max |Δ| in active-bond count per frame (only if both arms tracked it). */
+  bondTrajectoryMaxDiff: number | null;
+  framesCompared: number;
+}
+
+export interface ABPhaseDelta {
+  phase: string;
+  baselineSumMs: number;
+  treatmentSumMs: number;
+  /** baseline / treatment over the impact window. >1 = treatment faster. */
+  speedup: number;
+}
+
+export interface ABComparison {
+  label: string;
+  baseline: ScenarioResult;
+  treatment: ScenarioResult;
+  phases: ABPhaseDelta[];
+  /** Whole-frame speedup over the impact window (baseline mean / treatment mean). */
+  frameSpeedup: number;
+  parity: ABParity;
+}
+
+function sumField(samples: CoreProfilerSample[], key: string): number {
+  return samples.reduce((a, s) => a + field(s, key), 0);
+}
+
+/** Compare two runs of the same scenario over their impact windows. `phases` lists
+ *  the leaf phases to break out (the rest are summarized by frame speedup). */
+export function compareAB(label: string, baseline: ScenarioResult, treatment: ScenarioResult, phases: string[] = ['solverSolveMs', 'rapierStepMs', 'snapshotCaptureMs', 'snapshotRestoreMs']): ABComparison {
+  const bWin = impactSamples(baseline);
+  const tWin = impactSamples(treatment);
+  const phaseDeltas: ABPhaseDelta[] = phases.map((phase) => {
+    const baselineSumMs = sumField(bWin, phase);
+    const treatmentSumMs = sumField(tWin, phase);
+    return { phase, baselineSumMs, treatmentSumMs, speedup: treatmentSumMs > 0 ? baselineSumMs / treatmentSumMs : Infinity };
+  });
+  const bMean = computeStats(bWin.map((s) => field(s, 'totalMs'))).mean;
+  const tMean = computeStats(tWin.map((s) => field(s, 'totalMs'))).mean;
+
+  // Parity: compare per-frame body counts (and bonds, if tracked) over the common length.
+  const n = Math.min(baseline.samples.length, treatment.samples.length);
+  let bodyTrajectoryMaxDiff = 0;
+  for (let i = 0; i < n; i++) {
+    bodyTrajectoryMaxDiff = Math.max(bodyTrajectoryMaxDiff, Math.abs((baseline.samples[i].rigidBodies ?? 0) - (treatment.samples[i].rigidBodies ?? 0)));
+  }
+  let bondTrajectoryMaxDiff: number | null = null;
+  if (baseline.bondTrajectory && treatment.bondTrajectory) {
+    const m = Math.min(baseline.bondTrajectory.length, treatment.bondTrajectory.length);
+    bondTrajectoryMaxDiff = 0;
+    for (let i = 0; i < m; i++) bondTrajectoryMaxDiff = Math.max(bondTrajectoryMaxDiff, Math.abs(baseline.bondTrajectory[i] - treatment.bondTrajectory[i]));
+  }
+
+  return {
+    label,
+    baseline,
+    treatment,
+    phases: phaseDeltas,
+    frameSpeedup: tMean > 0 ? bMean / tMean : Infinity,
+    parity: {
+      bondsFinalMatch: baseline.bondsFinal === treatment.bondsFinal,
+      baselineBondsFinal: baseline.bondsFinal,
+      treatmentBondsFinal: treatment.bondsFinal,
+      baselineMaxBodies: baseline.maxRigidBodies,
+      treatmentMaxBodies: treatment.maxRigidBodies,
+      bodyTrajectoryMaxDiff,
+      bondTrajectoryMaxDiff,
+      framesCompared: n,
+    },
+  };
+}
+
+export function printABReport(cmp: ABComparison): void {
+  const log = (...a: unknown[]) => console.log(...a);
+  log('\n' + '='.repeat(92));
+  log(`  A/B COMPARISON — ${cmp.label}`);
+  log('='.repeat(92));
+  log(`  baseline:  ${cmp.baseline.name}  (islands total=${cmp.baseline.island?.total ?? 0}, meanSkipped/frame=${(cmp.baseline.island?.skippedMean ?? 0).toFixed(1)})`);
+  log(`  treatment: ${cmp.treatment.name}  (islands total=${cmp.treatment.island?.total ?? 0}, meanSkipped/frame=${(cmp.treatment.island?.skippedMean ?? 0).toFixed(1)})`);
+  log('');
+  log(`  ${'phase'.padEnd(22)} ${'baseline sum'.padStart(13)} ${'treatment sum'.padStart(14)} ${'speedup'.padStart(9)}`);
+  log('  ' + '-'.repeat(60));
+  for (const p of cmp.phases) {
+    log(`  ${p.phase.padEnd(22)} ${fmt(p.baselineSumMs, 11)}ms ${fmt(p.treatmentSumMs, 12)}ms ${(p.speedup).toFixed(2).padStart(8)}x`);
+  }
+  log('');
+  log(`  whole-frame speedup (impact window): ${cmp.frameSpeedup.toFixed(2)}x  ${cmp.frameSpeedup >= 1 ? '(treatment faster)' : '(treatment SLOWER)'}`);
+  log('');
+  const p = cmp.parity;
+  // Structural parity = the destruction itself: which bonds break, and when. This is
+  // what "looks the same" means. Transient rigid-body count can still jitter by a few
+  // (debris sleep/cleanup flips a threshold within solver tolerance) without any bond
+  // breaking differently — that is incidental, not a behavior change.
+  const fracturesIdentical = p.bondsFinalMatch && (p.bondTrajectoryMaxDiff === null || p.bondTrajectoryMaxDiff === 0);
+  const bitIdentical = fracturesIdentical && p.bodyTrajectoryMaxDiff === 0;
+  log('  PARITY (behavior must be preserved):');
+  log(`    final bonds:      baseline=${p.baselineBondsFinal}  treatment=${p.treatmentBondsFinal}  ${p.bondsFinalMatch ? 'MATCH ✓' : 'MISMATCH ✗'}`);
+  log(`    bond trajectory:  max |Δ|/frame = ${p.bondTrajectoryMaxDiff === null ? '(not tracked)' : p.bondTrajectoryMaxDiff}  ${fracturesIdentical ? '(fractures identical ✓)' : '(FRACTURES DIVERGE ✗)'}`);
+  log(`    max bodies:       baseline=${p.baselineMaxBodies}  treatment=${p.treatmentMaxBodies}`);
+  log(`    body trajectory:  max |Δ|/frame = ${p.bodyTrajectoryMaxDiff} over ${p.framesCompared} frames`);
+  if (bitIdentical) {
+    log('    => BIT-IDENTICAL observable behavior ✓ — speedup is free.');
+  } else if (fracturesIdentical) {
+    log(`    => DESTRUCTION IDENTICAL ✓ (same bonds break, same frames). Rigid-body count jitters by up to ${p.bodyTrajectoryMaxDiff} (transient debris/sleep bookkeeping within solver tolerance) — structural outcome unchanged.`);
+  } else {
+    log('    => FRACTURES DIVERGE ✗ — different bonds break; do NOT adopt without investigation.');
+  }
+  log('='.repeat(92) + '\n');
+}
+
+export function abToJsonReport(cmp: ABComparison): unknown {
+  return {
+    label: cmp.label,
+    frameSpeedup: +cmp.frameSpeedup.toFixed(3),
+    phases: cmp.phases.map((p) => ({ phase: p.phase, baselineSumMs: +p.baselineSumMs.toFixed(2), treatmentSumMs: +p.treatmentSumMs.toFixed(2), speedup: +p.speedup.toFixed(3) })),
+    parity: cmp.parity,
+    baseline: { name: cmp.baseline.name, bondsFinal: cmp.baseline.bondsFinal, maxBodies: cmp.baseline.maxRigidBodies, islandTotal: cmp.baseline.island?.total ?? 0 },
+    treatment: { name: cmp.treatment.name, bondsFinal: cmp.treatment.bondsFinal, maxBodies: cmp.treatment.maxRigidBodies, islandTotal: cmp.treatment.island?.total ?? 0, meanIslandsSkipped: +(cmp.treatment.island?.skippedMean ?? 0).toFixed(2) },
   };
 }
 

@@ -286,6 +286,20 @@ export type CoreProfilerSample = {
   bodyColliderCountAvg?: number | null;
   bodyColliderCountMedian?: number | null;
   bodyColliderCountP95?: number | null;
+  // ── rapierStepMs context (cheap counters that explain the Rapier step cost) ──
+  /** Total colliders in the Rapier world this frame. */
+  rapierColliderCount?: number;
+  /** Awake (non-sleeping) dynamic bodies — the bodies Rapier actually integrates;
+   *  rapierStepMs tracks this far more than the total body count, since sleeping
+   *  bodies are nearly free. */
+  rapierAwakeBodyCount?: number;
+  // ── island-aware solve activity (when the island solver is enabled) ──
+  /** Disconnected components the solver partitioned the graph into last solve. */
+  islandSolveTotal?: number;
+  /** Islands the solver actually solved this frame (>= ...skipped). */
+  islandSolveCount?: number;
+  /** Settled islands the solver skipped this frame (skip-settled effectiveness). */
+  islandsSkipped?: number;
 };
 
 export type SplitChild = {

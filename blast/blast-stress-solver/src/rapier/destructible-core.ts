@@ -588,6 +588,23 @@ export async function buildDestructibleCore({
     return count;
   }
 
+  // Awake (non-sleeping) dynamic bodies — the set Rapier actually integrates each
+  // step. rapierStepMs tracks this much more closely than the total body count,
+  // since sleeping bodies are nearly free. Only called under the profiler guard.
+  function countAwakeDynamicBodies(): number {
+    let count = 0;
+    try {
+      world.forEachRigidBody((body) => {
+        const b = body as RAPIER.RigidBody & { isDynamic?: () => boolean; isSleeping?: () => boolean };
+        const dynamic = typeof b.isDynamic === 'function' ? b.isDynamic() : !b.isFixed();
+        if (!dynamic) return;
+        if (typeof b.isSleeping === 'function' && b.isSleeping()) return;
+        count += 1;
+      });
+    } catch {}
+    return count;
+  }
+
   function buildColliderDescForNode(args: { nodeIndex: number; halfX: number; halfY: number; halfZ: number; isSupport: boolean }) {
     const { nodeIndex, halfX, halfY, halfZ, isSupport } = args;
     const builder = (scenario.colliderDescForNode && Array.isArray(scenario.colliderDescForNode)) ? (scenario.colliderDescForNode[nodeIndex] ?? null) : null;
@@ -2444,6 +2461,17 @@ export async function buildDestructibleCore({
         activeProfilerSample.bodyColliderCountAvg = bcs.avg;
         activeProfilerSample.bodyColliderCountMedian = bcs.median;
         activeProfilerSample.bodyColliderCountP95 = bcs.p95;
+      }
+      // rapierStepMs context: collider count + awake (integrated) dynamic bodies.
+      const colliderSet = (world as unknown as { colliders?: { len?: () => number } }).colliders;
+      if (typeof colliderSet?.len === 'function') activeProfilerSample.rapierColliderCount = colliderSet.len();
+      activeProfilerSample.rapierAwakeBodyCount = countAwakeDynamicBodies();
+      // Island-aware solve activity (cheap O(1) counters from the last solve).
+      if (islandSolverEnabled) {
+        const is = getIslandSolverStats();
+        activeProfilerSample.islandSolveTotal = solver.islandsTotal?.() ?? 0;
+        activeProfilerSample.islandSolveCount = is.islandCount;
+        activeProfilerSample.islandsSkipped = is.islandsSkipped;
       }
     }
 

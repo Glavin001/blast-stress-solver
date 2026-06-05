@@ -67,6 +67,7 @@
     "stress:medium": "node scripts/stress-city.mjs --medium",
     "stress:large": "node scripts/stress-city.mjs --large",
     "stress:json": "node scripts/stress-city.mjs --json",
+    "stress:island-ab": "node scripts/stress-city.mjs --ab-island",
     "sweep:high-rise": "node scripts/sweep-high-rise.mjs"
   },
   "devDependencies": {

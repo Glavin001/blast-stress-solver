@@ -44,6 +44,8 @@ const tier = has('--xl') ? 'xl' : has('--large') ? 'large' : has('--medium') ? '
 const only = (get('--scenario', '') || '').split(',').map((s) => s.trim()).filter(Boolean);
 const asJson = has('--json');
 const outFile = get('--out', null);
+// A/B the island-aware skip-settled solve vs the default whole-graph solve.
+const abIsland = has('--ab-island');
 
 // ── bundle the pure-TS suite (engine injected; three/rapier externalized) ─────
 const entry = resolve(here, '../src/tests/stress/runSuite.ts');
@@ -78,7 +80,7 @@ try {
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }
-const { runSuite, printReport, toJsonReport } = suite;
+const { runSuite, runIslandAB, printReport, toJsonReport, printABReport, abToJsonReport } = suite;
 
 // ── engine from dist (ESM build resolves the WASM URL cleanly in Node) ─────────
 const { buildDestructibleCore } = await import(resolve(distDir, 'rapier.js'));
@@ -90,27 +92,50 @@ if (asJson) {
   console.debug = () => {};
 }
 
-const results = await runSuite({
-  buildCore: buildDestructibleCore,
-  tier,
-  only,
-  onProgress: (name, i, total) => {
-    if (!asJson) console.error(`  [${i + 1}/${total}] ${name} ...`);
-  },
-});
+if (abIsland) {
+  const cmp = await runIslandAB({
+    buildCore: buildDestructibleCore,
+    tier,
+    scenario: only[0] || 'manyIslands',
+    onProgress: (label) => {
+      if (!asJson) console.error(`  ${label} ...`);
+    },
+  });
+  console.debug = origDebug;
+  console.warn = origWarn;
+  if (!asJson || outFile) printABReport(cmp);
+  if (asJson) {
+    const json = JSON.stringify(abToJsonReport(cmp), null, 2);
+    if (outFile) {
+      writeFileSync(resolve(process.cwd(), outFile), json);
+      console.error(`  wrote ${outFile}`);
+    } else {
+      console.log(json);
+    }
+  }
+} else {
+  const results = await runSuite({
+    buildCore: buildDestructibleCore,
+    tier,
+    only,
+    onProgress: (name, i, total) => {
+      if (!asJson) console.error(`  [${i + 1}/${total}] ${name} ...`);
+    },
+  });
 
-console.debug = origDebug;
-console.warn = origWarn;
+  console.debug = origDebug;
+  console.warn = origWarn;
 
-if (!asJson || outFile) {
-  printReport(results);
-}
-if (asJson) {
-  const json = JSON.stringify(toJsonReport(results), null, 2);
-  if (outFile) {
-    writeFileSync(resolve(process.cwd(), outFile), json);
-    console.error(`  wrote ${outFile}`);
-  } else {
-    console.log(json);
+  if (!asJson || outFile) {
+    printReport(results);
+  }
+  if (asJson) {
+    const json = JSON.stringify(toJsonReport(results), null, 2);
+    if (outFile) {
+      writeFileSync(resolve(process.cwd(), outFile), json);
+      console.error(`  wrote ${outFile}`);
+    } else {
+      console.log(json);
+    }
   }
 }

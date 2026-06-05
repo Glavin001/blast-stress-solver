@@ -18,7 +18,8 @@ import { fileURLToPath } from 'node:url';
 
 import { composeScenarios } from './stress/composeScenarios';
 import { buildCityScenario, CITY_SCENARIOS, CITY_SCENARIO_NAMES, mulberry32 } from './stress/cityScenario';
-import { runStressScenario, printReport, type BuildCore, type ScenarioResult } from './stress/harness';
+import { runStressScenario, printReport, printABReport, type BuildCore, type ScenarioResult } from './stress/harness';
+import { runIslandAB } from './stress/runSuite';
 import { buildTowerScenario } from '../scenarios/towerScenario';
 import { buildWallScenario } from '../scenarios/wallScenario';
 
@@ -138,6 +139,27 @@ describe.skipIf(!runtimeAvailable)('City destruction stress (requires WASM build
     if (!result.crashed && result.bondsFinal >= 0) {
       expect(result.bondsFinal).toBeLessThan(result.bondsInitial);
     }
+  }, 180_000);
+
+  it('island-aware skip-settled solve preserves destruction and cuts solve time on manyIslands', async () => {
+    await load();
+    const cmp = await runIslandAB({ buildCore: buildDestructibleCore, tier: 'small', scenario: 'manyIslands' });
+    printABReport(cmp);
+
+    // Behavior preservation is the hard constraint: the SAME bonds must break on the
+    // SAME frames (bit-identical bond trajectory + matching final bond count).
+    expect(cmp.parity.bondsFinalMatch).toBe(true);
+    expect(cmp.parity.bondTrajectoryMaxDiff).toBe(0);
+
+    // The island solver must actually engage and skip settled islands (otherwise the
+    // comparison is meaningless).
+    expect(cmp.treatment.island?.total ?? 0).toBeGreaterThan(0);
+    expect(cmp.treatment.island?.skippedMean ?? 0).toBeGreaterThan(0);
+
+    // And it should meaningfully cut the dominant phase (whole-graph CGNR solve).
+    // Driven by skipping ~40% of islands' solve work, so robust despite timing noise.
+    const solve = cmp.phases.find((p) => p.phase === 'solverSolveMs');
+    expect(solve?.speedup ?? 0).toBeGreaterThan(1.3);
   }, 180_000);
 
   afterAll(() => {
