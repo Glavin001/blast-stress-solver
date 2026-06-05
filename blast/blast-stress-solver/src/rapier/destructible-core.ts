@@ -1197,15 +1197,23 @@ export async function buildDestructibleCore({
     stopTiming(t0, 'contactDrainMs');
   }
 
-  function applyExternalForcesFromBuffer() {
+  // Apply the buffered external forces to the *current* body of each node, as an
+  // impulse (force × dt) on the body's contact point. Two reasons it's an impulse,
+  // not addForceAtPoint: (1) Rapier's addForce persists across steps and the core
+  // never resets it, so it would keep pushing; (2) we re-apply this on every
+  // resimulation pass (after the snapshot restore resets velocities) so a freed
+  // piece gets the impact the same tick it breaks off — re-applying an impulse
+  // after a velocity reset is exact and non-cumulative, whereas a force is not.
+  // The buffer is NOT cleared here; step() clears it once the whole tick is done.
+  function applyExternalForceImpulses(dt: number) {
     const t0 = startTiming();
     for (const pf of pendingExternalForces) {
       const chunk = chunks[pf.nodeIndex];
       if (!chunk || !chunk.active || chunk.bodyHandle == null) continue;
       const body = world.getRigidBody(chunk.bodyHandle);
       if (!body || body.isFixed()) continue;
-      body.addForceAtPoint(
-        { x: pf.force.x, y: pf.force.y, z: pf.force.z },
+      body.applyImpulseAtPoint(
+        { x: pf.force.x * dt, y: pf.force.y * dt, z: pf.force.z * dt },
         { x: pf.point.x, y: pf.point.y, z: pf.point.z },
         true,
       );
@@ -1213,7 +1221,6 @@ export async function buildDestructibleCore({
     if (activeProfilerSample) {
       activeProfilerSample.pendingExternalForces = pendingExternalForces.length;
     }
-    pendingExternalForces.length = 0;
     stopTiming(t0, 'externalForceMs');
   }
 
@@ -1640,6 +1647,29 @@ export async function buildDestructibleCore({
       }
     }
     stopTiming(splashT0, 'contactInjectSplashMs');
+
+    // Explicit external forces (applyExternalForce) are injected into the solver
+    // the same way contacts are — world→body-local rotation, ×stress-scale, at the
+    // node's local offset — so a *virtual* impact overstresses bonds and fractures
+    // exactly like a real contact. Re-run every pass (incl. resim) so the load is
+    // present whichever pass finally frees the piece. No splash: the primitive is
+    // a single-node force; radial/area shapes are composed by the caller.
+    for (const pf of pendingExternalForces) {
+      const chunk = chunks[pf.nodeIndex];
+      if (!chunk || !chunk.active || chunk.bodyHandle == null) continue;
+      const body = world.getRigidBody(chunk.bodyHandle);
+      if (!body) continue;
+      const rot = body.rotation();
+      const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
+      const fx = pf.force.x, fy = pf.force.y, fz = pf.force.z;
+      const lx = qw * qw * fx - 2 * qy * qw * fz + 2 * qz * qw * fy + qx * qx * fx - 2 * qy * qx * fy - 2 * qz * qx * fz - qz * qz * fx - qy * qy * fx
+        + 2 * qx * qy * fy + 2 * qx * qz * fz;
+      const ly = -2 * qw * qz * fx + qw * qw * fy + 2 * qw * qx * fz + 2 * qx * qy * fx + qy * qy * fy - 2 * qz * qy * fz - qx * qx * fy - qz * qz * fy
+        + 2 * qy * qz * fz;
+      const lz = 2 * qw * qy * fx - 2 * qw * qx * fy + qw * qw * fz + 2 * qx * qz * fx + 2 * qy * qz * fy + qz * qz * fz - qx * qx * fz - qy * qy * fz;
+      const hp = chunk.baseLocalOffset;
+      pushSolverForce(pf.nodeIndex, hp.x, hp.y, hp.z, lx * effectiveContactStressScale, ly * effectiveContactStressScale, lz * effectiveContactStressScale);
+    }
 
     // Submit the whole frame's contact forces (one FFI crossing on the fast path).
     const submitT0 = startTiming();
@@ -2344,7 +2374,7 @@ export async function buildDestructibleCore({
     cleanupDisabledColliders();
     stopTiming(preStepT0, 'preStepSweepMs');
 
-    applyExternalForcesFromBuffer();
+    applyExternalForceImpulses(clampedDt);
     spawnPendingProjectiles();
 
     if (resimulateOnFracture) {
@@ -2383,6 +2413,11 @@ export async function buildDestructibleCore({
         if (resimulateOnFracture) {
           restoreWorldSnapshot();
           captureWorldSnapshot();
+          // Re-apply external impacts to the (possibly newly-freed) current bodies
+          // before the resim step, so a piece that just broke off is pushed this
+          // same tick — the snapshot restore above reset velocities, so this is
+          // exact, not cumulative.
+          applyExternalForceImpulses(clampedDt);
           const rapierResimT0 = startTiming();
           world.step(eventQueue);
           stopTiming(rapierResimT0, 'rapierStepMs');
@@ -2410,6 +2445,10 @@ export async function buildDestructibleCore({
     flushColliderMigrations();
 
     cleanupExpiredProjectiles();
+
+    // External impacts are one-tick (like a contact): consumed by this step's
+    // physics + solver passes above, now cleared so they don't linger.
+    pendingExternalForces.length = 0;
 
     for (let ci = 0; ci < chunks.length; ci++) {
       const chunk = chunks[ci];
@@ -2650,6 +2689,22 @@ export async function buildDestructibleCore({
     } catch {}
   }
 
+  /**
+   * Register a virtual external force on a node for the next step — the primitive
+   * for non-contact impacts (explosions, wind, scripted shoves, …). It behaves
+   * like a real physical contact without needing a body to collide:
+   *  - Physics: applied to the node's current rigid body as an impulse (force × dt)
+   *    at `worldPoint` (no effect while the node is still on a fixed/bonded body).
+   *  - Stress solver: injected as a load (× contact-stress-scale) so bonds
+   *    overstress and the structure fractures, exactly like a contact force.
+   *  - Resim: if it causes a fracture, the impact is re-applied to the freed
+   *    pieces during the resimulation pass, so they break off AND fly the same
+   *    tick — no caller-side timing.
+   * It is a single-node primitive (one force at one point). Build radial/area
+   * "explosion" shapes on top by calling it per node. `worldForce` is a force in
+   * newtons held for the step (impulse = force × dt); pick its magnitude as you
+   * would a contact force.
+   */
   function applyExternalForce(nodeIndex: number, worldPoint: Vec3, worldForce: Vec3) {
     pendingExternalForces.push({ nodeIndex, point: worldPoint, force: worldForce });
   }

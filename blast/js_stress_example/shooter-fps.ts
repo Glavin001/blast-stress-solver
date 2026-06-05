@@ -101,24 +101,23 @@ type Transient = {
 
 const DEFAULT_BALL: BallParams = { radius: 0.35, mass: 1000, speed: 25 };
 
-// Peak solver force (Newtons) per unit of blast "strength", injected into the
-// stress solver so blasts overstress bonds and break the intact structure — the
-// same load path projectile impacts use. Tuned to the ~1e10 material scale the
-// destruction demos use; the Blast force slider scales it up/down.
-const BLAST_SOLVER_FORCE = 8e5;
+// Peak force (Newtons) per unit of blast "strength" applied to each in-range node
+// via the core's external-force primitive — which feeds both the physics engine
+// (impulse) and the stress solver (×contact scale → fracture) and rides resim, so
+// breaking bonds and flinging the freed pieces happens like a real contact. Tuned
+// to the ~1e10 material scale the destruction demos use; the Blast force slider
+// scales it up/down.
+const BLAST_FORCE = 2500;
 
 // A chunk caught in a blast, with its outward direction + falloff frozen at
 // detonation time (so a piece flies the right way whenever it finally breaks free).
 type BlastCandidate = { node: number; falloff: number; nx: number; ny: number; nz: number };
 
 type BlastField = {
-  cx: number; cy: number; cz: number;
   up: number;
-  solverForce: number; kick: number;
-  age: number; life: number; solverFrames: number;
+  force: number; // peak force (N) at the centre
+  life: number; // frames the blast keeps loading (sustains the fracture cascade)
   candidates: BlastCandidate[];
-  /** Body handles already kicked, so each freed piece gets exactly one impulse. */
-  kicked: Set<number>;
 };
 
 export function mountShooter(opts: ShooterOptions): ShooterHandle {
@@ -175,7 +174,6 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   const _ray = new THREE.Raycaster();
   const _ndc = new THREE.Vector2();
   const _q = new THREE.Quaternion();
-  const _qinv = new THREE.Quaternion();
   const _e = new THREE.Euler(0, 0, 0, 'YXZ');
   const _fwd = new THREE.Vector3();
   const _right = new THREE.Vector3();
@@ -695,60 +693,39 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     }
     if (!candidates.length) return;
     blastFields.push({
-      cx: center.x,
-      cy: center.y,
-      cz: center.z,
       up: cfg.blast.up,
-      solverForce: cfg.blast.strength * BLAST_SOLVER_FORCE, // peak Newtons at centre
-      kick: Math.min(cfg.blast.strength, 100) * 0.32, // peak Δv (m/s) at centre, applied once per piece
-      age: 0,
-      life: 45, // ~0.75 s: long enough for the fracture cascade to free every piece
-      solverFrames: 4, // sustain the fracture load for a few frames to propagate collapse
+      force: cfg.blast.strength * BLAST_FORCE, // peak force (N) at the centre
+      life: 2, // a short, contact-like pulse (sustained one extra frame for cascade)
       candidates,
-      kicked: new Set<number>(),
     });
   }
 
-  // Drive active blast fields: keep seeding bond stress, and give each piece a
-  // single outward impulse the moment it becomes a free dynamic body.
+  // Drive active blast fields. Each frame we hand every in-range node an outward
+  // force through the core's external-force primitive, which breaks the bonds
+  // (solver), flings the freed pieces (physics) and resolves both in one tick via
+  // resim — so the demo no longer pokes the solver or applies impulses itself.
   function updateBlastFields(core: DestructibleCore) {
     if (!blastFields.length) return;
     const world = core.world as RAPIER.World;
-    const solver = core.solver;
     for (let i = blastFields.length - 1; i >= 0; i--) {
       const f = blastFields[i];
-      const injectSolver = f.age < f.solverFrames;
-
       for (const c of f.candidates) {
         const chunk = core.chunks[c.node];
         if (!chunk || !chunk.active || chunk.destroyed || chunk.bodyHandle == null) continue;
         const body = world.getRigidBody(chunk.bodyHandle);
         if (!body) continue;
-
-        // Fracture pass: feed the outward load into the stress solver so bonds
-        // overstress and the structure comes apart (works on fixed bodies too).
-        if (injectSolver) {
-          const mag = f.solverForce * c.falloff;
-          _v2.set(c.nx * mag, c.ny * mag + mag * f.up, c.nz * mag);
-          const r = body.rotation();
-          _qinv.set(r.x, r.y, r.z, r.w).conjugate();
-          _v2.applyQuaternion(_qinv); // world force → body-local for the solver
-          try {
-            solver.addForce(c.node, chunk.baseLocalOffset, { x: _v2.x, y: _v2.y, z: _v2.z });
-          } catch { /* ignore */ }
-        }
-
-        // Kinetic pass: as soon as a piece is free (its own dynamic body), kick
-        // it outward once. This is what was missing — pieces freed a few frames
-        // after impact (bonded "grey" structure) now fly back, not just settle.
-        if (body.isDynamic() && !f.kicked.has(chunk.bodyHandle)) {
-          f.kicked.add(chunk.bodyHandle);
-          const j = body.mass() * f.kick * c.falloff;
-          body.applyImpulse({ x: c.nx * j, y: (c.ny + f.up) * j, z: c.nz * j }, true);
-        }
+        // Current world position of this chunk (so the impulse applies a realistic torque).
+        const t = body.translation();
+        const r = body.rotation();
+        _q.set(r.x, r.y, r.z, r.w);
+        _v.set(chunk.baseLocalOffset.x, chunk.baseLocalOffset.y, chunk.baseLocalOffset.z).applyQuaternion(_q);
+        const mag = f.force * c.falloff;
+        core.applyExternalForce(
+          c.node,
+          { x: t.x + _v.x, y: t.y + _v.y, z: t.z + _v.z },
+          { x: c.nx * mag, y: c.ny * mag + mag * f.up, z: c.nz * mag },
+        );
       }
-
-      f.age += 1;
       f.life -= 1;
       if (f.life <= 0) blastFields.splice(i, 1);
     }
