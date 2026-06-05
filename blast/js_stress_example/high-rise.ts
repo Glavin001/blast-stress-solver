@@ -45,6 +45,9 @@ const CONFIG = {
     // Voronoi-fracture the drywall infill walls (auto-bonded via WASM) instead of
     // the regular box grid. Heavier to build, but the walls shatter realistically.
     fractureWalls: false,
+    // Voronoi shards per concrete support pillar (column) storey-segment. 1 = solid
+    // box (default skeleton); >1 shatters each segment (auto-bonded via WASM).
+    pillarFractures: 2,
   },
   projectile: { radius: 0.6, mass: 2500, speed: 45 },
   solver: {
@@ -202,6 +205,7 @@ async function initScene() {
   // scenario is ignored). Slab divisions scale with the footprint so bigger buildings
   // keep ~3 m floor tiles instead of a few giant slabs.
   const b = CONFIG.building;
+  const fractureColumns = b.pillarFractures > 1;
   const opts: HighRiseOptions = {
     floorCount: b.floorCount,
     floorHeight: b.floorHeight,
@@ -212,8 +216,16 @@ async function initScene() {
     slabDivX: Math.max(4, Math.round(b.width / 3)),
     slabDivZ: Math.max(3, Math.round(b.depth / 3)),
   };
-  const scenario = b.fractureWalls
-    ? await buildHighRiseScenarioAsync({ ...opts, fractureInfill: true, bondMode: 'auto', pinata: pinata as any })
+  // Any fracturing (walls or pillars) needs the async builder + WASM auto-bonder.
+  const scenario = b.fractureWalls || fractureColumns
+    ? await buildHighRiseScenarioAsync({
+        ...opts,
+        fractureInfill: b.fractureWalls,
+        fractureColumns,
+        columnFragments: b.pillarFractures,
+        bondMode: 'auto',
+        pinata: pinata as any,
+      })
     : buildHighRiseScenario(opts);
 
   controls.target.set(defaults.camera.target.x, defaults.camera.target.y, defaults.camera.target.z);
@@ -322,6 +334,8 @@ bindSlider('cfg-width', CONFIG.building, 'width', (v) => v.toFixed(0) + ' m');
 bindSlider('cfg-depth', CONFIG.building, 'depth', (v) => v.toFixed(0) + ' m');
 bindSlider('cfg-columns-x', CONFIG.building, 'columnsX', (v) => v.toFixed(0));
 bindSlider('cfg-columns-z', CONFIG.building, 'columnsZ', (v) => v.toFixed(0));
+bindSlider('cfg-pillar-fractures', CONFIG.building, 'pillarFractures', (v) =>
+  v <= 1 ? 'solid' : v.toFixed(0) + ' shards');
 
 // Fracture-walls toggle: switches the drywall infill from boxes to Voronoi shards
 // (auto-bonded via WASM). Rebuilds immediately so the change is visible at once.

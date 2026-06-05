@@ -90,6 +90,17 @@ export type HighRiseOptions = {
    */
   infillFragmentsPerPanel?: number;
   /**
+   * Fracture the concrete support pillars (columns) into irregular Voronoi shards
+   * instead of one solid box per storey. Like `fractureInfill` this is only honored by
+   * the async builder (needs three-pinata) and pairs naturally with `bondMode: 'auto'`.
+   */
+  fractureColumns?: boolean;
+  /**
+   * Voronoi fragment count per column storey-segment when `fractureColumns` is on
+   * (default 2). 1 leaves the column as a single box.
+   */
+  columnFragments?: number;
+  /**
    * Pre-imported three-pinata module, forwarded to the fracturer. Required in browser
    * ESM environments where bare-specifier dynamic imports don't resolve.
    */
@@ -127,6 +138,8 @@ export const DEFAULT_HIGH_RISE_OPTIONS: Required<
     | 'transferMultiplier'
     | 'fractureInfill'
     | 'infillFragmentsPerPanel'
+    | 'fractureColumns'
+    | 'columnFragments'
     | 'pinata'
   >
 > & { bondMode: 'proximity' | 'auto' } = {
@@ -292,6 +305,10 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
   );
 
   // ── Columns: one chunk per storey at each grid position ───────────────────
+  // When `fractureColumns` is set, each storey-segment is Voronoi-shattered into
+  // `columnFragments` irregular shards (default 2) instead of a solid box; the shards
+  // keep the 'column' type so the strong column bond multipliers still apply.
+  const columnFragments = Math.max(1, Math.round(o.columnFragments ?? 2));
   for (let k = 0; k < floorCount; k++) {
     const yBottom = storeyBottomY(k);
     const yTop = storeyTopY(k);
@@ -299,15 +316,29 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
     const h = yTop - yBottom;
     for (const cx of colXs) {
       for (const cz of colZs) {
-        fragments.push(
-          ...subdivideBoxFragments({
-            center: { x: cx, y: cy, z: cz },
-            size: { x: columnSize, y: h, z: columnSize },
-            divisions: { x: 1, y: 1, z: 1 },
-            fragmentType: 'column',
-            density: concreteDensity,
-          }),
-        );
+        if (o.fractureColumns && columnFragments > 1) {
+          const geometry = new THREE.BoxGeometry(columnSize, h, columnSize, 1, 1, 1);
+          const shards = fractureGeometry(geometry, {
+            fragmentCount: columnFragments,
+            voronoiMode: '3D',
+            worldOffset: { x: cx, y: cy, z: cz },
+            pinata: o.pinata,
+          });
+          geometry.dispose();
+          for (const shard of shards) {
+            fragments.push({ ...shard, fragmentType: 'column', density: concreteDensity });
+          }
+        } else {
+          fragments.push(
+            ...subdivideBoxFragments({
+              center: { x: cx, y: cy, z: cz },
+              size: { x: columnSize, y: h, z: columnSize },
+              divisions: { x: 1, y: 1, z: 1 },
+              fragmentType: 'column',
+              density: concreteDensity,
+            }),
+          );
+        }
       }
     }
   }
@@ -479,7 +510,7 @@ function finalizeHighRiseScenario(
  * Voronoi-fractured infill and/or WASM auto-bonding use {@link buildHighRiseScenarioAsync}.
  */
 export function buildHighRiseScenario(options: HighRiseOptions = {}): ScenarioDesc {
-  const o = { ...DEFAULT_HIGH_RISE_OPTIONS, ...options, fractureInfill: false };
+  const o = { ...DEFAULT_HIGH_RISE_OPTIONS, ...options, fractureInfill: false, fractureColumns: false };
   if (o.bondMode === 'auto') {
     // Auto-bonding needs WASM (buildHighRiseScenarioAsync). The synchronous path here
     // falls back to proximity; we keep the option for API symmetry.
@@ -508,7 +539,7 @@ export function buildHighRiseScenario(options: HighRiseOptions = {}): ScenarioDe
 export async function buildHighRiseScenarioAsync(options: HighRiseOptions = {}): Promise<ScenarioDesc> {
   const o = { ...DEFAULT_HIGH_RISE_OPTIONS, ...options };
   // Fracturing is synchronous internally but needs the pinata module resolved first.
-  if (o.fractureInfill && !o.pinata) await ensurePinataLoaded();
+  if ((o.fractureInfill || o.fractureColumns) && !o.pinata) await ensurePinataLoaded();
   const collected = collectHighRiseFragments(o);
   const scenario = await buildScenarioFromFragmentsAsync(collected.fragments, {
     bondMode: o.bondMode,
