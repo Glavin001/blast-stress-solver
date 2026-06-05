@@ -485,9 +485,14 @@ export async function buildDestructibleCore({
   let world = new RAPIER.World({ x: 0, y: gravity, z: 0 });
   const eventQueue = new RAPIER.EventQueue(true);
 
+  // A scenario with no support nodes (no mass==0 anchors) is free-floating — nothing pins it to
+  // the world — so its root body must be DYNAMIC, matching the Rust pipeline. Anchored structures
+  // (the common case: walls/towers with supports) keep a fixed root. Without this, an anchor-free
+  // structure would be welded in place and could never move or be spun.
   const rootBody = world.createRigidBody(
-    RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0)
-    .setUserData({ root: true })
+    (hasSupports ? RAPIER.RigidBodyDesc.fixed() : RAPIER.RigidBodyDesc.dynamic())
+      .setTranslation(0, 0, 0)
+      .setUserData({ root: true })
   );
 
   const groundBody = world.createRigidBody(
@@ -688,15 +693,6 @@ export async function buildDestructibleCore({
   // cells never collide for any realistic local chunk offset.
   const SPLASH_KEY_STRIDE = 1 << 17; // 131072
   const SPLASH_KEY_OFFSET = 1 << 16; // 65536 (half-range, recentres negatives)
-  // Per-body spatial grid: bodyHandle -> (packed cell key -> chunk indices).
-  // Keying by body (not one global grid) means a same-body splash query only
-  // visits that body's chunks. This matters after fracturing: baseLocalOffset is
-  // the original asset-space centroid, so fragments that split off keep offsets in
-  // the same cells — a single global grid forces every query to scan (then discard)
-  // every other fragment's chunks sharing those cells (O(all originally-nearby
-  // chunks) per contact). Per-body buckets make it O(same-body nearby chunks).
-  const splashGrid = new Map<number, Map<number, number[]>>();
-  let splashGridDirty = true; // rebuild on first use and after splits
 
   function splashCellKey(ix: number, iy: number, iz: number): number {
     const px = ix + SPLASH_KEY_OFFSET;
@@ -713,58 +709,75 @@ export async function buildDestructibleCore({
     );
   }
 
-  function rebuildSplashGrid() {
-    splashGrid.clear();
-    for (let ci = 0; ci < chunks.length; ci++) {
-      const c = chunks[ci];
-      // Chunks without a body can never be a same-body splash neighbour (the query
-      // filters by bodyHandle), so they are omitted from the grid entirely.
-      if (!c || !c.active || c.bodyHandle == null) continue;
-      let bodyGrid = splashGrid.get(c.bodyHandle);
-      if (!bodyGrid) { bodyGrid = new Map<number, number[]>(); splashGrid.set(c.bodyHandle, bodyGrid); }
+  // ── Static splash adjacency (precomputed once) ──
+  // baseLocalOffset is a chunk's original asset-space centroid and never changes,
+  // so each node's spatial splash neighbours (within SPLASH_RADIUS) and their
+  // falloff weights are constant for the whole simulation. Precompute them once —
+  // in the same cell-iteration order the per-frame grid query used — then at
+  // injection just walk the list, filtering by current active/same-body state.
+  // This drops the per-frame grid rebuild, the Map lookups, and the per-neighbour
+  // sqrt from the hot path. CSR layout: node i's neighbours occupy
+  // [splashAdjStart[i], splashAdjStart[i+1]) in splashAdjNode / splashAdjWeight.
+  let splashAdjStart = new Int32Array(chunks.length + 1);
+  let splashAdjNode = new Int32Array(0);
+  let splashAdjWeight = new Float64Array(0);
+
+  function buildSplashAdjacency() {
+    // Temp spatial grid over every chunk by baseLocalOffset (body-independent), so
+    // the precompute doesn't depend on body-assignment timing during init.
+    const grid = new Map<number, number[]>();
+    for (let i = 0; i < chunks.length; i++) {
+      const c = chunks[i];
+      if (!c) continue;
       const key = splashGridKey(c.baseLocalOffset.x, c.baseLocalOffset.y, c.baseLocalOffset.z);
-      let bucket = bodyGrid.get(key);
-      if (!bucket) { bucket = []; bodyGrid.set(key, bucket); }
-      bucket.push(ci);
+      let b = grid.get(key);
+      if (!b) { b = []; grid.set(key, b); }
+      b.push(i);
     }
-    splashGridDirty = false;
-  }
-
-  // Reusable result array for splash neighbor lookups (avoids allocation per call)
-  const splashResult: number[] = [];
-
-  function collectSplashNeighbors(px: number, py: number, pz: number, radius: number, bodyHandle: number): number[] {
-    splashResult.length = 0;
-    const bodyGrid = splashGrid.get(bodyHandle);
-    if (!bodyGrid) return splashResult; // no active chunks for this body
-    const r2 = radius * radius;
-    const minIx = Math.floor((px - radius) * SPLASH_INV_CELL);
-    const maxIx = Math.floor((px + radius) * SPLASH_INV_CELL);
-    const minIy = Math.floor((py - radius) * SPLASH_INV_CELL);
-    const maxIy = Math.floor((py + radius) * SPLASH_INV_CELL);
-    const minIz = Math.floor((pz - radius) * SPLASH_INV_CELL);
-    const maxIz = Math.floor((pz + radius) * SPLASH_INV_CELL);
-    for (let ix = minIx; ix <= maxIx; ix++) {
-      for (let iy = minIy; iy <= maxIy; iy++) {
-        for (let iz = minIz; iz <= maxIz; iz++) {
-          const bucket = bodyGrid.get(splashCellKey(ix, iy, iz));
-          if (!bucket) continue;
-          for (let bi = 0; bi < bucket.length; bi++) {
-            const ci = bucket[bi];
-            const c = chunks[ci];
-            // Bucket is already same-body; the bodyHandle guard stays as a cheap
-            // safety net and keeps results byte-identical to the global-grid path.
-            if (!c || !c.active || c.bodyHandle !== bodyHandle) continue;
-            const dx = c.baseLocalOffset.x - px;
-            const dy = c.baseLocalOffset.y - py;
-            const dz = c.baseLocalOffset.z - pz;
-            if (dx * dx + dy * dy + dz * dz <= r2) splashResult.push(ci);
-          }
-        }
+    const R = SPLASH_RADIUS, r2 = R * R;
+    const starts = new Int32Array(chunks.length + 1);
+    const nodesOut: number[] = [];
+    const weightsOut: number[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const c0 = chunks[i];
+      if (c0) {
+        // The runtime hit position arrives via a Float32Array (stashPos), so fround
+        // the query origin to match its precision exactly — keeps the precomputed
+        // falloff weights byte-identical to the per-frame path.
+        const px = Math.fround(c0.baseLocalOffset.x), py = Math.fround(c0.baseLocalOffset.y), pz = Math.fround(c0.baseLocalOffset.z);
+        const minIx = Math.floor((px - R) * SPLASH_INV_CELL), maxIx = Math.floor((px + R) * SPLASH_INV_CELL);
+        const minIy = Math.floor((py - R) * SPLASH_INV_CELL), maxIy = Math.floor((py + R) * SPLASH_INV_CELL);
+        const minIz = Math.floor((pz - R) * SPLASH_INV_CELL), maxIz = Math.floor((pz + R) * SPLASH_INV_CELL);
+        // Same cell-iteration order as the per-frame grid query, so the resulting
+        // neighbour order (and thus force accumulation order) is byte-identical.
+        for (let ix = minIx; ix <= maxIx; ix++)
+          for (let iy = minIy; iy <= maxIy; iy++)
+            for (let iz = minIz; iz <= maxIz; iz++) {
+              const bucket = grid.get(splashCellKey(ix, iy, iz));
+              if (!bucket) continue;
+              for (let bi = 0; bi < bucket.length; bi++) {
+                const j = bucket[bi];
+                if (j === i) continue;
+                const cj = chunks[j];
+                const dx = cj.baseLocalOffset.x - px, dy = cj.baseLocalOffset.y - py, dz = cj.baseLocalOffset.z - pz;
+                const d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > r2) continue;
+                const dist = Math.sqrt(d2);
+                const falloff = 1 - dist / R;
+                const f2 = falloff * falloff;
+                if (f2 <= 0) continue;
+                nodesOut.push(j);
+                weightsOut.push(f2);
+              }
+            }
       }
+      starts[i + 1] = nodesOut.length;
     }
-    return splashResult;
+    splashAdjStart = starts;
+    splashAdjNode = Int32Array.from(nodesOut);
+    splashAdjWeight = Float64Array.from(weightsOut);
   }
+  buildSplashAdjacency();
 
   // ── Snapshot pool for reuse across frames ──
   let snapshotPool: BodySnapshot[] = [];
@@ -798,6 +811,10 @@ export async function buildDestructibleCore({
   let safeFrames = 0;
   let warnedColliderMapEmptyOnce = false;
   let solverGravityEnabled = true;
+  // Opt-in (default off): feed spinning dynamic actors their centrifugal acceleration each frame so
+  // tumbling debris keeps self-stressing, mirroring NVIDIA Blast's centrifugal-on-dynamic default.
+  // Off by default so it never perturbs scenarios tuned without it. Toggle via setSolverCentrifugalEnabled.
+  let solverCentrifugalEnabled = false;
 
   // ── Batched per-actor gravity ──
   // The solver actor table only changes on topology changes (splits), so the
@@ -1559,6 +1576,46 @@ export async function buildDestructibleCore({
     }
     stopTiming(gravityInjectT0, 'solverGravityInjectMs');
 
+    // Optionally feed each spinning dynamic actor its centrifugal acceleration so tumbling debris
+    // keeps self-stressing (NVIDIA Blast applies this to dynamic actors by default). The solver
+    // applies `ω × (ω × (nodePos − com))` per node, so we pass the actor's mass-weighted authored
+    // centre of mass and its angular velocity rotated into the actor's local frame. Opt-in.
+    if (solverCentrifugalEnabled) {
+      const solverActors = (solver as unknown as SolverActorsApi).actors?.() ?? [];
+      for (const actor of solverActors) {
+        if (!actor.nodes || actor.nodes.length < 2) continue; // solver ignores single-node actors
+        const entry = actorMap.get(actor.actorIndex);
+        if (!entry) continue;
+        const body = world.getRigidBody(entry.bodyHandle);
+        if (!body || body.isFixed()) continue; // only spinning dynamic actors tumble
+        const w = body.angvel();
+        if (w.x * w.x + w.y * w.y + w.z * w.z < 1e-8) continue; // effectively not spinning
+        // Rotate world angular velocity into the actor's local frame (R⁻¹·ω) — same conjugate
+        // rotation the gravity loop above uses to localize the gravity vector.
+        const rot = body.rotation();
+        const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
+        const wx = w.x, wy = w.y, wz = w.z;
+        const lwx = qw * qw * wx + 2 * qy * qw * wz - 2 * qz * qw * wy + qx * qx * wx + 2 * qy * qx * wy + 2 * qz * qx * wz - qz * qz * wx - qy * qy * wx;
+        const lwy = 2 * qx * qy * wx + qy * qy * wy + 2 * qz * qy * wz + 2 * qw * qz * wx - qz * qz * wy + qw * qw * wy - 2 * qx * qw * wz - qx * qx * wy;
+        const lwz = 2 * qx * qz * wx + 2 * qy * qz * wy + qz * qz * wz - 2 * qw * qy * wx - qy * qy * wz + 2 * qw * qx * wy - qx * qx * wz + qw * qw * wz;
+        // Mass-weighted centre of mass over the actor's nodes, in the authored frame.
+        let cx = 0, cy = 0, cz = 0, totalMass = 0;
+        for (const ni of actor.nodes) {
+          const m = scenario.nodes[ni]?.mass ?? 0;
+          if (m <= 0) continue;
+          const off = chunks[ni]?.baseLocalOffset;
+          if (!off) continue;
+          cx += off.x * m; cy += off.y * m; cz += off.z * m; totalMass += m;
+        }
+        if (totalMass <= 0) continue; // wholly static actor — does not tumble
+        solver.addCentrifugalAcceleration(
+          actor.actorIndex,
+          { x: cx / totalMass, y: cy / totalMass, z: cz / totalMass },
+          { x: lwx, y: lwy, z: lwz }
+        );
+      }
+    }
+
     // Inject external contact forces (e.g. projectile impacts) into the stress solver.
     // Converts world-space contact forces into body-local space and applies them
     // to the impacted node plus nearby nodes (splash radius) so that bond stress
@@ -1571,7 +1628,6 @@ export async function buildDestructibleCore({
     // through per-call addForce when the batched WASM export is absent.
     solverForceCount = 0;
     stashCount = 0;
-    const splashR = SPLASH_RADIUS;
 
     // Pass 1 — resolve: per-contact body + rotation round-trip, world→local force
     // rotation, buffer the full-strength hit force, and stash the hit for splash.
@@ -1603,15 +1659,15 @@ export async function buildDestructibleCore({
     }
     stopTiming(resolveT0, 'contactInjectResolveMs');
 
-    // Splash grid is rebuilt once per frame (only when topology changed). Hoisted
-    // out of the per-contact loop so it can be measured on its own.
+    // Grid pass removed: splash neighbours are precomputed (static adjacency).
+    // contactInjectGridMs is kept at ~0 for recording-schema continuity.
     const gridT0 = startTiming();
-    if (stashCount > 0 && splashGridDirty) rebuildSplashGrid();
     stopTiming(gridT0, 'contactInjectGridMs');
 
-    // Pass 2 — splash: for each stashed hit, find same-body neighbours within the
-    // splash radius and buffer the attenuated force. Uses the spatial grid for
-    // O(1) average lookups instead of an O(n) full scan.
+    // Pass 2 — splash: for each stashed hit, apply the attenuated force to its
+    // precomputed same-body neighbours within the splash radius. Walks the static
+    // adjacency (no grid query, no Map lookups, no per-neighbour sqrt — the falloff
+    // weight is precomputed) and filters by current active/same-body state.
     const splashT0 = startTiming();
     for (let si = 0; si < stashCount; si++) {
       const hitNode = stashNode[si];
@@ -1619,24 +1675,17 @@ export async function buildDestructibleCore({
       const sb = si * 3;
       const hx = stashPos[sb], hy = stashPos[sb + 1], hz = stashPos[sb + 2];
       const sfx = stashForce[sb], sfy = stashForce[sb + 1], sfz = stashForce[sb + 2];
-      // Hit node at full strength first, then its splash neighbours — exactly the
-      // per-contact order the original single loop used, so the accumulated
-      // per-node force totals are unchanged.
+      // Hit node at full strength first, then its splash neighbours — same
+      // per-contact order as before, so accumulated per-node forces are unchanged.
       pushSolverForce(hitNode, hx, hy, hz, sfx, sfy, sfz);
-      const neighbors = collectSplashNeighbors(hx, hy, hz, splashR, bodyHandle);
-      for (let ni = 0; ni < neighbors.length; ni++) {
-        const ci = neighbors[ni];
-        if (ci === hitNode) continue;
-        const c = chunks[ci];
-        const dx = c.baseLocalOffset.x - hx;
-        const dy = c.baseLocalOffset.y - hy;
-        const dz = c.baseLocalOffset.z - hz;
-        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (dist > splashR) continue;
-        const falloff = (1 - dist / splashR);
-        const f2 = falloff * falloff; // quadratic falloff
-        if (f2 <= 0) continue;
-        pushSolverForce(ci, c.baseLocalOffset.x, c.baseLocalOffset.y, c.baseLocalOffset.z, sfx * f2, sfy * f2, sfz * f2);
+
+      const aStart = splashAdjStart[hitNode], aEnd = splashAdjStart[hitNode + 1];
+      for (let k = aStart; k < aEnd; k++) {
+        const j = splashAdjNode[k];
+        const c = chunks[j];
+        if (!c || !c.active || c.bodyHandle !== bodyHandle) continue;
+        const w = splashAdjWeight[k];
+        pushSolverForce(j, c.baseLocalOffset.x, c.baseLocalOffset.y, c.baseLocalOffset.z, sfx * w, sfy * w, sfz * w);
       }
     }
     stopTiming(splashT0, 'contactInjectSplashMs');
@@ -1794,7 +1843,6 @@ export async function buildDestructibleCore({
 
       actorMap.set(actorIndex, { bodyHandle });
       sleepThresholdPending.add(bodyHandle);
-      splashGridDirty = true; // body topology changed
 
       for (const ni of nodeList) {
         const oldBody = chunks[ni]?.bodyHandle;
@@ -2667,6 +2715,10 @@ export async function buildDestructibleCore({
     solverGravityEnabled = v;
   }
 
+  function setSolverCentrifugalEnabled(v: boolean) {
+    solverCentrifugalEnabled = v;
+  }
+
   // Enable/disable island-aware solving and settled-island skipping at runtime (Stage 4).
   function setIslandSolver(opts: { enabled?: boolean; skipSettled?: boolean }) {
     if (opts.enabled != null) islandSolverEnabled = !!opts.enabled;
@@ -2816,6 +2868,7 @@ export async function buildDestructibleCore({
     stepSafe: wrappedStep,
     setGravity: setGravityFn,
     setSolverGravityEnabled,
+    setSolverCentrifugalEnabled,
     setSingleCollisionMode,
     setDebrisCollisionMode: setDebrisCollisionModeFn,
     getRigidBodyCount,
@@ -2866,6 +2919,23 @@ export async function buildDestructibleCore({
     __clearDebugSplitContinuityLog?: () => void;
   }).__clearDebugSplitContinuityLog = () => {
     splitContinuityLog.length = 0;
+  };
+
+  // Test/debug accessor: surfaces the precomputed static splash adjacency (per node,
+  // the same-radius neighbours and their quadratic falloff weights) so the precompute
+  // can be validated against an independent spatial computation.
+  (core as DestructibleCore & {
+    __debugSplashAdjacency?: () => { radius: number; perNode: Array<Array<{ node: number; weight: number }>> };
+  }).__debugSplashAdjacency = () => {
+    const perNode: Array<Array<{ node: number; weight: number }>> = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const list: Array<{ node: number; weight: number }> = [];
+      for (let k = splashAdjStart[i]; k < splashAdjStart[i + 1]; k++) {
+        list.push({ node: splashAdjNode[k], weight: splashAdjWeight[k] });
+      }
+      perNode.push(list);
+    }
+    return { radius: SPLASH_RADIUS, perNode };
   };
 
   return core;

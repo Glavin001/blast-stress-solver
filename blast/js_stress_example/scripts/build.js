@@ -61,6 +61,7 @@ const exportedFunctions = [
   '_ext_stress_solver_add_all_forces',
   '_ext_stress_solver_add_gravity',
   '_ext_stress_solver_add_actor_gravity',
+  '_ext_stress_solver_add_centrifugal_acceleration',
   '_ext_stress_solver_add_all_actor_gravity',
   '_ext_stress_solver_update',
   '_ext_stress_solver_overstressed_bond_count',

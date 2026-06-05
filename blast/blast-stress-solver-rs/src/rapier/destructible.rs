@@ -99,6 +99,10 @@ pub struct DestructibleSet {
     ground_body_handle: Option<RigidBodyHandle>,
     bond_table: Vec<BondDesc>,
     node_bonds: Vec<Vec<u32>>,
+    /// Authored `(centroid, mass)` per input node, in the solver's local frame. Used to compute
+    /// each actor's center of mass when feeding centrifugal acceleration (gated by
+    /// `FracturePolicy.apply_centrifugal`).
+    node_centroid_mass: Vec<(Vec3, f32)>,
     removed_bonds: Vec<bool>,
     destroyed_nodes: Vec<bool>,
     pending_split_events: VecDeque<SplitEvent>,
@@ -138,6 +142,9 @@ impl DestructibleSet {
             })
             .collect();
 
+        let node_centroid_mass: Vec<(Vec3, f32)> =
+            config.nodes.iter().map(|n| (n.centroid, n.mass)).collect();
+
         let tracker = BodyTracker::new(&scenario_nodes, config.node_sizes, config.node_colliders);
         let mut tracker = tracker;
         tracker.set_dynamic_body_ccd_enabled(config.dynamic_body_ccd_enabled);
@@ -158,6 +165,7 @@ impl DestructibleSet {
             ground_body_handle: None,
             bond_table: config.bonds,
             node_bonds,
+            node_centroid_mass,
             removed_bonds: vec![false; node_count],
             destroyed_nodes: vec![false; node_count],
             pending_split_events: VecDeque::new(),
@@ -323,6 +331,11 @@ impl DestructibleSet {
         // 1. Apply gravity in each actor's CURRENT local frame, so a chunk that has rotated
         //    feels gravity from the correct direction (gap #7). Mirrors the JS pipeline.
         self.apply_oriented_gravity(bodies);
+        // 1b. Optionally feed spinning dynamic actors their centrifugal acceleration so tumbling
+        //     debris keeps self-stressing (NVIDIA Blast applies this to dynamic actors by default).
+        if self.policy.apply_centrifugal {
+            self.apply_centrifugal(bodies);
+        }
         self.forces_applied = false;
 
         // 2. Update solver
@@ -745,6 +758,57 @@ impl DestructibleSet {
                 })
                 .unwrap_or(g);
             self.solver.add_actor_gravity(actor_index, local);
+        }
+    }
+
+    /// Feed each spinning dynamic actor its centrifugal acceleration in the solver's authored
+    /// frame: the solver applies `ω_local × (ω_local × (nodePos − com))` per node, where
+    /// `ω_local = R⁻¹·ω_world` (the body's spin brought back into the authored frame) and `com`
+    /// is the actor's mass-weighted authored centre of mass. Only multi-node dynamic actors with
+    /// non-negligible spin contribute. Gated by `FracturePolicy.apply_centrifugal`.
+    fn apply_centrifugal(&mut self, bodies: &RigidBodySet) {
+        // `actors()` returns owned node lists, so collecting up front frees the `&self.solver`
+        // borrow before the `&mut self.solver` `add_centrifugal_acceleration` calls below.
+        for actor in self.solver.actors() {
+            if actor.nodes.len() < 2 {
+                continue; // the solver ignores single-node actors anyway
+            }
+            // Read the spin from the actor's live dynamic body (static actors don't tumble).
+            let body = match self
+                .tracker
+                .node_body(actor.nodes[0])
+                .and_then(|h| bodies.get(h))
+            {
+                Some(b) if b.is_dynamic() => b,
+                _ => continue,
+            };
+            let w = *body.angvel();
+            if w.norm_squared() < 1.0e-8 {
+                continue; // effectively not spinning
+            }
+            let local_w = body.rotation().inverse_transform_vector(&w);
+
+            // Mass-weighted centre of mass over the actor's nodes, in the authored frame.
+            let mut com = Vec3::new(0.0, 0.0, 0.0);
+            let mut total_mass = 0.0f32;
+            for &node in &actor.nodes {
+                if let Some(cm) = self.node_centroid_mass.get(node as usize) {
+                    if cm.1 > 0.0 {
+                        com = com + cm.0 * cm.1;
+                        total_mass += cm.1;
+                    }
+                }
+            }
+            if total_mass <= 0.0 {
+                continue; // wholly static support actor
+            }
+            let com = com * (1.0 / total_mass);
+
+            self.solver.add_centrifugal_acceleration(
+                actor.actor_index,
+                com,
+                Vec3::new(local_w.x, local_w.y, local_w.z),
+            );
         }
     }
 

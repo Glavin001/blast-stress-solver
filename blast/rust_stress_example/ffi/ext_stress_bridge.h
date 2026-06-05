@@ -110,6 +110,11 @@ uint8_t ext_stress_solver_add_actor_gravity(ExtStressSolverHandle* handle,
                                             uint32_t actor_index,
                                             const StressVec3* local_gravity);
 
+uint8_t ext_stress_solver_add_centrifugal_acceleration(ExtStressSolverHandle* handle,
+                                                       uint32_t actor_index,
+                                                       const StressVec3* local_center_mass,
+                                                       const StressVec3* local_angular_velocity);
+
 // Batched per-actor gravity. Applies `world_gravity` to every actor the solver
 // currently tracks, rotating it into each actor's body-local frame on the C++
 // side so the caller does not need to materialise the actor list or cross the
