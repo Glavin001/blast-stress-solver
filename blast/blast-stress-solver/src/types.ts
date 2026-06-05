@@ -551,10 +551,54 @@ export interface ExtStressSolver {
    * acceleration. Passing a zero angular velocity is effectively a no-op.
    */
   addCentrifugalAcceleration(actorIndex: number, localCenterMass?: Vec3, localAngularVelocity?: Vec3): boolean;
+  /**
+   * Apply gravity to every actor the solver currently tracks in a single FFI
+   * crossing, rotating the supplied world gravity into each actor's body-local
+   * frame inside the WASM module.
+   *
+   * This is the batched counterpart to {@link ExtStressSolver.addActorGravity}:
+   * instead of materialising the actor list in JS and calling once per actor,
+   * the solver iterates its internal actor table itself.
+   *
+   * @param worldGravity World-space gravity vector (e.g. `{x:0, y:-9.81, z:0}`).
+   * @param rotations Optional flat buffer of unit quaternions laid out as
+   *   `[x, y, z, w]` per slot and indexed by actor index (slot N at offset
+   *   `4*N`). Actors without a valid rotation receive the unrotated world
+   *   gravity. Supply `body.rotation()` for each known actor.
+   * @param rotationCount Number of quaternion slots in `rotations`.
+   * @returns The number of actors gravity was applied to, or `-1` if the
+   *   underlying WASM runtime does not expose the batched entry point (in which
+   *   case fall back to {@link ExtStressSolver.addActorGravity}).
+   */
+  addAllActorGravity(worldGravity?: Vec3, rotations?: Float32Array, rotationCount?: number): number;
+  /** True when the WASM runtime exposes {@link ExtStressSolver.addAllActorGravity}. */
+  supportsBatchedGravity(): boolean;
   /** Run one solver update using previously applied forces/accelerations. */
   update(): void;
   /** Count of bonds currently overstressed beyond elastic limits. */
   overstressedBondCount(): number;
+  /** Number of connected components (islands) in the solver graph after the last
+   *  update. Static nodes are cut points, so structures sharing only a static/world
+   *  node count as separate islands. */
+  islandCount(): number;
+  /** Enable/disable island-aware solving: solve each disconnected component
+   *  independently. Single-island results are identical to the whole-graph solve;
+   *  multi-island results match within solver tolerance. Default: disabled. */
+  setIslandAware(enabled: boolean): void;
+  /** Whether island-aware solving is currently enabled. */
+  islandAware(): boolean;
+  /** Enable/disable skipping settled islands (requires islandAware). An island whose
+   *  velocity inputs are unchanged since its last solve and that already converged is not
+   *  re-solved (the solve would be a no-op); its stresses are kept. Any new input (contact,
+   *  wake) re-solves it the same frame. Paused, never evicted. Default: disabled. */
+  setSkipSettled(enabled: boolean): void;
+  /** Whether settled-island skipping is currently enabled. */
+  skipSettled(): boolean;
+  /** Number of settled islands skipped during the last update(). */
+  islandsSkipped(): number;
+  /** Islands the last update partitioned the graph into for the per-island solve
+   *  (islandsSkipped <= this; 0 unless island-aware solving ran with >1 island). */
+  islandsTotal(): number;
   /** Snapshot the current actor table (actor index + owned nodes). */
   actors(): Array<{ actorIndex: number; nodes: number[] }>;
   /** Generate fracture commands for the last update. */

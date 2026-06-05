@@ -10,12 +10,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import { buildDestructibleCore, createFrameProfilerOverlay } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 
 // ── Live frame profiler ───────────────────────────────────────
@@ -36,6 +37,15 @@ const profiler = createFrameProfilerOverlay({
       live: { bodies, bonds },
     };
   },
+});
+
+// Reusable session recorder — ● Record captures every dynamic body's per-frame
+// position/orientation + linear/angular velocity, every input (projectiles,
+// forces, gravity) and every fracture/topology change into a single gzipped
+// bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
+const recorder = createRecordingOverlay({
+  exportName: 'tower-collapse-recording',
+  getProfilerExport: () => profiler.exportData(),
 });
 
 // ── Config ────────────────────────────────────────────────────
@@ -68,7 +78,9 @@ const CONFIG = {
     skipSingleBodies: false,
   },
   optimization: {
-    smallBodyDampingMode: 'always' as string,
+    // Damp small debris only after it lands ('always' floats falling debris — see
+    // rapier.smallBodyDamping.fall.test.ts).
+    smallBodyDampingMode: 'afterGroundCollision' as string,
     debrisCleanupMode: 'always' as string,
     debrisTtlMs: 10000,
     maxCollidersForDebris: 2,
@@ -225,6 +237,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -248,6 +261,7 @@ async function initScene() {
   visualsRef = visuals;
 
   // Point the reusable frame-profiler overlay at this core.
+  recorder.attach(core, { scenario, meta: { demo: 'tower-collapse', config: CONFIG } });
   profiler.attach(core);
 }
 
@@ -419,6 +433,7 @@ function loop() {
     rapierDebug?.update();
     updateStatus(coreRef);
     profiler.render();
+    recorder.render();
   }
 
   const t1 = performance.now();
@@ -442,4 +457,5 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
+mountPipelineControls();
 initScene().then(() => loop());

@@ -64,7 +64,14 @@ export type FracturedTowerOptions = {
   fragmentCountPerColumn?: number;
   /** Total structure mass in kg. Auto-calculated (~600 kg/m^2 per floor) if omitted. */
   deckMass?: number;
-  /** Bond detection mode: 'proximity' (default) or 'auto' (WASM triangle-based) */
+  /**
+   * Bond detection mode (default: 'auto').
+   * - 'auto': WASM triangle-based bonding (NvBlast authoring). Derives bonds from
+   *   the fragments' actual coincident triangles — correct for the concave,
+   *   irregular Voronoi chunks this scenario produces.
+   * - 'proximity': fast JS AABB/SAT approximation. Cheaper, but mis-estimates
+   *   contacts on complex fractured shapes, so it is no longer the default here.
+   */
   bondMode?: 'proximity' | 'auto';
   /** Bond area normalization mode (default: 'perAxis') */
   areaNormalization?: AreaNormalizationMode;
@@ -109,7 +116,7 @@ export async function buildFracturedTowerScenario(
     fragmentCountPerFloor = 8,
     fragmentCountPerColumn = 4,
     deckMass,
-    bondMode = 'proximity',
+    bondMode = 'auto',
     areaNormalization = 'perAxis',
     pinata,
     rapier,

@@ -63,3 +63,8 @@ required-features = ["bench-support"]
 [[example]]
 name = "apply_profile"
 required-features = ["bench-support"]
+
+# Raw-Rapier per-call cost profiler (marginal cost incl. the deferred step work).
+[[example]]
+name = "rapier_cost_profile"
+required-features = ["bench-support"]

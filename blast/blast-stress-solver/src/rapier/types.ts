@@ -205,7 +205,25 @@ export type CoreProfilerSample = {
   dt: number;
   rapierStepMs: number;
   contactDrainMs: number;
+  /**
+   * Wrapper timer for the whole stress-solver phase. Historically an
+   * unattributable blob: it bundles the per-actor gravity fill (Rapier
+   * rotation round-trips), the external-contact/splash force injection, and
+   * the actual CGNR solve in WASM. The three `solver*Ms` fields below break it
+   * down so a regression can be pinned to JS injection (our code) vs. the
+   * vendored solver. They sum to ≈`solverUpdateMs` (minus negligible
+   * predicate/bookkeeping overhead).
+   */
   solverUpdateMs: number;
+  /** Sub-phase of `solverUpdateMs`: per-actor gravity fill into the solver
+   *  (Rapier `getRigidBody`/`rotation` round-trips, then the gravity FFI). */
+  solverGravityInjectMs: number;
+  /** Sub-phase of `solverUpdateMs`: external contact / splash force injection
+   *  (force rotation into body-local space + spatial-grid neighbour splash). */
+  solverContactInjectMs: number;
+  /** Sub-phase of `solverUpdateMs`: the actual `solver.update()` CGNR solve in
+   *  WASM (whole-graph; cost tracks bond count, not body count). */
+  solverSolveMs: number;
   damageReplayMs: number;
   damagePreviewMs: number;
   damageTickMs: number;
@@ -307,7 +325,7 @@ export type DestructibleCore = {
   setDebrisCollisionMode: (mode: DebrisCollisionMode) => void;
   getRigidBodyCount: () => number;
   getActiveBondsCount: () => number;
-  getSolverDebugLines: () => Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }>;
+  getSolverDebugLines: (mode?: number) => Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }>;
   // Bond interaction helpers
   getNodeBonds: (nodeIndex: number) => BondRef[];
   cutBond: (bondIndex: number) => boolean;
@@ -326,6 +344,23 @@ export type DestructibleCore = {
   setDebrisCleanup?: (opts: DebrisCleanupOptions) => void;
   getDebrisCleanupSettings?: () => DebrisCleanupOptions & { mode: OptimizationMode };
   setMaxCollidersForDebris?: (n: number) => void;
+  /** Stage-1 island settled-state measurement: connected components of the live
+   *  solver graph (static nodes as cut points) and the fraction of nodes/bonds
+   *  in islands whose bodies are all Rapier-asleep — the skippable-cost ceiling
+   *  for island-aware solving. Read-only instrumentation; no behavior change. */
+  getIslandSettledStats?: () => {
+    islandsTotal: number; islandsSettled: number;
+    totalNodes: number; settledNodes: number;
+    totalBonds: number; settledBonds: number;
+    settledNodeFraction: number; settledBondFraction: number;
+  };
+  /** Stage-4 island-aware solving: solve each disconnected component independently and
+   *  skip components that have settled (inputs unchanged since their last solve + already
+   *  converged). Observationally identical to the whole-graph solve; a settled component
+   *  re-solves the same frame its load changes (paused, never frozen). Off by default. */
+  setIslandSolver?: (opts: { enabled?: boolean; skipSettled?: boolean }) => void;
+  /** Current island-solver settings plus the last update's island count and skipped count. */
+  getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

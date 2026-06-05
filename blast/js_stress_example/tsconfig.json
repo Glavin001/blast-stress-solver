@@ -33,6 +33,8 @@
     "fracture-policy.ts",
     "high-rise.ts",
     "centrifugal-spinner.ts",
+    "cracking.ts",
+    "mini-city.ts",
     "rapier-debug-renderer.js",
     "extBridgeScenario.js",
     "bridge/types.ts",

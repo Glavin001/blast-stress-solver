@@ -40,6 +40,11 @@
  *     "colliderRebuildMs": { "mean": 0.1, "p95": 0.01, "max": 5.0 },
  *     "snapshotCaptureMs": { "mean": 1.0, "p95": 2.0, "max": 4.0 },
  *     "preStepSweepMs":    { "mean": 0.02, "p95": 0.05, "max": 0.1 }
+ *   },
+ *   "solverBreakdown": {                       // sub-phases of solverUpdateMs
+ *     "solverGravityInjectMs": { "mean": 1.8, "p95": 2.4, "max": 6.0 },  // JS
+ *     "solverContactInjectMs": { "mean": 0.3, "p95": 1.1, "max": 9.0 },  // JS
+ *     "solverSolveMs":         { "mean": 3.3, "p95": 4.5, "max": 55.0 }  // WASM
  *   }
  * }
  */
@@ -166,6 +171,17 @@ for (const key of phaseKeys) {
   }
 }
 
+// Sub-phases of solverUpdateMs (JS gravity fill + JS contact injection + WASM
+// CGNR solve). Kept separate from `phases` so they don't double-count the
+// solverUpdateMs leaf; lets the optimizer attribute solver cost to JS vs. WASM.
+const solverBreakdown = {};
+for (const key of ['solverGravityInjectMs', 'solverContactInjectMs', 'solverSolveMs']) {
+  const vals = samples.map(s => s[key] || 0);
+  if (Math.max(...vals) > 0.001) {
+    solverBreakdown[key] = stats(vals);
+  }
+}
+
 const overallStats = stats(allTotals);
 
 const result = {
@@ -189,6 +205,7 @@ const result = {
   bondSurvivalPct: +((bondsFinal / bondsInitial) * 100).toFixed(1),
   maxRigidBodies,
   phases,
+  solverBreakdown,
 };
 
 // Print JSON to stdout — this is what the optimizer reads

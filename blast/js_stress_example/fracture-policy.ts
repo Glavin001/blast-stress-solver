@@ -10,11 +10,12 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { buildDestructibleCore , createFrameProfilerOverlay } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 
 // ── Config ────────────────────────────────────────────────────
@@ -47,7 +48,9 @@ const CONFIG = {
     skipSingleBodies: false,
   },
   optimization: {
-    smallBodyDampingMode: 'always' as string,
+    // Damp small debris only after it lands ('always' floats falling debris — see
+    // rapier.smallBodyDamping.fall.test.ts).
+    smallBodyDampingMode: 'afterGroundCollision' as string,
     debrisCleanupMode: 'always' as string,
     debrisTtlMs: 10000,
     maxCollidersForDebris: 2,
@@ -148,6 +151,15 @@ function updateStatus(core: any, stepMs: number) {
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 // Reusable, self-mounting live frame-profiler overlay (per-phase cost + A/B).
 const profiler = createFrameProfilerOverlay();
+
+// Reusable session recorder — ● Record captures every dynamic body's per-frame
+// position/orientation + linear/angular velocity, every input (projectiles,
+// forces, gravity) and every fracture/topology change into a single gzipped
+// bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
+const recorder = createRecordingOverlay({
+  exportName: 'fracture-policy-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
@@ -195,6 +207,7 @@ async function initScene() {
       minAngularDamping: 2,
     },
     fracturePolicy: { ...CONFIG.fracturePolicy },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -214,6 +227,7 @@ async function initScene() {
 
   coreRef = core;
   core.setSolverCentrifugalEnabled(centrifugalEnabled);
+  recorder.attach(core, { scenario, meta: { demo: 'fracture-policy', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
   frameTimes = [];
@@ -405,6 +419,7 @@ const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
   profiler.render();
+  recorder.render();
 
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();
@@ -439,4 +454,5 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
+mountPipelineControls();
 initScene().then(() => loop());

@@ -11,7 +11,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import * as pinata from '@dgreenheck/three-pinata';
-import { buildDestructibleCore , createFrameProfilerOverlay } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
@@ -19,6 +19,7 @@ import {
   buildScenarioFromFragments,
   buildFoundationFragments,
 } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { FRACTURED_WALL_DEMO_CONFIG as CONFIG } from './fractured-demo-config.js';
 
 // ── Config ────────────────────────────────────────────────────
@@ -117,6 +118,15 @@ function updateStatus(core: any) {
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 // Reusable, self-mounting live frame-profiler overlay (per-phase cost + A/B).
 const profiler = createFrameProfilerOverlay();
+
+// Reusable session recorder — ● Record captures every dynamic body's per-frame
+// position/orientation + linear/angular velocity, every input (projectiles,
+// forces, gravity) and every fracture/topology change into a single gzipped
+// bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
+const recorder = createRecordingOverlay({
+  exportName: 'fractured-wall-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
@@ -182,6 +192,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -201,6 +212,7 @@ async function initScene() {
 
   coreRef = core;
   core.setSolverCentrifugalEnabled(centrifugalEnabled);
+  recorder.attach(core, { scenario, meta: { demo: 'fractured-wall' } });
   profiler.attach(core);
   visualsRef = visuals;
 }
@@ -342,6 +354,7 @@ const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
   profiler.render();
+  recorder.render();
   stats.begin();
 
   const dt = Math.min(clock.getDelta(), 1 / 30);
@@ -382,6 +395,7 @@ window.addEventListener('resize', onResize);
 
 // ── Boot ──────────────────────────────────────────────────────
 
+mountPipelineControls();
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize fractured wall demo:', err);
   const hint = document.querySelector('.viewport-hint');

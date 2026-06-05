@@ -15,8 +15,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 
 const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
 
@@ -32,10 +33,20 @@ const CONFIG = {
     // high-rise's stress response is near-bimodal, and a high value lets one hit seed a
     // slow global collapse. Raise it for a more impact-reactive (and collapse-prone) frame.
     contactForceScale: 8,
+    // Stress-solver internals (Blast knobs). These secretly set the fracture THRESHOLD:
+    // - iterations: CG steps/frame. Low = under-converged stress (under-reports → robust
+    //   but physically inaccurate); high = converged true stress (accurate → readily
+    //   cascades) and much costlier. There is a sharp cliff, not a gradient.
+    // - graphReduction: coarsens the support graph; higher = lower peak stress (sparser /
+    //   chunkier cracks, eventually none) and cheaper.
+    iterations: 24,
+    graphReduction: 0,
   },
   physics: { debrisCollisionMode: 'all', friction: 0.25, restitution: 0 },
   optimization: {
-    smallBodyDampingMode: 'always',
+    // Damp small debris only after it lands; 'always' also damps it mid-air (caps the fall at
+    // ~g/damping ≈ 5 m/s → "floaty" collapse). See rapier.smallBodyDamping.fall.test.ts.
+    smallBodyDampingMode: 'afterGroundCollision',
     debrisCleanupMode: 'always',
     debrisTtlMs: 10000,
     maxCollidersForDebris: 3,
@@ -141,6 +152,15 @@ function updatePerf() {
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 // Reusable, self-mounting live frame-profiler overlay (per-phase cost + A/B).
 const profiler = createFrameProfilerOverlay();
+
+// Reusable session recorder — ● Record captures every dynamic body's per-frame
+// position/orientation + linear/angular velocity, every input (projectiles,
+// forces, gravity) and every fracture/topology change into a single gzipped
+// bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
+const recorder = createRecordingOverlay({
+  exportName: 'high-rise-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 // Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
@@ -171,7 +191,11 @@ async function initScene() {
     scenario,
     gravity: CONFIG.solver.gravity,
     materialScale: defaults.materialScale,
-    solverSettings: scaledLimits(),
+    solverSettings: {
+      ...scaledLimits(),
+      maxSolverIterationsPerFrame: CONFIG.solver.iterations,
+      graphReductionLevel: CONFIG.solver.graphReduction,
+    },
     friction: CONFIG.physics.friction,
     restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.solver.contactForceScale,
@@ -188,6 +212,7 @@ async function initScene() {
       minLinearDamping: 2,
       minAngularDamping: 2,
     },
+    ...pipelineCoreOverrides(),
   });
 
   const group = new THREE.Group();
@@ -206,6 +231,7 @@ async function initScene() {
 
   coreRef = core;
   core.setSolverCentrifugalEnabled(centrifugalEnabled);
+  recorder.attach(core, { scenario, meta: { demo: 'high-rise', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
   initialBonds = core.getActiveBondsCount();
@@ -291,6 +317,8 @@ bindSlider('cfg-proj-speed', CONFIG.projectile, 'speed', (v) => v.toFixed(0) + '
 // Structure / solver
 bindSlider('cfg-strength', CONFIG.solver, 'strength', (v) => v.toFixed(2) + '×');
 bindSlider('cfg-contact-force', CONFIG.solver, 'contactForceScale', (v) => v.toFixed(0));
+bindSlider('cfg-iterations', CONFIG.solver, 'iterations', (v) => v.toFixed(0));
+bindSlider('cfg-graph-reduction', CONFIG.solver, 'graphReduction', (v) => v.toFixed(0));
 bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1) + ' m/s²', (v) => coreRef?.setGravity(v));
 
 // Physics
@@ -328,6 +356,7 @@ const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
   profiler.render();
+  recorder.render();
   stats.begin();
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();
@@ -355,6 +384,7 @@ function onResize() {
 }
 window.addEventListener('resize', onResize);
 
+mountPipelineControls();
 initScene()
   .then(() => loop())
   .catch((err) => {

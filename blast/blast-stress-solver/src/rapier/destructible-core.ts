@@ -31,7 +31,7 @@ import { applyCollisionGroupsForBody as applyCollisionGroupsForBodyImpl, type Co
 import { ContactBuffer } from './contactBuffer';
 import {
   computeSpeedFactor,
-  computeRelativeSpeed,
+  relativeSpeedBetweenBodies,
   getBodyForColliderHandle,
   worldPointToBodyLocal,
   chunkWorldCenter as chunkWorldCenterHelper,
@@ -70,7 +70,11 @@ export type BuildDestructibleCoreOptions = {
    *  Default 0 = fully decouple impacts from the stress solver (the solver then only
    *  carries gravity / structural load, which redistributes robustly around holes). */
   damageContactStressScale?: number;
-  /** Whether newly created split bodies should enable CCD (default true for compatibility). */
+  /** Whether newly created split bodies should enable CCD. Default **false**: CCD on every
+   *  fragment is expensive (swept tests on hundreds of debris bodies) and, near the debris pile,
+   *  clamps a fast chunk to its first predicted contact each frame — which reads as the big
+   *  chunks "floating"/lagging down while open-air debris falls normally. CCD is kept ON for the
+   *  projectile (which must not tunnel through the structure). Opt back in per-body if needed. */
   fractureBodyCcdEnabled?: boolean;
   /** Whether spawned projectiles should enable CCD (default true). */
   projectileCcdEnabled?: boolean;
@@ -112,6 +116,11 @@ type InteractionGroupsValue = Parameters<RAPIER.Collider['setCollisionGroups']>[
 type RapierQuaternion = { x: number; y: number; z: number; w: number };
 type SolverActorsApi = {
   actors?: () => Array<{ actorIndex: number; nodes: number[] }>;
+  /** Batched per-actor gravity (rotates world gravity into each actor's local
+   *  frame inside WASM). Returns the number of actors updated, or -1 when the
+   *  runtime predates this export. */
+  addAllActorGravity?: (worldGravity?: Vec3, rotations?: Float32Array, rotationCount?: number) => number;
+  supportsBatchedGravity?: () => boolean;
 };
 type DebugWindow = Window & {
   debugStressSolver?: { printSolver?: () => unknown };
@@ -166,7 +175,7 @@ export async function buildDestructibleCore({
   resimulateOnDamageDestroy = !!damage?.enabled,
   contactForceScale = 30,
   damageContactStressScale = 0,
-  fractureBodyCcdEnabled = true,
+  fractureBodyCcdEnabled = false,
   projectileCcdEnabled = true,
   skipSingleBodies = false,
   sleepLinearThreshold = 0.1,
@@ -195,6 +204,9 @@ export async function buildDestructibleCore({
     rapierStepMs: 0,
     contactDrainMs: 0,
     solverUpdateMs: 0,
+    solverGravityInjectMs: 0,
+    solverContactInjectMs: 0,
+    solverSolveMs: 0,
     damageReplayMs: 0,
     damagePreviewMs: 0,
     damageTickMs: 0,
@@ -432,7 +444,23 @@ export async function buildDestructibleCore({
     console.warn('[Core] no supports (nodes with mass=0) found in scenario', scenario);
   }
 
+  // Island-aware solving (Stage 4 integration). Off by default so existing behavior is unchanged.
+  // When enabled, the stress solve runs per disconnected component ("island") and skips components
+  // that have settled — their velocity inputs are unchanged since the last solve and they already
+  // converged, so re-solving is a no-op. This is observationally identical to the whole-graph solve
+  // but far cheaper for large, partially-active worlds. A settled component re-solves the same frame
+  // its load changes (a new contact, or a neighbour waking shifts its input), so it is paused, never
+  // frozen or evicted: anything settled can always be loaded and fractured again.
+  let islandSolverEnabled = false;
+  let islandSolverSkipSettled = true;
+
   const solver = runtime.createExtSolver({ nodes, bonds, settings: scaledSettings });
+
+  function applyIslandSolverSettings() {
+    solver.setIslandAware?.(islandSolverEnabled);
+    solver.setSkipSettled?.(islandSolverEnabled && islandSolverSkipSettled);
+  }
+  applyIslandSolverSettings();
 
   const bondTable: Array<{ index:number; node0:number; node1:number; centroid:Vec3; normal:Vec3; area:number }> = scenario.bonds.map((b, i) => ({ index: i, node0: b.node0, node1: b.node1, centroid: b.centroid, normal: b.normal, area: b.area }));
   const bondsByNode = new Map<number, number[]>();
@@ -642,15 +670,32 @@ export async function buildDestructibleCore({
   const SPLASH_RADIUS = 2.0;
   const SPLASH_CELL = SPLASH_RADIUS; // cell size = splash radius
   const SPLASH_INV_CELL = 1 / SPLASH_CELL;
-  // Map from "ix,iy,iz" grid key to array of node indices
-  const splashGrid = new Map<string, number[]>();
+  // Bit-packed integer grid keys avoid the per-cell `${ix},${iy},${iz}` string
+  // allocation that previously ran for every cell in a 3D box on every external
+  // contact (heavy transient GC pressure on the injection path). Each axis index
+  // is recentred by SPLASH_KEY_OFFSET (so negatives pack cleanly) and packed in
+  // base-SPLASH_KEY_STRIDE. The stride/offset give a ±65535-cell (±131 km at the
+  // 2 m cell size) range while keeping the composite key below 2^53, so distinct
+  // cells never collide for any realistic local chunk offset.
+  const SPLASH_KEY_STRIDE = 1 << 17; // 131072
+  const SPLASH_KEY_OFFSET = 1 << 16; // 65536 (half-range, recentres negatives)
+  // Map from packed integer grid key to array of node indices
+  const splashGrid = new Map<number, number[]>();
   let splashGridDirty = true; // rebuild on first use and after splits
 
-  function splashGridKey(x: number, y: number, z: number): string {
-    const ix = Math.floor(x * SPLASH_INV_CELL);
-    const iy = Math.floor(y * SPLASH_INV_CELL);
-    const iz = Math.floor(z * SPLASH_INV_CELL);
-    return `${ix},${iy},${iz}`;
+  function splashCellKey(ix: number, iy: number, iz: number): number {
+    const px = ix + SPLASH_KEY_OFFSET;
+    const py = iy + SPLASH_KEY_OFFSET;
+    const pz = iz + SPLASH_KEY_OFFSET;
+    return (px * SPLASH_KEY_STRIDE + py) * SPLASH_KEY_STRIDE + pz;
+  }
+
+  function splashGridKey(x: number, y: number, z: number): number {
+    return splashCellKey(
+      Math.floor(x * SPLASH_INV_CELL),
+      Math.floor(y * SPLASH_INV_CELL),
+      Math.floor(z * SPLASH_INV_CELL),
+    );
   }
 
   function rebuildSplashGrid() {
@@ -681,7 +726,7 @@ export async function buildDestructibleCore({
     for (let ix = minIx; ix <= maxIx; ix++) {
       for (let iy = minIy; iy <= maxIy; iy++) {
         for (let iz = minIz; iz <= maxIz; iz++) {
-          const bucket = splashGrid.get(`${ix},${iy},${iz}`);
+          const bucket = splashGrid.get(splashCellKey(ix, iy, iz));
           if (!bucket) continue;
           for (let bi = 0; bi < bucket.length; bi++) {
             const ci = bucket[bi];
@@ -705,6 +750,15 @@ export async function buildDestructibleCore({
   const snapshotIndex = new Map<number, BodySnapshot>();
   const bodyRestoreProvenance = new Map<number, FractureBodyProvenance>();
   const splitContinuityLog: SplitContinuityRecord[] = [];
+  // Reused (handle-retained) bodies that lost colliders since the last snapshot capture and
+  // therefore need their velocity re-derived for the shifted COM after a resim restore (the
+  // restore re-applies the stale COM-velocity from the snapshot). See reconcileReusedBodyVelocity.
+  const comDirtyReusedBodies = new Set<number>();
+  // Parent bodies that had colliders migrated away to newly-created children this flush. The
+  // parent keeps its handle (it is "reused"/retired) but its COM shifts, so it needs the same
+  // velocity reconciliation as a reused body. Populated by flushPendingBodies (which knows the
+  // inherit-from parent) and consumed by flushColliderMigrations after the colliders move.
+  const bodiesThatLostColliders = new Set<number>();
 
   // ── Sleep threshold tracking ──
   let sleepThresholdsApplied = false; // Track if we've already set thresholds on all bodies
@@ -725,6 +779,22 @@ export async function buildDestructibleCore({
   // tumbling debris keeps self-stressing, mirroring NVIDIA Blast's centrifugal-on-dynamic default.
   // Off by default so it never perturbs scenarios tuned without it. Toggle via setSolverCentrifugalEnabled.
   let solverCentrifugalEnabled = false;
+
+  // ── Batched per-actor gravity ──
+  // The solver actor table only changes on topology changes (splits), so the
+  // materialised actor list is cached and rebuilt lazily, instead of crossing
+  // the FFI boundary to re-collect it every frame. `addAllActorGravity` then
+  // applies gravity to all actors in a single WASM call, rotating world gravity
+  // into each actor's body-local frame inside C++ (one crossing per frame
+  // instead of one per actor — thousands fewer on large scenes).
+  let solverActorsCache: Array<{ actorIndex: number; nodes: number[] }> = [];
+  let solverActorsDirty = true;
+  // One quaternion (x,y,z,w) per actor slot, indexed by actor index. Actor
+  // (family) indices are bounded by the support-chunk/node count.
+  const solverActorRotations = new Float32Array(Math.max(scenario.nodes?.length ?? 0, 1) * 4);
+  // Lazily probed: false when the WASM runtime predates addAllActorGravity, in
+  // which case we fall back to the per-actor addActorGravity loop.
+  let solverBatchedGravity: boolean | undefined;
   const damageOptions: Required<DamageOptions & { autoDetachOnDestroy?: boolean; autoCleanupPhysics?: boolean }> = {
     enabled: !!damage?.enabled,
     strengthPerVolume: damage?.strengthPerVolume ?? 10000,
@@ -815,13 +885,11 @@ export async function buildDestructibleCore({
     maxForceMagnitude: number;
     totalForceWorld?: Vec3;
   }> = [];
-  const bufferedInternalContacts: Array<{
-    nodeA: number;
-    nodeB: number;
-    bodyHandle: number;
-    totalForceMagnitude: number;
-    maxForceMagnitude: number;
-  }> = [];
+  // Internal (same-body, node↔node) contacts were previously materialised into a
+  // full object array that nothing consumed except the profiler counter below.
+  // We keep only the count (used by the `bufferedInternalContacts` profiler
+  // metric) and skip building the throwaway objects.
+  let bufferedInternalContactCount = 0;
 
   // --- Buffered contacts for damage rollback replay ---
   const contactReplayBuffer = new ContactBuffer();
@@ -834,31 +902,20 @@ export async function buildDestructibleCore({
     fastSpeedFactor: damageOptions.fastSpeedFactor,
   };
 
-  function getChunkWorldCenter(nodeIndex: number): Vec3 | null {
-    const chunk = chunks[nodeIndex];
-    if (!chunk) return null;
-    const { body } = actorBodyForNode(nodeIndex);
-    if (!body) return null;
-    return chunkWorldCenterHelper(body, chunk.baseLocalOffset);
-  }
-
-  function getWorldPointToActorLocal(nodeIndex: number, worldPoint: Vec3): Vec3 | null {
-    try {
-      const { body } = actorBodyForNode(nodeIndex);
-      if (!body) return null;
-      return worldPointToBodyLocal(body, worldPoint);
-    } catch {
-      return null;
-    }
-  }
-
   function drainContactForces() {
     const t0 = startTiming();
     bufferedExternalContacts.length = 0;
-    bufferedInternalContacts.length = 0;
+    bufferedInternalContactCount = 0;
     contactReplayBuffer.clear();
 
     const dt = lastStepDt;
+    // The full speed-scaling / momentum / local-point / replay-buffer pipeline
+    // exists solely to feed the damage system. When damage is disabled the
+    // stress solver only needs totalForce/maxForce/forceVec, so we skip all of
+    // that per-event WASM round-tripping (relative-speed, world→local transforms,
+    // replay recording). Behaviour is byte-identical because the sole consumer —
+    // damageDrivePass — early-returns when damage is off.
+    const damageOn = damageOptions.enabled;
 
     eventQueue.drainContactForceEvents((ev) => {
       const h1 = ev.collider1();
@@ -871,32 +928,15 @@ export async function buildDestructibleCore({
       const forceVec: Vec3 | undefined = typeof (ev as any).totalForce === 'function'
         ? (ev as any).totalForce() as Vec3
         : undefined;
-      // Extract world contact points (when available from Rapier)
-      const wp = typeof (ev as any).worldContactPoint === 'function'
-        ? (ev as any).worldContactPoint() as Vec3 | undefined
-        : undefined;
-      const wp2 = typeof (ev as any).worldContactPoint2 === 'function'
-        ? (ev as any).worldContactPoint2() as Vec3 | undefined
-        : undefined;
-      const p1 = wp ?? wp2 ?? fallbackContactPoint(world, h1);
-      const p2 = wp2 ?? wp ?? fallbackContactPoint(world, h2);
 
-      const isInternal = (node1 != null && node2 != null);
-      const pForNode1 = node1 != null ? (wp ?? wp2 ?? getChunkWorldCenter(node1) ?? p1) : undefined;
-      const pForNode2 = node2 != null ? (wp2 ?? wp ?? getChunkWorldCenter(node2) ?? p2) : undefined;
-      const relAnchor = pForNode1 ?? pForNode2 ?? p1 ?? p2;
+      // Resolve both bodies exactly once. Needed always for ground-collision
+      // tracking, and reused by the damage pipeline below (relative speed +
+      // momentum boost) instead of re-resolving the colliders.
+      const b1 = getBodyForColliderHandle(world, h1);
+      const b2 = getBodyForColliderHandle(world, h2);
 
-      // Speed-scaled effective magnitude
-      const relSpeed = computeRelativeSpeed(world, h1, h2, relAnchor);
-      const speedFactor = computeSpeedFactor(relSpeed, isInternal, speedScalingOpts);
-      let effMag = (totalForce ?? 0) * speedFactor;
-
-      // Projectile momentum boost
+      // Track ground collisions for optimization modes (damage-independent).
       try {
-        const b1 = getBodyForColliderHandle(world, h1);
-        const b2 = getBodyForColliderHandle(world, h2);
-
-        // Track ground collisions for optimization modes
         if (b1 && b2) {
           const isB1Ground = b1.handle === groundBody.handle;
           const isB2Ground = b2.handle === groundBody.handle;
@@ -914,34 +954,76 @@ export async function buildDestructibleCore({
             }
           }
         }
+      } catch { /* defensive: don't let ground tracking crash contact drain */ }
 
+      // Damage-only derived quantities. Default effMag to the raw force; the
+      // local points stay null. These are only consumed by the replay buffer.
+      let effMag = totalForce ?? 0;
+      let local1: Vec3 | null = null;
+      let local2: Vec3 | null = null;
+
+      if (damageOn) {
+        // Extract world contact points (when available from Rapier)
+        const wp = typeof (ev as any).worldContactPoint === 'function'
+          ? (ev as any).worldContactPoint() as Vec3 | undefined
+          : undefined;
+        const wp2 = typeof (ev as any).worldContactPoint2 === 'function'
+          ? (ev as any).worldContactPoint2() as Vec3 | undefined
+          : undefined;
+        const p1 = wp ?? wp2 ?? fallbackContactPoint(world, h1);
+        const p2 = wp2 ?? wp ?? fallbackContactPoint(world, h2);
+
+        // Resolve each node's owning body once, then reuse it for both the
+        // chunk-center anchor and the world→local transform.
+        const bodyN1 = node1 != null ? actorBodyForNode(node1).body : null;
+        const bodyN2 = node2 != null ? actorBodyForNode(node2).body : null;
+        const chunk1c = node1 != null ? chunks[node1] : undefined;
+        const chunk2c = node2 != null ? chunks[node2] : undefined;
+        const center1 = (bodyN1 && chunk1c) ? chunkWorldCenterHelper(bodyN1, chunk1c.baseLocalOffset) : null;
+        const center2 = (bodyN2 && chunk2c) ? chunkWorldCenterHelper(bodyN2, chunk2c.baseLocalOffset) : null;
+
+        const isInternal = (node1 != null && node2 != null);
+        const pForNode1 = node1 != null ? (wp ?? wp2 ?? center1 ?? p1) : undefined;
+        const pForNode2 = node2 != null ? (wp2 ?? wp ?? center2 ?? p2) : undefined;
+        const relAnchor = pForNode1 ?? pForNode2 ?? p1 ?? p2;
+
+        // Speed-scaled effective magnitude (reusing the already-resolved bodies)
+        const relSpeed = relativeSpeedBetweenBodies(b1, b2, relAnchor);
+        const speedFactor = computeSpeedFactor(relSpeed, isInternal, speedScalingOpts);
+        effMag = (totalForce ?? 0) * speedFactor;
+
+        // Projectile momentum boost
         if (node1 != null || node2 != null) {
-          effMag = applyProjectileMomentumBoost(b1, b2, relSpeed, dt, effMag);
+          try {
+            effMag = applyProjectileMomentumBoost(b1, b2, relSpeed, dt, effMag);
+          } catch { /* defensive: don't let boost logic crash contact drain */ }
         }
-      } catch { /* defensive: don't let boost logic crash contact drain */ }
 
-      // Compute body-local contact points for splash AOE damage
-      const local1 = (node1 != null && pForNode1) ? getWorldPointToActorLocal(node1, pForNode1) : null;
-      const local2 = (node2 != null && pForNode2) ? getWorldPointToActorLocal(node2, pForNode2) : null;
+        // Compute body-local contact points for splash AOE damage
+        if (node1 != null && pForNode1 && bodyN1) {
+          try { local1 = worldPointToBodyLocal(bodyN1, pForNode1); } catch { local1 = null; }
+        }
+        if (node2 != null && pForNode2 && bodyN2) {
+          try { local2 = worldPointToBodyLocal(bodyN2, pForNode2); } catch { local2 = null; }
+        }
+      }
 
-      // --- Buffer contacts for stress solver injection (unchanged logic) ---
+      // --- Buffer contacts for stress solver injection (damage-independent) ---
+      // Replay-buffer recording is gated on damageOn — its only reader is the
+      // damage drive pass.
       if (node1 != null && node2 != null) {
         const chunk1 = chunks[node1];
         const chunk2 = chunks[node2];
         if (chunk1 && chunk2 && chunk1.bodyHandle === chunk2.bodyHandle) {
-          bufferedInternalContacts.push({
-            nodeA: node1,
-            nodeB: node2,
-            bodyHandle: chunk1.bodyHandle!,
-            totalForceMagnitude: totalForce,
-            maxForceMagnitude: maxForce,
-          });
-          // Buffer for damage replay with speed-scaled magnitude
-          contactReplayBuffer.recordInternal({
-            nodeA: node1, nodeB: node2, effMag, dt,
-            localPointA: local1 ?? undefined,
-            localPointB: local2 ?? undefined,
-          });
+          // Internal (same-body) contact: no stress injection; count for profiler.
+          bufferedInternalContactCount += 1;
+          if (damageOn) {
+            contactReplayBuffer.recordInternal({
+              nodeA: node1, nodeB: node2, effMag, dt,
+              localPointA: local1 ?? undefined,
+              localPointB: local2 ?? undefined,
+            });
+          }
         } else {
           if (chunk1) {
             bufferedExternalContacts.push({
@@ -951,10 +1033,12 @@ export async function buildDestructibleCore({
               maxForceMagnitude: maxForce,
               totalForceWorld: forceVec,
             });
-            contactReplayBuffer.recordExternal({
-              nodeIndex: node1, effMag, dt,
-              localPoint: local1 ?? undefined,
-            });
+            if (damageOn) {
+              contactReplayBuffer.recordExternal({
+                nodeIndex: node1, effMag, dt,
+                localPoint: local1 ?? undefined,
+              });
+            }
           }
           if (chunk2) {
             bufferedExternalContacts.push({
@@ -964,10 +1048,12 @@ export async function buildDestructibleCore({
               maxForceMagnitude: maxForce,
               totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
             });
-            contactReplayBuffer.recordExternal({
-              nodeIndex: node2, effMag, dt,
-              localPoint: local2 ?? undefined,
-            });
+            if (damageOn) {
+              contactReplayBuffer.recordExternal({
+                nodeIndex: node2, effMag, dt,
+                localPoint: local2 ?? undefined,
+              });
+            }
           }
         }
       } else if (node1 != null) {
@@ -980,10 +1066,12 @@ export async function buildDestructibleCore({
             maxForceMagnitude: maxForce,
             totalForceWorld: forceVec,
           });
-          contactReplayBuffer.recordExternal({
-            nodeIndex: node1, effMag, dt,
-            localPoint: local1 ?? undefined,
-          });
+          if (damageOn) {
+            contactReplayBuffer.recordExternal({
+              nodeIndex: node1, effMag, dt,
+              localPoint: local1 ?? undefined,
+            });
+          }
           if (chunk.bodyHandle != null) bodiesCollidedWithGround.add(chunk.bodyHandle);
         }
       } else if (node2 != null) {
@@ -996,10 +1084,12 @@ export async function buildDestructibleCore({
             maxForceMagnitude: maxForce,
             totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
           });
-          contactReplayBuffer.recordExternal({
-            nodeIndex: node2, effMag, dt,
-            localPoint: local2 ?? undefined,
-          });
+          if (damageOn) {
+            contactReplayBuffer.recordExternal({
+              nodeIndex: node2, effMag, dt,
+              localPoint: local2 ?? undefined,
+            });
+          }
           if (chunk.bodyHandle != null) bodiesCollidedWithGround.add(chunk.bodyHandle);
         }
       }
@@ -1083,6 +1173,36 @@ export async function buildDestructibleCore({
       y: sourceLinvel.y + comCorrection.y,
       z: sourceLinvel.z + comCorrection.z,
     }, true);
+  }
+
+  // When a body is REUSED across a split — it keeps its handle and merely loses the
+  // colliders that migrated to its new siblings — its centre of mass shifts. Rapier
+  // stores `linvel` as the velocity of the COM and keeps that value when colliders are
+  // removed, so the body's velocity *field* jumps by `ω × ΔCOM` at every other point
+  // (e.g. its retained chunks). The created-child path is corrected by
+  // `syncBodyVelocityFromSource`; the reused body has no such correction otherwise — that
+  // is the "big fragment hovers / lurches after it fractures" bug (TESTING.md gap #1b).
+  //
+  // `removeCollider` defers the mass-property recompute, so `worldCom()` here still reads
+  // the PRE-removal COM. Capture it, force the recompute, then shift `linvel` by
+  // `ω × (newCom − oldCom)` so the field is preserved at the points that stayed on the
+  // body. Mirrors Rust's `reconcile_child_velocity_with_com`.
+  function reconcileReusedBodyVelocity(body: RapierRigidBody, oldComOverride?: Vec3) {
+    if (body.isFixed()) return;
+    // worldCom() may return a reused buffer, so snapshot the OLD components before any
+    // recompute can mutate it.
+    const oldRaw = oldComOverride ?? body.worldCom();
+    const oldCom = { x: oldRaw.x, y: oldRaw.y, z: oldRaw.z };
+    const recompute = (body as RapierRigidBody & {
+      recomputeMassPropertiesFromColliders?: () => void;
+    }).recomputeMassPropertiesFromColliders;
+    if (typeof recompute === 'function') recompute.call(body);
+    const newCom = body.worldCom();
+    const lever = { x: newCom.x - oldCom.x, y: newCom.y - oldCom.y, z: newCom.z - oldCom.z };
+    if (lever.x * lever.x + lever.y * lever.y + lever.z * lever.z <= 1e-12) return;
+    const correction = cross(body.angvel(), lever);
+    const lv = body.linvel();
+    body.setLinvel({ x: lv.x + correction.x, y: lv.y + correction.y, z: lv.z + correction.z }, true);
   }
 
   function recordBodyContinuity(
@@ -1194,6 +1314,9 @@ export async function buildDestructibleCore({
   function captureWorldSnapshot() {
     const t0 = startTiming();
     snapshotGeneration += 1;
+    // The fresh snapshot records each body's current COM, so any collider changes are now
+    // "baked in" relative to it; clear the dirty set so only post-capture splits are tracked.
+    comDirtyReusedBodies.clear();
     if (snapshotMode === 'world') {
       savedWorldSnapshot = world.takeSnapshot();
       savedBodySnapshots = null;
@@ -1226,6 +1349,17 @@ export async function buildDestructibleCore({
       }
     } else if (savedBodySnapshots) {
       restoreDynamicBodySnapshots(world, savedBodySnapshots, snapshotPoolSize);
+      // The restore re-applied each reused body's stale COM-velocity (the snapshot stores
+      // linvel at the COM it had with its full collider set). For reused bodies that have
+      // since lost colliders, re-derive the velocity for the shifted COM so they don't
+      // hover/lurch when the re-simulation steps them (gap #1b). Created bodies are handled
+      // by restoreCreatedBodyFromSource below.
+      for (const bodyHandle of comDirtyReusedBodies) {
+        const snap = snapshotIndex.get(bodyHandle);
+        if (!snap) continue; // created after this snapshot -> handled below, not a reused body
+        const body = world.getRigidBody(bodyHandle);
+        if (body) reconcileReusedBodyVelocity(body, snap.com);
+      }
       for (const [bodyHandle, provenance] of bodyRestoreProvenance) {
         if (provenance.createdAtSnapshotGeneration !== snapshotGeneration) continue;
         if (snapshotIndex.has(bodyHandle)) continue;
@@ -1239,28 +1373,91 @@ export async function buildDestructibleCore({
     const passT0 = startTiming();
 
     const solverT0 = startTiming();
-    if (solverGravityEnabled) {
-      const solverActors = (solver as unknown as SolverActorsApi).actors?.() ?? [];
-      for (const actor of solverActors) {
-        const entry = actorMap.get(actor.actorIndex);
-        if (!entry) {
-          solver.addActorGravity(actor.actorIndex, { x: 0, y: gravity, z: 0 });
-          continue;
+
+    // Skip solver when idle: no external contacts, no recent fractures/topology changes,
+    // solver has converged (no residual error from prior frames), and not a resimulation pass.
+    // Without the convergence check, the solver might skip frames where it hasn't fully
+    // resolved stress in large structures (CGNR may need multiple frames to converge).
+    //
+    // Decide this BEFORE injecting gravity/forces. If we're going to skip the solve this
+    // frame, re-injecting gravity is wasted work — it would never be consumed by an update()
+    // and only perturbs the already-converged residual, so skipping it takes the idle
+    // residual to ~0 (matching Rapier). None of the gravity/force injection below mutates
+    // the predicate's inputs, so hoisting it here is value-identical. The predicate re-arms
+    // automatically the moment activity resumes (a new contact, a non-converged residual, or
+    // an active fracture countdown — all already accounted for here).
+    const hasExternalForces = bufferedExternalContacts.length > 0 || pendingExternalForces.length > 0;
+    const solverConverged = typeof solver.converged === 'function' ? solver.converged() : false;
+    const shouldSkipSolver = fracturePolicySettings.idleSkip && !hasExternalForces && solverFractureCountdown <= 0 && solverConverged && passIndex === 0 && safeFrames > 2;
+
+    const gravityInjectT0 = startTiming();
+    if (!shouldSkipSolver && solverGravityEnabled) {
+      const solverApi = solver as unknown as SolverActorsApi;
+
+      // Refresh the cached actor list only when topology changed (splits). The
+      // list mirrors the solver's internal actor table, so the batched WASM
+      // call can iterate the same set without re-materialising it each frame.
+      if (solverActorsDirty) {
+        solverActorsCache = solverApi.actors?.() ?? [];
+        solverActorsDirty = false;
+      }
+
+      if (solverBatchedGravity === undefined) {
+        solverBatchedGravity = solverApi.supportsBatchedGravity?.() ?? false;
+      }
+
+      if (solverBatchedGravity && solverApi.addAllActorGravity) {
+        // Fast path: write each known actor's body rotation into a flat buffer
+        // (indexed by actor index), then apply gravity to every actor in one
+        // FFI crossing. C++ rotates the world gravity into each actor's local
+        // frame; actors without a body keep the identity rotation (i.e. the
+        // unrotated world gravity), matching the per-actor fallback below.
+        const rotations = solverActorRotations;
+        const slotCount = rotations.length >> 2;
+        for (const actor of solverActorsCache) {
+          const slot = actor.actorIndex << 2;
+          if (slot < 0 || (slot >> 2) >= slotCount) continue;
+          const entry = actorMap.get(actor.actorIndex);
+          const body = entry ? world.getRigidBody(entry.bodyHandle) : undefined;
+          if (body) {
+            const rot = body.rotation();
+            rotations[slot] = rot.x;
+            rotations[slot + 1] = rot.y;
+            rotations[slot + 2] = rot.z;
+            rotations[slot + 3] = rot.w;
+          } else {
+            rotations[slot] = 0;
+            rotations[slot + 1] = 0;
+            rotations[slot + 2] = 0;
+            rotations[slot + 3] = 1; // identity → unrotated world gravity
+          }
         }
-        const body = world.getRigidBody(entry.bodyHandle);
-        if (!body) {
-          solver.addActorGravity(actor.actorIndex, { x: 0, y: gravity, z: 0 });
-          continue;
+        solverApi.addAllActorGravity({ x: 0, y: gravity, z: 0 }, rotations, slotCount);
+      } else {
+        // Legacy fallback: one FFI crossing per actor (runtime predates the
+        // batched entry point). Mirrors the batched math exactly.
+        for (const actor of solverActorsCache) {
+          const entry = actorMap.get(actor.actorIndex);
+          if (!entry) {
+            solver.addActorGravity(actor.actorIndex, { x: 0, y: gravity, z: 0 });
+            continue;
+          }
+          const body = world.getRigidBody(entry.bodyHandle);
+          if (!body) {
+            solver.addActorGravity(actor.actorIndex, { x: 0, y: gravity, z: 0 });
+            continue;
+          }
+          const rot = body.rotation();
+          const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
+          const gx = 0, gy = gravity, gz = 0;
+          const ix = qw * qw * gx + 2 * qy * qw * gz - 2 * qz * qw * gy + qx * qx * gx + 2 * qy * qx * gy + 2 * qz * qx * gz - qz * qz * gx - qy * qy * gx;
+          const iy = 2 * qx * qy * gx + qy * qy * gy + 2 * qz * qy * gz + 2 * qw * qz * gx - qz * qz * gy + qw * qw * gy - 2 * qx * qw * gz - qx * qx * gy;
+          const iz = 2 * qx * qz * gx + 2 * qy * qz * gy + qz * qz * gz - 2 * qw * qy * gx - qy * qy * gz + 2 * qw * qx * gy - qx * qx * gz + qw * qw * gz;
+          solver.addActorGravity(actor.actorIndex, { x: ix, y: iy, z: iz });
         }
-        const rot = body.rotation();
-        const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
-        const gx = 0, gy = gravity, gz = 0;
-        const ix = qw * qw * gx + 2 * qy * qw * gz - 2 * qz * qw * gy + qx * qx * gx + 2 * qy * qx * gy + 2 * qz * qx * gz - qz * qz * gx - qy * qy * gx;
-        const iy = 2 * qx * qy * gx + qy * qy * gy + 2 * qz * qy * gz + 2 * qw * qz * gx - qz * qz * gy + qw * qw * gy - 2 * qx * qw * gz - qx * qx * gy;
-        const iz = 2 * qx * qz * gx + 2 * qy * qz * gy + qz * qz * gz - 2 * qw * qy * gx - qy * qy * gz + 2 * qw * qx * gy - qx * qx * gz + qw * qw * gz;
-        solver.addActorGravity(actor.actorIndex, { x: ix, y: iy, z: iz });
       }
     }
+    stopTiming(gravityInjectT0, 'solverGravityInjectMs');
 
     // Optionally feed each spinning dynamic actor its centrifugal acceleration so tumbling debris
     // keeps self-stressing (NVIDIA Blast applies this to dynamic actors by default). The solver
@@ -1306,6 +1503,7 @@ export async function buildDestructibleCore({
     // Converts world-space contact forces into body-local space and applies them
     // to the impacted node plus nearby nodes (splash radius) so that bond stress
     // reflects collision impacts, not just gravity.
+    const contactInjectT0 = startTiming();
     for (const contact of bufferedExternalContacts) {
       if (!contact.totalForceWorld) continue;
       const hitChunk = chunks[contact.nodeIndex];
@@ -1350,16 +1548,12 @@ export async function buildDestructibleCore({
         });
       }
     }
+    stopTiming(contactInjectT0, 'solverContactInjectMs');
 
-    // Skip solver when idle: no external contacts, no recent fractures/topology changes,
-    // solver has converged (no residual error from prior frames), and not a resimulation pass.
-    // Without the convergence check, the solver might skip frames where it hasn't fully
-    // resolved stress in large structures (CGNR may need multiple frames to converge).
-    const hasExternalForces = bufferedExternalContacts.length > 0 || pendingExternalForces.length > 0;
-    const solverConverged = typeof solver.converged === 'function' ? solver.converged() : false;
-    const shouldSkipSolver = fracturePolicySettings.idleSkip && !hasExternalForces && solverFractureCountdown <= 0 && solverConverged && passIndex === 0 && safeFrames > 2;
     if (!shouldSkipSolver) {
+      const solveT0 = startTiming();
       solver.update();
+      stopTiming(solveT0, 'solverSolveMs');
     }
     solverHadExternalForces = hasExternalForces;
     if (solverFractureCountdown > 0) solverFractureCountdown--;
@@ -1470,6 +1664,10 @@ export async function buildDestructibleCore({
       const newBody = world.createRigidBody(desc);
       const bodyHandle = newBody.handle;
       if (!isSupport && maxDynamicBodies > 0) dynamicBodies++;
+      // The parent keeps its handle but loses this child's colliders -> its COM will shift.
+      // Record it so flushColliderMigrations can reconcile its velocity once the colliders move
+      // (skips the fixed root/ground in the consume loop). See reconcileReusedBodyVelocity.
+      bodiesThatLostColliders.add(inheritFromBodyHandle);
       bodyRestoreProvenance.set(bodyHandle, {
         inheritFromBodyHandle,
         createdAtSnapshotGeneration: snapshotGeneration,
@@ -1612,7 +1810,15 @@ export async function buildDestructibleCore({
       );
     }
 
-    // Clean up source bodies that lost all colliders during migration
+    // Parent/source bodies that lost colliders during migration: either retire them (emptied)
+    // or — for a REUSED fragment that kept some colliders — reconcile its velocity for the
+    // shifted centre of mass so it does not hover/lurch (gap #1b). `bodiesThatLostColliders`
+    // is the reused parent (flushPendingBodies pre-updates chunk.bodyHandle, so the parent does
+    // NOT appear in `sourceBodiesAffected`); the latter still covers in-place collider moves.
+    // `comDirtyReusedBodies` lets the resim restore re-apply the correction (the snapshot
+    // restores the stale COM-velocity).
+    for (const bh of bodiesThatLostColliders) sourceBodiesAffected.add(bh);
+    bodiesThatLostColliders.clear();
     for (const bh of sourceBodiesAffected) {
       if (bh === rootBody.handle || bh === groundBody.handle) continue;
       const body = world.getRigidBody(bh);
@@ -1621,6 +1827,9 @@ export async function buildDestructibleCore({
       const count = typeof rb.numColliders === 'function' ? rb.numColliders() : -1;
       if (count === 0) {
         bodiesToRemove.add(bh);
+      } else if (!body.isFixed()) {
+        comDirtyReusedBodies.add(bh);
+        reconcileReusedBodyVelocity(body);
       }
     }
 
@@ -1781,6 +1990,10 @@ export async function buildDestructibleCore({
   function processSplitEvents(
     splitEvents: Array<{ parentActorIndex: number; children: Array<{ actorIndex: number; nodes: number[] }> }>,
   ) {
+    // Splits are the only thing that mutates the solver's actor table, so this
+    // is where the cached actor list (used by the batched gravity path) must be
+    // invalidated.
+    if (splitEvents.length > 0) solverActorsDirty = true;
     for (const split of splitEvents) {
       const parentActorIndex = split.parentActorIndex;
       const parentEntry = actorMap.get(parentActorIndex);
@@ -2052,7 +2265,7 @@ export async function buildDestructibleCore({
 
     if (activeProfilerSample) {
       activeProfilerSample.bufferedExternalContacts = bufferedExternalContacts.length;
-      activeProfilerSample.bufferedInternalContacts = bufferedInternalContacts.length;
+      activeProfilerSample.bufferedInternalContacts = bufferedInternalContactCount;
     }
 
     const needsResim = damageDrivePass(dt);
@@ -2168,9 +2381,105 @@ export async function buildDestructibleCore({
     return bondTable.length - removedBondIndices.size;
   }
 
-  function getSolverDebugLines(): Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }> {
+  // ── Stage 1: island settled-state measurement (read-only instrumentation) ──
+  // Connected components of the ACTIVE bond graph, treating static (mass<=0)
+  // nodes as non-merging CUT POINTS — a shared ground node carries sqrt_I_inv=0
+  // in the solver, so it propagates no stress and two structures sharing only
+  // the ground are physically independent islands. An island is "settled" iff
+  // every rigid body it sits on is Rapier-asleep: its inputs (body-local gravity
+  // + contacts) cannot change until something wakes it. This measures the
+  // fraction of the solve that island-aware skipping could avoid, with ZERO
+  // behavior change — it is the GO/NO-GO gate before the C++ refactor.
+  function islandFind(parent: Int32Array, x: number): number {
+    let r = x;
+    while (parent[r] !== r) r = parent[r];
+    while (parent[x] !== r) { const nx = parent[x]; parent[x] = r; x = nx; }
+    return r;
+  }
+
+  // Connected components of the live solver graph, derived from the ACTUAL
+  // fracture topology rather than the JS bond table: two nodes are unioned only
+  // when a bond joins them AND they currently sit on the same rigid body
+  // (`chunk.bodyHandle`). Blast splits bodies exactly along broken bonds, so a
+  // cross-body bond is a broken/severed bond and must not reconnect islands —
+  // this sidesteps the known `removedBondIndices` tracking lag. Static (mass<=0)
+  // nodes are cut points (a shared ground node carries no stress).
+  function rebuildIslandComponents(): Int32Array {
+    const n = chunks.length;
+    const parent = new Int32Array(n);
+    for (let i = 0; i < n; i++) parent[i] = i;
+    for (let bi = 0; bi < bondTable.length; bi++) {
+      const b = bondTable[bi];
+      const c0 = chunks[b.node0]; const c1 = chunks[b.node1];
+      if (!c0 || !c1 || !c0.active || !c1.active) continue;
+      if (c0.bodyHandle == null || c0.bodyHandle !== c1.bodyHandle) continue; // severed / cross-body
+      if ((scenario.nodes[b.node0]?.mass ?? 0) <= 0 || (scenario.nodes[b.node1]?.mass ?? 0) <= 0) continue;
+      const r0 = islandFind(parent, b.node0);
+      const r1 = islandFind(parent, b.node1);
+      if (r0 !== r1) parent[r0] = r1;
+    }
+    return parent;
+  }
+
+  // Skippable-fraction ceiling for island-aware solving. An island is settled
+  // iff it sits on a detached dynamic body that is Rapier-asleep — its inputs
+  // can't change until something wakes it. Nodes still on the fixed root (intact
+  // structure) are counted active here (their skip would come from per-island
+  // convergence, not sleep), so this is a LOWER BOUND on the achievable skip.
+  function getIslandSettledStats() {
+    const parent = rebuildIslandComponents();
+    const agg = new Map<number, { nodes: number; bonds: number; body: number | null }>();
+    let totalNodes = 0;
+    for (let ni = 0; ni < chunks.length; ni++) {
+      const chunk = chunks[ni];
+      if (!chunk || !chunk.active || chunk.bodyHandle == null) continue;
+      if ((scenario.nodes[ni]?.mass ?? 0) <= 0) continue;
+      const root = islandFind(parent, ni);
+      let a = agg.get(root);
+      if (!a) { a = { nodes: 0, bonds: 0, body: chunk.bodyHandle }; agg.set(root, a); }
+      a.nodes++;
+      totalNodes++;
+    }
+    let totalBonds = 0;
+    for (let bi = 0; bi < bondTable.length; bi++) {
+      const b = bondTable[bi];
+      const c0 = chunks[b.node0]; const c1 = chunks[b.node1];
+      if (!c0 || !c1 || !c0.active || !c1.active) continue;
+      if (c0.bodyHandle == null || c0.bodyHandle !== c1.bodyHandle) continue;
+      if ((scenario.nodes[b.node0]?.mass ?? 0) <= 0 || (scenario.nodes[b.node1]?.mass ?? 0) <= 0) continue;
+      totalBonds++;
+      const a = agg.get(islandFind(parent, b.node0));
+      if (a) a.bonds++;
+    }
+    let islandsTotal = 0, islandsSettled = 0, qNodes = 0, qBonds = 0;
+    for (const a of agg.values()) {
+      islandsTotal++;
+      const bh = a.body;
+      let settled = false;
+      if (bh != null && bh !== rootBody.handle && bh !== groundBody.handle) {
+        const body = world.getRigidBody(bh);
+        settled = !!body && typeof (body as { isSleeping?: () => boolean }).isSleeping === 'function'
+          && (body as { isSleeping: () => boolean }).isSleeping();
+      }
+      if (settled) { islandsSettled++; qNodes += a.nodes; qBonds += a.bonds; }
+    }
+    return {
+      islandsTotal,
+      islandsSettled,
+      totalNodes,
+      settledNodes: qNodes,
+      totalBonds,
+      settledBonds: qBonds,
+      settledNodeFraction: totalNodes ? qNodes / totalNodes : 0,
+      settledBondFraction: totalBonds ? qBonds / totalBonds : 0,
+    };
+  }
+
+  function getSolverDebugLines(
+    mode: number = 0 /* ExtDebugMode: 0=Max 1=Compression 2=Tension 3=Shear */,
+  ): Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }> {
     try {
-      return (solver as any).fillDebugRender?.({ mode: 0 /* ExtDebugMode.Max */, scale: 1.0 }) ?? [];
+      return (solver as any).fillDebugRender?.({ mode, scale: 1.0 }) ?? [];
     } catch {
       return [];
     }
@@ -2253,6 +2562,7 @@ export async function buildDestructibleCore({
   }
 
   function setGravityFn(g: number) {
+    gravity = g; // also drive the STRESS solver's per-actor gravity (not just Rapier's)
     world.gravity = { x: 0, y: g, z: 0 };
   }
 
@@ -2262,6 +2572,27 @@ export async function buildDestructibleCore({
 
   function setSolverCentrifugalEnabled(v: boolean) {
     solverCentrifugalEnabled = v;
+  }
+
+  // Enable/disable island-aware solving and settled-island skipping at runtime (Stage 4).
+  function setIslandSolver(opts: { enabled?: boolean; skipSettled?: boolean }) {
+    if (opts.enabled != null) islandSolverEnabled = !!opts.enabled;
+    if (opts.skipSettled != null) islandSolverSkipSettled = !!opts.skipSettled;
+    applyIslandSolverSettings();
+  }
+
+  function getIslandSolverStats() {
+    // Prefer the count the per-island solve actually used this frame (fresh, and always
+    // >= islandsSkipped). It is 0 when island-aware solving didn't run (off, or a single
+    // island fell back to the whole-graph path), so fall back to the always-available
+    // partition stat — which only refreshes on a topology resync — for fragmentation.
+    const solveTotal = solver.islandsTotal?.() ?? 0;
+    return {
+      enabled: islandSolverEnabled,
+      skipSettled: islandSolverSkipSettled,
+      islandCount: solveTotal > 0 ? solveTotal : (solver.islandCount?.() ?? 0),
+      islandsSkipped: solver.islandsSkipped?.() ?? 0,
+    };
   }
 
   function getCollisionGroupContext(): CollisionGroupContext {
@@ -2397,6 +2728,9 @@ export async function buildDestructibleCore({
     setDebrisCollisionMode: setDebrisCollisionModeFn,
     getRigidBodyCount,
     getActiveBondsCount,
+    getIslandSettledStats,
+    setIslandSolver,
+    getIslandSolverStats,
     getSolverDebugLines,
     getNodeBonds,
     cutBond,
