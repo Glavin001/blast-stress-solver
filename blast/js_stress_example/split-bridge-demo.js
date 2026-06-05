@@ -79,7 +79,7 @@ init().catch((e) => {
 });
 
 async function init() {
-  await RAPIER.init();
+  await RAPIER.init?.();
 
   // Three.js
   const canvas = ensureCanvas();

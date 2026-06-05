@@ -19,7 +19,7 @@ function makeChunk(nodeIndex: number, size = { x: 1, y: 1, z: 1 }) {
 
 describe('rapierHierarchyApplier two-phase migration', () => {
   beforeAll(async () => {
-    await RAPIER.init();
+    await RAPIER.init?.();
   });
 
   it('splits a 2x2 quad into two bodies and migrates colliders safely', () => {

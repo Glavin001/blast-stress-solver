@@ -65,7 +65,7 @@ async function runTicks(world: any, ticks: number, postStep?: () => void) {
 
 describe('Manual split fixtures (solver-free)', () => {
   beforeAll(async () => {
-    await RAPIER.init();
+    await RAPIER.init?.();
   });
 
   it('cube4_single: one split into two children and remains stable for 600 ticks', async () => {

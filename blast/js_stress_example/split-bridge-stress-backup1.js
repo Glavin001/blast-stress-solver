@@ -89,7 +89,7 @@ const state = {
 init().catch((e) => console.error('Demo init failed:', e));
 
 async function init() {
-  await RAPIER.init();
+  await RAPIER.init?.();
 
   // Three
   const canvas = ensureCanvas();

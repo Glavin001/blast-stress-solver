@@ -25,7 +25,7 @@
                 "imports": {
                     "three": "/vendor/three/build/three.module.js",
                     "three/addons/": "/vendor/three/examples/jsm/",
-                    "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs"
+                    "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.js"
                 }
             }
         </script>
@@ -40,7 +40,7 @@
             import RAPIER from '@dimforge/rapier3d-compat'
             import RapierDebugRenderer from '../blast/js_stress_example/rapier-debug-renderer.js'
 
-            await RAPIER.init() // This line is only needed if using the compat version
+            await RAPIER.init?.() // This line is only needed if using the compat version
             const gravity = new RAPIER.Vector3(0.0, -9.81, 0.0)
             const world = new RAPIER.World(gravity)
             const dynamicBodies = []

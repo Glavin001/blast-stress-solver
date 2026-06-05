@@ -18,6 +18,7 @@
   "license": "ISC",
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.1",
+    "@dimforge/rapier3d-simd": "^0.19.3",
     "lil-gui": "^0.20.0",
     "three": "^0.180.0"
   }

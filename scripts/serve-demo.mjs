@@ -68,7 +68,7 @@ if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     process.exit(1)
 }
 
-const rapierCompatDir = resolve(nodeModulesDir, '@dimforge/rapier3d-compat')
+const rapierCompatDir = resolve(nodeModulesDir, '@dimforge/rapier3d-simd')
 const rapierDebugDir = resolve(projectRoot, 'deps/rapier.js/rapier-compat/builds/3d/pkg')
 
 const blastStressSolverDir = resolve(projectRoot, 'blast/blast-stress-solver/dist')

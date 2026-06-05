@@ -125,7 +125,7 @@ const state = {
 init().catch((e) => console.error('Demo init failed:', e));
 
 async function init() {
-  await RAPIER.init();
+  await RAPIER.init?.();
   
   // Initialize configuration manager with saved config or defaults
   const savedConfig = loadConfigFromStorage();
