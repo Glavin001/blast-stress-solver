@@ -23,7 +23,7 @@
     <main class="layout">
       <section class="viewport">
         <canvas id="demo-canvas"></canvas>
-        <div class="viewport-hint">Toggle "Centrifugal" to make the spinning beams shatter</div>
+        <div class="viewport-hint">Centrifugal on, then lower Bond strength (Reset) or raise Spin rate to shatter</div>
       </section>
 
       <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
@@ -37,10 +37,11 @@
           <a href="./demo-index.html" class="back-link">&larr; All Demos</a>
           <h1>&#127744; Centrifugal Spinner</h1>
           <p>
-            Free-floating beams spun in zero gravity. With <strong>Centrifugal</strong> off they spin
-            forever intact; turn it on and the inward (centripetal) load crushes their bonds and they
-            shatter from the inside out. This is the difference the stress solver's centrifugal
-            acceleration makes.
+            A free-floating beam spun in zero gravity. With <strong>Centrifugal</strong> off it spins
+            forever, intact. Turn it on and the inward (centripetal) load fights the bonds: at the
+            default high <strong>Bond strength</strong> the beam still holds, so lower Bond strength
+            (then <strong>Reset</strong>) or raise the <strong>Spin rate</strong> until the load wins
+            and it snaps apart. That crossover is the stress solver's centrifugal acceleration at work.
           </p>
         </header>
 
@@ -53,8 +54,8 @@
           </div>
           <div class="config-row">
             <label class="config-label" for="cfg-spin">Spin rate &#9733;</label>
-            <input type="range" id="cfg-spin" class="config-slider" min="0" max="80" step="1" value="45" />
-            <span class="config-value"><span id="cfg-spin-value">45</span> rad/s</span>
+            <input type="range" id="cfg-spin" class="config-slider" min="0" max="120" step="1" value="20" />
+            <span class="config-value"><span id="cfg-spin-value">20</span> rad/s</span>
           </div>
         </section>
 
@@ -72,9 +73,9 @@
             <span class="config-value"><span id="cfg-segments-value">9</span></span>
           </div>
           <div class="config-row">
-            <label class="config-label" for="cfg-bond-strength">Bond strength</label>
-            <input type="range" id="cfg-bond-strength" class="config-slider" min="0.1" max="5" step="0.1" value="0.4" />
-            <span class="config-value"><span id="cfg-bond-strength-value">0.4</span></span>
+            <label class="config-label" for="cfg-bond-strength">Bond strength (log)</label>
+            <input type="range" id="cfg-bond-strength" class="config-slider" min="0" max="8" step="0.1" value="6" />
+            <span class="config-value"><span id="cfg-bond-strength-value">1.0e+6</span></span>
           </div>
         </section>
 

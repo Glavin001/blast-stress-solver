@@ -26,13 +26,16 @@ import { buildSpinningBeamsScenario } from 'blast-stress-solver/scenarios';
 // ── Config ────────────────────────────────────────────────────
 
 const CONFIG = {
-  centrifugal: false, // start OFF so the user sees it spin intact, then flips it on to shatter
-  spin: 45, // rad/s about +Y
-  // One centered beam by default: it spins about its own centre and snaps cleanly in the middle —
-  // the unambiguous A/B. Raising "Beams" adds more (they ride one free body and shatter together).
+  centrifugal: false, // start OFF so the user sees it spin intact, then flips it on
+  spin: 20, // rad/s about +Y (live)
+  // One centered beam by default: it spins about its own centre and snaps in the middle.
+  // Raising "Beams" adds more (they ride one free body and break together).
   beams: 1,
   segments: 9,
-  bondStrength: 0.4, // compression fatal limit — lower = more fragile
+  // Compression fatal limit (Reset to apply). The centrifugal stress is large in solver units even
+  // at modest spin, so this needs a wide range: start strong enough that the beam holds together,
+  // then lower it (or raise Spin rate) until it shatters.
+  bondStrength: 1.0e6,
 };
 
 // ── Three.js setup ────────────────────────────────────────────
@@ -219,7 +222,21 @@ bindSlider('cfg-spin', CONFIG, 'spin', (v) => v.toFixed(0));
 // Deferred (need Reset): scene shape and bond strength.
 bindSlider('cfg-beams', CONFIG, 'beams');
 bindSlider('cfg-segments', CONFIG, 'segments');
-bindSlider('cfg-bond-strength', CONFIG, 'bondStrength', (v) => v.toFixed(1));
+// Bond strength is logarithmic: the slider holds log10(compressionFatalLimit) over a wide range
+// (1 … 1e8) so there is actually a setting where the beam survives the spin. Reset to apply.
+{
+  const slider = document.getElementById('cfg-bond-strength') as HTMLInputElement | null;
+  const display = document.getElementById('cfg-bond-strength-value');
+  const fmt = (v: number) => (v >= 1000 ? v.toExponential(1) : v.toFixed(1));
+  if (slider) {
+    slider.value = String(Math.log10(CONFIG.bondStrength));
+    if (display) display.textContent = fmt(CONFIG.bondStrength);
+    slider.addEventListener('input', () => {
+      CONFIG.bondStrength = Math.pow(10, parseFloat(slider.value));
+      if (display) display.textContent = fmt(CONFIG.bondStrength);
+    });
+  }
+}
 
 // ── Render loop ──────────────────────────────────────────────
 
