@@ -23,7 +23,7 @@
     <main class="layout">
       <section class="viewport">
         <canvas id="demo-canvas"></canvas>
-        <div class="viewport-hint">Toggle Centrifugal — the beam snaps. Raise Bond strength or lower Spin rate to keep it intact.</div>
+        <div class="viewport-hint">Toggle Centrifugal — a few bonds near the middle snap. Raise Bond strength for fewer breaks (live).</div>
       </section>
 
       <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
@@ -38,10 +38,11 @@
           <h1>&#127744; Centrifugal Spinner</h1>
           <p>
             A free-floating beam spun in zero gravity. With <strong>Centrifugal</strong> off it spins
-            forever, intact. Turn it on and the inward (centripetal) load fights the bonds — at the
-            default settings it wins and the beam snaps. The crossover is sharp: peak stress grows as
-            spin² (≈ 30·ω²), so raise <strong>Bond strength</strong> past it (or drop the
-            <strong>Spin rate</strong>) to keep the beam whole. Strength and shape apply live.
+            forever, intact. Turn it on and the inward (centripetal) load loads the bonds in
+            compression — strongest at the centre — so at the default settings a few bonds near the
+            middle give way while the ends hang on. Raise <strong>Bond strength</strong> for fewer
+            breaks (it goes fully intact past the threshold), lower it for more, or change the
+            <strong>Spin rate</strong> (stress grows with spin²). Strength and shape apply live.
           </p>
         </header>
 
@@ -74,8 +75,8 @@
           </div>
           <div class="config-row">
             <label class="config-label" for="cfg-bond-strength">Bond strength (log)</label>
-            <input type="range" id="cfg-bond-strength" class="config-slider" min="1" max="6" step="0.1" value="3.3" />
-            <span class="config-value"><span id="cfg-bond-strength-value">2000</span></span>
+            <input type="range" id="cfg-bond-strength" class="config-slider" min="1" max="6" step="0.05" value="3.48" />
+            <span class="config-value"><span id="cfg-bond-strength-value">3000</span></span>
           </div>
         </section>
 

@@ -32,11 +32,12 @@ const CONFIG = {
   // Raising "Beams" adds more (they ride one free body and break together).
   beams: 1,
   segments: 9,
-  // Compression fatal limit. Measured (Rust pipeline, same solver): a spinning beam's peak bond
-  // stress ≈ 30·ω², so it breaks when bondStrength < 30·ω² and holds above it. At the default spin
-  // (20 rad/s ⇒ threshold ≈ 12000) a strength of 2000 is well below threshold, so the beam snaps
-  // when you enable centrifugal; raise it past ~12000 (or lower the spin) to keep it intact.
-  bondStrength: 2000,
+  // Compression fatal limit. Measured in the Rust pipeline (same solver), bonds broken of 8 at
+  // spin 20 as strength rises: ≤1750→8 (all), 2000-3250→6, 3500-4250→4, 4500-4750→2, ≥5000→0.
+  // Default 3000 lands in the partial band (a few break, not all); the JS/WASM pipeline applies
+  // fewer fractures than Rust, so on the web you'll see a couple. Slide strength up for fewer
+  // breaks, down for more — it applies live.
+  bondStrength: 3000,
 };
 
 // ── Three.js setup ────────────────────────────────────────────
