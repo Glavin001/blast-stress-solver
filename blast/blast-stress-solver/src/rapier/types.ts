@@ -242,6 +242,10 @@ export type CoreProfilerSample = {
   // Extended stats (optional)
   splitChildCounts?: number[];
   splitPlannerMs?: number;
+  /** A/B diagnostic: time the *reference* (dense-Hungarian) split planner would
+   *  have taken on this frame's splits. Only populated when the profiler is
+   *  configured with `measureReferencePlanner`. Never affects the simulation. */
+  splitPlannerReferenceMs?: number;
   bodyCount?: number;
   bodyColliderCountMin?: number | null;
   bodyColliderCountMax?: number | null;
@@ -259,6 +263,12 @@ export type SplitChild = {
 export type CoreProfilerConfig = {
   enabled: boolean;
   onSample?: (sample: CoreProfilerSample) => void;
+  /** A/B diagnostic (off by default): also run the reference (dense-Hungarian)
+   *  split planner on each split and record `splitPlannerReferenceMs`, so a demo
+   *  can show what frame time the old planner would have cost. This re-introduces
+   *  the old O(N^3) work for measurement only — the result is discarded and the
+   *  simulation is unaffected. Capped to avoid multi-second hangs on huge splits. */
+  measureReferencePlanner?: boolean;
 };
 
 export type DestructibleCore = {

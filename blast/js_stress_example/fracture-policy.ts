@@ -10,7 +10,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { buildDestructibleCore } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore , createFrameProfilerOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
@@ -146,6 +146,8 @@ function updateStatus(core: any, stepMs: number) {
 // ── Main ──────────────────────────────────────────────────────
 
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
+// Reusable, self-mounting live frame-profiler overlay (per-phase cost + A/B).
+const profiler = createFrameProfilerOverlay();
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
@@ -209,6 +211,7 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
 
   coreRef = core;
+  profiler.attach(core);
   visualsRef = visuals;
   frameTimes = [];
 }
@@ -393,6 +396,7 @@ const clock = new THREE.Clock();
 
 function loop() {
   requestAnimationFrame(loop);
+  profiler.render();
 
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();

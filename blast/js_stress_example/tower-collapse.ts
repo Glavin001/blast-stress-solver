@@ -10,13 +10,33 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import { buildDestructibleCore } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
+
+// ── Live frame profiler ───────────────────────────────────────
+// Reusable, self-mounting overlay: streams the core's per-frame profiler into a
+// rolling per-phase breakdown so a dip below 60fps is immediately attributable
+// to a phase (and, via its A/B toggle, compared against the old split planner).
+// `getMeta` enriches the ⬇ JSON/CSV data dump with the live scenario + config.
+const profiler = createFrameProfilerOverlay({
+  exportName: 'tower-collapse-profile',
+  getMeta: () => {
+    let bodies: number | undefined;
+    let bonds: number | undefined;
+    try { bodies = coreRef?.getRigidBodyCount(); } catch { /* ignore */ }
+    try { bonds = coreRef?.getActiveBondsCount(); } catch { /* ignore */ }
+    return {
+      demo: 'tower-collapse',
+      config: { tower: { ...CONFIG.tower }, solver: { ...CONFIG.solver }, physics: { ...CONFIG.physics } },
+      live: { bodies, bonds },
+    };
+  },
+});
 
 // ── Config ────────────────────────────────────────────────────
 
@@ -223,6 +243,9 @@ async function initScene() {
 
   coreRef = core;
   visualsRef = visuals;
+
+  // Point the reusable frame-profiler overlay at this core.
+  profiler.attach(core);
 }
 
 // ── Projectile shooting ───────────────────────────────────────
@@ -387,6 +410,7 @@ function loop() {
     });
     rapierDebug?.update();
     updateStatus(coreRef);
+    profiler.render();
   }
 
   const t1 = performance.now();
