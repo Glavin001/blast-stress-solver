@@ -225,6 +225,15 @@ extern "C" {
         mode: u32,
     );
 
+    pub(crate) fn ext_stress_solver_add_all_forces(
+        handle: *mut ExtStressSolverHandle,
+        node_indices: *const u32,
+        local_positions: *const f32,
+        local_forces: *const f32,
+        count: u32,
+        mode: u32,
+    ) -> u32;
+
     pub(crate) fn ext_stress_solver_add_gravity(
         handle: *mut ExtStressSolverHandle,
         local_gravity: *const Vec3,

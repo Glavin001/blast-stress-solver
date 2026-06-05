@@ -121,6 +121,11 @@ type SolverActorsApi = {
    *  runtime predates this export. */
   addAllActorGravity?: (worldGravity?: Vec3, rotations?: Float32Array, rotationCount?: number) => number;
   supportsBatchedGravity?: () => boolean;
+  /** Batched external-force injection (one FFI crossing for a whole frame's
+   *  contact forces). Returns the number applied, or -1 when the runtime
+   *  predates this export. */
+  addAllForces?: (nodeIndices: Uint32Array, positions: Float32Array, forces: Float32Array, count: number) => number;
+  supportsBatchedForces?: () => boolean;
 };
 type DebugWindow = Window & {
   debugStressSolver?: { printSolver?: () => unknown };
@@ -791,6 +796,58 @@ export async function buildDestructibleCore({
   // Lazily probed: false when the WASM runtime predates addAllActorGravity, in
   // which case we fall back to the per-actor addActorGravity loop.
   let solverBatchedGravity: boolean | undefined;
+
+  // ── Batched contact-force injection ──
+  // Contact forces (one per impacted node plus its splash neighbours) are
+  // accumulated into these flat, parallel buffers during the injection loop and
+  // submitted to the solver in a single FFI crossing via addAllForces — instead
+  // of one ext_stress_solver_add_force crossing per node, which dominated frame
+  // time on dense scenes (mini-city: ~53% of wall time). Grown geometrically and
+  // reused across frames. Lazily probed: false when the WASM runtime predates the
+  // batched export, in which case flushForceBatch() falls back to per-call addForce.
+  let solverForceIdx = new Uint32Array(256);
+  let solverForcePos = new Float32Array(256 * 3);
+  let solverForceVec = new Float32Array(256 * 3);
+  let solverForceCount = 0;
+  let solverBatchedForces: boolean | undefined;
+  const solverForceFallbackPos: Vec3 = { x: 0, y: 0, z: 0 };
+  const solverForceFallbackVec: Vec3 = { x: 0, y: 0, z: 0 };
+
+  function pushSolverForce(nodeIndex: number, px: number, py: number, pz: number, fx: number, fy: number, fz: number): void {
+    const i = solverForceCount;
+    if (i >= solverForceIdx.length) {
+      const n = solverForceIdx.length * 2;
+      const idx = new Uint32Array(n); idx.set(solverForceIdx); solverForceIdx = idx;
+      const pos = new Float32Array(n * 3); pos.set(solverForcePos); solverForcePos = pos;
+      const vec = new Float32Array(n * 3); vec.set(solverForceVec); solverForceVec = vec;
+    }
+    solverForceIdx[i] = nodeIndex >>> 0;
+    const b = i * 3;
+    solverForcePos[b] = px; solverForcePos[b + 1] = py; solverForcePos[b + 2] = pz;
+    solverForceVec[b] = fx; solverForceVec[b + 1] = fy; solverForceVec[b + 2] = fz;
+    solverForceCount = i + 1;
+  }
+
+  // Submit the accumulated contact forces. Fast path: one batched FFI crossing.
+  // Fallback (older runtimes): replay the buffer through per-call addForce, which
+  // is byte-identical to the original per-contact injection.
+  function flushForceBatch(): void {
+    if (solverForceCount === 0) return;
+    const solverApi = solver as unknown as SolverActorsApi;
+    if (solverBatchedForces === undefined) {
+      solverBatchedForces = solverApi.supportsBatchedForces?.() ?? false;
+    }
+    if (solverBatchedForces && solverApi.addAllForces) {
+      solverApi.addAllForces(solverForceIdx, solverForcePos, solverForceVec, solverForceCount);
+    } else {
+      for (let i = 0; i < solverForceCount; i++) {
+        const b = i * 3;
+        solverForceFallbackPos.x = solverForcePos[b]; solverForceFallbackPos.y = solverForcePos[b + 1]; solverForceFallbackPos.z = solverForcePos[b + 2];
+        solverForceFallbackVec.x = solverForceVec[b]; solverForceFallbackVec.y = solverForceVec[b + 1]; solverForceFallbackVec.z = solverForceVec[b + 2];
+        solver.addForce(solverForceIdx[i], solverForceFallbackPos, solverForceFallbackVec);
+      }
+    }
+  }
   const damageOptions: Required<DamageOptions & { autoDetachOnDestroy?: boolean; autoCleanupPhysics?: boolean }> = {
     enabled: !!damage?.enabled,
     strengthPerVolume: damage?.strengthPerVolume ?? 10000,
@@ -1460,6 +1517,12 @@ export async function buildDestructibleCore({
     // to the impacted node plus nearby nodes (splash radius) so that bond stress
     // reflects collision impacts, not just gravity.
     const contactInjectT0 = startTiming();
+    // Accumulate every contact force (hit node + splash neighbours) into flat
+    // buffers, then submit them in one batched FFI crossing below. Replaces the
+    // previous one-add_force-crossing-per-node pattern that dominated frame time
+    // on dense scenes. The fallback inside flushForceBatch() replays the same
+    // buffer through per-call addForce when the batched WASM export is absent.
+    solverForceCount = 0;
     for (const contact of bufferedExternalContacts) {
       if (!contact.totalForceWorld) continue;
       const hitChunk = chunks[contact.nodeIndex];
@@ -1476,14 +1539,14 @@ export async function buildDestructibleCore({
       const ly = -2 * qw * qz * fx + qw * qw * fy + 2 * qw * qx * fz + 2 * qx * qy * fx + qy * qy * fy - 2 * qz * qy * fz - qx * qx * fy - qz * qz * fy
         + 2 * qy * qz * fz;
       const lz = 2 * qw * qy * fx - 2 * qw * qx * fy + qw * qw * fz + 2 * qx * qz * fx + 2 * qy * qz * fy + qz * qz * fz - qx * qx * fz - qy * qy * fz;
-      const scaledForce = { x: lx * effectiveContactStressScale, y: ly * effectiveContactStressScale, z: lz * effectiveContactStressScale };
+      const sfx = lx * effectiveContactStressScale, sfy = ly * effectiveContactStressScale, sfz = lz * effectiveContactStressScale;
 
       // Apply to hit node at full strength
-      solver.addForce(contact.nodeIndex, hitChunk.baseLocalOffset, scaledForce);
+      const hitPos = hitChunk.baseLocalOffset;
+      pushSolverForce(contact.nodeIndex, hitPos.x, hitPos.y, hitPos.z, sfx, sfy, sfz);
 
       // Splash: apply attenuated force to neighboring nodes on the same body
       // Uses spatial grid for O(1) average lookups instead of O(n) full scan
-      const hitPos = hitChunk.baseLocalOffset;
       const splashR = SPLASH_RADIUS;
       if (splashGridDirty) rebuildSplashGrid();
       const neighbors = collectSplashNeighbors(hitPos.x, hitPos.y, hitPos.z, splashR, hitChunk.bodyHandle!);
@@ -1499,11 +1562,11 @@ export async function buildDestructibleCore({
         const falloff = (1 - dist / splashR);
         const f2 = falloff * falloff; // quadratic falloff
         if (f2 <= 0) continue;
-        solver.addForce(ci, c.baseLocalOffset, {
-          x: scaledForce.x * f2, y: scaledForce.y * f2, z: scaledForce.z * f2,
-        });
+        pushSolverForce(ci, c.baseLocalOffset.x, c.baseLocalOffset.y, c.baseLocalOffset.z, sfx * f2, sfy * f2, sfz * f2);
       }
     }
+    // Submit the whole frame's contact forces in a single FFI crossing.
+    flushForceBatch();
     stopTiming(contactInjectT0, 'solverContactInjectMs');
 
     if (!shouldSkipSolver) {
