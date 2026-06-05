@@ -107,11 +107,18 @@ const DEFAULT_BALL: BallParams = { radius: 0.35, mass: 1000, speed: 25 };
 // destruction demos use; the Blast force slider scales it up/down.
 const BLAST_SOLVER_FORCE = 8e5;
 
+// A chunk caught in a blast, with its outward direction + falloff frozen at
+// detonation time (so a piece flies the right way whenever it finally breaks free).
+type BlastCandidate = { node: number; falloff: number; nx: number; ny: number; nz: number };
+
 type BlastField = {
   cx: number; cy: number; cz: number;
-  radius: number; up: number;
+  up: number;
   solverForce: number; kick: number;
-  frames: number; total: number; solverFrames: number;
+  age: number; life: number; solverFrames: number;
+  candidates: BlastCandidate[];
+  /** Body handles already kicked, so each freed piece gets exactly one impulse. */
+  kicked: Set<number>;
 };
 
 export function mountShooter(opts: ShooterOptions): ShooterHandle {
@@ -652,91 +659,98 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     spawnShockwave(s.worldPos, cfg.blast.radius);
   }
 
-  // Register a blast at `center`. The actual work runs over the next few frames
-  // in updateBlastFields(): intact chunks live on the *fixed* root/actor bodies,
-  // so a Rapier force does nothing to them — fracturing them requires feeding the
-  // load into the stress solver (the same path projectile impacts use). The blast
-  // also flings the resulting dynamic pieces (and any loose debris) kinetically.
-  function explodeAt(_core: DestructibleCore, center: THREE.Vector3) {
+  // Register a blast at `center`. Intact chunks live on the *fixed* root/actor
+  // bodies, so a Rapier force does nothing to them — fracturing them needs the
+  // load fed into the stress solver (the path projectile impacts use). And the
+  // outward fling can't be applied while a chunk is still fixed/bonded, so it
+  // must wait until the piece actually breaks free. We freeze the in-range chunk
+  // set + outward direction here, then over the next ~0.6 s updateBlastFields()
+  // keeps seeding the fracture load AND kicks each piece outward the instant it
+  // becomes dynamic — however many frames the fracture cascade takes.
+  function explodeAt(core: DestructibleCore, center: THREE.Vector3) {
+    const world = core.world as RAPIER.World;
+    const radius = cfg.blast.radius;
+    const candidates: BlastCandidate[] = [];
+    for (const chunk of core.chunks) {
+      if (!chunk.active || chunk.destroyed || chunk.bodyHandle == null) continue;
+      const body = world.getRigidBody(chunk.bodyHandle);
+      if (!body) continue;
+      const t = body.translation();
+      const r = body.rotation();
+      _q.set(r.x, r.y, r.z, r.w);
+      _v.set(chunk.baseLocalOffset.x, chunk.baseLocalOffset.y, chunk.baseLocalOffset.z).applyQuaternion(_q);
+      const dx = t.x + _v.x - center.x;
+      const dy = t.y + _v.y - center.y;
+      const dz = t.z + _v.z - center.z;
+      const dist = Math.hypot(dx, dy, dz);
+      if (dist > radius) continue;
+      const inv = dist > 1e-4 ? 1 / dist : 0;
+      candidates.push({
+        node: chunk.nodeIndex,
+        falloff: 1 - dist / radius,
+        nx: dist > 1e-4 ? dx * inv : 0,
+        ny: dist > 1e-4 ? dy * inv : 1,
+        nz: dist > 1e-4 ? dz * inv : 0,
+      });
+    }
+    if (!candidates.length) return;
     blastFields.push({
       cx: center.x,
       cy: center.y,
       cz: center.z,
-      radius: cfg.blast.radius,
       up: cfg.blast.up,
       solverForce: cfg.blast.strength * BLAST_SOLVER_FORCE, // peak Newtons at centre
-      kick: Math.min(cfg.blast.strength, 80) * 0.6, // peak Δv (m/s) at centre
-      frames: 6,
-      total: 6,
-      solverFrames: 3, // sustain the fracture load for a few frames to propagate collapse
+      kick: Math.min(cfg.blast.strength, 100) * 0.32, // peak Δv (m/s) at centre, applied once per piece
+      age: 0,
+      life: 45, // ~0.75 s: long enough for the fracture cascade to free every piece
+      solverFrames: 4, // sustain the fracture load for a few frames to propagate collapse
+      candidates,
+      kicked: new Set<number>(),
     });
   }
 
-  // Drive active blast fields: seed bond stress (fracture) + impulse loose pieces.
+  // Drive active blast fields: keep seeding bond stress, and give each piece a
+  // single outward impulse the moment it becomes a free dynamic body.
   function updateBlastFields(core: DestructibleCore) {
     if (!blastFields.length) return;
     const world = core.world as RAPIER.World;
     const solver = core.solver;
     for (let i = blastFields.length - 1; i >= 0; i--) {
       const f = blastFields[i];
-      const injectSolver = f.total - f.frames < f.solverFrames;
+      const injectSolver = f.age < f.solverFrames;
 
-      // Fracture pass: inject an outward load into the stress solver for every
-      // live chunk in range — works on intact (fixed-body) chunks too, which is
-      // what actually breaks the grey structure apart.
-      if (injectSolver) {
-        for (const chunk of core.chunks) {
-          if (!chunk.active || chunk.destroyed || chunk.bodyHandle == null) continue;
-          const body = world.getRigidBody(chunk.bodyHandle);
-          if (!body) continue;
-          const t = body.translation();
+      for (const c of f.candidates) {
+        const chunk = core.chunks[c.node];
+        if (!chunk || !chunk.active || chunk.destroyed || chunk.bodyHandle == null) continue;
+        const body = world.getRigidBody(chunk.bodyHandle);
+        if (!body) continue;
+
+        // Fracture pass: feed the outward load into the stress solver so bonds
+        // overstress and the structure comes apart (works on fixed bodies too).
+        if (injectSolver) {
+          const mag = f.solverForce * c.falloff;
+          _v2.set(c.nx * mag, c.ny * mag + mag * f.up, c.nz * mag);
           const r = body.rotation();
-          _q.set(r.x, r.y, r.z, r.w);
-          _v.set(chunk.baseLocalOffset.x, chunk.baseLocalOffset.y, chunk.baseLocalOffset.z).applyQuaternion(_q);
-          const dx = t.x + _v.x - f.cx;
-          const dy = t.y + _v.y - f.cy;
-          const dz = t.z + _v.z - f.cz;
-          const dist = Math.hypot(dx, dy, dz);
-          if (dist > f.radius) continue;
-          const falloff = 1 - dist / f.radius;
-          const inv = dist > 1e-4 ? 1 / dist : 0;
-          const nx = dist > 1e-4 ? dx * inv : 0;
-          const ny = dist > 1e-4 ? dy * inv : 1;
-          const nz = dist > 1e-4 ? dz * inv : 0;
-          const mag = f.solverForce * falloff;
-          // World-space outward force (+ up bias) rotated into the body's local frame.
-          _v2.set(nx * mag, ny * mag + mag * f.up, nz * mag);
-          _qinv.copy(_q).conjugate();
-          _v2.applyQuaternion(_qinv);
+          _qinv.set(r.x, r.y, r.z, r.w).conjugate();
+          _v2.applyQuaternion(_qinv); // world force → body-local for the solver
           try {
-            solver.addForce(chunk.nodeIndex, chunk.baseLocalOffset, { x: _v2.x, y: _v2.y, z: _v2.z });
+            solver.addForce(c.node, chunk.baseLocalOffset, { x: _v2.x, y: _v2.y, z: _v2.z });
           } catch { /* ignore */ }
+        }
+
+        // Kinetic pass: as soon as a piece is free (its own dynamic body), kick
+        // it outward once. This is what was missing — pieces freed a few frames
+        // after impact (bonded "grey" structure) now fly back, not just settle.
+        if (body.isDynamic() && !f.kicked.has(chunk.bodyHandle)) {
+          f.kicked.add(chunk.bodyHandle);
+          const j = body.mass() * f.kick * c.falloff;
+          body.applyImpulse({ x: c.nx * j, y: (c.ny + f.up) * j, z: c.nz * j }, true);
         }
       }
 
-      // Kinetic pass: fling every dynamic body in range (loose debris + pieces
-      // that just broke off). Spread over the field's lifetime so freshly-detached
-      // chunks still catch some of the blast.
-      const perFrame = f.kick / f.total;
-      world.forEachRigidBody((body: RAPIER.RigidBody) => {
-        if (!body.isDynamic()) return; // skip fixed + the kinematic player capsule
-        const t = body.translation();
-        const dx = t.x - f.cx;
-        const dy = t.y - f.cy;
-        const dz = t.z - f.cz;
-        const dist = Math.hypot(dx, dy, dz);
-        if (dist > f.radius) return;
-        const falloff = 1 - dist / f.radius;
-        const inv = dist > 1e-4 ? 1 / dist : 0;
-        const nx = dist > 1e-4 ? dx * inv : 0;
-        const ny = dist > 1e-4 ? dy * inv : 1;
-        const nz = dist > 1e-4 ? dz * inv : 0;
-        const j = body.mass() * perFrame * falloff;
-        body.applyImpulse({ x: nx * j, y: (ny + f.up) * j, z: nz * j }, true);
-      });
-
-      f.frames -= 1;
-      if (f.frames <= 0) blastFields.splice(i, 1);
+      f.age += 1;
+      f.life -= 1;
+      if (f.life <= 0) blastFields.splice(i, 1);
     }
   }
 
