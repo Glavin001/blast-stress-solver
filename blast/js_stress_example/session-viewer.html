@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Session Viewer — blast-stress-solver</title>
+    <link rel="stylesheet" href="./styles/demo-common.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three/build/three.module.js",
+          "three/addons/": "/vendor/three/examples/jsm/",
+          "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs",
+          "blast-stress-solver": "/vendor/blast-stress-solver/index.js",
+          "blast-stress-solver/rapier": "/vendor/blast-stress-solver/rapier.js",
+          "blast-stress-solver/three": "/vendor/blast-stress-solver/three.js",
+          "blast-stress-solver/scenarios": "/vendor/blast-stress-solver/scenarios.js"
+        }
+      }
+    </script>
+    <style>
+      .viewport { cursor: default; }
+
+      /* ── Drop / empty-state overlay ─────────────────────────── */
+      .drop-overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        text-align: center;
+        padding: 2rem;
+        background: rgba(5, 7, 12, 0.78);
+        backdrop-filter: blur(3px);
+        z-index: 30;
+        transition: background 0.15s, border-color 0.15s;
+      }
+      .drop-overlay.hidden { display: none; }
+      .drop-overlay.drag { background: rgba(20, 30, 60, 0.85); }
+      .drop-overlay .drop-card {
+        border: 1.5px dashed rgba(120, 150, 255, 0.4);
+        border-radius: 16px;
+        padding: 2.5rem 3rem;
+        max-width: 520px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.85rem;
+      }
+      .drop-overlay.drag .drop-card { border-color: rgba(140, 180, 255, 0.95); }
+      .drop-overlay .icon { font-size: 2.6rem; }
+      .drop-overlay h2 { margin: 0; font-size: 1.15rem; font-weight: 650; }
+      .drop-overlay p { margin: 0; font-size: 0.82rem; color: rgba(200, 210, 240, 0.6); line-height: 1.5; }
+      .drop-overlay code {
+        background: rgba(255, 255, 255, 0.07);
+        padding: 0.05rem 0.35rem;
+        border-radius: 4px;
+        font-size: 0.78rem;
+      }
+      .pick-btn {
+        margin-top: 0.4rem;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 600;
+        font-size: 0.85rem;
+        color: #cfe;
+        background: rgba(107, 140, 255, 0.18);
+        border: 1px solid rgba(107, 140, 255, 0.5);
+        border-radius: 8px;
+        padding: 0.6rem 1.3rem;
+      }
+      .pick-btn:hover { background: rgba(107, 140, 255, 0.32); }
+      .load-error {
+        display: none;
+        color: #ff9aa6;
+        font-size: 0.8rem;
+        max-width: 420px;
+        line-height: 1.5;
+      }
+
+      /* ── Transport bar ──────────────────────────────────────── */
+      .transport {
+        position: absolute;
+        left: 12px;
+        right: 12px;
+        bottom: 12px;
+        display: none;
+        flex-direction: column;
+        gap: 6px;
+        padding: 10px 12px 11px;
+        background: rgba(8, 11, 20, 0.82);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 12px;
+        backdrop-filter: blur(6px);
+        z-index: 20;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      }
+      .transport .strip-wrap { position: relative; height: 18px; }
+      #event-strip { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 4px;
+        background: rgba(255, 255, 255, 0.04); }
+      .transport .row { display: flex; align-items: center; gap: 12px; }
+      #scrub { flex: 1; height: 4px; accent-color: #6b8cff; cursor: pointer; }
+      .t-btn {
+        cursor: pointer;
+        width: 34px; height: 30px;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: 13px;
+        color: #e7ecff;
+        background: rgba(107, 140, 255, 0.16);
+        border: 1px solid rgba(107, 140, 255, 0.4);
+        border-radius: 7px;
+      }
+      .t-btn:hover { background: rgba(107, 140, 255, 0.3); }
+      #time-label { font-size: 11.5px; color: rgba(200, 210, 240, 0.85); min-width: 86px; }
+      .transport label { font-size: 11px; color: rgba(200, 210, 240, 0.7); display: inline-flex; gap: 5px; align-items: center; }
+      .transport select {
+        font: inherit; font-size: 11px; color: #e7ecff;
+        background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 5px; padding: 2px 4px;
+      }
+
+      /* ── Sidebar key/value blocks ───────────────────────────── */
+      .kv { display: flex; justify-content: space-between; gap: 10px; font-size: 0.78rem; padding: 3px 0; }
+      .kv span { color: rgba(200, 210, 240, 0.55); }
+      .kv b { color: #f5f7ff; font-weight: 600; text-align: right; word-break: break-word; }
+      .legend { display: flex; flex-direction: column; gap: 5px; font-size: 0.74rem; color: rgba(200, 210, 240, 0.7); }
+      .legend .lg { display: flex; align-items: center; gap: 7px; }
+      .legend .sw { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+      .help { font-size: 0.72rem; color: rgba(200, 210, 240, 0.5); line-height: 1.5; }
+      .help kbd {
+        background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 4px; padding: 0 4px; font-family: ui-monospace, monospace; font-size: 0.68rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="viewport">
+        <canvas id="viewer-canvas"></canvas>
+
+        <div class="drop-overlay" id="drop-overlay">
+          <div class="drop-card">
+            <div class="icon">⏯️</div>
+            <h2>Session Recording Viewer</h2>
+            <p>
+              Drop a <code>*.sim.json.gz</code> recording here (or pick one) to play it
+              back visually. These are produced by the in-app
+              <strong>⏺ Session recorder</strong> on any destruction demo — press
+              <strong>● Record</strong>, do the thing, then <strong>⬇ Save</strong>.
+            </p>
+            <button class="pick-btn" id="pick-btn">Choose recording…</button>
+            <input type="file" id="file-input" accept=".gz,.json,application/json,application/gzip" hidden />
+            <div class="load-error" id="load-error"></div>
+          </div>
+        </div>
+
+        <!-- Transport -->
+        <div class="transport" id="transport">
+          <div class="strip-wrap"><canvas id="event-strip"></canvas></div>
+          <div class="row">
+            <button class="t-btn" id="play-btn" title="Play">▶</button>
+            <span id="time-label">0 · 0.00s</span>
+            <input type="range" id="scrub" min="0" max="0" step="1" value="0" />
+            <label>Speed
+              <select id="speed-sel">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+            <label><input type="checkbox" id="loop-chk" checked /> Loop</label>
+          </div>
+        </div>
+      </section>
+
+      <aside class="sidebar" id="sidebar">
+        <header>
+          <a href="./demo-index.html" class="back-link">← All Demos</a>
+          <h1>⏯️ Session Viewer</h1>
+          <p>Import &amp; replay <code>*.sim.json[.gz]</code> recordings</p>
+        </header>
+
+        <section class="config-section">
+          <h2 class="section-title">Recording</h2>
+          <div id="meta" class="status-grid" style="display:block">
+            <div class="kv"><span>No recording</span><b>—</b></div>
+          </div>
+          <div class="control-actions" style="margin-top:0.6rem">
+            <button id="load-another" class="button">↥ Load recording…</button>
+          </div>
+        </section>
+
+        <section class="status-panel">
+          <h2>Current frame</h2>
+          <div id="stats" style="display:block">
+            <div class="kv"><span>—</span><b>—</b></div>
+          </div>
+        </section>
+
+        <section class="config-section">
+          <h2 class="section-title">Legend</h2>
+          <div class="legend">
+            <div class="lg"><span class="sw" style="background:#6a8cff"></span> Fragment (coloured per rigid body — same colour = moves together)</div>
+            <div class="lg"><span class="sw" style="background:#4a5168"></span> Static support (mass 0)</div>
+            <div class="lg"><span class="sw" style="background:#ff5566"></span> Projectile / unowned body</div>
+          </div>
+        </section>
+
+        <section class="config-section">
+          <h2 class="section-title">Timeline events</h2>
+          <div class="legend">
+            <div class="lg"><span class="sw" style="background:#5fe0a0"></span> Projectile spawn</div>
+            <div class="lg"><span class="sw" style="background:#ff4d5e"></span> Chunk destroyed</div>
+            <div class="lg"><span class="sw" style="background:#ff9a3d"></span> Chunk detached</div>
+            <div class="lg"><span class="sw" style="background:#ffd060"></span> External force</div>
+            <div class="lg"><span class="sw" style="background:#6cb6ff"></span> Gravity change</div>
+            <div class="lg"><span class="sw" style="background:rgba(150,170,255,0.6)"></span> Migrate (split)</div>
+          </div>
+        </section>
+
+        <section class="config-section">
+          <h2 class="section-title">Controls</h2>
+          <p class="help">
+            <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> step
+            (<kbd>Shift</kbd> = ×10) · drag to orbit · scroll to zoom.
+            Drop a new file anytime to load it.
+          </p>
+        </section>
+      </aside>
+    </main>
+
+    <script>
+      // Sidebar toggle + open the file picker from the two "load" buttons.
+      (function () {
+        var pick = document.getElementById('pick-btn');
+        var loadAnother = document.getElementById('load-another');
+        var input = document.getElementById('file-input');
+        if (pick) pick.addEventListener('click', function () { input.click(); });
+        if (loadAnother) loadAnother.addEventListener('click', function () { input.click(); });
+      })();
+    </script>
+    <script type="module" src="./dist/session-viewer.js"></script>
+  </body>
+</html>
