@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { DestructibleCore } from '../rapier/types';
 
-/** Debug line from solver (local space) */
+/** Debug line from solver (rest/local space) */
 export type DebugLine = {
   p0: { x: number; y: number; z: number };
   p1: { x: number; y: number; z: number };
@@ -11,9 +11,24 @@ export type DebugLine = {
 
 const GRID_CELL_SIZE = 2.0;
 
+type Pose = { t: THREE.Vector3; q: THREE.Quaternion };
+
 /**
  * Helper class for rendering stress solver debug lines.
- * Encapsulates all caching and GPU buffer management for optimal performance.
+ *
+ * The solver emits each line as a pair of node centroids in the *rest* frame
+ * (the original, undamaged body's local space) — exactly the values stored in
+ * `chunk.baseLocalOffset`. To draw a line in the world we must transform each
+ * endpoint by the pose of the rigid body that currently owns that endpoint's
+ * chunk.
+ *
+ * Correctness note: every endpoint is mapped to its *own* chunk and transformed
+ * by that chunk's *current* `bodyHandle` (which the core keeps up to date as
+ * fragments break off). We deliberately do NOT infer a single owning "actor"
+ * per line from `solver.actors()`/`actorMap`: those mappings were cached behind
+ * weak version keys (`actorMap.size`, which only ever grows) and went stale when
+ * actor indices were recycled, so lines were transformed by the wrong (often
+ * flown-away) body and appeared floating in the sky / scattered nonsensically.
  *
  * Usage:
  *   const helper = new SolverDebugLinesHelper();
@@ -34,27 +49,30 @@ export class SolverDebugLinesHelper {
   private colors: Float32Array;
   private maxLines: number;
 
-  // Spatial grid for chunk lookups (built once per core)
+  // Spatial grid mapping rest-space cells -> chunk indices (chunk rest centroids
+  // never move, so this is built once and only rebuilt if the chunk count changes).
   private chunkGrid: Map<string, number[]> | null = null;
-  private chunkGridCoreId = -1;
+  private chunkGridChunkCount = -1;
 
-  // Line-to-chunk cache (computed once, permanent until line count changes)
-  private lineToChunk: number[] = [];
-  private lineToChunkCount = -1;
+  // Per-line endpoint -> chunk caches. A line's endpoints are fixed node centroids
+  // in rest space, so the endpoint->chunk mapping is static for a given bond. The
+  // rendered-line set only shrinks (a bond drops out when its last sub-bond breaks),
+  // so the line count changing is a reliable signal to rebuild these.
+  private lineChunk0: Int32Array = new Int32Array(0);
+  private lineChunk1: Int32Array = new Int32Array(0);
+  private lineChunkCount = -1;
 
-  // Node-to-actor cache (invalidated when actor count changes)
-  private nodeToActorCache = new Map<number, number>();
-  private nodeToActorVersion = -1;
+  // Per-frame pose cache keyed by the chunk's CURRENT bodyHandle. Rebuilt every
+  // frame (no staleness). Reuses pooled Vector3/Quaternion objects to avoid churn.
+  private readonly bodyPosePool: Pose[] = [];
+  private readonly bodyPoseMap = new Map<number, Pose>();
+  private bodyPoolIndex = 0;
 
-  // Pooled pose objects for actor transforms
-  private readonly actorPosePool: Array<{ t: THREE.Vector3; q: THREE.Quaternion }> = [];
-  private readonly actorPoseMap = new Map<number, { t: THREE.Vector3; q: THREE.Quaternion }>();
+  // Root-body pose, used as the fallback for any chunk without a live body.
+  private readonly rootPose: Pose = { t: new THREE.Vector3(), q: new THREE.Quaternion() };
 
-  // Reusable transform objects
-  private readonly v0 = new THREE.Vector3();
-  private readonly v1 = new THREE.Vector3();
-  private readonly rootPoseT = new THREE.Vector3();
-  private readonly rootPoseQ = new THREE.Quaternion();
+  // Reusable transform scratch
+  private readonly v = new THREE.Vector3();
 
   constructor(initialMaxLines = 50000) {
     this.maxLines = initialMaxLines;
@@ -84,7 +102,7 @@ export class SolverDebugLinesHelper {
   /**
    * Update debug lines each frame.
    * @param core The destructible core instance
-   * @param lines Debug lines from solver (local space)
+   * @param lines Debug lines from solver (rest/local space)
    * @param visible Whether to show the lines
    */
   update(core: DestructibleCore, lines: DebugLine[], visible: boolean): void {
@@ -104,9 +122,10 @@ export class SolverDebugLinesHelper {
 
     // Ensure caches are up to date
     this.ensureChunkGrid(core);
-    this.ensureLineToChunkCache(core, lines);
-    this.updateNodeToActorCache(core);
-    this.updateActorPoses(core);
+    this.ensureLineChunkCache(core, lines);
+
+    // Snapshot the current body poses (fresh every frame)
+    this.updateBodyPoses(core);
 
     // Transform and write lines to GPU buffers
     this.transformLines(core, lines, lineCount);
@@ -122,16 +141,15 @@ export class SolverDebugLinesHelper {
   }
 
   /**
-   * Invalidate all caches. Call when core is disposed/reset.
+   * Invalidate all caches. Call when the core is disposed/reset or replaced.
    */
   invalidate(): void {
     this.chunkGrid = null;
-    this.chunkGridCoreId = -1;
-    this.lineToChunk = [];
-    this.lineToChunkCount = -1;
-    this.nodeToActorCache.clear();
-    this.nodeToActorVersion = -1;
-    this.actorPoseMap.clear();
+    this.chunkGridChunkCount = -1;
+    this.lineChunk0 = new Int32Array(0);
+    this.lineChunk1 = new Int32Array(0);
+    this.lineChunkCount = -1;
+    this.bodyPoseMap.clear();
   }
 
   /**
@@ -164,12 +182,12 @@ export class SolverDebugLinesHelper {
   }
 
   // =========================================================================
-  // Private: Chunk grid (built once per core)
+  // Private: Chunk grid (built once per core; chunk rest centroids are static)
   // =========================================================================
 
   private ensureChunkGrid(core: DestructibleCore): void {
-    const coreId = core.chunks.length;
-    if (this.chunkGrid && this.chunkGridCoreId === coreId) return;
+    const chunkCount = core.chunks.length;
+    if (this.chunkGrid && this.chunkGridChunkCount === chunkCount) return;
 
     this.chunkGrid = new Map();
     for (let i = 0; i < core.chunks.length; i++) {
@@ -182,7 +200,9 @@ export class SolverDebugLinesHelper {
       }
       arr.push(i);
     }
-    this.chunkGridCoreId = coreId;
+    this.chunkGridChunkCount = chunkCount;
+    // Endpoint->chunk indices reference this grid; force a rebuild.
+    this.lineChunkCount = -1;
   }
 
   private getGridKey(x: number, y: number, z: number): string {
@@ -190,25 +210,6 @@ export class SolverDebugLinesHelper {
     const cy = Math.floor(y / GRID_CELL_SIZE);
     const cz = Math.floor(z / GRID_CELL_SIZE);
     return `${cx},${cy},${cz}`;
-  }
-
-  // =========================================================================
-  // Private: Line-to-chunk cache (permanent, only rebuilt when line count changes)
-  // =========================================================================
-
-  private ensureLineToChunkCache(core: DestructibleCore, lines: DebugLine[]): void {
-    if (this.lineToChunkCount === lines.length) return;
-
-    // Rebuild cache - this only happens when bonds break (line count changes)
-    this.lineToChunk = new Array(lines.length);
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const mx = (line.p0.x + line.p1.x) * 0.5;
-      const my = (line.p0.y + line.p1.y) * 0.5;
-      const mz = (line.p0.z + line.p1.z) * 0.5;
-      this.lineToChunk[i] = this.findNearestChunkIndex(core, mx, my, mz);
-    }
-    this.lineToChunkCount = lines.length;
   }
 
   private findNearestChunkIndex(core: DestructibleCore, mx: number, my: number, mz: number): number {
@@ -248,70 +249,75 @@ export class SolverDebugLinesHelper {
   }
 
   // =========================================================================
-  // Private: Node-to-actor cache (updated when actor structure changes)
+  // Private: Per-line endpoint -> chunk cache
   // =========================================================================
 
-  private updateNodeToActorCache(core: DestructibleCore): void {
-    const currentVersion = core.actorMap.size;
-    if (this.nodeToActorVersion === currentVersion) return;
+  private ensureLineChunkCache(core: DestructibleCore, lines: DebugLine[]): void {
+    if (this.lineChunkCount === lines.length) return;
 
-    this.nodeToActorCache.clear();
-    try {
-      const solver = core.solver as unknown as {
-        actors?: () => Array<{ actorIndex: number; nodes: number[] }>;
-      };
-      const actors = solver.actors?.() ?? [];
-      for (const a of actors) {
-        const nodes = Array.isArray(a.nodes) ? a.nodes : [];
-        for (const n of nodes) {
-          this.nodeToActorCache.set(n, a.actorIndex);
-        }
-      }
-    } catch {
-      // Ignore errors from solver
+    // Rebuild — this only happens when the rendered-line count changes (a bond
+    // dropping out as it fully breaks). Each endpoint is matched to the chunk
+    // whose rest centroid it coincides with, so it can follow that chunk's body.
+    this.lineChunk0 = new Int32Array(lines.length);
+    this.lineChunk1 = new Int32Array(lines.length);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      this.lineChunk0[i] = this.findNearestChunkIndex(core, line.p0.x, line.p0.y, line.p0.z);
+      this.lineChunk1[i] = this.findNearestChunkIndex(core, line.p1.x, line.p1.y, line.p1.z);
     }
-    this.nodeToActorVersion = currentVersion;
+    this.lineChunkCount = lines.length;
   }
 
   // =========================================================================
-  // Private: Actor poses (updated every frame)
+  // Private: Per-frame body poses (no staleness)
   // =========================================================================
 
-  private updateActorPoses(core: DestructibleCore): void {
-    this.actorPoseMap.clear();
-    let poseIndex = 0;
+  private updateBodyPoses(core: DestructibleCore): void {
+    this.bodyPoseMap.clear();
+    this.bodyPoolIndex = 0;
 
-    for (const [actorIndex, { bodyHandle }] of core.actorMap.entries()) {
-      const body = core.world.getRigidBody(bodyHandle);
-      if (!body) continue;
-
-      const tr = body.translation();
-      const rot = body.rotation();
-      const pose = this.getPooledPose(poseIndex++);
-      pose.t.set(tr.x, tr.y, tr.z);
-      pose.q.set(rot.x, rot.y, rot.z, rot.w);
-      this.actorPoseMap.set(actorIndex, pose);
-    }
-
-    // Update root pose
+    // Root pose: fallback for any chunk whose body can't be resolved.
     const rootBody = core.world.getRigidBody(core.rootBodyHandle);
     if (rootBody) {
       const rt = rootBody.translation();
       const rr = rootBody.rotation();
-      this.rootPoseT.set(rt.x, rt.y, rt.z);
-      this.rootPoseQ.set(rr.x, rr.y, rr.z, rr.w);
+      this.rootPose.t.set(rt.x, rt.y, rt.z);
+      this.rootPose.q.set(rr.x, rr.y, rr.z, rr.w);
     } else {
-      this.rootPoseT.set(0, 0, 0);
-      this.rootPoseQ.identity();
+      this.rootPose.t.set(0, 0, 0);
+      this.rootPose.q.identity();
     }
+    // Chunks still attached to the root share the root pose directly.
+    this.bodyPoseMap.set(core.rootBodyHandle, this.rootPose);
   }
 
-  private getPooledPose(index: number): { t: THREE.Vector3; q: THREE.Quaternion } {
-    if (index < this.actorPosePool.length) {
-      return this.actorPosePool[index];
+  private poseForChunk(core: DestructibleCore, chunkIndex: number): Pose {
+    if (chunkIndex < 0) return this.rootPose;
+    const chunk = core.chunks[chunkIndex];
+    const bh = chunk?.bodyHandle;
+    if (bh == null) return this.rootPose;
+
+    const cached = this.bodyPoseMap.get(bh);
+    if (cached) return cached;
+
+    const body = core.world.getRigidBody(bh);
+    if (!body) return this.rootPose;
+
+    const pose = this.getPooledPose(this.bodyPoolIndex++);
+    const tr = body.translation();
+    const rot = body.rotation();
+    pose.t.set(tr.x, tr.y, tr.z);
+    pose.q.set(rot.x, rot.y, rot.z, rot.w);
+    this.bodyPoseMap.set(bh, pose);
+    return pose;
+  }
+
+  private getPooledPose(index: number): Pose {
+    if (index < this.bodyPosePool.length) {
+      return this.bodyPosePool[index];
     }
-    const pose = { t: new THREE.Vector3(), q: new THREE.Quaternion() };
-    this.actorPosePool.push(pose);
+    const pose: Pose = { t: new THREE.Vector3(), q: new THREE.Quaternion() };
+    this.bodyPosePool.push(pose);
     return pose;
   }
 
@@ -319,31 +325,27 @@ export class SolverDebugLinesHelper {
   // Private: Transform lines to world space and write to GPU buffers
   // =========================================================================
 
-  private transformLines(_core: DestructibleCore, lines: DebugLine[], lineCount: number): void {
+  private transformLines(core: DestructibleCore, lines: DebugLine[], lineCount: number): void {
     for (let i = 0; i < lineCount; i++) {
       const line = lines[i];
 
-      // Use cached line-to-chunk mapping (O(1) array access)
-      const chunkIndex = this.lineToChunk[i];
-      const actorIdx = chunkIndex >= 0 ? this.nodeToActorCache.get(chunkIndex) : undefined;
+      // Each endpoint follows its OWN chunk's current rigid body.
+      const pose0 = this.poseForChunk(core, this.lineChunk0[i]);
+      const pose1 = this.poseForChunk(core, this.lineChunk1[i]);
 
-      // Get pose (actor or root fallback)
-      const pose = actorIdx != null ? this.actorPoseMap.get(actorIdx) : null;
-      const poseT = pose ? pose.t : this.rootPoseT;
-      const poseQ = pose ? pose.q : this.rootPoseQ;
-
-      // Transform endpoints
-      this.v0.set(line.p0.x, line.p0.y, line.p0.z).applyQuaternion(poseQ).add(poseT);
-      this.v1.set(line.p1.x, line.p1.y, line.p1.z).applyQuaternion(poseQ).add(poseT);
-
-      // Write positions
       const base = i * 6;
-      this.positions[base] = this.v0.x;
-      this.positions[base + 1] = this.v0.y;
-      this.positions[base + 2] = this.v0.z;
-      this.positions[base + 3] = this.v1.x;
-      this.positions[base + 4] = this.v1.y;
-      this.positions[base + 5] = this.v1.z;
+
+      // Endpoint 0
+      this.v.set(line.p0.x, line.p0.y, line.p0.z).applyQuaternion(pose0.q).add(pose0.t);
+      this.positions[base] = this.v.x;
+      this.positions[base + 1] = this.v.y;
+      this.positions[base + 2] = this.v.z;
+
+      // Endpoint 1
+      this.v.set(line.p1.x, line.p1.y, line.p1.z).applyQuaternion(pose1.q).add(pose1.t);
+      this.positions[base + 3] = this.v.x;
+      this.positions[base + 4] = this.v.y;
+      this.positions[base + 5] = this.v.z;
 
       // Write colors (inline extraction)
       const c0 = line.color0;
