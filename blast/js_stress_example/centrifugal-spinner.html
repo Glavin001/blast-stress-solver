@@ -23,7 +23,7 @@
     <main class="layout">
       <section class="viewport">
         <canvas id="demo-canvas"></canvas>
-        <div class="viewport-hint">Centrifugal on, then lower Bond strength (Reset) or raise Spin rate to shatter</div>
+        <div class="viewport-hint">Toggle Centrifugal — the beam snaps. Raise Bond strength or lower Spin rate to keep it intact.</div>
       </section>
 
       <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
@@ -38,10 +38,10 @@
           <h1>&#127744; Centrifugal Spinner</h1>
           <p>
             A free-floating beam spun in zero gravity. With <strong>Centrifugal</strong> off it spins
-            forever, intact. Turn it on and the inward (centripetal) load fights the bonds: at the
-            default high <strong>Bond strength</strong> the beam still holds, so lower Bond strength
-            (then <strong>Reset</strong>) or raise the <strong>Spin rate</strong> until the load wins
-            and it snaps apart. That crossover is the stress solver's centrifugal acceleration at work.
+            forever, intact. Turn it on and the inward (centripetal) load fights the bonds — at the
+            default settings it wins and the beam snaps. The crossover is sharp: peak stress grows as
+            spin² (≈ 30·ω²), so raise <strong>Bond strength</strong> past it (or drop the
+            <strong>Spin rate</strong>) to keep the beam whole. Strength and shape apply live.
           </p>
         </header>
 
@@ -59,9 +59,9 @@
           </div>
         </section>
 
-        <!-- Scene (deferred – needs Reset) -->
+        <!-- Scene shape + strength (rebuild the beam on release) -->
         <section class="config-section">
-          <h2 class="section-title">Beams (Reset to apply)</h2>
+          <h2 class="section-title">Beams &amp; strength <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
           <div class="config-row">
             <label class="config-label" for="cfg-beams">Beams</label>
             <input type="range" id="cfg-beams" class="config-slider" min="1" max="8" step="1" value="1" />
@@ -74,8 +74,8 @@
           </div>
           <div class="config-row">
             <label class="config-label" for="cfg-bond-strength">Bond strength (log)</label>
-            <input type="range" id="cfg-bond-strength" class="config-slider" min="0" max="8" step="0.1" value="6" />
-            <span class="config-value"><span id="cfg-bond-strength-value">1.0e+6</span></span>
+            <input type="range" id="cfg-bond-strength" class="config-slider" min="1" max="6" step="0.1" value="3.3" />
+            <span class="config-value"><span id="cfg-bond-strength-value">2000</span></span>
           </div>
         </section>
 

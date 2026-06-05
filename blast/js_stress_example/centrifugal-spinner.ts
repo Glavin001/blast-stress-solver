@@ -32,10 +32,11 @@ const CONFIG = {
   // Raising "Beams" adds more (they ride one free body and break together).
   beams: 1,
   segments: 9,
-  // Compression fatal limit (Reset to apply). The centrifugal stress is large in solver units even
-  // at modest spin, so this needs a wide range: start strong enough that the beam holds together,
-  // then lower it (or raise Spin rate) until it shatters.
-  bondStrength: 1.0e6,
+  // Compression fatal limit. Measured (Rust pipeline, same solver): a spinning beam's peak bond
+  // stress ≈ 30·ω², so it breaks when bondStrength < 30·ω² and holds above it. At the default spin
+  // (20 rad/s ⇒ threshold ≈ 12000) a strength of 2000 is well below threshold, so the beam snaps
+  // when you enable centrifugal; raise it past ~12000 (or lower the spin) to keep it intact.
+  bondStrength: 2000,
 };
 
 // ── Three.js setup ────────────────────────────────────────────
@@ -177,13 +178,17 @@ function applySpin(core: any) {
 
 // ── UI wiring ────────────────────────────────────────────────
 
-document.getElementById('btn-reset')?.addEventListener('click', async () => {
+// Rebuild the scene (used by Reset and by the deferred sliders so they apply without a separate
+// Reset click — the scene is a single cheap beam).
+async function rebuild() {
   visualsRef?.dispose();
   coreRef?.dispose();
   coreRef = null;
   visualsRef = null;
   await initScene();
-});
+}
+
+document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });
 
 document.getElementById('btn-debug')?.addEventListener('click', () => {
   showDebug = !showDebug;
@@ -192,7 +197,7 @@ document.getElementById('btn-debug')?.addEventListener('click', () => {
   btn.textContent = showDebug ? '◈ Hide Debug' : '◇ Show Debug';
 });
 
-function bindSlider(id: string, obj: Record<string, any>, key: string, fmt?: (v: number) => string) {
+function bindSlider(id: string, obj: Record<string, any>, key: string, fmt?: (v: number) => string, onChange?: () => void) {
   const slider = document.getElementById(id) as HTMLInputElement | null;
   const display = document.getElementById(id + '-value');
   if (!slider) return;
@@ -203,6 +208,7 @@ function bindSlider(id: string, obj: Record<string, any>, key: string, fmt?: (v:
     obj[key] = v;
     if (display) display.textContent = fmt ? fmt(v) : String(v);
   });
+  if (onChange) slider.addEventListener('change', onChange);
 }
 
 function bindCheckbox(id: string, obj: Record<string, any>, key: string, onChange?: (v: boolean) => void) {
@@ -219,15 +225,15 @@ function bindCheckbox(id: string, obj: Record<string, any>, key: string, onChang
 bindCheckbox('cfg-centrifugal', CONFIG, 'centrifugal', (v) => coreRef?.setSolverCentrifugalEnabled(v));
 // Live: spin rate is read every frame in applySpin().
 bindSlider('cfg-spin', CONFIG, 'spin', (v) => v.toFixed(0));
-// Deferred (need Reset): scene shape and bond strength.
-bindSlider('cfg-beams', CONFIG, 'beams');
-bindSlider('cfg-segments', CONFIG, 'segments');
-// Bond strength is logarithmic: the slider holds log10(compressionFatalLimit) over a wide range
-// (1 … 1e8) so there is actually a setting where the beam survives the spin. Reset to apply.
+// Scene shape + bond strength rebuild the scene on release ('change') so they apply live.
+bindSlider('cfg-beams', CONFIG, 'beams', undefined, () => void rebuild());
+bindSlider('cfg-segments', CONFIG, 'segments', undefined, () => void rebuild());
+// Bond strength is logarithmic: the slider holds log10(compressionFatalLimit) over 1 … 1e6 so both
+// a "holds" and a "shatters" regime are reachable (threshold ≈ 30·ω²).
 {
   const slider = document.getElementById('cfg-bond-strength') as HTMLInputElement | null;
   const display = document.getElementById('cfg-bond-strength-value');
-  const fmt = (v: number) => (v >= 1000 ? v.toExponential(1) : v.toFixed(1));
+  const fmt = (v: number) => (v >= 1000 ? v.toExponential(1) : v.toFixed(0));
   if (slider) {
     slider.value = String(Math.log10(CONFIG.bondStrength));
     if (display) display.textContent = fmt(CONFIG.bondStrength);
@@ -235,6 +241,7 @@ bindSlider('cfg-segments', CONFIG, 'segments');
       CONFIG.bondStrength = Math.pow(10, parseFloat(slider.value));
       if (display) display.textContent = fmt(CONFIG.bondStrength);
     });
+    slider.addEventListener('change', () => void rebuild());
   }
 }
 
