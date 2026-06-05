@@ -931,8 +931,10 @@ class ExtStressSolver implements ExtStressSolverType {
     const result = this.module.ccall('ext_stress_solver_generate_fracture_commands', 'number', ['number', 'number', 'number', 'number'], [this.handle, this._fractureCommandsPtr, this._fracturePtr, limit]);
 
     const view = this.memory.view();
+    // ExtStressFractureCommands struct (12 bytes): actorIndex@0, bondFractures*@4, bondFractureCount@8.
+    // (Slot @4 is a pointer we already know — it's _fracturePtr — so we skip it.)
     const actorIndex = view.getUint32(this._fractureCommandsPtr + 0, true);
-    const count = view.getUint32(this._fractureCommandsPtr + 4, true);
+    const count = view.getUint32(this._fractureCommandsPtr + 8, true);
     const fractures: ExtStressBondFracture[] = [];
     for (let i = 0; i < count; ++i) {
       const base = this._fracturePtr + i * this.sizes.extBondFracture;

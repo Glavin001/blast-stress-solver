@@ -34,6 +34,33 @@
 #define _mm256_set_m128(vh, vl) _mm256_insertf128_ps(_mm256_castps128_ps256(vl), (vh), 1)
 #endif
 
+#if defined(__wasm__)
+// WASM target with `-mavx`: emscripten 3.1.68+ ships native __m256 / SSE / AVX
+// intrinsics on top of wasm-simd128 (each 256-bit op lowers to two 128-bit
+// ops).  But there is no hardware FMA in baseline wasm-simd128, so the FMA3
+// intrinsics aren't emulated and any call to `_mm{,256}_fmadd_ps` is a
+// compile error on this target.
+//
+// Provide the four FMA intrinsics the AngLin6 kernels use as explicit
+// `add(mul(a, b), c)` sequences.  Two roundings instead of one, but that
+// matches what `-O3 -msimd128` already does for the autovectorized scalar
+// path — same arithmetic semantics, no new numeric drift relative to the
+// shipping scalar build.
+//
+// (FMA3 hardware would also let us collapse mul+add into a single rounded
+// op; relaxed-simd's `f32x4.relaxed_madd` is available on some browsers, but
+// its rounding is implementation-defined, which breaks the bit-exact
+// settled-skip gate in stress.cpp.  Stay on the deterministic path.)
+#include <wasm_simd128.h>
+
+#define _mm_fmadd_ps(a, b, c)     _mm_add_ps(_mm_mul_ps((a), (b)), (c))
+#define _mm_fnmadd_ps(a, b, c)    _mm_sub_ps((c), _mm_mul_ps((a), (b)))
+#define _mm_fmsub_ps(a, b, c)     _mm_sub_ps(_mm_mul_ps((a), (b)), (c))
+#define _mm256_fmadd_ps(a, b, c)  _mm256_add_ps(_mm256_mul_ps((a), (b)), (c))
+#define _mm256_fnmadd_ps(a, b, c) _mm256_sub_ps((c), _mm256_mul_ps((a), (b)))
+#define _mm256_fmsub_ps(a, b, c)  _mm256_sub_ps(_mm256_mul_ps((a), (b)), (c))
+#endif
+
 
 #define SIMD_ALIGN_16(code) NV_ALIGN_PREFIX(16) code NV_ALIGN_SUFFIX(16)
 #define SIMD_ALIGN_32(code) NV_ALIGN_PREFIX(32) code NV_ALIGN_SUFFIX(32)
