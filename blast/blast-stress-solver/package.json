@@ -52,7 +52,7 @@
     "build": "npm run build:ts && node ./scripts/copy-dist.js",
     "prepare": "npm run build",
     "test": "npm run build && vitest run",
-    "test:invariants": "vitest run src/tests/kernels.proptest.test.ts src/tests/highRise.scenario.test.ts src/tests/rapier.invariants.test.ts src/tests/rapier.resim-continuity.test.ts src/tests/rapier.splitVelocity.mechanism.test.ts src/tests/rapier.splitVelocity.noHover.test.ts src/tests/rapier.smallBodyDamping.fall.test.ts src/tests/rapier.contactStability.mechanism.test.ts src/tests/rapier.ccd.test.ts src/tests/rapier.splitMigrator.test.ts src/tests/rapier.headless-scenarios.test.ts src/tests/solver-mechanisms.test.ts src/tests/stress.gravity.test.ts src/tests/bondStress.parity.test.ts src/tests/stressLimits.boundary.test.ts src/tests/damage.invariants.test.ts",
+    "test:invariants": "vitest run src/tests/kernels.proptest.test.ts src/tests/highRise.scenario.test.ts src/tests/rapier.invariants.test.ts src/tests/rapier.resim-continuity.test.ts src/tests/rapier.splitVelocity.mechanism.test.ts src/tests/rapier.splitVelocity.noHover.test.ts src/tests/rapier.smallBodyDamping.fall.test.ts src/tests/rapier.contactStability.mechanism.test.ts src/tests/rapier.ccd.test.ts src/tests/rapier.splitMigrator.test.ts src/tests/rapier.headless-scenarios.test.ts src/tests/solver-mechanisms.test.ts src/tests/stress.gravity.test.ts src/tests/bondStress.parity.test.ts src/tests/stressLimits.boundary.test.ts src/tests/damage.invariants.test.ts src/tests/rapier.externalForce.test.ts",
     "test:soak": "vitest run",
     "build:ts": "tsup --config tsup.config.ts",
     "postbuild:ts": "npm run generate:high-rise",
