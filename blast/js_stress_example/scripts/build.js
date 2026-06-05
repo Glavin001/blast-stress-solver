@@ -98,25 +98,41 @@ const exportedFunctions = [
   '_free'
 ];
 
-const enableAssertions = process.env.EMCC_ASSERTIONS !== '0';
+// Default-off for production: a debug WASM with assertions is 4x larger, slower
+// to load, and runs significantly slower in the hot solver loop. Opt in with
+// EMCC_ASSERTIONS=1 when bisecting a crash; default builds are stripped.
+const enableAssertions = process.env.EMCC_ASSERTIONS === '1';
 const enableProfiling = process.env.EMCC_PROFILING === '1';
+// Opt-out for LTO: link-time optimization gives whole-program inlining across
+// the 22 translation units below (notably inlining the CGNR kernels into
+// ext_stress_solver_update), at the cost of ~20s extra link time. Disable with
+// EMCC_NO_LTO=1 if iterating locally and only the JS bridge changed.
+const enableLTO = process.env.EMCC_NO_LTO !== '1';
+// Opt-in for the native AVX path. emscripten ≥ 3.1.68 lowers __m256 /
+// _mm256_* down to two wasm-simd128 ops, so the vendored AngLin6 kernels in
+// anglin6.h / coupling.h / inertia.h compile directly with -mavx — no simde,
+// no rewriting.  BUT in the measured large-tower scenario the AVX path runs
+// ~5× slower on the solver hot loop than the scalar AngLin6Ops<float> path
+// (which clang already autovectorizes to f32x4 ops under -O3 -msimd128), so
+// the default is OFF.  Toggle with EMCC_USE_SIMD=1 to A/B; see PR description
+// for analysis.  When emscripten ships native FMA (relaxed-simd or a future
+// hardware ext) the AVX path should overtake the scalar autovec.
+const enableSimd = process.env.EMCC_USE_SIMD === '1';
 
+// The TS bridge in blast-stress-solver/src/stress.ts reaches for
+// Module.HEAPU8 / HEAPU32 / HEAPF32 (it rebuilds the DataView after every
+// memory grow, and uses HEAPF32.set / HEAPU32.set for bulk-copy FFI paths
+// like addAllActorGravity / addAllForces).  emscripten 5.0+ doesn't attach
+// those to the Module object unless explicitly requested, so list them
+// here; cwrap/ccall/UTF8ToString are the JS helpers the bridge uses for
+// FFI calls and the one sizeof error string.
 const exportedRuntimeMethods = [
   'cwrap',
   'ccall',
-  'getValue',
-  'setValue',
   'UTF8ToString',
-  'stringToUTF8',
-  'lengthBytesUTF8',
-  'HEAP8',
   'HEAPU8',
-  'HEAP16',
-  'HEAPU16',
-  'HEAP32',
   'HEAPU32',
-  'HEAPF32',
-  'HEAPF64'
+  'HEAPF32'
 ];
 
 const commonArgs = [
@@ -161,25 +177,77 @@ const commonArgs = [
   '-I' + sdkStressDir,
   '-I' + sdkAuthoringDir,
   '-I' + sdkAuthoringCommonDir,
-  '-DSTRESS_SOLVER_FORCE_SCALAR=1',
-  '-DSTRESS_SOLVER_NO_SIMD=1',
+  ...(enableSimd
+    ? [
+        // SIMD path: leave STRESS_SOLVER_NO_SIMD off so anglin6.h /
+        // coupling.h / inertia.h's __m128 specializations (which reach for
+        // __m256 inside — the AngLin6 type holds 8 floats) compile through
+        // emscripten's native AVX intrinsic lowering. The scalar path is
+        // still available as AngLin6Ops<Float_Scalar>; we just flip
+        // s_use_simd via the __wasm__ branch in stress.cpp so the runtime
+        // picks the CGNR_SIMD typedef.
+      ]
+    : [
+        // Scalar path (default): force AngLin6Ops<Float_Scalar> at runtime
+        // (s_use_simd = false) and skip compiling the SIMD-only kernels.
+        '-DSTRESS_SOLVER_FORCE_SCALAR=1',
+        '-DSTRESS_SOLVER_NO_SIMD=1',
+      ]),
   '-D__linux__=1',
   '-D__arm__=1',
   '-DCOMPILE_VECTOR_INTRINSICS=0',
   '-DNDEBUG=1',
   '-std=c++17',
   '-O3',
-  '-msimd128',            // Enable WASM SIMD auto-vectorization for scalar math loops
+  // -msimd128 enables WASM SIMD auto-vectorization for the scalar math loops
+  // in anglin6.h / inertia.h / coupling.h.  -msse4.2 widens the SSE intrinsic
+  // pool clang can fuse shuffles/loads into.  -mavx (added when EMCC_USE_SIMD)
+  // unlocks the __m256 / _mm256_* intrinsics the AngLin6 SIMD specializations
+  // use; emscripten 3.1.68+ lowers each AVX op to two wasm-simd128 ops.
+  '-msimd128',
+  '-msse4.2',
+  ...(enableSimd ? ['-mavx'] : []),
+  // Whole-program / no-runtime-overhead settings. The C++ here doesn't throw,
+  // doesn't use RTTI, doesn't longjmp, doesn't touch a filesystem, and only
+  // uses fprintf(stderr, ...) for one warning (which emcc still satisfies
+  // without FILESYSTEM via the JS console). Dropping each gives smaller WASM,
+  // less JS glue, and (for -flto / -fno-exceptions) tighter codegen.
+  '-fno-exceptions',
+  '-fno-rtti',
+  '-fno-math-errno',         // Don't set errno from <math.h>; safe — code never reads errno.
+  '-fno-trapping-math',      // Assume FP ops don't trap; safe — no FE_* trap handling.
+  '-fno-stack-protector',    // Stack canaries are a no-op on wasm32 anyway.
+  '-fvisibility=hidden',     // Internal symbols don't reach the JS export table.
   '-sWASM=1',
   '-sMODULARIZE=1',
   '-sALLOW_MEMORY_GROWTH=1',
+  '-sFILESYSTEM=0',          // No FS — saves ~30 KB of JS glue + runtime init.
+  '-sSUPPORT_LONGJMP=0',     // No setjmp/longjmp in any TU.
+  '-sNO_EXIT_RUNTIME=1',     // Module lives for the process; no atexit/_exit.
+  '-sDISABLE_EXCEPTION_CATCHING=1',  // Pair with -fno-exceptions.
+  '-sDYNAMIC_EXECUTION=0',   // No eval() / new Function() — smaller JS, CSP-safe.
+  '-sSTACK_SIZE=1048576',    // 1 MiB stack (default is 64 KiB): provides headroom for the solver's heavy AngLin6 temporaries on large graphs.
+  // Extra Binaryen pass: `--converge` re-runs the standard `-O3` pipeline
+  // until a fixed point. Earlier passes expose simplifications (constant
+  // folding through the CGNR inner kernels, dead-block elimination) that
+  // the next iteration can fold further, at the cost of a few extra seconds
+  // of link time.
+  '-sBINARYEN_EXTRA_PASSES=--converge',
   `-sEXPORTED_FUNCTIONS=[${exportedFunctions.map((fn) => `"${fn}"`).join(',')}]`,
   `-sEXPORTED_RUNTIME_METHODS=[${exportedRuntimeMethods.map((name) => `"${name}"`).join(',')}]`
 ];
 
+if (enableLTO) {
+  // -flto applies to both compile (each .cpp -> bitcode) and link (whole-program
+  // inlining + dead-code elimination across TUs). Required at both stages.
+  commonArgs.push('-flto');
+}
+
 if (enableAssertions) {
   console.log('Building with assertions');
   commonArgs.push('-sASSERTIONS=1');
+} else {
+  commonArgs.push('-sASSERTIONS=0');
 }
 
 if (enableProfiling) {
