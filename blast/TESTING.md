@@ -281,3 +281,39 @@ Blast computes this with `getExcessForces`.
 > bonds); wall-collapse determinism holds across runs. The gap #1 split COM bug only manifests
 > when a fragment is *rotating at the fracture instant* (stress-driven fractures usually fire
 > before rotation develops), which matches the "sometimes" sudden-movement report.
+
+## Web → Rust parity port (island solving, batched gravity, contact splash)
+
+The web library's recent performance/hardening work was ported to Rust. Most of it binds the
+**same shared C++ core** the WASM build uses (`blast/source/shared/stress_solver/stress.cpp`,
+exposed through `blast/rust_stress_example/ffi/ext_stress_bridge.cpp`), so parity is by
+construction, not reimplementation.
+
+- **Island-aware solving** (`island_solver_test.rs`): `ExtStressSolver::set_island_aware` /
+  `set_skip_settled` + counters, wired into `DestructibleSet` (default **ON** for production
+  sets; the raw solver keeps the C++ default OFF so `cross_validation_test.rs` fixtures stay
+  bit-identical). Tests lock: single-island ⇒ bit-identical whole-graph fallback; multi-island
+  fracture sequence/partition parity; skip-settled engages and is a *perfect no-op*.
+- **Batched actor gravity** (`batched_actor_gravity_test.rs`): one FFI crossing rotates gravity
+  into every actor's frame. The bridge forward-rotates by the supplied quaternion, so we pass each
+  body rotation's **conjugate** to reproduce `R⁻¹·g` byte-identically to the per-actor path (which
+  is retained as `apply_oriented_gravity_per_actor` for the equivalence test). Gravity orientation
+  is `R⁻¹·g` (verified physically correct, gap #7); note the **web uses the forward `R·g`** there —
+  a latent web/Rust convention divergence worth a focused follow-up.
+- **Island quiescence stats** (`island_settled_stats_test.rs`): `DestructibleSet::island_settled_stats`
+  (union-find with static nodes as cut points; settled = body asleep) — read-only instrumentation.
+- **Contact injection + per-body splash grid** (`contact_injection_test.rs`):
+  `DestructibleSet::inject_contacts` (rotate world→local, hit node + same-body splash neighbours
+  with `(1−d/R)²` falloff, batched submit) with a per-body grid keyed on stable asset centroids.
+  The grid is an acceleration structure only — tested **byte-for-byte against a full-scan reference**
+  (intact and post-fracture).
+
+> **Why island-aware solving can shift a large cascade slightly (e.g. weak wall 86→84 fractures).**
+> Bonds in different islands share no nodes, so the CGNR system is *block-diagonal*. With a direct
+> solve in exact arithmetic per-island ≡ whole-graph. But CGNR is iterative and computes its
+> step-size scalars (α, β) from **global** dot-products; for a multi-block system those shared
+> scalars are a compromise, so whole-graph CG stagnates at a higher residual floor while per-island
+> CG gives each block its own optimal scalars and converges *tighter*. Empirically per-island
+> reaches a **lower** residual (it is at least as accurate), and the gap is structural (stable from
+> 200→1000 iterations, not under-convergence). With ≤1 island it falls back bit-identically. Guarded
+> by `per_island_residual_is_no_worse_than_whole_graph` and the deterministic 84/30 golden.
