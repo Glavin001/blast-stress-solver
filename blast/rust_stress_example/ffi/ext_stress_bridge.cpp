@@ -565,6 +565,61 @@ ext_stress_solver_add_actor_gravity(ExtStressSolverHandle* handlePtr,
     return 1U;
 }
 
+extern "C" uint32_t
+ext_stress_solver_add_all_actor_gravity(ExtStressSolverHandle* handlePtr,
+                                        float world_gravity_x,
+                                        float world_gravity_y,
+                                        float world_gravity_z,
+                                        const float* actor_rotations,
+                                        uint32_t rotation_count)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0U;
+    }
+
+    const float gx = world_gravity_x;
+    const float gy = world_gravity_y;
+    const float gz = world_gravity_z;
+
+    uint32_t applied = 0U;
+    for (auto& entry : handle->actors)
+    {
+        if (!entry.actor)
+        {
+            continue;
+        }
+
+        NvcVec3 localGravity{gx, gy, gz};
+
+        // Rotate world gravity into the actor's body-local frame using its
+        // rigid-body orientation. This mirrors the per-actor math previously
+        // performed in JS (destructible-core.ts) so behaviour is unchanged,
+        // it just happens here in a single FFI crossing for all actors.
+        if (actor_rotations && entry.actorIndex < rotation_count)
+        {
+            const float* q = actor_rotations + static_cast<size_t>(entry.actorIndex) * 4U;
+            const float qx = q[0];
+            const float qy = q[1];
+            const float qz = q[2];
+            const float qw = q[3];
+
+            localGravity.x = qw * qw * gx + 2.0f * qy * qw * gz - 2.0f * qz * qw * gy + qx * qx * gx
+                + 2.0f * qy * qx * gy + 2.0f * qz * qx * gz - qz * qz * gx - qy * qy * gx;
+            localGravity.y = 2.0f * qx * qy * gx + qy * qy * gy + 2.0f * qz * qy * gz + 2.0f * qw * qz * gx
+                - qz * qz * gy + qw * qw * gy - 2.0f * qx * qw * gz - qx * qx * gy;
+            localGravity.z = 2.0f * qx * qz * gx + 2.0f * qy * qz * gy + qz * qz * gz - 2.0f * qw * qy * gx
+                - qy * qy * gz + 2.0f * qw * qx * gy - qx * qx * gz + qw * qw * gz;
+        }
+
+        handle->solver->addGravity(*entry.actor, localGravity);
+        ++applied;
+    }
+
+    return applied;
+}
+
 extern "C" void
 ext_stress_solver_update(ExtStressSolverHandle* handlePtr)
 {

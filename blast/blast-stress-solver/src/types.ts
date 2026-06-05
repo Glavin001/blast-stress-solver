@@ -537,6 +537,28 @@ export interface ExtStressSolver {
    * Passing `{0,0,0}` is a no-op, so skip the call entirely when you do not need to apply per-actor gravity for that frame.
    */
   addActorGravity(actorIndex: number, localGravity?: Vec3): boolean;
+  /**
+   * Apply gravity to every actor the solver currently tracks in a single FFI
+   * crossing, rotating the supplied world gravity into each actor's body-local
+   * frame inside the WASM module.
+   *
+   * This is the batched counterpart to {@link ExtStressSolver.addActorGravity}:
+   * instead of materialising the actor list in JS and calling once per actor,
+   * the solver iterates its internal actor table itself.
+   *
+   * @param worldGravity World-space gravity vector (e.g. `{x:0, y:-9.81, z:0}`).
+   * @param rotations Optional flat buffer of unit quaternions laid out as
+   *   `[x, y, z, w]` per slot and indexed by actor index (slot N at offset
+   *   `4*N`). Actors without a valid rotation receive the unrotated world
+   *   gravity. Supply `body.rotation()` for each known actor.
+   * @param rotationCount Number of quaternion slots in `rotations`.
+   * @returns The number of actors gravity was applied to, or `-1` if the
+   *   underlying WASM runtime does not expose the batched entry point (in which
+   *   case fall back to {@link ExtStressSolver.addActorGravity}).
+   */
+  addAllActorGravity(worldGravity?: Vec3, rotations?: Float32Array, rotationCount?: number): number;
+  /** True when the WASM runtime exposes {@link ExtStressSolver.addAllActorGravity}. */
+  supportsBatchedGravity(): boolean;
   /** Run one solver update using previously applied forces/accelerations. */
   update(): void;
   /** Count of bonds currently overstressed beyond elastic limits. */

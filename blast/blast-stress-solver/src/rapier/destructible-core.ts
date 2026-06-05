@@ -116,6 +116,11 @@ type InteractionGroupsValue = Parameters<RAPIER.Collider['setCollisionGroups']>[
 type RapierQuaternion = { x: number; y: number; z: number; w: number };
 type SolverActorsApi = {
   actors?: () => Array<{ actorIndex: number; nodes: number[] }>;
+  /** Batched per-actor gravity (rotates world gravity into each actor's local
+   *  frame inside WASM). Returns the number of actors updated, or -1 when the
+   *  runtime predates this export. */
+  addAllActorGravity?: (worldGravity?: Vec3, rotations?: Float32Array, rotationCount?: number) => number;
+  supportsBatchedGravity?: () => boolean;
 };
 type DebugWindow = Window & {
   debugStressSolver?: { printSolver?: () => unknown };
@@ -199,6 +204,9 @@ export async function buildDestructibleCore({
     rapierStepMs: 0,
     contactDrainMs: 0,
     solverUpdateMs: 0,
+    solverGravityInjectMs: 0,
+    solverContactInjectMs: 0,
+    solverSolveMs: 0,
     damageReplayMs: 0,
     damagePreviewMs: 0,
     damageTickMs: 0,
@@ -734,6 +742,22 @@ export async function buildDestructibleCore({
   let safeFrames = 0;
   let warnedColliderMapEmptyOnce = false;
   let solverGravityEnabled = true;
+
+  // ── Batched per-actor gravity ──
+  // The solver actor table only changes on topology changes (splits), so the
+  // materialised actor list is cached and rebuilt lazily, instead of crossing
+  // the FFI boundary to re-collect it every frame. `addAllActorGravity` then
+  // applies gravity to all actors in a single WASM call, rotating world gravity
+  // into each actor's body-local frame inside C++ (one crossing per frame
+  // instead of one per actor — thousands fewer on large scenes).
+  let solverActorsCache: Array<{ actorIndex: number; nodes: number[] }> = [];
+  let solverActorsDirty = true;
+  // One quaternion (x,y,z,w) per actor slot, indexed by actor index. Actor
+  // (family) indices are bounded by the support-chunk/node count.
+  const solverActorRotations = new Float32Array(Math.max(scenario.nodes?.length ?? 0, 1) * 4);
+  // Lazily probed: false when the WASM runtime predates addAllActorGravity, in
+  // which case we fall back to the per-actor addActorGravity loop.
+  let solverBatchedGravity: boolean | undefined;
   const damageOptions: Required<DamageOptions & { autoDetachOnDestroy?: boolean; autoCleanupPhysics?: boolean }> = {
     enabled: !!damage?.enabled,
     strengthPerVolume: damage?.strengthPerVolume ?? 10000,
@@ -1292,33 +1316,97 @@ export async function buildDestructibleCore({
     const passT0 = startTiming();
 
     const solverT0 = startTiming();
-    if (solverGravityEnabled) {
-      const solverActors = (solver as unknown as SolverActorsApi).actors?.() ?? [];
-      for (const actor of solverActors) {
-        const entry = actorMap.get(actor.actorIndex);
-        if (!entry) {
-          solver.addActorGravity(actor.actorIndex, { x: 0, y: gravity, z: 0 });
-          continue;
+
+    // Skip solver when idle: no external contacts, no recent fractures/topology changes,
+    // solver has converged (no residual error from prior frames), and not a resimulation pass.
+    // Without the convergence check, the solver might skip frames where it hasn't fully
+    // resolved stress in large structures (CGNR may need multiple frames to converge).
+    //
+    // Decide this BEFORE injecting gravity/forces. If we're going to skip the solve this
+    // frame, re-injecting gravity is wasted work — it would never be consumed by an update()
+    // and only perturbs the already-converged residual, so skipping it takes the idle
+    // residual to ~0 (matching Rapier). None of the gravity/force injection below mutates
+    // the predicate's inputs, so hoisting it here is value-identical. The predicate re-arms
+    // automatically the moment activity resumes (a new contact, a non-converged residual, or
+    // an active fracture countdown — all already accounted for here).
+    const hasExternalForces = bufferedExternalContacts.length > 0 || pendingExternalForces.length > 0;
+    const solverConverged = typeof solver.converged === 'function' ? solver.converged() : false;
+    const shouldSkipSolver = fracturePolicySettings.idleSkip && !hasExternalForces && solverFractureCountdown <= 0 && solverConverged && passIndex === 0 && safeFrames > 2;
+
+    const gravityInjectT0 = startTiming();
+    if (!shouldSkipSolver && solverGravityEnabled) {
+      const solverApi = solver as unknown as SolverActorsApi;
+
+      // Refresh the cached actor list only when topology changed (splits). The
+      // list mirrors the solver's internal actor table, so the batched WASM
+      // call can iterate the same set without re-materialising it each frame.
+      if (solverActorsDirty) {
+        solverActorsCache = solverApi.actors?.() ?? [];
+        solverActorsDirty = false;
+      }
+
+      if (solverBatchedGravity === undefined) {
+        solverBatchedGravity = solverApi.supportsBatchedGravity?.() ?? false;
+      }
+
+      if (solverBatchedGravity && solverApi.addAllActorGravity) {
+        // Fast path: write each known actor's body rotation into a flat buffer
+        // (indexed by actor index), then apply gravity to every actor in one
+        // FFI crossing. C++ rotates the world gravity into each actor's local
+        // frame; actors without a body keep the identity rotation (i.e. the
+        // unrotated world gravity), matching the per-actor fallback below.
+        const rotations = solverActorRotations;
+        const slotCount = rotations.length >> 2;
+        for (const actor of solverActorsCache) {
+          const slot = actor.actorIndex << 2;
+          if (slot < 0 || (slot >> 2) >= slotCount) continue;
+          const entry = actorMap.get(actor.actorIndex);
+          const body = entry ? world.getRigidBody(entry.bodyHandle) : undefined;
+          if (body) {
+            const rot = body.rotation();
+            rotations[slot] = rot.x;
+            rotations[slot + 1] = rot.y;
+            rotations[slot + 2] = rot.z;
+            rotations[slot + 3] = rot.w;
+          } else {
+            rotations[slot] = 0;
+            rotations[slot + 1] = 0;
+            rotations[slot + 2] = 0;
+            rotations[slot + 3] = 1; // identity → unrotated world gravity
+          }
         }
-        const body = world.getRigidBody(entry.bodyHandle);
-        if (!body) {
-          solver.addActorGravity(actor.actorIndex, { x: 0, y: gravity, z: 0 });
-          continue;
+        solverApi.addAllActorGravity({ x: 0, y: gravity, z: 0 }, rotations, slotCount);
+      } else {
+        // Legacy fallback: one FFI crossing per actor (runtime predates the
+        // batched entry point). Mirrors the batched math exactly.
+        for (const actor of solverActorsCache) {
+          const entry = actorMap.get(actor.actorIndex);
+          if (!entry) {
+            solver.addActorGravity(actor.actorIndex, { x: 0, y: gravity, z: 0 });
+            continue;
+          }
+          const body = world.getRigidBody(entry.bodyHandle);
+          if (!body) {
+            solver.addActorGravity(actor.actorIndex, { x: 0, y: gravity, z: 0 });
+            continue;
+          }
+          const rot = body.rotation();
+          const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
+          const gx = 0, gy = gravity, gz = 0;
+          const ix = qw * qw * gx + 2 * qy * qw * gz - 2 * qz * qw * gy + qx * qx * gx + 2 * qy * qx * gy + 2 * qz * qx * gz - qz * qz * gx - qy * qy * gx;
+          const iy = 2 * qx * qy * gx + qy * qy * gy + 2 * qz * qy * gz + 2 * qw * qz * gx - qz * qz * gy + qw * qw * gy - 2 * qx * qw * gz - qx * qx * gy;
+          const iz = 2 * qx * qz * gx + 2 * qy * qz * gy + qz * qz * gz - 2 * qw * qy * gx - qy * qy * gz + 2 * qw * qx * gy - qx * qx * gz + qw * qw * gz;
+          solver.addActorGravity(actor.actorIndex, { x: ix, y: iy, z: iz });
         }
-        const rot = body.rotation();
-        const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
-        const gx = 0, gy = gravity, gz = 0;
-        const ix = qw * qw * gx + 2 * qy * qw * gz - 2 * qz * qw * gy + qx * qx * gx + 2 * qy * qx * gy + 2 * qz * qx * gz - qz * qz * gx - qy * qy * gx;
-        const iy = 2 * qx * qy * gx + qy * qy * gy + 2 * qz * qy * gz + 2 * qw * qz * gx - qz * qz * gy + qw * qw * gy - 2 * qx * qw * gz - qx * qx * gy;
-        const iz = 2 * qx * qz * gx + 2 * qy * qz * gy + qz * qz * gz - 2 * qw * qy * gx - qy * qy * gz + 2 * qw * qx * gy - qx * qx * gz + qw * qw * gz;
-        solver.addActorGravity(actor.actorIndex, { x: ix, y: iy, z: iz });
       }
     }
+    stopTiming(gravityInjectT0, 'solverGravityInjectMs');
 
     // Inject external contact forces (e.g. projectile impacts) into the stress solver.
     // Converts world-space contact forces into body-local space and applies them
     // to the impacted node plus nearby nodes (splash radius) so that bond stress
     // reflects collision impacts, not just gravity.
+    const contactInjectT0 = startTiming();
     for (const contact of bufferedExternalContacts) {
       if (!contact.totalForceWorld) continue;
       const hitChunk = chunks[contact.nodeIndex];
@@ -1363,16 +1451,12 @@ export async function buildDestructibleCore({
         });
       }
     }
+    stopTiming(contactInjectT0, 'solverContactInjectMs');
 
-    // Skip solver when idle: no external contacts, no recent fractures/topology changes,
-    // solver has converged (no residual error from prior frames), and not a resimulation pass.
-    // Without the convergence check, the solver might skip frames where it hasn't fully
-    // resolved stress in large structures (CGNR may need multiple frames to converge).
-    const hasExternalForces = bufferedExternalContacts.length > 0 || pendingExternalForces.length > 0;
-    const solverConverged = typeof solver.converged === 'function' ? solver.converged() : false;
-    const shouldSkipSolver = fracturePolicySettings.idleSkip && !hasExternalForces && solverFractureCountdown <= 0 && solverConverged && passIndex === 0 && safeFrames > 2;
     if (!shouldSkipSolver) {
+      const solveT0 = startTiming();
       solver.update();
+      stopTiming(solveT0, 'solverSolveMs');
     }
     solverHadExternalForces = hasExternalForces;
     if (solverFractureCountdown > 0) solverFractureCountdown--;
@@ -1809,6 +1893,10 @@ export async function buildDestructibleCore({
   function processSplitEvents(
     splitEvents: Array<{ parentActorIndex: number; children: Array<{ actorIndex: number; nodes: number[] }> }>,
   ) {
+    // Splits are the only thing that mutates the solver's actor table, so this
+    // is where the cached actor list (used by the batched gravity path) must be
+    // invalidated.
+    if (splitEvents.length > 0) solverActorsDirty = true;
     for (const split of splitEvents) {
       const parentActorIndex = split.parentActorIndex;
       const parentEntry = actorMap.get(parentActorIndex);

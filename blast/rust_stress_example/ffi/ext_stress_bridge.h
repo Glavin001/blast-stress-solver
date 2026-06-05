@@ -97,6 +97,25 @@ uint8_t ext_stress_solver_add_actor_gravity(ExtStressSolverHandle* handle,
                                             uint32_t actor_index,
                                             const StressVec3* local_gravity);
 
+// Batched per-actor gravity. Applies `world_gravity` to every actor the solver
+// currently tracks, rotating it into each actor's body-local frame on the C++
+// side so the caller does not need to materialise the actor list or cross the
+// FFI boundary once per actor.
+//
+// `actor_rotations` is an optional flat buffer of unit quaternions laid out as
+// [x, y, z, w] per slot and indexed by actor index (slot N starts at offset
+// 4*N). `rotation_count` is the number of slots available. Actors whose index
+// falls outside [0, rotation_count) — or all actors when `actor_rotations` is
+// null — receive the unrotated world gravity (identity rotation).
+//
+// Returns the number of actors gravity was applied to.
+uint32_t ext_stress_solver_add_all_actor_gravity(ExtStressSolverHandle* handle,
+                                                 float world_gravity_x,
+                                                 float world_gravity_y,
+                                                 float world_gravity_z,
+                                                 const float* actor_rotations,
+                                                 uint32_t rotation_count);
+
 void ext_stress_solver_update(ExtStressSolverHandle* handle);
 
 uint32_t ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* handle);
