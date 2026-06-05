@@ -8,7 +8,7 @@ on:
 
 # ── Change this to your default/production branch ──────────
 env:
-  PRODUCTION_BRANCH: feat/rapier-destruction
+  PRODUCTION_BRANCH: main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
