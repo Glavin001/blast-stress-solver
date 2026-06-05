@@ -564,7 +564,7 @@ public:
 
     void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
-        sync(bonds);
+        sync(bonds, islandAware);
 
         for (const NodeData& node : m_nodesData)
         {
@@ -747,7 +747,7 @@ private:
         }
     }
 
-    void sync(const NvBlastBond* bonds)
+    void sync(const NvBlastBond* bonds, bool islandAware)
     {
         const bool resynced = m_nodesDirty || m_bondsDirty;
         if (m_nodesDirty)
@@ -759,7 +759,10 @@ private:
         {
             syncBonds(bonds);
         }
-        if (resynced)
+        // Island partitioning only feeds the islandCount stat — the solve never reads it — so it is
+        // only computed when island-aware solving is enabled. This keeps flag-off truly zero-cost
+        // (no per-resync union-find when island solving is off).
+        if (resynced && islandAware)
         {
             computeIslands();
         }

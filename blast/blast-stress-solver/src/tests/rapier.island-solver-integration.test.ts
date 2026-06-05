@@ -62,7 +62,7 @@ describe.skipIf(!runtimeAvailable)('Island solver integration (requires WASM bui
     const r = await run(false);
     expect(r.enabled).toBe(false);
     expect(r.maxSkipped).toBe(0);
-    expect(r.maxIslandCount).toBe(2);   // the graph still has two components; we just don't skip them
+    expect(r.maxIslandCount).toBe(0);   // island partition isn't computed when island solving is off — zero-overhead
   });
 
   it('skips settled islands in the full pipeline, with the same outcome as disabled', async () => {

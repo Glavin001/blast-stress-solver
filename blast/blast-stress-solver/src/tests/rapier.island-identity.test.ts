@@ -61,6 +61,7 @@ describe.skipIf(!runtimeAvailable)('Island identity (requires WASM build)', () =
     const rt = await (await loadRuntime()).loadStressSolver();
     const { nodes, bonds } = twoArmsSharingGround();
     const solver = rt.createExtSolver({ nodes, bonds, settings });
+    solver.setIslandAware(true); // the island partition (islandCount) is only computed when island-aware solving is on
     solver.addGravity({ x: 0, y: -10, z: 0 });
     solver.update();
     // One Blast actor (arms connect through the shared ground chunk)...
@@ -74,6 +75,7 @@ describe.skipIf(!runtimeAvailable)('Island identity (requires WASM build)', () =
     const rt = await (await loadRuntime()).loadStressSolver();
     const { nodes, bonds } = oneArm();
     const solver = rt.createExtSolver({ nodes, bonds, settings });
+    solver.setIslandAware(true); // the island partition (islandCount) is only computed when island-aware solving is on
     solver.addGravity({ x: 0, y: -10, z: 0 });
     solver.update();
     expect(solver.islandCount()).toBe(1);
