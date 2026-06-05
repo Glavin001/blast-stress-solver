@@ -154,22 +154,8 @@ async function rebuild() {
   try { await initScene(); } finally { rebuilding = false; }
 }
 
-function shoot(ndcX: number, ndcY: number) {
-  const core = coreRef; if (!core) return;
-  const rc = new THREE.Raycaster();
-  rc.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
-  const d = rc.ray.direction.clone().normalize();
-  // aim a small fast ball at the beam plane (z=0)
-  const t = -rc.ray.origin.z / (d.z || -1);
-  const hit = rc.ray.origin.clone().addScaledVector(d, Math.max(2, t));
-  core.enqueueProjectile({
-    position: { x: hit.x - d.x * 5, y: hit.y - d.y * 5, z: hit.z - d.z * 5 },
-    velocity: { x: d.x * 22, y: d.y * 22, z: d.z * 22 },
-    radius: 0.35, mass: 400, ttl: 2500,
-  });
-}
-// Clicks are routed through the shared shooter module (mounted at boot), which
-// delegates ball-mode shots back to `shoot` via its `shootBall` hook.
+// Shooting is handled by the shared shooter module (mounted at boot); the ball
+// spawns from the camera using the params passed via getBallParams below.
 
 // ── Controls ──────────────────────────────────────────────────
 function bindSlider(id: string, get: () => number, set: (v: number) => void, fmt: (v: number) => string, onInput?: (v: number) => void) {
@@ -239,7 +225,7 @@ shooter = mountShooter({
   controls,
   scene,
   getCore: () => coreRef,
-  shootBall: shoot,
+  getBallParams: () => ({ radius: 0.35, mass: 400, speed: 22 }),
 });
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize cracking demo:', err);

@@ -157,6 +157,12 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   let charCollider: RAPIER.Collider | null = null;
   let charController: RAPIER.KinematicCharacterController | null = null;
   let charCore: DestructibleCore | null = null; // world the character lives in
+  // The character controller ignores projectiles and thrown charges, so they
+  // never block you or get shoved by you — they pass straight through.
+  const charQueryFilter = (col: RAPIER.Collider): boolean => {
+    const ud = col.parent()?.userData as { projectile?: boolean; stickyExplosive?: boolean } | undefined;
+    return !(ud && (ud.projectile || ud.stickyExplosive));
+  };
 
   // Scratch objects (avoid per-frame allocation on the hot path).
   const _ray = new THREE.Raycaster();
@@ -373,6 +379,12 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       RAPIER.ColliderDesc.capsule(CAPSULE.halfHeight, CAPSULE.radius),
       charBody,
     );
+    // Ghost the capsule physically (filter = 0): nothing bounces off the player,
+    // so projectiles/charges fired from the camera don't collide with you. The
+    // controller still navigates the world via its own query (permissive
+    // filterGroups + charQueryFilter) below, so you're still blocked by walls,
+    // stand on floors/debris and can push debris.
+    charCollider.setCollisionGroups(0x00010000);
     const ctrl = world.createCharacterController(0.02);
     ctrl.enableAutostep(0.5, 0.2, true); // climb small debris / steps
     ctrl.enableSnapToGround(0.5); // stay glued to surfaces walking down
@@ -817,7 +829,15 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     }
 
     // Resolve the desired motion against the world (slides, steps, lands).
-    charController.computeColliderMovement(charCollider, { x: _move.x * dt, y: dy, z: _move.z * dt });
+    // Permissive filterGroups (the capsule itself is a physics ghost) + a
+    // predicate that skips projectiles/charges so they don't block the player.
+    charController.computeColliderMovement(
+      charCollider,
+      { x: _move.x * dt, y: dy, z: _move.z * dt },
+      undefined,
+      0xffffffff,
+      charQueryFilter,
+    );
     grounded = charController.computedGrounded();
     const corr = charController.computedMovement();
     const p = charBody.translation();
