@@ -45,6 +45,7 @@ const profiler = createFrameProfilerOverlay({
 // forces, gravity) and every fracture/topology change into a single gzipped
 // bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
 const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
   exportName: 'tower-collapse-recording',
   getProfilerExport: () => profiler.exportData(),
 });
@@ -65,7 +66,7 @@ const CONFIG = {
   projectile: {
     radius: 0.35,
     mass: 1_000,
-    speed: 22,
+    speed: 40,
   },
   solver: {
     gravity: -9.81,
@@ -79,10 +80,10 @@ const CONFIG = {
     skipSingleBodies: false,
   },
   optimization: {
-    // Damp small debris only after it lands ('always' floats falling debris — see
+    // Damping defaults to off; 'afterGroundCollision' would damp small debris only after it lands ('always' floats falling debris — see
     // rapier.smallBodyDamping.fall.test.ts).
-    smallBodyDampingMode: 'afterGroundCollision' as string,
-    debrisCleanupMode: 'always' as string,
+    smallBodyDampingMode: 'off' as string,
+    debrisCleanupMode: 'afterGroundCollision' as string,
     debrisTtlMs: 10000,
     maxCollidersForDebris: 2,
   },

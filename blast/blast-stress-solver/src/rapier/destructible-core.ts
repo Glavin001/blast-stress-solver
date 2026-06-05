@@ -59,6 +59,16 @@ export type BuildDestructibleCoreOptions = {
    * `perBody` is the default and recommended mode.
    * `world` is retained for compatibility but is not the preferred path. */
   snapshotMode?: 'perBody' | 'world';
+  /** Skip the resim snapshot re-capture taken between the rollback-restore and the
+   *  resim `world.step()` on the **final** allowed resim pass. That capture only
+   *  exists to be restored by a *subsequent* resim pass; on the last pass — which
+   *  is *every* fracture frame when `maxResimulationPasses === 1` (the default,
+   *  production resim path) — nothing ever restores it, so it is dead work
+   *  (~0.8 ms/fracture frame). Output is unchanged: the skipped snapshot is only
+   *  read by a later pass that does not run. Default **true**. Set false for the
+   *  legacy always-capture behaviour (the output-equivalence A/B test pins both
+   *  paths to identical trajectories; also an emergency rollback switch). */
+  deferRedundantResimSnapshot?: boolean;
   onWorldReplaced?: (newWorld: RAPIER.World) => void;
   resimulateOnDamageDestroy?: boolean;
   /** Scale factor for contact forces fed into the stress solver (default 30).
@@ -176,6 +186,7 @@ export async function buildDestructibleCore({
   resimulateOnFracture = true,
   maxResimulationPasses = 1,
   snapshotMode = 'perBody',
+  deferRedundantResimSnapshot = true,
   onWorldReplaced,
   resimulateOnDamageDestroy = !!damage?.enabled,
   contactForceScale = 30,
@@ -847,6 +858,15 @@ export async function buildDestructibleCore({
   let solverBatchedForces: boolean | undefined;
   const solverForceFallbackPos: Vec3 = { x: 0, y: 0, z: 0 };
   const solverForceFallbackVec: Vec3 = { x: 0, y: 0, z: 0 };
+
+  // Per-frame body-rotation cache for the contact resolve pass, keyed by body
+  // handle. A single impact spreads over many contacts on the same fragment, and a
+  // body's rotation is constant across the frame, so this collapses N redundant
+  // getRigidBody()+rotation() FFI round-trips per body down to one. The cached
+  // value is the exact bits the per-contact call would return, so the world→local
+  // force is byte-identical. Reused across frames (cleared each frame) — no
+  // per-frame Map allocation; entries hold null for handles with no live body.
+  const contactRotCache = new Map<number, { x: number; y: number; z: number; w: number } | null>();
 
   function pushSolverForce(nodeIndex: number, px: number, py: number, pz: number, fx: number, fy: number, fz: number): void {
     const i = solverForceCount;
@@ -1632,16 +1652,26 @@ export async function buildDestructibleCore({
     // Pass 1 — resolve: per-contact body + rotation round-trip, world→local force
     // rotation, buffer the full-strength hit force, and stash the hit for splash.
     const resolveT0 = startTiming();
+    contactRotCache.clear();
     for (const contact of bufferedExternalContacts) {
-      if (!contact.totalForceWorld) continue;
+      const fw = contact.totalForceWorld;
+      if (!fw) continue;
       const hitChunk = chunks[contact.nodeIndex];
       if (!hitChunk || !hitChunk.active || hitChunk.bodyHandle == null) continue;
-      const body = world.getRigidBody(hitChunk.bodyHandle);
-      if (!body) continue;
+      const bodyHandle = hitChunk.bodyHandle;
+      // Fetch each body's rotation once per frame; reuse it for every other contact
+      // sharing that body (see contactRotCache).
+      let rot = contactRotCache.get(bodyHandle);
+      if (rot === undefined) {
+        const body = world.getRigidBody(bodyHandle);
+        if (body) { const r = body.rotation(); rot = { x: r.x, y: r.y, z: r.z, w: r.w }; }
+        else rot = null;
+        contactRotCache.set(bodyHandle, rot);
+      }
+      if (!rot) continue;
       // Rotate force from world space to body-local space
-      const rot = body.rotation();
       const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
-      const fx = contact.totalForceWorld.x, fy = contact.totalForceWorld.y, fz = contact.totalForceWorld.z;
+      const fx = fw.x, fy = fw.y, fz = fw.z;
       // Inverse quaternion rotation (conjugate)
       const lx = qw * qw * fx - 2 * qy * qw * fz + 2 * qz * qw * fy + qx * qx * fx - 2 * qy * qx * fy - 2 * qz * qx * fz - qz * qz * fx - qy * qy * fx
         + 2 * qx * qy * fy + 2 * qx * qz * fz;
@@ -1685,7 +1715,8 @@ export async function buildDestructibleCore({
         const c = chunks[j];
         if (!c || !c.active || c.bodyHandle !== bodyHandle) continue;
         const w = splashAdjWeight[k];
-        pushSolverForce(j, c.baseLocalOffset.x, c.baseLocalOffset.y, c.baseLocalOffset.z, sfx * w, sfy * w, sfz * w);
+        const bo = c.baseLocalOffset;
+        pushSolverForce(j, bo.x, bo.y, bo.z, sfx * w, sfy * w, sfz * w);
       }
     }
     stopTiming(splashT0, 'contactInjectSplashMs');
@@ -2430,7 +2461,13 @@ export async function buildDestructibleCore({
         const resimT0 = startTiming();
         if (resimulateOnFracture) {
           restoreWorldSnapshot();
-          captureWorldSnapshot();
+          // The re-capture here is only consumed by a *subsequent* pass's restore
+          // (the next loop iteration). On the final allowed pass none follows, so
+          // skip it — dead work on every fracture frame when maxResim === 1. The
+          // snapshot is otherwise unread, so output is identical (proven by the
+          // deferRedundantResimSnapshot A/B in rapier.resim-perf.test.ts).
+          const willResimAgain = resimCount + 1 < maxResim;
+          if (!deferRedundantResimSnapshot || willResimAgain) captureWorldSnapshot();
           const rapierResimT0 = startTiming();
           world.step(eventQueue);
           stopTiming(rapierResimT0, 'rapierStepMs');
