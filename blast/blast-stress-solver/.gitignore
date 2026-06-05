@@ -3,3 +3,7 @@ dist/
 
 # stress-city.mjs writes a transient esbuild bundle here (cleaned up on exit)
 .stress-city-*/
+
+# generated stress reports / transient run logs
+stress-report*.json
+err.log
