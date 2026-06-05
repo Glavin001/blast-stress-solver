@@ -143,6 +143,8 @@ let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 const profiler = createFrameProfilerOverlay();
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
+// Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
+let centrifugalEnabled = false;
 let rebuilding = false;
 
 async function initScene() {
@@ -203,6 +205,7 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: CONFIG.features.debug });
 
   coreRef = core;
+  core.setSolverCentrifugalEnabled(centrifugalEnabled);
   profiler.attach(core);
   visualsRef = visuals;
   initialBonds = core.getActiveBondsCount();
@@ -291,6 +294,10 @@ bindSlider('cfg-contact-force', CONFIG.solver, 'contactForceScale', (v) => v.toF
 bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1) + ' m/s²', (v) => coreRef?.setGravity(v));
 
 // Physics
+document.getElementById('cfg-centrifugal')?.addEventListener('change', (e) => {
+  centrifugalEnabled = (e.target as HTMLInputElement).checked;
+  coreRef?.setSolverCentrifugalEnabled(centrifugalEnabled);
+});
 bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) => coreRef?.setDebrisCollisionMode(v as any));
 bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
 bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));

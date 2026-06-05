@@ -169,6 +169,8 @@ let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
+// Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
+let centrifugalEnabled = false;
 
 async function initScene() {
   let scenario = buildTowerScenario(CONFIG.tower);
@@ -242,6 +244,7 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
 
   coreRef = core;
+  core.setSolverCentrifugalEnabled(centrifugalEnabled);
   visualsRef = visuals;
 
   // Point the reusable frame-profiler overlay at this core.
@@ -290,6 +293,11 @@ document.getElementById('btn-reset')?.addEventListener('click', async () => {
   coreRef = null;
   visualsRef = null;
   await initScene();
+});
+
+document.getElementById('cfg-centrifugal')?.addEventListener('change', (e) => {
+  centrifugalEnabled = (e.target as HTMLInputElement).checked;
+  coreRef?.setSolverCentrifugalEnabled(centrifugalEnabled);
 });
 
 document.getElementById('btn-debug')?.addEventListener('click', () => {
