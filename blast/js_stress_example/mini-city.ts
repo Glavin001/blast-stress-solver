@@ -45,6 +45,8 @@ const CONFIG = {
     maxFloors: 6,
     fragments: 5, // Voronoi fragments per wall (floors/columns scale from this)
     seed: 7,
+    massDensityMin: 600, // kg per m² per floor (min, randomised per building)
+    massDensityMax: 1200, // kg per m² per floor (max)
   },
   projectile: { radius: 0.6, mass: 1500, speed: 60 },
   destroy: {
@@ -180,7 +182,7 @@ function mulberry32(a: number) {
 // Geometry/size live in scenario.parameters and are per-node, so they are
 // concatenated in node order. Fragment geometry is local to each node's
 // centroid, so only centroids (and bond indices) need offsetting.
-type Part = { scenario: ScenarioDesc; offset: Vec3 };
+type Part = { scenario: ScenarioDesc; offset: Vec3; massMultiplier?: number };
 
 function mergeScenarios(parts: Part[]): ScenarioDesc {
   const nodes: any[] = [];
@@ -189,7 +191,7 @@ function mergeScenarios(parts: Part[]): ScenarioDesc {
   const fragmentGeometries: any[] = [];
   let base = 0;
 
-  for (const { scenario, offset } of parts) {
+  for (const { scenario, offset, massMultiplier = 1 } of parts) {
     const params = (scenario.parameters ?? {}) as any;
     const sizes = (params.fragmentSizes ?? []) as Vec3[];
     const geos = (params.fragmentGeometries ?? []) as unknown[];
@@ -201,7 +203,7 @@ function mergeScenarios(parts: Part[]): ScenarioDesc {
           y: n.centroid.y + offset.y,
           z: n.centroid.z + offset.z,
         },
-        mass: n.mass,
+        mass: n.mass != null && n.mass > 0 ? n.mass * massMultiplier : n.mass,
         volume: n.volume,
       });
       fragmentSizes.push(sizes[i]);
@@ -257,7 +259,7 @@ const VARIANTS_PER_SHAPE = 3;
 
 async function buildCity(): Promise<ScenarioDesc> {
   buildings.length = 0;
-  const { grid, street, widthMin, widthMax, minFloors, maxFloors, fragments, seed } =
+  const { grid, street, widthMin, widthMax, minFloors, maxFloors, fragments, seed, massDensityMin, massDensityMax } =
     CONFIG.city;
   const rng = mulberry32(seed * 2654435761);
 
@@ -341,7 +343,9 @@ async function buildCity(): Promise<ScenarioDesc> {
 
       const cx = -half + c * cell;
       const cz = -half + r * cell;
-      parts.push({ scenario, offset: { x: cx, y: 0, z: cz } });
+      const density = massDensityMin + rng() * (massDensityMax - massDensityMin);
+      const massMultiplier = density / 320; // 320 is the base density baked into fractureTower
+      parts.push({ scenario, offset: { x: cx, y: 0, z: cz }, massMultiplier });
 
       buildings.push({
         cx,
@@ -633,6 +637,8 @@ bindSlider('cfg-min-floors', CONFIG.city, 'minFloors');
 bindSlider('cfg-max-floors', CONFIG.city, 'maxFloors');
 bindSlider('cfg-frags', CONFIG.city, 'fragments');
 bindSlider('cfg-seed', CONFIG.city, 'seed');
+bindSlider('cfg-mass-density-min', CONFIG.city, 'massDensityMin', (v) => v.toLocaleString() + ' kg/m²/fl');
+bindSlider('cfg-mass-density-max', CONFIG.city, 'massDensityMax', (v) => v.toLocaleString() + ' kg/m²/fl');
 
 // Projectile (live at shoot time)
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
