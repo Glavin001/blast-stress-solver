@@ -69,6 +69,23 @@ export type BuildDestructibleCoreOptions = {
    *  legacy always-capture behaviour (the output-equivalence A/B test pins both
    *  paths to identical trajectories; also an emergency rollback switch). */
   deferRedundantResimSnapshot?: boolean;
+  /** Experimental resim scoping (default **false**, runtime-toggleable via
+   *  `setScopedResim`). On a fracture the resim re-runs `world.step()` over *every*
+   *  body, but only the fractured region and what it touches actually move
+   *  differently the second time. With this on, bodies that are effectively
+   *  stationary and not part of this frame's fracture are pinned at their
+   *  initial-step result and slept for the resim step, so Rapier's island solver
+   *  skips them. Rapier auto-wakes a sleeper the moment an active body *contacts*
+   *  it, so contact-gain coupling is preserved, and the seeds' contact closure is
+   *  re-stepped too. It is **NOT byte-identical for cascading fractures**: a body
+   *  whose support fractures away loses a contact (which Rapier does not wake on)
+   *  and the error compounds through the fracture feedback loop — hence opt-in.
+   *  Byte-identical for isolated fractures. See the measured divergence/speedup in
+   *  `rapier.resim-perf.test.ts`. */
+  scopedResim?: boolean;
+  /** Linear speed (m/s) below which a non-fracture body is treated as stationary
+   *  and eligible to be skipped during the resim step. Default = `sleepLinearThreshold`. */
+  scopedResimLinearThreshold?: number;
   onWorldReplaced?: (newWorld: RAPIER.World) => void;
   resimulateOnDamageDestroy?: boolean;
   /** Scale factor for contact forces fed into the stress solver (default 30).
@@ -187,6 +204,8 @@ export async function buildDestructibleCore({
   maxResimulationPasses = 1,
   snapshotMode = 'perBody',
   deferRedundantResimSnapshot = true,
+  scopedResim = false,
+  scopedResimLinearThreshold,
   onWorldReplaced,
   resimulateOnDamageDestroy = !!damage?.enabled,
   contactForceScale = 30,
@@ -472,6 +491,9 @@ export async function buildDestructibleCore({
   // its load changes (a new contact, or a neighbour waking shifts its input), so it is paused, never
   // frozen or evicted: anything settled can always be loaded and fractured again.
   let islandSolverEnabled = false;
+  // Runtime-toggleable scoped-resim flag (see setScopedResim). Starts from the
+  // build option; the demo sidebar flips it live so it can be A/B'd in-browser.
+  let scopedResimEnabled = scopedResim;
   let islandSolverSkipSettled = true;
 
   const solver = runtime.createExtSolver({ nodes, bonds, settings: scaledSettings });
@@ -1506,6 +1528,120 @@ export async function buildDestructibleCore({
     stopTiming(t0, 'snapshotRestoreMs');
   }
 
+  // ── Scoped resim (opt-in, experimental) ─────────────────────────────────────
+  // The resim re-steps the whole world after a fracture, but only the fractured
+  // region and bodies it touches move differently the second time. These helpers
+  // pin the *stationary, non-fracture* bodies at their initial-step result and put
+  // them to sleep for the resim step, so Rapier skips them. Rapier auto-wakes any
+  // sleeper an active body collides with, so contact-gain coupling is preserved;
+  // the seeds' contact closure is re-stepped to cover bodies resting on the
+  // fractured structure where that contact is still in the narrow phase. NOT
+  // byte-identical for cascading fractures (support-loss is invisible here) — opt-in.
+  type FrozenBody = {
+    h: number;
+    t: { x: number; y: number; z: number };
+    r: { x: number; y: number; z: number; w: number };
+    lv: { x: number; y: number; z: number };
+    av: { x: number; y: number; z: number };
+  };
+  const resimFrozen: FrozenBody[] = []; // reused buffer (no per-frame allocation)
+  let resimFrozenCount = 0;
+
+  /** Bodies that must be re-simulated in the resim: the fracture seeds plus their
+   *  transitive contact neighbours (a couple of rings), from the initial-step
+   *  narrow phase. */
+  function buildResimContactClosure(seeds: Set<number>, rings = 2): Set<number> {
+    const affected = new Set<number>(seeds);
+    let frontier: number[] = Array.from(seeds);
+    for (let ring = 0; ring < rings && frontier.length > 0; ring += 1) {
+      const next: number[] = [];
+      for (const h of frontier) {
+        const body = world.getRigidBody(h);
+        if (!body) continue;
+        const nc = body.numColliders();
+        for (let i = 0; i < nc; i += 1) {
+          const col = body.collider(i);
+          world.contactPairsWith(col, (other) => {
+            const parent = other.parent();
+            if (!parent) return;
+            if (!affected.has(parent.handle)) {
+              affected.add(parent.handle);
+              next.push(parent.handle);
+            }
+          });
+        }
+      }
+      frontier = next;
+    }
+    return affected;
+  }
+
+  /** Snapshot the post-initial-step (P1) state of bodies eligible to be skipped,
+   *  BEFORE the rollback restore overwrites it. Returns how many will be frozen. */
+  function captureScopedResimFreeze(): number {
+    resimFrozenCount = 0;
+    const linThr = scopedResimLinearThreshold ?? sleepSettings.linear ?? 0.05;
+    const angThr = sleepSettings.angular ?? linThr;
+    const l2 = linThr * linThr;
+    const a2 = (angThr || linThr) * (angThr || linThr);
+    // Fracture-affected seeds (must be re-stepped): bodies created this frame and
+    // split sources whose COM shifted, plus their contact closure.
+    const seeds = new Set<number>(comDirtyReusedBodies);
+    for (const [h, prov] of bodyRestoreProvenance) {
+      if (prov.createdAtSnapshotGeneration === snapshotGeneration) seeds.add(h);
+    }
+    const affected = buildResimContactClosure(seeds);
+    world.forEachRigidBody((body) => {
+      if (body.isFixed()) return;
+      const h = body.handle;
+      if (affected.has(h)) return;
+      const lv = body.linvel();
+      if (lv.x * lv.x + lv.y * lv.y + lv.z * lv.z > l2) return; // moving → re-step
+      const av = body.angvel();
+      if (av.x * av.x + av.y * av.y + av.z * av.z > a2) return; // spinning → re-step
+      const t = body.translation();
+      const r = body.rotation();
+      let f = resimFrozen[resimFrozenCount];
+      if (!f) {
+        f = { h, t: { x: 0, y: 0, z: 0 }, r: { x: 0, y: 0, z: 0, w: 1 }, lv: { x: 0, y: 0, z: 0 }, av: { x: 0, y: 0, z: 0 } };
+        resimFrozen.push(f);
+      }
+      f.h = h;
+      f.t.x = t.x; f.t.y = t.y; f.t.z = t.z;
+      f.r.x = r.x; f.r.y = r.y; f.r.z = r.z; f.r.w = r.w;
+      f.lv.x = lv.x; f.lv.y = lv.y; f.lv.z = lv.z;
+      f.av.x = av.x; f.av.y = av.y; f.av.z = av.z;
+      resimFrozenCount += 1;
+    });
+    return resimFrozenCount;
+  }
+
+  /** After the rollback restore (which moved everyone back to P0 and woke them),
+   *  pin the frozen bodies back at their P1 result and sleep them so the resim
+   *  step skips them. */
+  function applyScopedResimFreeze() {
+    for (let i = 0; i < resimFrozenCount; i += 1) {
+      const f = resimFrozen[i];
+      const b = world.getRigidBody(f.h);
+      if (!b) continue;
+      b.setTranslation(f.t, false);
+      b.setRotation(f.r, false);
+      b.setLinvel(f.lv, false);
+      b.setAngvel(f.av, false);
+      b.sleep();
+    }
+  }
+
+  /** Wake the frozen bodies after the resim step so the next frame's initial step
+   *  integrates them normally. (Bodies an active body collided with were already
+   *  auto-woken by Rapier and stepped; waking them again is a no-op.) */
+  function wakeScopedResimFreeze() {
+    for (let i = 0; i < resimFrozenCount; i += 1) {
+      const b = world.getRigidBody(resimFrozen[i].h);
+      if (b) b.wakeUp();
+    }
+  }
+
   function processOneFracturePass(passIndex: number, reasons: string[]): boolean {
     const passT0 = startTiming();
 
@@ -2460,6 +2596,9 @@ export async function buildDestructibleCore({
       while (resimCount < maxResim) {
         const resimT0 = startTiming();
         if (resimulateOnFracture) {
+          // Scoped resim: capture the to-be-skipped bodies' P1 state BEFORE the
+          // rollback overwrites it (opt-in; no-op when disabled).
+          const frozen = scopedResimEnabled ? captureScopedResimFreeze() : 0;
           restoreWorldSnapshot();
           // The re-capture here is only consumed by a *subsequent* pass's restore
           // (the next loop iteration). On the final allowed pass none follows, so
@@ -2468,9 +2607,14 @@ export async function buildDestructibleCore({
           // deferRedundantResimSnapshot A/B in rapier.resim-perf.test.ts).
           const willResimAgain = resimCount + 1 < maxResim;
           if (!deferRedundantResimSnapshot || willResimAgain) captureWorldSnapshot();
+          // Pin stationary, decoupled bodies at their P1 result and sleep them so
+          // the resim world.step() skips them (Rapier auto-wakes any one a moving
+          // body collides with). The fractured region still re-steps in full.
+          if (frozen > 0) applyScopedResimFreeze();
           const rapierResimT0 = startTiming();
           world.step(eventQueue);
           stopTiming(rapierResimT0, 'rapierStepMs');
+          if (frozen > 0) wakeScopedResimFreeze();
           drainContactForces();
         }
 
@@ -2763,6 +2907,14 @@ export async function buildDestructibleCore({
     applyIslandSolverSettings();
   }
 
+  // Toggle scoped resim live (experimental). Takes effect on the next fracture frame.
+  function setScopedResim(enabled: boolean) {
+    scopedResimEnabled = !!enabled;
+  }
+  function getScopedResim() {
+    return scopedResimEnabled;
+  }
+
   function getIslandSolverStats() {
     // Prefer the count the per-island solve actually used this frame (fresh, and always
     // >= islandsSkipped). It is 0 when island-aware solving didn't run (off, or a single
@@ -2912,6 +3064,8 @@ export async function buildDestructibleCore({
     getActiveBondsCount,
     getIslandSettledStats,
     setIslandSolver,
+    setScopedResim,
+    getScopedResim,
     getIslandSolverStats,
     getSolverDebugLines,
     getNodeBonds,

@@ -73,6 +73,10 @@ const CONFIG = {
     // Island-aware solve: solve each disconnected group independently and skip groups that have
     // settled (no input change + already converged). On by default; toggled live in the sidebar.
     islandSolver: true,
+    // Scoped resim (experimental): on a fracture, skip re-stepping stationary, decoupled debris
+    // in the resim pass. Faster, but NOT byte-identical for cascading fractures — off by default;
+    // toggle live to A/B whether it "looks the same".
+    scopedResim: false,
   },
   features: { debug: false },
 };
@@ -439,6 +443,7 @@ async function initScene() {
 
   coreRef = core;
   core.setIslandSolver?.({ enabled: CONFIG.optimization.islandSolver }); // persist the toggle across rebuilds
+  core.setScopedResim?.(CONFIG.optimization.scopedResim); // persist the experimental toggle across rebuilds
   recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -689,6 +694,9 @@ bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 100
 );
 bindToggle('cfg-island-solver', CONFIG.optimization, 'islandSolver', (v) =>
   coreRef?.setIslandSolver?.({ enabled: v }),
+);
+bindToggle('cfg-scoped-resim', CONFIG.optimization, 'scopedResim', (v) =>
+  coreRef?.setScopedResim?.(v),
 );
 
 // Actions

@@ -375,6 +375,10 @@ export type DestructibleCore = {
    *  converged). Observationally identical to the whole-graph solve; a settled component
    *  re-solves the same frame its load changes (paused, never frozen). Off by default. */
   setIslandSolver?: (opts: { enabled?: boolean; skipSettled?: boolean }) => void;
+  /** Toggle experimental scoped resim live (skip stationary, decoupled bodies in
+   *  the resim step). Opt-in; not byte-identical for cascading fractures. */
+  setScopedResim?: (enabled: boolean) => void;
+  getScopedResim?: () => boolean;
   /** Current island-solver settings plus the last update's island count and skipped count. */
   getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
   // Damageable chunks API (present when damage is enabled)

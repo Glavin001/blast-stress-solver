@@ -409,4 +409,86 @@ describe.skipIf(!runtimeAvailable)('Resim / rapier perf levers (requires WASM bu
       expect(dominantHits).toBeGreaterThanOrEqual(2);
     }, 180_000);
   });
+
+  // ── D. Scoped resim (opt-in): re-step only the fractured region ─────────────
+  // Skips stationary, decoupled bodies during the resim world.step(). This pins
+  // down BOTH the win and the documented limitation so the trade-off can't drift:
+  // byte-identical for an isolated fracture, divergent for cascading ones.
+  describe('D. Scoped resim — faithful for isolated fractures, divergent for cascades', () => {
+    it('is runtime-toggleable via setScopedResim (default off)', async () => {
+      await loadModules();
+      const core = await buildDestructibleCore({
+        scenario: buildTowerScenario({ side: 4, stories: 6, totalMass: 1500 }),
+        gravity: -9.81, materialScale: 1e8, debrisCleanup: { mode: 'off' },
+      });
+      expect(core.getScopedResim?.()).toBe(false); // off by default
+      core.setScopedResim?.(true);
+      expect(core.getScopedResim?.()).toBe(true);
+      core.setScopedResim?.(false);
+      expect(core.getScopedResim?.()).toBe(false);
+      try { core.dispose(); } catch { /* ignore */ }
+    }, 30_000);
+
+    it('ISOLATED fracture: byte-identical to a full resim, and the resim step is cheaper', async () => {
+      await loadModules();
+      // A single hard hit fractures the tower once → one resim pass, no settled
+      // debris resting on a structure that later re-fractures → no support-loss case.
+      const mk = () => buildTowerScenario({ side: 6, stories: 12, totalMass: 5000 });
+      const plan = centerHit(6, 45000);
+      const frames = 120;
+      const full = await runScenario(mk(), { scopedResim: false }, { frames, plan });
+      const scoped = await runScenario(mk(), { scopedResim: true }, { frames, plan });
+
+      const d = compareTrajectories(full.trajectory, scoped.trajectory);
+      const resimRapier = (run: RunResult) => {
+        const rs = run.samples.filter((s) => (s.resimPasses ?? 0) > 0);
+        return { n: rs.length, rapier: rs.reduce((a, s) => a + (s.rapierStepMs ?? 0), 0) / Math.max(1, rs.length) };
+      };
+      const fR = resimRapier(full), sR = resimRapier(scoped);
+      console.log('\n  [Scoped resim — ISOLATED] single-impact tower');
+      console.log(`    resim frames ${fR.n}; rapierStep/resim-frame full ${fR.rapier.toFixed(2)}ms → scoped ${sR.rapier.toFixed(2)}ms; ` +
+        `divergence ${d.maxPosDelta.toFixed(5)} m`);
+
+      expect(fR.n).toBeGreaterThan(0);
+      // The contract this test pins down: skipping decoupled bodies changes nothing
+      // for an isolated fracture — byte-identical to a full resim.
+      expect(d.maxPosDelta).toBe(0);
+      expect(d.maxQuatDelta).toBe(0);
+      // (Speedup is reported above, not asserted: a single resim frame is too noisy
+      // to gate on, and when little is quiescent the closure overhead can offset the
+      // saving. The win shows up on debris-heavy scenes — see the CASCADING case and
+      // the in-browser toggle.)
+    }, 120_000);
+
+    it('CASCADING fracture: documents that scoped resim diverges (why it is opt-in)', async () => {
+      await loadModules();
+      // Repeated impacts over time → settled debris ends up resting on structures
+      // that later re-fracture. The resim drops their support, but Rapier only
+      // auto-wakes on contact GAIN (not loss), so a frozen body misses the fall and
+      // the error compounds through the fracture feedback loop. This is the regime
+      // real scenes live in — the reason scoped resim is NOT a default.
+      const mk = () => buildTowerScenario({ side: 7, stories: 18, totalMass: 9000 });
+      const plan: ImpactPlan[] = [4, 30, 60, 90, 120].map((frame, i) => ({
+        frame,
+        projectiles: [{
+          position: { x: 5 * Math.cos(i), y: 9 * (0.3 + 0.1 * i), z: 5 * Math.sin(i) + 3 },
+          velocity: { x: -20 * Math.cos(i), y: -3, z: -34 }, radius: 0.4, mass: 28000,
+        }],
+      }));
+      const frames = 200;
+      const full = await runScenario(mk(), { scopedResim: false }, { frames, plan });
+      const scoped = await runScenario(mk(), { scopedResim: true }, { frames, plan });
+      const d = compareTrajectories(full.trajectory, scoped.trajectory);
+      const resimFrames = full.samples.filter((s) => (s.resimPasses ?? 0) > 0).length;
+      console.log('\n  [Scoped resim — CASCADING] multi-impact tower');
+      console.log(`    resim frames ${resimFrames}; divergence maxPos ${d.maxPosDelta.toFixed(2)} m ` +
+        `(firstDiverge frame ${d.firstDivergeFrame}) — this is why scoped resim is opt-in, not default`);
+
+      // Sustained fracturing must have happened (several resim frames).
+      expect(resimFrames).toBeGreaterThanOrEqual(3);
+      // The known limitation, asserted so it is not mistaken for byte-identical:
+      // cascading fractures diverge once decoupling can't be predicted at resim time.
+      expect(d.maxPosDelta).toBeGreaterThan(0.5);
+    }, 180_000);
+  });
 });

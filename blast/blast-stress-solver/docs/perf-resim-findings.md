@@ -74,14 +74,32 @@ change — the groundwork for acting on it.
 
 ## Output-safe levers, ranked by (impact × safety)
 
-### 1. Scope the resim to fracture-affected bodies/islands — *biggest, output-safe*
-The second `world.step()` is the most expensive thing on a fracture frame
-(it re-runs the dominant phase). Only bodies reachable from the fracture — via a
-surviving bond or a contact — can differ between the two passes. Restrict the
-re-step (and the snapshot/restore) to that set; leave settled/independent islands
-at their initial-pass result. **Output is provably unchanged** for the frozen set
-(same inputs → same integration). Guarded by the determinism harness
-(`maxPosDelta === 0`); the island instrumentation already quantifies the ceiling.
+### 1. Scope the resim to fracture-affected bodies — *implemented as opt-in `scopedResim`; NOT byte-identical for cascades*
+The second `world.step()` is the most expensive thing on a fracture frame. The
+idea: pin stationary, decoupled bodies at their initial-step result and sleep them
+for the resim step, so Rapier's island solver skips them; the fractured region and
+its contact closure still re-step. Rapier auto-wakes a sleeper the instant an
+active body *contacts* it, so contact-*gain* coupling is preserved.
+
+**Implemented behind `scopedResim` (default off; live toggle `setScopedResim`, and
+a sidebar checkbox in the mini-city demo).** Measured with the equivalence harness
+(`rapier.resim-perf.test.ts` §D):
+
+- **Isolated fracture → byte-identical** (`maxPosDelta === 0`), resim step ~40 %
+  cheaper. Safe and faithful.
+- **Cascading fracture → diverges (~12.8 m).** A body resting *on* a structure
+  that fractures loses its support in the resim, but Rapier only auto-wakes on
+  contact *gain*, never *loss* — and the post-fracture contact graph needed to
+  detect that coupling doesn't exist until the resim itself runs (so the contact
+  closure can't see it). The error then compounds chaotically through the
+  fracture → stress → fracture feedback loop.
+
+So it cannot be a default (real scenes cascade — the mini-city had 321 cascading
+resim frames). It ships as an **opt-in experiment** so the "looks the same?"
+trade-off can be evaluated live in the browser. The truly output-safe version
+would require predicting the resim's own contact changes, which is not possible
+ahead of the step; the only effective *general* lever is sleep (§4), which changes
+output by design.
 
 ### 2. Drop the dead snapshot re-capture on the final resim pass — *free, easy, safe*
 The `captureWorldSnapshot()` after `restoreWorldSnapshot()` exists only to support

@@ -205,6 +205,9 @@
           <label class="toggle-row"><input type="checkbox" id="cfg-island-solver" checked />
             <span class="toggle-text">Island solver &#9733;
               <small>Solve each disconnected group on its own and skip ones that have settled &mdash; same result, less work.</small></span></label>
+          <label class="toggle-row"><input type="checkbox" id="cfg-scoped-resim" />
+            <span class="toggle-text">Scoped resim (experimental)
+              <small>On a fracture, skip re-stepping settled, decoupled debris in the resim pass. Faster, but may diverge on heavy cascades &mdash; toggle and watch whether it looks the same.</small></span></label>
         </section>
 
         <!-- Actions -->
