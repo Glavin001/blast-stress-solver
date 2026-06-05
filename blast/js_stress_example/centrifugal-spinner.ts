@@ -51,10 +51,11 @@ const camera = new THREE.PerspectiveCamera(
   0.1,
   400,
 );
-camera.position.set(0, 7, 16);
+// The beams float at y≈6 (above the core's invisible ground plane), so look there.
+camera.position.set(0, 8, 18);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 0, 0);
+controls.target.set(0, 6, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.update();
@@ -65,9 +66,9 @@ const dirLight = new THREE.DirectionalLight(0xffeedd, 1.0);
 dirLight.position.set(8, 14, 10);
 scene.add(dirLight);
 
-// A faint grid for orientation (there is no ground — this is a zero-gravity scene).
+// A faint grid at the ground plane (y=0) for orientation; the beams float well above it.
 const grid = new THREE.GridHelper(40, 40, 0x223044, 0x152030);
-grid.position.y = -6;
+grid.position.y = 0;
 scene.add(grid);
 
 // ── Stats panel ──────────────────────────────────────────────

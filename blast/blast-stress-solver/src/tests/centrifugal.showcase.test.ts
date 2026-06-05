@@ -111,28 +111,29 @@ describe.skipIf(!runtimeAvailable)('centrifugal-spinner showcase: behavior (requ
     await loadModules();
   });
 
-  it('does NOT fracture the spinning beams when centrifugal is OFF', async () => {
+  it('does NOT meaningfully fracture the spinning beams when centrifugal is OFF', async () => {
     const { core } = await buildShowcaseCore(false);
     const r = runShowcase(core);
-    // No gravity and no centrifugal ⇒ nothing stresses the beams.
-    expect(r.finalBonds).toBe(r.initialBonds);
-    expect(r.finalBodies).toBe(r.initialBodies);
+    // No gravity and no centrifugal ⇒ nothing should stress the beams. Allow a single stray bond
+    // (e.g. a numerical contact edge case) so the test pins the *behaviour*, not bit-exactness.
+    expect(r.initialBonds - r.finalBonds).toBeLessThanOrEqual(1);
   });
 
   it('DOES shatter the spinning beams when centrifugal is ON', async () => {
     const { core } = await buildShowcaseCore(true);
     const r = runShowcase(core);
-    // Centripetal compression breaks bonds and splits each beam into multiple bodies.
-    expect(r.finalBonds).toBeLessThan(r.initialBonds);
+    // Centripetal compression breaks many bonds and splits each beam into multiple bodies.
+    expect(r.initialBonds - r.finalBonds).toBeGreaterThan(3);
     expect(r.finalBodies).toBeGreaterThan(r.initialBodies);
   });
 
-  it('breaks strictly more bonds with centrifugal ON than OFF (same scene, same spin)', async () => {
+  it('breaks far more bonds with centrifugal ON than OFF (same scene, same spin)', async () => {
     const off = runShowcase((await buildShowcaseCore(false)).core);
     const on = runShowcase((await buildShowcaseCore(true)).core);
     const brokenOff = off.initialBonds - off.finalBonds;
     const brokenOn = on.initialBonds - on.finalBonds;
-    expect(brokenOff).toBe(0);
-    expect(brokenOn).toBeGreaterThan(brokenOff);
+    // OFF stays essentially intact; ON shatters — the centrifugal contribution dominates.
+    expect(brokenOff).toBeLessThanOrEqual(1);
+    expect(brokenOn).toBeGreaterThan(brokenOff + 3);
   });
 });

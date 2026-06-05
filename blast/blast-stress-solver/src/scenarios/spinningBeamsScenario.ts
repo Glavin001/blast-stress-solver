@@ -27,6 +27,13 @@ export interface SpinningBeamsOptions {
   massPerSegment?: number;
   /** Multiplier on each bond's contact area. Smaller area ⇒ higher stress ⇒ easier to break. */
   areaScale?: number;
+  /**
+   * Height (m) to float the beams above the origin. The core always spawns an invisible ground
+   * plane at y=0; since the beams spin about the vertical axis they would otherwise sweep through
+   * it like a blade and generate stray contacts. Lifting them clear keeps the only load
+   * centrifugal.
+   */
+  height?: number;
 }
 
 export const DEFAULT_SPINNING_BEAMS_OPTIONS: Required<SpinningBeamsOptions> = {
@@ -36,6 +43,7 @@ export const DEFAULT_SPINNING_BEAMS_OPTIONS: Required<SpinningBeamsOptions> = {
   gap: 1.4,
   massPerSegment: 1.0,
   areaScale: 1.0,
+  height: 6.0,
 };
 
 /**
@@ -43,7 +51,7 @@ export const DEFAULT_SPINNING_BEAMS_OPTIONS: Required<SpinningBeamsOptions> = {
  * free body that can be spun and fractured purely by centrifugal load.
  */
 export function buildSpinningBeamsScenario(opts: SpinningBeamsOptions = {}): ScenarioDesc {
-  const { beams, segments, segmentSize, gap, massPerSegment, areaScale } = {
+  const { beams, segments, segmentSize, gap, massPerSegment, areaScale, height } = {
     ...DEFAULT_SPINNING_BEAMS_OPTIONS,
     ...opts,
   };
@@ -63,7 +71,7 @@ export function buildSpinningBeamsScenario(opts: SpinningBeamsOptions = {}): Sce
 
     for (let i = 0; i < segments; i++) {
       const x = (i - segCenter) * segmentSize;
-      nodes.push({ centroid: { x, y: 0, z }, mass: massPerSegment, volume });
+      nodes.push({ centroid: { x, y: height, z }, mass: massPerSegment, volume });
     }
 
     for (let i = 0; i < segments - 1; i++) {
@@ -74,7 +82,7 @@ export function buildSpinningBeamsScenario(opts: SpinningBeamsOptions = {}): Sce
       bonds.push({
         node0: a,
         node1: c,
-        centroid: { x: (na.x + nc.x) * 0.5, y: 0, z },
+        centroid: { x: (na.x + nc.x) * 0.5, y: height, z },
         normal: { x: 1, y: 0, z: 0 }, // bonds run along the beam axis
         area,
       });
