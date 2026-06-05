@@ -26,10 +26,12 @@ import { buildSpinningBeamsScenario } from 'blast-stress-solver/scenarios';
 // ── Config ────────────────────────────────────────────────────
 
 const CONFIG = {
-  centrifugal: false, // start OFF so the user sees "nothing happens", then flips it on
+  centrifugal: false, // start OFF so the user sees it spin intact, then flips it on to shatter
   spin: 45, // rad/s about +Y
-  beams: 4,
-  segments: 7,
+  // One centered beam by default: it spins about its own centre and snaps cleanly in the middle —
+  // the unambiguous A/B. Raising "Beams" adds more (they ride one free body and shatter together).
+  beams: 1,
+  segments: 9,
   bondStrength: 0.4, // compression fatal limit — lower = more fragile
 };
 

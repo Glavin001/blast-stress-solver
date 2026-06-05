@@ -476,9 +476,14 @@ export async function buildDestructibleCore({
   let world = new RAPIER.World({ x: 0, y: gravity, z: 0 });
   const eventQueue = new RAPIER.EventQueue(true);
 
+  // A scenario with no support nodes (no mass==0 anchors) is free-floating — nothing pins it to
+  // the world — so its root body must be DYNAMIC, matching the Rust pipeline. Anchored structures
+  // (the common case: walls/towers with supports) keep a fixed root. Without this, an anchor-free
+  // structure would be welded in place and could never move or be spun.
   const rootBody = world.createRigidBody(
-    RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0)
-    .setUserData({ root: true })
+    (hasSupports ? RAPIER.RigidBodyDesc.fixed() : RAPIER.RigidBodyDesc.dynamic())
+      .setTranslation(0, 0, 0)
+      .setUserData({ root: true })
   );
 
   const groundBody = world.createRigidBody(
