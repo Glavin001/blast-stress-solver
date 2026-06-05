@@ -179,6 +179,11 @@ pub struct SimConfig {
     pub with_ground: bool,
     /// Enable debris sleep thresholds + cleanup, matching the demos' "lots of bodies" tuning.
     pub debris_optimizations: bool,
+    /// Solve each disconnected component ("island") independently (production default ON). Lets
+    /// the harness A/B island-aware solving vs the whole-graph path for perf comparison.
+    pub island_aware: bool,
+    /// Skip settled islands (requires `island_aware`). Production default ON.
+    pub skip_settled: bool,
 }
 
 impl Default for SimConfig {
@@ -198,6 +203,8 @@ impl Default for SimConfig {
             dt: 1.0 / 60.0,
             with_ground: true,
             debris_optimizations: false,
+            island_aware: true,
+            skip_settled: true,
         }
     }
 }
@@ -355,6 +362,8 @@ impl Sim {
             small_body_damping,
             debris_cleanup,
             dynamic_body_ccd_enabled: false,
+            island_aware: cfg.island_aware,
+            skip_settled: cfg.skip_settled,
         })
         .expect("failed to build DestructibleSet");
         set.set_time_step(cfg.dt);

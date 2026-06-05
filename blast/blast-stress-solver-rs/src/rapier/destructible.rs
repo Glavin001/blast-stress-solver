@@ -56,6 +56,14 @@ pub struct DestructibleConfig {
     pub small_body_damping: SmallBodyDampingOptions,
     pub debris_cleanup: DebrisCleanupOptions,
     pub dynamic_body_ccd_enabled: bool,
+    /// Solve each disconnected component ("island") of the support graph independently. With ≤1
+    /// island the C++ core falls back to the bit-identical whole-graph path, so this is
+    /// observationally identical while letting large, partially-active worlds skip settled work.
+    /// Defaults ON for production [`DestructibleSet`]s (the raw [`ExtStressSolver`] stays off).
+    pub island_aware: bool,
+    /// Skip islands whose velocity inputs are bit-identical to their last solve and that already
+    /// converged (a guaranteed no-op). Requires `island_aware`. Defaults ON.
+    pub skip_settled: bool,
 }
 
 /// Result of a single step.
@@ -77,6 +85,42 @@ pub struct StepResult {
     pub split_estimate_ms: f32,
     /// Cohorts of body handles that were produced by the same split this step.
     pub split_cohorts: Vec<SplitCohort>,
+    /// Islands the per-island solve partitioned the graph into this step (0 when the whole-graph
+    /// path ran: island-aware off, a single island, or an idle-skipped frame).
+    pub islands_total: usize,
+    /// Islands skipped this step because they were settled (0 unless island-aware + skip-settled).
+    pub islands_skipped: usize,
+}
+
+/// Current island-solver configuration plus the last update's island counts.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IslandSolverStats {
+    /// Whether per-island solving is enabled.
+    pub island_aware: bool,
+    /// Whether settled-island skipping is enabled.
+    pub skip_settled: bool,
+    /// Disconnected components in the live support graph right now.
+    pub island_count: usize,
+    /// Islands the last per-island `update()` partitioned into (0 if the whole-graph path ran).
+    pub islands_total: usize,
+    /// Islands skipped in the last `update()` because they were settled.
+    pub islands_skipped: usize,
+}
+
+/// Read-only measurement of how much of the structure is "settled" — the skippable-cost ceiling
+/// for island-aware solving. Mirrors the web library's `getIslandSettledStats`. An island is the
+/// connected component of the live bond graph with **static (support) nodes as cut points**; it is
+/// settled when its rigid body is asleep. No behavior change — pure instrumentation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IslandSettledStats {
+    pub islands_total: usize,
+    pub islands_settled: usize,
+    pub total_nodes: usize,
+    pub settled_nodes: usize,
+    pub total_bonds: usize,
+    pub settled_bonds: usize,
+    pub settled_node_fraction: f32,
+    pub settled_bond_fraction: f32,
 }
 
 /// Main orchestrator for destructible structures with Rapier integration.
@@ -109,6 +153,10 @@ pub struct DestructibleSet {
     /// Physics timestep used to convert solver-reported excess *forces* into one-shot
     /// impulses on newly separated fragments. Defaults to 1/60; set via `set_time_step`.
     time_step: f32,
+    /// Whether per-island solving is enabled on the solver (mirrors the C++ solver state).
+    island_aware: bool,
+    /// Whether settled-island skipping is enabled on the solver.
+    skip_settled: bool,
 }
 
 impl DestructibleSet {
@@ -116,7 +164,13 @@ impl DestructibleSet {
     ///
     /// You must call `initialize()` after creating the Rapier world to set up the initial bodies.
     pub fn new(config: DestructibleConfig) -> Option<Self> {
-        let solver = ExtStressSolver::new(&config.nodes, &config.bonds, &config.solver_settings)?;
+        let mut solver =
+            ExtStressSolver::new(&config.nodes, &config.bonds, &config.solver_settings)?;
+        // Island-aware solving is a runtime toggle on the C++ core (default off on the raw solver,
+        // which keeps the cross-validation fixtures bit-identical). Production `DestructibleSet`s
+        // opt in here; skip-settled only takes effect when island-aware is on.
+        solver.set_island_aware(config.island_aware);
+        solver.set_skip_settled(config.skip_settled);
         let node_count = config.nodes.len();
         let mut node_bonds = vec![Vec::new(); node_count];
         for (bond_index, bond) in config.bonds.iter().enumerate() {
@@ -164,6 +218,8 @@ impl DestructibleSet {
             forces_applied: false,
             frames_since_fracture: u32::MAX,
             time_step: 1.0 / 60.0,
+            island_aware: config.island_aware,
+            skip_settled: config.skip_settled,
         })
     }
 
@@ -227,6 +283,8 @@ impl DestructibleSet {
             small_body_damping: SmallBodyDampingOptions::default(),
             debris_cleanup: DebrisCleanupOptions::default(),
             dynamic_body_ccd_enabled: false,
+            island_aware: true,
+            skip_settled: true,
         })
     }
 
@@ -328,6 +386,9 @@ impl DestructibleSet {
         // 2. Update solver
         self.solver.update();
         result.converged = self.solver.converged();
+        // Island instrumentation (0 unless per-island solving actually ran this frame).
+        result.islands_total = self.solver.islands_total() as usize;
+        result.islands_skipped = self.solver.islands_skipped() as usize;
 
         // 3. Check for overstressed bonds
         let overstressed = self.solver.overstressed_bond_count();
@@ -436,6 +497,128 @@ impl DestructibleSet {
             self.sleep_thresholds,
             self.debris_cleanup.max_colliders_for_debris,
         )
+    }
+
+    /// Enable/disable per-island solving and settled-island skipping at runtime (mirrors the web
+    /// library's `setIslandSolver`). Skip-settled only takes effect while island-aware is on. With
+    /// ≤1 island the solver falls back to the bit-identical whole-graph path, so toggling this is
+    /// observationally identical to the legacy solve.
+    pub fn set_island_solver(&mut self, island_aware: bool, skip_settled: bool) {
+        self.island_aware = island_aware;
+        self.skip_settled = skip_settled;
+        self.solver.set_island_aware(island_aware);
+        self.solver.set_skip_settled(skip_settled);
+    }
+
+    /// Current island-solver settings plus the last update's island totals (mirrors the web
+    /// library's `getIslandSolverStats`).
+    pub fn island_solver_stats(&self) -> IslandSolverStats {
+        IslandSolverStats {
+            island_aware: self.island_aware,
+            skip_settled: self.skip_settled,
+            island_count: self.solver.island_count() as usize,
+            islands_total: self.solver.islands_total() as usize,
+            islands_skipped: self.solver.islands_skipped() as usize,
+        }
+    }
+
+    /// Measure the "settled" fraction of the structure — the skippable-cost ceiling for
+    /// island-aware solving (read-only; mirrors the web's `getIslandSettledStats`). Partitions the
+    /// live bond graph into islands with **static/support nodes as cut points** (two structures
+    /// sharing only a static anchor are independent islands), then counts an island as settled when
+    /// its rigid body is asleep. Because Blast splits bodies exactly along broken bonds, two nodes
+    /// joined by a live bond are always on the same body, so unioning only same-body, non-support,
+    /// non-destroyed bonds reproduces the web's component structure without depending on bond-removal
+    /// bookkeeping.
+    pub fn island_settled_stats(&self, bodies: &RigidBodySet) -> IslandSettledStats {
+        let node_count = self.destroyed_nodes.len();
+        // Path-compressing union-find over the node set.
+        let mut parent: Vec<u32> = (0..node_count as u32).collect();
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                parent[x as usize] = parent[parent[x as usize] as usize];
+                x = parent[x as usize];
+            }
+            x
+        }
+
+        let active = |n: u32| -> bool {
+            let i = n as usize;
+            i < node_count && !self.destroyed_nodes[i] && !self.tracker.is_support(n)
+        };
+
+        for bond in &self.bond_table {
+            let (n0, n1) = (bond.node0, bond.node1);
+            if !active(n0) || !active(n1) {
+                continue;
+            }
+            match (self.tracker.node_body(n0), self.tracker.node_body(n1)) {
+                (Some(b0), Some(b1)) if b0 == b1 => {
+                    let (r0, r1) = (find(&mut parent, n0), find(&mut parent, n1));
+                    if r0 != r1 {
+                        parent[r0 as usize] = r1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Aggregate per island root: node counts + the (single) owning body.
+        let mut island_nodes: HashMap<u32, (usize, Option<RigidBodyHandle>)> = HashMap::new();
+        for n in 0..node_count as u32 {
+            if !active(n) {
+                continue;
+            }
+            let Some(body) = self.tracker.node_body(n) else {
+                continue;
+            };
+            let root = find(&mut parent, n);
+            let entry = island_nodes.entry(root).or_insert((0, Some(body)));
+            entry.0 += 1;
+        }
+        // Bond counts per island root (same filters as the union pass).
+        let mut island_bonds: HashMap<u32, usize> = HashMap::new();
+        for bond in &self.bond_table {
+            let (n0, n1) = (bond.node0, bond.node1);
+            if !active(n0) || !active(n1) {
+                continue;
+            }
+            match (self.tracker.node_body(n0), self.tracker.node_body(n1)) {
+                (Some(b0), Some(b1)) if b0 == b1 => {
+                    *island_bonds.entry(find(&mut parent, n0)).or_insert(0) += 1;
+                }
+                _ => {}
+            }
+        }
+
+        let mut stats = IslandSettledStats::default();
+        for (root, (nodes, body)) in &island_nodes {
+            let bonds = island_bonds.get(root).copied().unwrap_or(0);
+            stats.islands_total += 1;
+            stats.total_nodes += nodes;
+            stats.total_bonds += bonds;
+            let settled = body
+                .filter(|h| Some(*h) != self.ground_body_handle)
+                .and_then(|h| bodies.get(h))
+                .map(|b| b.is_sleeping())
+                .unwrap_or(false);
+            if settled {
+                stats.islands_settled += 1;
+                stats.settled_nodes += nodes;
+                stats.settled_bonds += bonds;
+            }
+        }
+        stats.settled_node_fraction = if stats.total_nodes > 0 {
+            stats.settled_nodes as f32 / stats.total_nodes as f32
+        } else {
+            0.0
+        };
+        stats.settled_bond_fraction = if stats.total_bonds > 0 {
+            stats.settled_bonds as f32 / stats.total_bonds as f32
+        } else {
+            0.0
+        };
+        stats
     }
 
     /// Enable/disable per-split point-velocity continuity recording. Observability
@@ -729,11 +912,54 @@ impl DestructibleSet {
     /// (`R⁻¹·g`). The solver works in the authored frame, so this is how an actor's current
     /// orientation affects its gravity-induced stress (a tilted beam bends; an upright one
     /// only compresses). Actors with no body fall back to world-space gravity. See gap #7.
+    ///
+    /// Batched into a single FFI crossing: we build a rotation buffer indexed by actor index
+    /// and let the C++ core rotate world gravity into every actor's local frame at once. The
+    /// bridge applies a *forward* rotation by the supplied quaternion, so we pass each body's
+    /// rotation **conjugate** `(−i, −j, −k, w)` to reproduce `R⁻¹·g` exactly — byte-identical
+    /// to [`apply_oriented_gravity_per_actor`]. Actors with no body keep the identity quaternion
+    /// (unrotated world gravity), matching the per-actor fallback.
+    ///
+    /// [`apply_oriented_gravity_per_actor`]: Self::apply_oriented_gravity_per_actor
     fn apply_oriented_gravity(&mut self, bodies: &RigidBodySet) {
+        let reps = self.solver.collect_actor_reps();
+        if reps.is_empty() {
+            return;
+        }
+        // The bridge indexes rotations by actor index (sparse after fractures), so the buffer
+        // must span `max_actor_index + 1` slots; unset slots stay identity (qw = 1).
+        let max_actor = reps.iter().map(|(ai, _)| *ai).max().unwrap_or(0) as usize;
+        let mut rotations = vec![0.0f32; (max_actor + 1) * 4];
+        for slot in rotations.chunks_exact_mut(4) {
+            slot[3] = 1.0; // identity quaternion → unrotated world gravity
+        }
+        for (actor_index, first_node) in reps {
+            if let Some(q) = self
+                .tracker
+                .node_body(first_node)
+                .and_then(|h| bodies.get(h))
+                .map(|body| *body.rotation())
+            {
+                let base = actor_index as usize * 4;
+                // Conjugate: forward-rotating by it equals `body.rotation().inverse_transform`.
+                rotations[base] = -q.i;
+                rotations[base + 1] = -q.j;
+                rotations[base + 2] = -q.k;
+                rotations[base + 3] = q.w;
+            }
+        }
+        self.solver.add_all_actor_gravity(self.gravity, &rotations);
+    }
+
+    /// Per-actor (one FFI crossing per actor) oriented-gravity application. Retained as the
+    /// reference implementation behind [`apply_oriented_gravity`], which batches the same math
+    /// into a single crossing. Kept for the batched/per-actor equivalence test.
+    ///
+    /// [`apply_oriented_gravity`]: Self::apply_oriented_gravity
+    #[cfg(any(test, feature = "bench-support"))]
+    pub fn apply_oriented_gravity_per_actor(&mut self, bodies: &RigidBodySet) {
         let g = self.gravity;
         let world_g = vector![g.x, g.y, g.z];
-        // Only the first node per actor is needed (to find the actor's body orientation),
-        // so use the allocation-light rep collector instead of `actors()`.
         for (actor_index, first_node) in self.solver.collect_actor_reps() {
             let local = self
                 .tracker

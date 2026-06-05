@@ -245,6 +245,18 @@ extern "C" {
         local_gravity: *const Vec3,
     ) -> u8;
 
+    /// Apply world gravity to every actor in one FFI crossing, rotating gravity into each
+    /// actor's local frame using `actor_rotations` (flat `[qx, qy, qz, qw]` quads indexed by
+    /// actor index; `null` ⇒ unrotated world gravity). Returns the number of actors updated.
+    pub(crate) fn ext_stress_solver_add_all_actor_gravity(
+        handle: *mut ExtStressSolverHandle,
+        world_gravity_x: f32,
+        world_gravity_y: f32,
+        world_gravity_z: f32,
+        actor_rotations: *const f32,
+        rotation_count: u32,
+    ) -> u32;
+
     pub(crate) fn ext_stress_solver_update(handle: *mut ExtStressSolverHandle);
 
     pub(crate) fn ext_stress_solver_overstressed_bond_count(
@@ -301,4 +313,26 @@ extern "C" {
     pub(crate) fn ext_stress_solver_get_angular_error(handle: *const ExtStressSolverHandle) -> f32;
 
     pub(crate) fn ext_stress_solver_converged(handle: *const ExtStressSolverHandle) -> u8;
+
+    // ── Island-aware solving (parity with the web library; backed by the same C++ core) ──
+    /// Number of disconnected components ("islands") in the live support graph.
+    pub(crate) fn ext_stress_solver_island_count(handle: *const ExtStressSolverHandle) -> u32;
+
+    /// Enable/disable per-island solving. When there is ≤1 island the solver falls back to the
+    /// bit-identical whole-graph path, so enabling this is observationally identical.
+    pub(crate) fn ext_stress_solver_set_island_aware(handle: *mut ExtStressSolverHandle, enabled: u8);
+
+    pub(crate) fn ext_stress_solver_get_island_aware(handle: *const ExtStressSolverHandle) -> u8;
+
+    /// Enable/disable skipping islands whose velocity inputs are bit-identical to their last solve
+    /// and that already converged (a guaranteed no-op). Requires island-aware solving to be on.
+    pub(crate) fn ext_stress_solver_set_skip_settled(handle: *mut ExtStressSolverHandle, enabled: u8);
+
+    pub(crate) fn ext_stress_solver_get_skip_settled(handle: *const ExtStressSolverHandle) -> u8;
+
+    /// Islands skipped in the last `update()` (only meaningful with island-aware + skip-settled on).
+    pub(crate) fn ext_stress_solver_islands_skipped(handle: *const ExtStressSolverHandle) -> u32;
+
+    /// Islands the last per-island `update()` actually partitioned the graph into.
+    pub(crate) fn ext_stress_solver_islands_total(handle: *const ExtStressSolverHandle) -> u32;
 }

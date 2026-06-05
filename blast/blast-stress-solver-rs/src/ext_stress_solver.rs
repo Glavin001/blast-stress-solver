@@ -127,9 +127,78 @@ impl ExtStressSolver {
         unsafe { ffi::ext_stress_solver_add_actor_gravity(self.handle, actor_index, &gravity) != 0 }
     }
 
+    /// Apply world gravity to every actor in a single FFI crossing, rotating gravity into each
+    /// actor's local frame using `rotations` — a flat `[qx, qy, qz, qw]` quaternion per actor
+    /// **indexed by actor index** (so the slice must be sized `(max_actor_index + 1) * 4`).
+    /// Pass an empty slice to apply unrotated world gravity to all actors. Returns the number of
+    /// actors updated. This is byte-identical to calling [`add_actor_gravity`] per actor with the
+    /// gravity pre-rotated into the actor's local frame — the C++ core uses the same formula.
+    ///
+    /// [`add_actor_gravity`]: Self::add_actor_gravity
+    pub fn add_all_actor_gravity(&mut self, world_gravity: Vec3, rotations: &[f32]) -> u32 {
+        let (ptr, count) = if rotations.is_empty() {
+            (std::ptr::null(), 0u32)
+        } else {
+            debug_assert!(
+                rotations.len() % 4 == 0,
+                "rotations must be [qx, qy, qz, qw] quads"
+            );
+            (rotations.as_ptr(), (rotations.len() / 4) as u32)
+        };
+        unsafe {
+            ffi::ext_stress_solver_add_all_actor_gravity(
+                self.handle,
+                world_gravity.x,
+                world_gravity.y,
+                world_gravity.z,
+                ptr,
+                count,
+            )
+        }
+    }
+
     /// Run one solver update (computes stresses from accumulated forces).
     pub fn update(&mut self) {
         unsafe { ffi::ext_stress_solver_update(self.handle) }
+    }
+
+    /// Number of disconnected components ("islands") in the live support graph.
+    pub fn island_count(&self) -> u32 {
+        unsafe { ffi::ext_stress_solver_island_count(self.handle) }
+    }
+
+    /// Enable/disable per-island solving. With ≤1 island the solver falls back to the
+    /// bit-identical whole-graph path, so enabling this is observationally identical to the
+    /// legacy solve while letting large, partially-active worlds skip settled components.
+    pub fn set_island_aware(&mut self, enabled: bool) {
+        unsafe { ffi::ext_stress_solver_set_island_aware(self.handle, enabled as u8) }
+    }
+
+    /// Whether per-island solving is currently enabled.
+    pub fn island_aware(&self) -> bool {
+        unsafe { ffi::ext_stress_solver_get_island_aware(self.handle) != 0 }
+    }
+
+    /// Enable/disable skipping settled islands (inputs bit-identical to last solve + already
+    /// converged). Requires [`set_island_aware`](Self::set_island_aware) to be on to take effect.
+    pub fn set_skip_settled(&mut self, enabled: bool) {
+        unsafe { ffi::ext_stress_solver_set_skip_settled(self.handle, enabled as u8) }
+    }
+
+    /// Whether settled-island skipping is currently enabled.
+    pub fn skip_settled(&self) -> bool {
+        unsafe { ffi::ext_stress_solver_get_skip_settled(self.handle) != 0 }
+    }
+
+    /// Islands skipped in the last `update()` (0 unless island-aware + skip-settled were on).
+    pub fn islands_skipped(&self) -> u32 {
+        unsafe { ffi::ext_stress_solver_islands_skipped(self.handle) }
+    }
+
+    /// Islands the last per-island `update()` partitioned the graph into (0 if the whole-graph
+    /// path ran — i.e. island-aware off, or a single island fell back to the whole-graph solve).
+    pub fn islands_total(&self) -> u32 {
+        unsafe { ffi::ext_stress_solver_islands_total(self.handle) }
     }
 
     /// Number of bonds that exceeded their fatal stress limit after the last `update()`.
