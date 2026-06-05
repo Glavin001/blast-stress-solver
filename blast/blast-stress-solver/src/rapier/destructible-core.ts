@@ -868,6 +868,25 @@ export async function buildDestructibleCore({
   // per-frame Map allocation; entries hold null for handles with no live body.
   const contactRotCache = new Map<number, { x: number; y: number; z: number; w: number } | null>();
 
+  // ── Chunk world-transform readout cache ──
+  // The end-of-step loop recomputes every active chunk's worldPosition/worldQuaternion
+  // from its owning body's pose. But a chunk's world transform only changes when its body
+  // moves, and on a large idle/settled scene almost every body is unchanged frame-to-frame:
+  // the intact city sits on ONE *fixed* root body (never moves), and detached debris that
+  // has come to rest is Rapier-asleep (also doesn't move). Both return a *bit-identical*
+  // pose every frame. So we fetch each body's pose once per frame and skip the per-chunk
+  // recompute — and its two Vec3 allocations — when the pose equals last frame's. This was
+  // the single largest idle cost on big cities (≈14 ms/frame at 14k fragments: O(chunks)
+  // FFI getRigidBody calls + math + GC churn for transforms that never changed).
+  //
+  // Output-identical: a skipped chunk keeps last frame's worldPosition/worldQuaternion,
+  // which is exactly what the recompute would produce from the unchanged pose. The skip is
+  // disarmed on any topology-change frame (fracture/resim), where chunk.localOffset or a
+  // chunk's body assignment can change without the body's pose bits changing.
+  type BodyXformPose = { px: number; py: number; pz: number; qx: number; qy: number; qz: number; qw: number };
+  const lastBodyXformPose = new Map<number, BodyXformPose>();
+  const frameBodyXformPose = new Map<number, (BodyXformPose & { skip: boolean }) | null>();
+
   function pushSolverForce(nodeIndex: number, px: number, py: number, pz: number, fx: number, fy: number, fz: number): void {
     const i = solverForceCount;
     if (i >= solverForceIdx.length) {
@@ -2031,6 +2050,9 @@ export async function buildDestructibleCore({
       nodesByBodyHandle.delete(bh);
       debrisCreationTimes.delete(bh);
       bodyRestoreProvenance.delete(bh);
+      // Drop the cached pose so a future body that reuses this handle can't match a stale
+      // pose and be wrongly skipped by the chunk-transform readout cache.
+      lastBodyXformPose.delete(bh);
     }
     bodiesToRemove.clear();
     stopTiming(t0, 'cleanupDisabledMs');
@@ -2496,25 +2518,51 @@ export async function buildDestructibleCore({
 
     cleanupExpiredProjectiles();
 
+    // Disarm the unchanged-pose skip on topology-change frames: a fracture/resim can move a
+    // chunk to a new body or change its localOffset while the (old or new) body's pose bits
+    // are unchanged, so those frames must recompute every chunk unconditionally.
+    const allowXformSkip = !hadFracture && !needsResim;
+    frameBodyXformPose.clear();
     for (let ci = 0; ci < chunks.length; ci++) {
       const chunk = chunks[ci];
       if (!chunk.active || chunk.bodyHandle == null) continue;
-      const body = world.getRigidBody(chunk.bodyHandle);
-      if (!body) continue;
-      const pos = body.translation();
-      const rot = body.rotation();
+      const bh = chunk.bodyHandle;
+      // Fetch each body's pose once per frame; decide skip vs recompute for the whole body.
+      let entry = frameBodyXformPose.get(bh);
+      if (entry === undefined) {
+        const body = world.getRigidBody(bh);
+        if (!body) { frameBodyXformPose.set(bh, null); continue; }
+        const pos = body.translation();
+        const rot = body.rotation();
+        const last = lastBodyXformPose.get(bh);
+        const unchanged = allowXformSkip && last != null
+          && last.px === pos.x && last.py === pos.y && last.pz === pos.z
+          && last.qx === rot.x && last.qy === rot.y && last.qz === rot.z && last.qw === rot.w;
+        entry = { px: pos.x, py: pos.y, pz: pos.z, qx: rot.x, qy: rot.y, qz: rot.z, qw: rot.w, skip: unchanged };
+        frameBodyXformPose.set(bh, entry);
+        if (!unchanged) {
+          if (last) {
+            last.px = pos.x; last.py = pos.y; last.pz = pos.z;
+            last.qx = rot.x; last.qy = rot.y; last.qz = rot.z; last.qw = rot.w;
+          } else {
+            lastBodyXformPose.set(bh, { px: pos.x, py: pos.y, pz: pos.z, qx: rot.x, qy: rot.y, qz: rot.z, qw: rot.w });
+          }
+        }
+      }
+      if (entry === null || entry.skip) continue; // body unchanged → chunk transform already current
       const lx = chunk.localOffset.x, ly = chunk.localOffset.y, lz = chunk.localOffset.z;
-      const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
+      const px = entry.px, py = entry.py, pz = entry.pz;
+      const qx = entry.qx, qy = entry.qy, qz = entry.qz, qw = entry.qw;
       const rx = qw * lx + qy * lz - qz * ly;
       const ry = qw * ly + qz * lx - qx * lz;
       const rz = qw * lz + qx * ly - qy * lx;
       const rw = -(qx * lx + qy * ly + qz * lz);
       chunk.worldPosition = {
-        x: pos.x + rw * (-qx) + rx * qw + ry * (-qz) - rz * (-qy),
-        y: pos.y + rw * (-qy) + ry * qw + rz * (-qx) - rx * (-qz),
-        z: pos.z + rw * (-qz) + rz * qw + rx * (-qy) - ry * (-qx),
+        x: px + rw * (-qx) + rx * qw + ry * (-qz) - rz * (-qy),
+        y: py + rw * (-qy) + ry * qw + rz * (-qx) - rx * (-qz),
+        z: pz + rw * (-qz) + rz * qw + rx * (-qy) - ry * (-qx),
       };
-      chunk.worldQuaternion = { x: rot.x, y: rot.y, z: rot.z, w: rot.w };
+      chunk.worldQuaternion = { x: qx, y: qy, z: qz, w: qw };
     }
 
     if (activeProfilerSample) {
