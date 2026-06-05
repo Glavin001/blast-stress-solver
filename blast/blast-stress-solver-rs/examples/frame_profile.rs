@@ -94,6 +94,23 @@ fn print_run(name: &str, reports: &[FrameReport], fp0: &QualityFingerprint, fp1:
         avg(&resim),
         avg(&edits)
     );
+    // Solver-step sub-phase breakdown (mirrors the web profiler) + island-aware stats.
+    let g: Vec<f64> = reports.iter().map(|r| r.solver_gravity_inject_ms).collect();
+    let ci: Vec<f64> = reports.iter().map(|r| r.solver_contact_inject_ms).collect();
+    let sv: Vec<f64> = reports.iter().map(|r| r.solver_solve_ms).collect();
+    let max_islands = reports.iter().map(|r| r.islands_total).max().unwrap_or(0);
+    let max_skipped = reports.iter().map(|r| r.islands_skipped).max().unwrap_or(0);
+    println!(
+        "  solver subphases gravity={:.3}  contact_inject={:.3}  solve={:.3}  (contact: resolve={:.3} grid={:.3} splash={:.3} submit={:.3})",
+        avg(&g),
+        avg(&ci),
+        avg(&sv),
+        avg(&reports.iter().map(|r| r.contact_inject_resolve_ms).collect::<Vec<_>>()),
+        avg(&reports.iter().map(|r| r.contact_inject_grid_ms).collect::<Vec<_>>()),
+        avg(&reports.iter().map(|r| r.contact_inject_splash_ms).collect::<Vec<_>>()),
+        avg(&reports.iter().map(|r| r.contact_inject_submit_ms).collect::<Vec<_>>()),
+    );
+    println!("  islands          max_total={max_islands}  max_skipped={max_skipped}");
     println!(
         "  SPIKE @frame {}  total={:.3}ms  (physics={:.3} stress_step={:.3} resim_phys={:.3} snap={:.3} edits={:.3})  fractures={} new_bodies={} passes={}",
         spike_i, spike.total_ms, spike.physics_ms, spike.solver_step_ms, spike.resim_physics_ms,

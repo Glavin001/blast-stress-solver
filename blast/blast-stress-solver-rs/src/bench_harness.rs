@@ -22,8 +22,9 @@ use std::time::Instant;
 use rapier3d::prelude::*;
 
 use crate::rapier::{
-    BodySnapshots, DestructibleConfig, DestructibleSet, FracturePolicy, ResimulationOptions,
-    SleepThresholdOptions, SmallBodyDampingOptions, SplitApplyResult,
+    BodySnapshots, ContactInjectTiming, ContactInjection, DestructibleConfig, DestructibleSet,
+    FracturePolicy, ResimulationOptions, SleepThresholdOptions, SmallBodyDampingOptions,
+    SplitApplyResult, DEFAULT_SPLASH_RADIUS,
 };
 use crate::rapier::{DebrisCleanupOptions, OptimizationMode};
 use crate::scenarios::{
@@ -234,6 +235,21 @@ pub struct FrameReport {
     pub split_events: usize,
     pub dynamic_bodies: usize,
     pub converged: bool,
+    // ── Solver-step sub-phases (mirror the web profiler), summed over resim passes ──
+    /// Per-actor oriented-gravity injection inside the solver step (ms).
+    pub solver_gravity_inject_ms: f64,
+    /// External contact-force injection (rotate + splash + submit) for the frame (ms).
+    pub solver_contact_inject_ms: f64,
+    /// The C++ CGNR stress solve `update()` (ms).
+    pub solver_solve_ms: f64,
+    /// Contact-inject sub-spans (resolve / grid rebuild / splash / batched submit), ms.
+    pub contact_inject_resolve_ms: f64,
+    pub contact_inject_grid_ms: f64,
+    pub contact_inject_splash_ms: f64,
+    pub contact_inject_submit_ms: f64,
+    /// Islands the per-island solve partitioned into / skipped this frame (last pass).
+    pub islands_total: usize,
+    pub islands_skipped: usize,
 }
 
 /// A fingerprint of simulation *outcome* — used to guard against "cheating"
@@ -483,10 +499,14 @@ impl Sim {
         best
     }
 
-    /// Inject contact forces from each projectile's momentum change into the solver,
-    /// rotated into the hit body's local frame (mirrors the demo's contact-force path).
-    fn inject_contact_forces(&mut self, pre_vel: &[Vector<Real>]) {
+    /// Inject contact forces from each projectile's momentum change into the solver via the
+    /// production [`DestructibleSet::inject_contacts`] path (world→local rotation + per-body splash
+    /// grid + batched submit). The harness resolves each projectile to its nearest live node
+    /// (projectiles carry no collider→node mapping here); a real consumer would use
+    /// `collider_node`. Returns the per-phase timing for the frame profiler.
+    fn inject_contact_forces(&mut self, pre_vel: &[Vector<Real>]) -> ContactInjectTiming {
         let dt = self.ip.dt;
+        let mut contacts: Vec<ContactInjection> = Vec::new();
         for (i, (handle, mass)) in self.projectiles.clone().iter().enumerate() {
             let Some(body) = self.bodies.get(*handle) else {
                 continue;
@@ -497,22 +517,16 @@ impl Sim {
                 continue;
             }
             let pos = body.translation();
-            if let Some((node, world_p)) = self.nearest_node_world(pos.x, pos.y, pos.z) {
+            if let Some((node, _world_p)) = self.nearest_node_world(pos.x, pos.y, pos.z) {
                 let world_force = dp / dt;
-                // Rotate into the hit node's body-local frame, as the solver expects.
-                let local_force = self
-                    .set
-                    .node_body(node)
-                    .and_then(|h| self.bodies.get(h))
-                    .map(|b| b.rotation().inverse_transform_vector(&world_force))
-                    .unwrap_or(world_force);
-                self.set.add_force(
+                contacts.push(ContactInjection {
                     node,
-                    world_p,
-                    Vec3::new(local_force.x, local_force.y, local_force.z),
-                );
+                    world_force: Vec3::new(world_force.x, world_force.y, world_force.z),
+                });
             }
         }
+        self.set
+            .inject_contacts(&contacts, DEFAULT_SPLASH_RADIUS, 1.0, &self.bodies)
     }
 
     fn capture_pre_vel(&self) -> Vec<Vector<Real>> {
@@ -575,8 +589,10 @@ impl Sim {
                 report.resim_physics_ms += phys_ms;
             }
 
-            // 2. Inject contact forces from projectile impacts.
-            self.inject_contact_forces(&pre_vel);
+            // 2. Inject contact forces from projectile impacts (production splash path).
+            let t_contact = Instant::now();
+            let ct: ContactInjectTiming = self.inject_contact_forces(&pre_vel);
+            let contact_ms = t_contact.elapsed().as_secs_f64() * 1e3;
 
             // 3. Stress solve + fracture + topology edits.
             let t_step = Instant::now();
@@ -590,6 +606,17 @@ impl Sim {
                 &mut self.multibody_joints,
             );
             report.solver_step_ms += t_step.elapsed().as_secs_f64() * 1e3;
+
+            // Solver-step sub-phase attribution (mirrors the web profiler).
+            report.solver_contact_inject_ms += contact_ms;
+            report.contact_inject_resolve_ms += ct.resolve_ms as f64;
+            report.contact_inject_grid_ms += ct.grid_ms as f64;
+            report.contact_inject_splash_ms += ct.splash_ms as f64;
+            report.contact_inject_submit_ms += ct.submit_ms as f64;
+            report.solver_gravity_inject_ms += r.gravity_inject_ms as f64;
+            report.solver_solve_ms += r.solve_ms as f64;
+            report.islands_total = r.islands_total;
+            report.islands_skipped = r.islands_skipped;
 
             report.fractures += r.fractures;
             report.new_bodies += r.new_bodies;

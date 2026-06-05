@@ -11,7 +11,10 @@ pub use body_tracker::{BodyTracker, SplitContinuityRecord};
 #[cfg(any(test, feature = "bench-support"))]
 pub use body_tracker::{SplitApplyResult, SplitEditStats};
 pub use collision_groups::DebrisCollisionMode;
-pub use destructible::{DestructibleConfig, DestructibleSet, SplitCohort, StepResult};
+pub use destructible::{
+    ContactInjectTiming, ContactInjection, DestructibleConfig, DestructibleSet, IslandSettledStats,
+    IslandSolverStats, SplitCohort, StepResult, DEFAULT_SPLASH_RADIUS,
+};
 pub use fracture_policy::FracturePolicy;
 pub use optimization::{
     DebrisCleanupOptions, OptimizationMode, OptimizationResult, SleepThresholdOptions,

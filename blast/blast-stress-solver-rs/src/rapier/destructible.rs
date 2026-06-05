@@ -90,6 +90,10 @@ pub struct StepResult {
     pub islands_total: usize,
     /// Islands skipped this step because they were settled (0 unless island-aware + skip-settled).
     pub islands_skipped: usize,
+    /// Sub-phase of the solver step: per-actor oriented-gravity injection (ms).
+    pub gravity_inject_ms: f32,
+    /// Sub-phase of the solver step: the C++ CGNR stress solve `update()` (ms).
+    pub solve_ms: f32,
 }
 
 /// Current island-solver configuration plus the last update's island counts.
@@ -157,6 +161,41 @@ pub struct DestructibleSet {
     island_aware: bool,
     /// Whether settled-island skipping is enabled on the solver.
     skip_settled: bool,
+    /// Authored asset-space centroid per node (stable across splits). Used as the application
+    /// point and splash-grid key for contact-force injection, mirroring the web `baseLocalOffset`.
+    node_centroids: Vec<Vec3>,
+    /// Per-body splash grid: body → (packed cell key → node indices). Keyed by body so a same-body
+    /// splash query only visits that body's nodes. Rebuilt lazily after topology changes.
+    splash_grid: HashMap<RigidBodyHandle, HashMap<i64, Vec<u32>>>,
+    /// Rebuild the splash grid on next use (set after any split changes node→body mapping).
+    splash_grid_dirty: bool,
+}
+
+/// Bit-packed splash-grid cell key range (mirrors the web library). Each axis index is recentred by
+/// `SPLASH_KEY_OFFSET` so negatives pack cleanly, then packed in base-`SPLASH_KEY_STRIDE`.
+const SPLASH_KEY_STRIDE: i64 = 1 << 17;
+const SPLASH_KEY_OFFSET: i64 = 1 << 16;
+
+/// Default splash radius (metres) for [`DestructibleSet::inject_contacts`], matching the web runtime.
+pub const DEFAULT_SPLASH_RADIUS: f32 = 2.0;
+
+/// One external contact to inject into the stress solver: a world-space `force` applied at node
+/// `node` (resolve it from the hit collider via [`DestructibleSet::collider_node`]). The library
+/// rotates the force into the node's body-local frame and splashes it to nearby same-body nodes.
+#[derive(Clone, Copy, Debug)]
+pub struct ContactInjection {
+    pub node: u32,
+    pub world_force: Vec3,
+}
+
+/// Per-phase timing (milliseconds) for one [`DestructibleSet::inject_contacts`] call, mirroring the
+/// web profiler's `contactInject{Resolve,Grid,Splash,Submit}Ms` spans.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContactInjectTiming {
+    pub resolve_ms: f32,
+    pub grid_ms: f32,
+    pub splash_ms: f32,
+    pub submit_ms: f32,
 }
 
 impl DestructibleSet {
@@ -220,6 +259,9 @@ impl DestructibleSet {
             time_step: 1.0 / 60.0,
             island_aware: config.island_aware,
             skip_settled: config.skip_settled,
+            node_centroids: config.nodes.iter().map(|n| n.centroid).collect(),
+            splash_grid: HashMap::new(),
+            splash_grid_dirty: true,
         })
     }
 
@@ -380,11 +422,15 @@ impl DestructibleSet {
 
         // 1. Apply gravity in each actor's CURRENT local frame, so a chunk that has rotated
         //    feels gravity from the correct direction (gap #7). Mirrors the JS pipeline.
+        let t_gravity = Instant::now();
         self.apply_oriented_gravity(bodies);
+        result.gravity_inject_ms = t_gravity.elapsed().as_secs_f64() as f32 * 1_000.0;
         self.forces_applied = false;
 
         // 2. Update solver
+        let t_solve = Instant::now();
         self.solver.update();
+        result.solve_ms = t_solve.elapsed().as_secs_f64() as f32 * 1_000.0;
         result.converged = self.solver.converged();
         // Island instrumentation (0 unless per-island solving actually ran this frame).
         result.islands_total = self.solver.islands_total() as usize;
@@ -459,6 +505,218 @@ impl DestructibleSet {
         self.solver
             .add_force(node_index, position, force, ForceMode::Force);
         self.forces_applied = true;
+    }
+
+    /// Inject a batch of external contacts into the stress solver (mirrors the web runtime's
+    /// contact-injection path). For each contact the world force is rotated into the hit node's
+    /// body-local frame, applied at full strength to the hit node, then "splashed" to nearby
+    /// same-body nodes within `splash_radius` with quadratic falloff `(1 − d/R)²`, and all forces
+    /// are submitted in one batched FFI crossing. A per-body spatial grid (keyed on stable asset
+    /// centroids) replaces the old O(nodes) scan. Force accumulation order — hit node, then its
+    /// neighbours, per contact — matches the web exactly so the per-node float sums are identical.
+    ///
+    /// `contact_stress_scale` scales the injected force (1.0 = raw). Returns per-phase timing for
+    /// profiling. Use [`collider_node`](Self::collider_node) to resolve a hit collider to its node.
+    pub fn inject_contacts(
+        &mut self,
+        contacts: &[ContactInjection],
+        splash_radius: f32,
+        contact_stress_scale: f32,
+        bodies: &RigidBodySet,
+    ) -> ContactInjectTiming {
+        let mut timing = ContactInjectTiming::default();
+        let (node_indices, positions, forces) =
+            self.contact_force_batch(contacts, splash_radius, contact_stress_scale, bodies, &mut timing);
+
+        // Submit one batched FFI crossing.
+        let t_submit = Instant::now();
+        if !node_indices.is_empty() {
+            self.solver
+                .add_all_forces(&node_indices, &positions, &forces, ForceMode::Force);
+            self.forces_applied = true;
+        }
+        timing.submit_ms = t_submit.elapsed().as_secs_f64() as f32 * 1_000.0;
+        timing
+    }
+
+    /// Build the flat `(node_indices, positions, forces)` batch [`inject_contacts`] would submit,
+    /// without submitting it. Runs the same two-pass resolve→splash logic and fills `timing` for the
+    /// resolve/grid/splash spans. Exposed so consumers (and tests) can inspect or compare the exact
+    /// per-node force batch before it crosses the FFI boundary.
+    ///
+    /// [`inject_contacts`]: Self::inject_contacts
+    pub fn contact_force_batch(
+        &mut self,
+        contacts: &[ContactInjection],
+        splash_radius: f32,
+        contact_stress_scale: f32,
+        bodies: &RigidBodySet,
+        timing: &mut ContactInjectTiming,
+    ) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let mut node_indices: Vec<u32> = Vec::new();
+        let mut positions: Vec<f32> = Vec::new();
+        let mut forces: Vec<f32> = Vec::new();
+        if contacts.is_empty() {
+            return (node_indices, positions, forces);
+        }
+
+        // Pass 1 — resolve: per-contact body lookup, world→local force rotation, stash the hit.
+        let t_resolve = Instant::now();
+        // Stash entries: (hit_node, body, local_force). The application point is the node's stable
+        // asset centroid (node_centroids), looked up again in pass 2.
+        let mut stash: Vec<(u32, RigidBodyHandle, Vec3)> = Vec::with_capacity(contacts.len());
+        for c in contacts {
+            let node = c.node;
+            if (node as usize) >= self.node_centroids.len()
+                || self.destroyed_nodes.get(node as usize).copied().unwrap_or(true)
+            {
+                continue;
+            }
+            let Some(body_handle) = self.tracker.node_body(node) else {
+                continue;
+            };
+            let Some(body) = bodies.get(body_handle) else {
+                continue;
+            };
+            let wf = vector![c.world_force.x, c.world_force.y, c.world_force.z];
+            let lf = body.rotation().inverse_transform_vector(&wf);
+            let local = Vec3::new(
+                lf.x * contact_stress_scale,
+                lf.y * contact_stress_scale,
+                lf.z * contact_stress_scale,
+            );
+            stash.push((node, body_handle, local));
+        }
+        timing.resolve_ms = t_resolve.elapsed().as_secs_f64() as f32 * 1_000.0;
+
+        // Grid rebuild (once, only when topology changed).
+        let t_grid = Instant::now();
+        if !stash.is_empty() && self.splash_grid_dirty {
+            self.rebuild_splash_grid();
+        }
+        timing.grid_ms = t_grid.elapsed().as_secs_f64() as f32 * 1_000.0;
+
+        // Pass 2 — splash: hit node at full strength, then same-body neighbours with falloff.
+        let t_splash = Instant::now();
+        let r2 = splash_radius * splash_radius;
+        let mut neighbors: Vec<u32> = Vec::new();
+        let mut push = |idx: u32, p: Vec3, f: Vec3| {
+            node_indices.push(idx);
+            positions.extend_from_slice(&[p.x, p.y, p.z]);
+            forces.extend_from_slice(&[f.x, f.y, f.z]);
+        };
+        for (hit_node, body_handle, local_force) in &stash {
+            let hit = self.node_centroids[*hit_node as usize];
+            push(*hit_node, hit, *local_force);
+            neighbors.clear();
+            self.collect_splash_neighbors(hit, splash_radius, *body_handle, &mut neighbors);
+            for &ci in &neighbors {
+                if ci == *hit_node {
+                    continue;
+                }
+                let c = self.node_centroids[ci as usize];
+                let d2 = (c.x - hit.x).powi(2) + (c.y - hit.y).powi(2) + (c.z - hit.z).powi(2);
+                if d2 > r2 {
+                    continue;
+                }
+                let dist = d2.sqrt();
+                let falloff = 1.0 - dist / splash_radius;
+                let f2 = falloff * falloff;
+                if f2 <= 0.0 {
+                    continue;
+                }
+                push(
+                    ci,
+                    c,
+                    Vec3::new(local_force.x * f2, local_force.y * f2, local_force.z * f2),
+                );
+            }
+        }
+        timing.splash_ms = t_splash.elapsed().as_secs_f64() as f32 * 1_000.0;
+
+        (node_indices, positions, forces)
+    }
+
+    /// Rebuild the per-body splash grid from the live node→body mapping. Nodes without a live body
+    /// (or destroyed) are omitted — they can never be a same-body splash neighbour.
+    fn rebuild_splash_grid(&mut self) {
+        self.splash_grid.clear();
+        for node in 0..self.node_centroids.len() as u32 {
+            if self.destroyed_nodes.get(node as usize).copied().unwrap_or(true) {
+                continue;
+            }
+            let Some(body) = self.tracker.node_body(node) else {
+                continue;
+            };
+            let c = self.node_centroids[node as usize];
+            let key = Self::splash_grid_key(c);
+            self.splash_grid
+                .entry(body)
+                .or_default()
+                .entry(key)
+                .or_default()
+                .push(node);
+        }
+        self.splash_grid_dirty = false;
+    }
+
+    /// Collect same-body node indices whose asset centroid lies within `radius` of `center`, into
+    /// `out` (cleared first). Visits only the hit body's grid cells.
+    fn collect_splash_neighbors(
+        &self,
+        center: Vec3,
+        radius: f32,
+        body: RigidBodyHandle,
+        out: &mut Vec<u32>,
+    ) {
+        out.clear();
+        let Some(body_grid) = self.splash_grid.get(&body) else {
+            return;
+        };
+        let r2 = radius * radius;
+        // Index with the SAME fixed cell size the grid was built with; the passed `radius` only
+        // drives the box extent and the distance test, so any radius stays correct.
+        let inv = 1.0 / DEFAULT_SPLASH_RADIUS;
+        let cell = |v: f32| (v * inv).floor() as i64;
+        let (min_x, max_x) = (cell(center.x - radius), cell(center.x + radius));
+        let (min_y, max_y) = (cell(center.y - radius), cell(center.y + radius));
+        let (min_z, max_z) = (cell(center.z - radius), cell(center.z + radius));
+        for ix in min_x..=max_x {
+            for iy in min_y..=max_y {
+                for iz in min_z..=max_z {
+                    let Some(bucket) = body_grid.get(&Self::splash_cell_key(ix, iy, iz)) else {
+                        continue;
+                    };
+                    for &ci in bucket {
+                        let c = self.node_centroids[ci as usize];
+                        let d2 = (c.x - center.x).powi(2)
+                            + (c.y - center.y).powi(2)
+                            + (c.z - center.z).powi(2);
+                        if d2 <= r2 {
+                            out.push(ci);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn splash_cell_key(ix: i64, iy: i64, iz: i64) -> i64 {
+        let px = ix + SPLASH_KEY_OFFSET;
+        let py = iy + SPLASH_KEY_OFFSET;
+        let pz = iz + SPLASH_KEY_OFFSET;
+        (px * SPLASH_KEY_STRIDE + py) * SPLASH_KEY_STRIDE + pz
+    }
+
+    fn splash_grid_key(c: Vec3) -> i64 {
+        // Cell size == splash radius is baked into the grid at rebuild time via the radius used by
+        // `collect_splash_neighbors`; the grid stores by the same cell size used for queries.
+        let inv = 1.0 / DEFAULT_SPLASH_RADIUS;
+        Self::splash_cell_key(
+            (c.x * inv).floor() as i64,
+            (c.y * inv).floor() as i64,
+            (c.z * inv).floor() as i64,
+        )
     }
 
     /// Apply an external acceleration to a node.
@@ -1020,6 +1278,10 @@ impl DestructibleSet {
         result: &mut StepResult,
     ) {
         let pending_len = self.pending_split_events.len();
+        if pending_len > 0 {
+            // Any split changes the node→body mapping, so the per-body splash grid is stale.
+            self.splash_grid_dirty = true;
+        }
 
         for _ in 0..pending_len {
             let Some(event) = self.pending_split_events.pop_front() else {
@@ -1269,5 +1531,46 @@ impl DestructibleSet {
 
     fn bond_matches(bond: &BondDesc, node0: u32, node1: u32) -> bool {
         (bond.node0 == node0 && bond.node1 == node1) || (bond.node0 == node1 && bond.node1 == node0)
+    }
+}
+
+#[cfg(test)]
+mod splash_grid_tests {
+    use super::*;
+
+    #[test]
+    fn cell_key_is_injective_and_handles_negatives() {
+        // Distinct cells (including negative coordinates) must produce distinct keys, and the same
+        // cell must always map to the same key (so grid buckets never collide or alias).
+        let cells = [
+            (0, 0, 0),
+            (1, 0, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+            (-1, 0, 0),
+            (0, -1, 0),
+            (0, 0, -1),
+            (-3, 7, -42),
+            (65535, -65536, 12345),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for &(x, y, z) in &cells {
+            let k = DestructibleSet::splash_cell_key(x, y, z);
+            assert_eq!(k, DestructibleSet::splash_cell_key(x, y, z), "key is deterministic");
+            assert!(seen.insert(k, (x, y, z)).is_none(), "cell {:?} collided with {:?}", (x, y, z), seen.get(&k));
+        }
+    }
+
+    #[test]
+    fn grid_key_matches_cell_key_of_floored_coords() {
+        let inv = 1.0 / DEFAULT_SPLASH_RADIUS;
+        for &(x, y, z) in &[(0.1f32, -0.1, 3.9), (-5.5, 2.0, -2.01), (10.0, -10.0, 0.0)] {
+            let expected = DestructibleSet::splash_cell_key(
+                (x * inv).floor() as i64,
+                (y * inv).floor() as i64,
+                (z * inv).floor() as i64,
+            );
+            assert_eq!(DestructibleSet::splash_grid_key(Vec3::new(x, y, z)), expected);
+        }
     }
 }

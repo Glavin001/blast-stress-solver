@@ -152,3 +152,44 @@ fn shatter_matches_golden_band() {
 // 180 frames): the shatter fragments the wall into ~97 actors / ~96 dynamic bodies.
 const GOLDEN_ACTORS_BASELINE: f32 = 97.0;
 const GOLDEN_DYN_BASELINE: f32 = 96.0;
+
+/// W5 — frame profiler shape: the new solver sub-phase fields must populate and stay self-consistent
+/// (gravity + contact-inject + solve ≤ the whole solver step, +eps), and island counts must satisfy
+/// islands_total ≥ islands_skipped every frame. Structural (not timing-threshold) to avoid flakiness.
+#[test]
+fn frame_profiler_subphases_are_self_consistent() {
+    let (scn, cfg, proj) = weak_ball_wall();
+    let mut sim = Sim::new(&scn, cfg);
+    let mut saw_contact = false;
+    let mut saw_solve = false;
+    for f in 0..60 {
+        if f == 20 {
+            sim.spawn_projectile(&proj);
+        }
+        let r = sim.step_frame();
+        // Sub-phases are summed over resim passes; allow a small slack for timer granularity and
+        // the un-attributed glue between phases inside the step.
+        let sub = r.solver_gravity_inject_ms + r.solver_contact_inject_ms + r.solver_solve_ms;
+        assert!(
+            sub <= r.solver_step_ms + r.solver_contact_inject_ms + 5.0,
+            "frame {f}: sub-phases {sub:.3} should not wildly exceed solver_step {:.3}",
+            r.solver_step_ms
+        );
+        assert!(r.solver_gravity_inject_ms >= 0.0 && r.solver_solve_ms >= 0.0);
+        assert!(
+            r.contact_inject_resolve_ms >= 0.0
+                && r.contact_inject_grid_ms >= 0.0
+                && r.contact_inject_splash_ms >= 0.0
+                && r.contact_inject_submit_ms >= 0.0
+        );
+        assert!(r.islands_total >= r.islands_skipped, "frame {f}: total < skipped");
+        if r.solver_contact_inject_ms > 0.0 {
+            saw_contact = true;
+        }
+        if r.solver_solve_ms > 0.0 {
+            saw_solve = true;
+        }
+    }
+    assert!(saw_solve, "the CGNR solve sub-phase should register time");
+    assert!(saw_contact, "the contact-injection sub-phase should register after the ball is fired");
+}
