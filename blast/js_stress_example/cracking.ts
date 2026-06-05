@@ -16,6 +16,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { buildDestructibleCore } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle } from 'blast-stress-solver/three';
+import { mountShooter } from './shooter-fps.js';
 
 // ── Cantilever scenario ───────────────────────────────────────
 const BEAM = { length: 8, height: 3, mass: 80 };
@@ -109,6 +110,7 @@ function setText(id: string, v: string) { const el = document.getElementById(id)
 // ── Scene lifecycle ───────────────────────────────────────────
 let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
+let shooter: ReturnType<typeof mountShooter> | null = null;
 let rebuilding = false;
 let initialBonds = 0;
 
@@ -152,24 +154,8 @@ async function rebuild() {
   try { await initScene(); } finally { rebuilding = false; }
 }
 
-function shoot(ndcX: number, ndcY: number) {
-  const core = coreRef; if (!core) return;
-  const rc = new THREE.Raycaster();
-  rc.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
-  const d = rc.ray.direction.clone().normalize();
-  // aim a small fast ball at the beam plane (z=0)
-  const t = -rc.ray.origin.z / (d.z || -1);
-  const hit = rc.ray.origin.clone().addScaledVector(d, Math.max(2, t));
-  core.enqueueProjectile({
-    position: { x: hit.x - d.x * 5, y: hit.y - d.y * 5, z: hit.z - d.z * 5 },
-    velocity: { x: d.x * 22, y: d.y * 22, z: d.z * 22 },
-    radius: 0.35, mass: 400, ttl: 2500,
-  });
-}
-canvas.addEventListener('click', (e) => {
-  const r = canvas.getBoundingClientRect();
-  shoot(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
-});
+// Shooting is handled by the shared shooter module (mounted at boot); the ball
+// spawns from the camera using the params passed via getBallParams below.
 
 // ── Controls ──────────────────────────────────────────────────
 function bindSlider(id: string, get: () => number, set: (v: number) => void, fmt: (v: number) => string, onInput?: (v: number) => void) {
@@ -222,6 +208,7 @@ function loop() {
     visualsRef.update({ debug: false, updateBVH: false, updateProjectiles: true });
     updateCracks();
   }
+  shooter?.update();
   renderer.render(scene, camera);
 }
 
@@ -232,6 +219,14 @@ function onResize() {
 }
 window.addEventListener('resize', onResize);
 
+shooter = mountShooter({
+  canvas,
+  camera,
+  controls,
+  scene,
+  getCore: () => coreRef,
+  getBallParams: () => ({ radius: 0.35, mass: 400, speed: 22 }),
+});
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize cracking demo:', err);
   const hint = document.querySelector('.viewport-hint');
