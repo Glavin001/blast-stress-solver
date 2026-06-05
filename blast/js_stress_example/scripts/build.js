@@ -97,25 +97,25 @@ const exportedFunctions = [
   '_free'
 ];
 
-const enableAssertions = process.env.EMCC_ASSERTIONS !== '0';
+// Default-off for production: a debug WASM with assertions is 4x larger, slower
+// to load, and runs significantly slower in the hot solver loop. Opt in with
+// EMCC_ASSERTIONS=1 when bisecting a crash; default builds are stripped.
+const enableAssertions = process.env.EMCC_ASSERTIONS === '1';
 const enableProfiling = process.env.EMCC_PROFILING === '1';
+// Opt-out for LTO: link-time optimization gives whole-program inlining across
+// the 22 translation units below (notably inlining the CGNR kernels into
+// ext_stress_solver_update), at the cost of ~20s extra link time. Disable with
+// EMCC_NO_LTO=1 if iterating locally and only the JS bridge changed.
+const enableLTO = process.env.EMCC_NO_LTO !== '1';
 
+// EXPORTED_RUNTIME_METHODS only covers JS helpers — HEAPU8/HEAPU32/HEAPF32 are
+// auto-attached to Module by emscripten's runtime when ALLOW_MEMORY_GROWTH=1
+// (the TS bridge re-reads .HEAPU8.buffer after grow events), so listing them
+// here is a no-op that emits a warning per build.
 const exportedRuntimeMethods = [
   'cwrap',
   'ccall',
-  'getValue',
-  'setValue',
-  'UTF8ToString',
-  'stringToUTF8',
-  'lengthBytesUTF8',
-  'HEAP8',
-  'HEAPU8',
-  'HEAP16',
-  'HEAPU16',
-  'HEAP32',
-  'HEAPU32',
-  'HEAPF32',
-  'HEAPF64'
+  'UTF8ToString'
 ];
 
 const commonArgs = [
@@ -168,17 +168,54 @@ const commonArgs = [
   '-DNDEBUG=1',
   '-std=c++17',
   '-O3',
-  '-msimd128',            // Enable WASM SIMD auto-vectorization for scalar math loops
+  // -msimd128 enables WASM SIMD auto-vectorization for the scalar math loops in
+  // anglin6.h / inertia.h / coupling.h (the SISD AngLin6Ops path; the vendored
+  // __m256 specializations are gated off behind STRESS_SOLVER_NO_SIMD because
+  // emscripten 3.1.51 has no __m256/_mm_fmadd_ps). -msse4.2 widens the intrinsic
+  // pool clang can fuse loads/shuffles into when vectorizing the same scalar code.
+  '-msimd128',
+  '-msse4.2',
+  // Whole-program / no-runtime-overhead settings. The C++ here doesn't throw,
+  // doesn't use RTTI, doesn't longjmp, doesn't touch a filesystem, and only
+  // uses fprintf(stderr, ...) for one warning (which emcc still satisfies
+  // without FILESYSTEM via the JS console). Dropping each gives smaller WASM,
+  // less JS glue, and (for -flto / -fno-exceptions) tighter codegen.
+  '-fno-exceptions',
+  '-fno-rtti',
+  '-fno-math-errno',         // Don't set errno from <math.h>; safe — code never reads errno.
+  '-fno-trapping-math',      // Assume FP ops don't trap; safe — no FE_* trap handling.
+  '-fno-stack-protector',    // Stack canaries are a no-op on wasm32 anyway.
+  '-fvisibility=hidden',     // Internal symbols don't reach the JS export table.
   '-sWASM=1',
   '-sMODULARIZE=1',
   '-sALLOW_MEMORY_GROWTH=1',
+  '-sFILESYSTEM=0',          // No FS — saves ~30 KB of JS glue + runtime init.
+  '-sSUPPORT_LONGJMP=0',     // No setjmp/longjmp in any TU.
+  '-sNO_EXIT_RUNTIME=1',     // Module lives for the process; no atexit/_exit.
+  '-sDISABLE_EXCEPTION_CATCHING=1',  // Pair with -fno-exceptions.
+  '-sDYNAMIC_EXECUTION=0',   // No eval() / new Function() — smaller JS, CSP-safe.
+  '-sSTACK_SIZE=1048576',    // 1 MiB stack (default is 64 KiB): provides headroom for the solver's heavy AngLin6 temporaries on large graphs.
+  // Extra Binaryen passes layered on top of the default `wasm-opt -O3` run.
+  // `--gufa` (Global Use Flow Analysis) is whole-program; this WASM is closed
+  // (no dynamic linking) so its extra precision pays off. `--converge` then
+  // re-runs the standard pipeline until a fixed point, catching simplifications
+  // exposed by GUFA. Both add a few seconds of link time.
+  '-sBINARYEN_EXTRA_PASSES=--gufa,--converge',
   `-sEXPORTED_FUNCTIONS=[${exportedFunctions.map((fn) => `"${fn}"`).join(',')}]`,
   `-sEXPORTED_RUNTIME_METHODS=[${exportedRuntimeMethods.map((name) => `"${name}"`).join(',')}]`
 ];
 
+if (enableLTO) {
+  // -flto applies to both compile (each .cpp -> bitcode) and link (whole-program
+  // inlining + dead-code elimination across TUs). Required at both stages.
+  commonArgs.push('-flto');
+}
+
 if (enableAssertions) {
   console.log('Building with assertions');
   commonArgs.push('-sASSERTIONS=1');
+} else {
+  commonArgs.push('-sASSERTIONS=0');
 }
 
 if (enableProfiling) {
