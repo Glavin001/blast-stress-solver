@@ -17,6 +17,7 @@ import {
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountShooter } from './shooter-fps.js';
 import { buildWallScenario } from 'blast-stress-solver/scenarios';
 
 // ── Config ────────────────────────────────────────────────────
@@ -167,6 +168,7 @@ let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
 // Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
 let centrifugalEnabled = false;
+let shooter: ReturnType<typeof mountShooter> | null = null;
 
 async function initScene() {
   let scenario = buildWallScenario(CONFIG.wall);
@@ -248,39 +250,8 @@ async function initScene() {
 }
 
 // ── Projectile shooting ───────────────────────────────────────
-
-function shootProjectile(ndcX: number, ndcY: number) {
-  const core = coreRef;
-  if (!core) return;
-
-  // Ray from camera through click point
-  const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
-  const dir = raycaster.ray.direction.clone().normalize();
-
-  core.enqueueProjectile({
-    position: {
-      x: camera.position.x,
-      y: camera.position.y,
-      z: camera.position.z,
-    },
-    velocity: {
-      x: dir.x * CONFIG.projectile.speed,
-      y: dir.y * CONFIG.projectile.speed,
-      z: dir.z * CONFIG.projectile.speed,
-    },
-    radius: CONFIG.projectile.radius,
-    mass: CONFIG.projectile.mass,
-    ttl: 6000,
-  });
-}
-
-canvas.addEventListener('click', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  shootProjectile(ndcX, ndcY);
-});
+// Shooting (ball + sticky-explosive modes) and the first-person camera are
+// handled by the shared shooter module, mounted during boot below.
 
 // ── UI wiring ─────────────────────────────────────────────────
 
@@ -421,6 +392,8 @@ function loop() {
     updateStatus(coreRef);
   }
 
+  shooter?.update();
+
   const t1 = performance.now();
   renderer.render(scene, camera);
   _renderMs += ((performance.now() - t1) - _renderMs) * EMA;
@@ -443,4 +416,12 @@ window.addEventListener('resize', onResize);
 // ── Boot ──────────────────────────────────────────────────────
 
 mountPipelineControls();
+shooter = mountShooter({
+  canvas,
+  camera,
+  controls,
+  scene,
+  getCore: () => coreRef,
+  getBallParams: () => CONFIG.projectile,
+});
 initScene().then(() => loop());

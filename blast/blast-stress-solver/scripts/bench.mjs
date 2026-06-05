@@ -175,7 +175,18 @@ for (const key of phaseKeys) {
 // CGNR solve). Kept separate from `phases` so they don't double-count the
 // solverUpdateMs leaf; lets the optimizer attribute solver cost to JS vs. WASM.
 const solverBreakdown = {};
-for (const key of ['solverGravityInjectMs', 'solverContactInjectMs', 'solverSolveMs']) {
+for (const key of [
+  'solverGravityInjectMs',
+  'solverContactInjectMs',
+  // sub-phases of solverContactInjectMs (sum to it): JS resolve (Rapier
+  // getRigidBody/rotation round-trips), splash-grid rebuild, splash neighbour
+  // search + force buffering, and the WASM submit (addForce FFI + C++ per-force).
+  'contactInjectResolveMs',
+  'contactInjectGridMs',
+  'contactInjectSplashMs',
+  'contactInjectSubmitMs',
+  'solverSolveMs',
+]) {
   const vals = samples.map(s => s[key] || 0);
   if (Math.max(...vals) > 0.001) {
     solverBreakdown[key] = stats(vals);

@@ -84,6 +84,39 @@ impl ExtStressSolver {
         }
     }
 
+    /// Apply many forces in a single FFI crossing, mirroring [`add_force`] for
+    /// each entry. `positions` and `forces` are flat `[x, y, z]` triples that
+    /// run parallel to `node_indices` (entry `i` reads slice `3*i..3*i + 3`).
+    /// `mode` is shared by every entry. Returns the number of entries applied.
+    ///
+    /// [`add_force`]: Self::add_force
+    pub fn add_all_forces(
+        &mut self,
+        node_indices: &[u32],
+        positions: &[f32],
+        forces: &[f32],
+        mode: ForceMode,
+    ) -> u32 {
+        let count = node_indices.len();
+        if count == 0 {
+            return 0;
+        }
+        debug_assert!(
+            positions.len() >= count * 3 && forces.len() >= count * 3,
+            "positions/forces must hold 3 floats per node index"
+        );
+        unsafe {
+            ffi::ext_stress_solver_add_all_forces(
+                self.handle,
+                node_indices.as_ptr(),
+                positions.as_ptr(),
+                forces.as_ptr(),
+                count as u32,
+                mode as u32,
+            )
+        }
+    }
+
     /// Apply gravity to all actors.
     pub fn add_gravity(&mut self, gravity: Vec3) {
         unsafe { ffi::ext_stress_solver_add_gravity(self.handle, &gravity) }

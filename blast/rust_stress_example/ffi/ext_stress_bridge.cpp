@@ -41,6 +41,13 @@ struct ExtStressSolverHandleImpl
     };
 
     std::vector<ActorEntry> actors;
+    // O(1) input-node -> owning-actor lookup. inputNodeToActorSlot[n] is the slot
+    // in `actors` that owns input node n (UINT32_MAX = unowned). Rebuilt lazily by
+    // ensureActorIndex() when `actorIndexDirty` is set after an actor-table change
+    // (rebuildActorTable / apply_fracture_commands / reset). Replaces the former
+    // O(total nodes) linear scan that ran once per injected force.
+    std::vector<uint32_t> inputNodeToActorSlot;
+    bool actorIndexDirty{true};
     std::vector<uint8_t> splitScratch;
     std::vector<NvBlastActor*> splitActors;
     std::vector<NvBlastBondFractureData> fractureScratch;
@@ -226,6 +233,7 @@ void rebuildActorTable(ExtStressSolverHandleImpl& handle)
 
         handle.actors.push_back(std::move(entry));
     }
+    handle.actorIndexDirty = true;
 }
 
 ExtStressSolverHandleImpl::ActorEntry* findActorByIndex(ExtStressSolverHandleImpl& handle, uint32_t actorIndex)
@@ -252,16 +260,45 @@ const ExtStressSolverHandleImpl::ActorEntry* findActorByPointer(const ExtStressS
     return nullptr;
 }
 
+// Rebuild the input-node -> actor-slot table when stale. One O(total graph
+// nodes) pass, amortised across a whole frame's force injections: the actor
+// table only changes on fracture/reset, never during injection, so all the
+// per-force lookups in a frame share a single rebuild. This replaces the prior
+// O(total nodes) linear scan that ran once *per* injected force.
+void ensureActorIndex(ExtStressSolverHandleImpl& handle)
+{
+    if (!handle.actorIndexDirty)
+    {
+        return;
+    }
+
+    handle.inputNodeToActorSlot.assign(handle.inputToGraph.size(), UINT32_MAX);
+    for (uint32_t slot = 0; slot < handle.actors.size(); ++slot)
+    {
+        for (uint32_t inputNode : handle.actors[slot].inputNodes)
+        {
+            // First writer wins, matching the prior loop's first-match semantics
+            // (each input node is owned by exactly one actor, so this is moot in
+            // practice but keeps behaviour identical defensively).
+            if (inputNode < handle.inputNodeToActorSlot.size()
+                && handle.inputNodeToActorSlot[inputNode] == UINT32_MAX)
+            {
+                handle.inputNodeToActorSlot[inputNode] = slot;
+            }
+        }
+    }
+    handle.actorIndexDirty = false;
+}
+
 ExtStressSolverHandleImpl::ActorEntry* findActorOwningInputNode(ExtStressSolverHandleImpl& handle, uint32_t inputIndex)
 {
-    for (auto& entry : handle.actors)
+    ensureActorIndex(handle);
+    if (inputIndex < handle.inputNodeToActorSlot.size())
     {
-        for (uint32_t n : entry.inputNodes)
+        const uint32_t slot = handle.inputNodeToActorSlot[inputIndex];
+        if (slot < handle.actors.size())
         {
-            if (n == inputIndex)
-            {
-                return &entry;
-            }
+            return &handle.actors[slot];
         }
     }
     return nullptr;
@@ -490,7 +527,46 @@ ext_stress_solver_reset(ExtStressSolverHandle* handlePtr)
         return;
     }
     handle->solver->reset();
+    // Defensive: the actor table is unchanged by a solver reset, but re-arm the
+    // index so any lookup after a reset can't observe a stale slot mapping.
+    handle->actorIndexDirty = true;
 }
+
+namespace
+{
+// Shared force-application path used by both the single-force and batched
+// entry points so their behaviour can never diverge. Mirrors the original
+// ext_stress_solver_add_force logic exactly: prefer the actor that owns the
+// input node (so the force lands in the right family after splits); otherwise
+// fall back to the graph-node index.
+inline void applyForceToInputNode(ExtStressSolverHandleImpl& handle,
+                                  uint32_t node_index,
+                                  const NvcVec3& pos,
+                                  const NvcVec3& force,
+                                  ExtForceMode::Enum mode)
+{
+    if (node_index >= handle.inputToGraph.size())
+    {
+        return;
+    }
+
+    const uint32_t graphIndex = handle.inputToGraph[node_index];
+
+    if (auto* entry = findActorOwningInputNode(handle, node_index))
+    {
+        if (entry->actor)
+        {
+            handle.solver->addForce(*entry->actor, pos, force, mode);
+            return;
+        }
+    }
+
+    if (graphIndex != UINT32_MAX)
+    {
+        handle.solver->addForce(graphIndex, force, mode);
+    }
+}
+} // namespace
 
 extern "C" void
 ext_stress_solver_add_force(ExtStressSolverHandle* handlePtr,
@@ -500,28 +576,57 @@ ext_stress_solver_add_force(ExtStressSolverHandle* handlePtr,
                            uint32_t mode)
 {
     auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
-    if (!handle || !handle->solver || node_index >= handle->inputToGraph.size())
+    if (!handle || !handle->solver)
     {
         return;
     }
 
-    const uint32_t graphIndex = handle->inputToGraph[node_index];
     const NvcVec3 force = local_force ? toNvcVec3(*local_force) : NvcVec3{0.0f, 0.0f, 0.0f};
     const NvcVec3 pos = local_position ? toNvcVec3(*local_position) : NvcVec3{0.0f, 0.0f, 0.0f};
+    applyForceToInputNode(*handle, node_index, pos, force, toForceMode(mode));
+}
 
-    if (auto* entry = findActorOwningInputNode(*handle, node_index))
+// Batched external-force injection. Applies `count` forces in a single FFI
+// crossing instead of one crossing per force, mirroring
+// ext_stress_solver_add_force for every entry. The parallel input arrays are:
+//   node_indices[i]              -> input node index for force i
+//   local_positions[3*i + 0..2]  -> body-local application point (x, y, z)
+//   local_forces[3*i + 0..2]     -> body-local force vector (x, y, z)
+// `mode` is shared by every force (the contact-injection caller always uses
+// Force mode). A null position or force array is treated as all-zero. Returns
+// the number of entries processed.
+extern "C" uint32_t
+ext_stress_solver_add_all_forces(ExtStressSolverHandle* handlePtr,
+                                 const uint32_t* node_indices,
+                                 const float* local_positions,
+                                 const float* local_forces,
+                                 uint32_t count,
+                                 uint32_t mode)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || !node_indices || count == 0U)
     {
-        if (entry->actor)
+        return 0U;
+    }
+
+    const ExtForceMode::Enum forceMode = toForceMode(mode);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        NvcVec3 pos{0.0f, 0.0f, 0.0f};
+        NvcVec3 force{0.0f, 0.0f, 0.0f};
+        if (local_positions)
         {
-            handle->solver->addForce(*entry->actor, pos, force, toForceMode(mode));
-            return;
+            const float* p = local_positions + static_cast<size_t>(i) * 3U;
+            pos = NvcVec3{p[0], p[1], p[2]};
         }
+        if (local_forces)
+        {
+            const float* f = local_forces + static_cast<size_t>(i) * 3U;
+            force = NvcVec3{f[0], f[1], f[2]};
+        }
+        applyForceToInputNode(*handle, node_indices[i], pos, force, forceMode);
     }
-
-    if (graphIndex != UINT32_MAX)
-    {
-        handle->solver->addForce(graphIndex, force, toForceMode(mode));
-    }
+    return count;
 }
 
 extern "C" void
@@ -1110,6 +1215,10 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
         if (out_node_count) { *out_node_count = 0; }
         return 0U;
     }
+
+    // This call erases the parent actor entry and pushes child entries below, so
+    // the input-node -> actor index must be rebuilt before the next lookup.
+    handle->actorIndexDirty = true;
 
     uint32_t storedEvents = 0;
     uint32_t storedChildren = 0;

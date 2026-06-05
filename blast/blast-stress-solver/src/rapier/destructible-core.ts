@@ -121,6 +121,11 @@ type SolverActorsApi = {
    *  runtime predates this export. */
   addAllActorGravity?: (worldGravity?: Vec3, rotations?: Float32Array, rotationCount?: number) => number;
   supportsBatchedGravity?: () => boolean;
+  /** Batched external-force injection (one FFI crossing for a whole frame's
+   *  contact forces). Returns the number applied, or -1 when the runtime
+   *  predates this export. */
+  addAllForces?: (nodeIndices: Uint32Array, positions: Float32Array, forces: Float32Array, count: number) => number;
+  supportsBatchedForces?: () => boolean;
 };
 type DebugWindow = Window & {
   debugStressSolver?: { printSolver?: () => unknown };
@@ -206,6 +211,10 @@ export async function buildDestructibleCore({
     solverUpdateMs: 0,
     solverGravityInjectMs: 0,
     solverContactInjectMs: 0,
+    contactInjectResolveMs: 0,
+    contactInjectGridMs: 0,
+    contactInjectSplashMs: 0,
+    contactInjectSubmitMs: 0,
     solverSolveMs: 0,
     damageReplayMs: 0,
     damagePreviewMs: 0,
@@ -684,8 +693,14 @@ export async function buildDestructibleCore({
   // cells never collide for any realistic local chunk offset.
   const SPLASH_KEY_STRIDE = 1 << 17; // 131072
   const SPLASH_KEY_OFFSET = 1 << 16; // 65536 (half-range, recentres negatives)
-  // Map from packed integer grid key to array of node indices
-  const splashGrid = new Map<number, number[]>();
+  // Per-body spatial grid: bodyHandle -> (packed cell key -> chunk indices).
+  // Keying by body (not one global grid) means a same-body splash query only
+  // visits that body's chunks. This matters after fracturing: baseLocalOffset is
+  // the original asset-space centroid, so fragments that split off keep offsets in
+  // the same cells — a single global grid forces every query to scan (then discard)
+  // every other fragment's chunks sharing those cells (O(all originally-nearby
+  // chunks) per contact). Per-body buckets make it O(same-body nearby chunks).
+  const splashGrid = new Map<number, Map<number, number[]>>();
   let splashGridDirty = true; // rebuild on first use and after splits
 
   function splashCellKey(ix: number, iy: number, iz: number): number {
@@ -707,10 +722,14 @@ export async function buildDestructibleCore({
     splashGrid.clear();
     for (let ci = 0; ci < chunks.length; ci++) {
       const c = chunks[ci];
-      if (!c || !c.active) continue;
+      // Chunks without a body can never be a same-body splash neighbour (the query
+      // filters by bodyHandle), so they are omitted from the grid entirely.
+      if (!c || !c.active || c.bodyHandle == null) continue;
+      let bodyGrid = splashGrid.get(c.bodyHandle);
+      if (!bodyGrid) { bodyGrid = new Map<number, number[]>(); splashGrid.set(c.bodyHandle, bodyGrid); }
       const key = splashGridKey(c.baseLocalOffset.x, c.baseLocalOffset.y, c.baseLocalOffset.z);
-      let bucket = splashGrid.get(key);
-      if (!bucket) { bucket = []; splashGrid.set(key, bucket); }
+      let bucket = bodyGrid.get(key);
+      if (!bucket) { bucket = []; bodyGrid.set(key, bucket); }
       bucket.push(ci);
     }
     splashGridDirty = false;
@@ -721,6 +740,8 @@ export async function buildDestructibleCore({
 
   function collectSplashNeighbors(px: number, py: number, pz: number, radius: number, bodyHandle: number): number[] {
     splashResult.length = 0;
+    const bodyGrid = splashGrid.get(bodyHandle);
+    if (!bodyGrid) return splashResult; // no active chunks for this body
     const r2 = radius * radius;
     const minIx = Math.floor((px - radius) * SPLASH_INV_CELL);
     const maxIx = Math.floor((px + radius) * SPLASH_INV_CELL);
@@ -731,11 +752,13 @@ export async function buildDestructibleCore({
     for (let ix = minIx; ix <= maxIx; ix++) {
       for (let iy = minIy; iy <= maxIy; iy++) {
         for (let iz = minIz; iz <= maxIz; iz++) {
-          const bucket = splashGrid.get(splashCellKey(ix, iy, iz));
+          const bucket = bodyGrid.get(splashCellKey(ix, iy, iz));
           if (!bucket) continue;
           for (let bi = 0; bi < bucket.length; bi++) {
             const ci = bucket[bi];
             const c = chunks[ci];
+            // Bucket is already same-body; the bodyHandle guard stays as a cheap
+            // safety net and keeps results byte-identical to the global-grid path.
             if (!c || !c.active || c.bodyHandle !== bodyHandle) continue;
             const dx = c.baseLocalOffset.x - px;
             const dy = c.baseLocalOffset.y - py;
@@ -800,6 +823,87 @@ export async function buildDestructibleCore({
   // Lazily probed: false when the WASM runtime predates addAllActorGravity, in
   // which case we fall back to the per-actor addActorGravity loop.
   let solverBatchedGravity: boolean | undefined;
+
+  // ── Batched contact-force injection ──
+  // Contact forces (one per impacted node plus its splash neighbours) are
+  // accumulated into these flat, parallel buffers during the injection loop and
+  // submitted to the solver in a single FFI crossing via addAllForces — instead
+  // of one ext_stress_solver_add_force crossing per node, which dominated frame
+  // time on dense scenes (mini-city: ~53% of wall time). Grown geometrically and
+  // reused across frames. Lazily probed: false when the WASM runtime predates the
+  // batched export, in which case flushForceBatch() falls back to per-call addForce.
+  let solverForceIdx = new Uint32Array(256);
+  let solverForcePos = new Float32Array(256 * 3);
+  let solverForceVec = new Float32Array(256 * 3);
+  let solverForceCount = 0;
+  let solverBatchedForces: boolean | undefined;
+  const solverForceFallbackPos: Vec3 = { x: 0, y: 0, z: 0 };
+  const solverForceFallbackVec: Vec3 = { x: 0, y: 0, z: 0 };
+
+  function pushSolverForce(nodeIndex: number, px: number, py: number, pz: number, fx: number, fy: number, fz: number): void {
+    const i = solverForceCount;
+    if (i >= solverForceIdx.length) {
+      const n = solverForceIdx.length * 2;
+      const idx = new Uint32Array(n); idx.set(solverForceIdx); solverForceIdx = idx;
+      const pos = new Float32Array(n * 3); pos.set(solverForcePos); solverForcePos = pos;
+      const vec = new Float32Array(n * 3); vec.set(solverForceVec); solverForceVec = vec;
+    }
+    solverForceIdx[i] = nodeIndex >>> 0;
+    const b = i * 3;
+    solverForcePos[b] = px; solverForcePos[b + 1] = py; solverForcePos[b + 2] = pz;
+    solverForceVec[b] = fx; solverForceVec[b + 1] = fy; solverForceVec[b + 2] = fz;
+    solverForceCount = i + 1;
+  }
+
+  // Per-contact stash carrying each resolved hit (node, owning body, local hit
+  // point, body-local force) from the resolve pass into the splash pass. Splitting
+  // injection into two passes lets each be timed with a single frame-level span
+  // (robust to coarse perf.now() quantisation), instead of per-contact spans.
+  // Forces accumulate additively in the solver, so applying all hits then all
+  // splash forces yields the same per-node totals as the original interleaved order.
+  let stashNode = new Uint32Array(256);
+  let stashBody = new Float64Array(256);
+  let stashPos = new Float32Array(256 * 3);
+  let stashForce = new Float32Array(256 * 3);
+  let stashCount = 0;
+
+  function pushContactStash(nodeIndex: number, bodyHandle: number, px: number, py: number, pz: number, fx: number, fy: number, fz: number): void {
+    const i = stashCount;
+    if (i >= stashNode.length) {
+      const n = stashNode.length * 2;
+      const sn = new Uint32Array(n); sn.set(stashNode); stashNode = sn;
+      const sb = new Float64Array(n); sb.set(stashBody); stashBody = sb;
+      const sp = new Float32Array(n * 3); sp.set(stashPos); stashPos = sp;
+      const sf = new Float32Array(n * 3); sf.set(stashForce); stashForce = sf;
+    }
+    stashNode[i] = nodeIndex >>> 0;
+    stashBody[i] = bodyHandle;
+    const b = i * 3;
+    stashPos[b] = px; stashPos[b + 1] = py; stashPos[b + 2] = pz;
+    stashForce[b] = fx; stashForce[b + 1] = fy; stashForce[b + 2] = fz;
+    stashCount = i + 1;
+  }
+
+  // Submit the accumulated contact forces. Fast path: one batched FFI crossing.
+  // Fallback (older runtimes): replay the buffer through per-call addForce, which
+  // is byte-identical to the original per-contact injection.
+  function flushForceBatch(): void {
+    if (solverForceCount === 0) return;
+    const solverApi = solver as unknown as SolverActorsApi;
+    if (solverBatchedForces === undefined) {
+      solverBatchedForces = solverApi.supportsBatchedForces?.() ?? false;
+    }
+    if (solverBatchedForces && solverApi.addAllForces) {
+      solverApi.addAllForces(solverForceIdx, solverForcePos, solverForceVec, solverForceCount);
+    } else {
+      for (let i = 0; i < solverForceCount; i++) {
+        const b = i * 3;
+        solverForceFallbackPos.x = solverForcePos[b]; solverForceFallbackPos.y = solverForcePos[b + 1]; solverForceFallbackPos.z = solverForcePos[b + 2];
+        solverForceFallbackVec.x = solverForceVec[b]; solverForceFallbackVec.y = solverForceVec[b + 1]; solverForceFallbackVec.z = solverForceVec[b + 2];
+        solver.addForce(solverForceIdx[i], solverForceFallbackPos, solverForceFallbackVec);
+      }
+    }
+  }
   const damageOptions: Required<DamageOptions & { autoDetachOnDestroy?: boolean; autoCleanupPhysics?: boolean }> = {
     enabled: !!damage?.enabled,
     strengthPerVolume: damage?.strengthPerVolume ?? 10000,
@@ -1509,6 +1613,18 @@ export async function buildDestructibleCore({
     // to the impacted node plus nearby nodes (splash radius) so that bond stress
     // reflects collision impacts, not just gravity.
     const contactInjectT0 = startTiming();
+    // Injection runs in timed passes so the recording can attribute the cost
+    // (resolve vs splash-grid vs splash vs WASM submit) instead of one opaque
+    // span. Forces accumulate into flat buffers and submit in one batched FFI
+    // crossing; the fallback inside flushForceBatch() replays the same buffer
+    // through per-call addForce when the batched WASM export is absent.
+    solverForceCount = 0;
+    stashCount = 0;
+    const splashR = SPLASH_RADIUS;
+
+    // Pass 1 — resolve: per-contact body + rotation round-trip, world→local force
+    // rotation, buffer the full-strength hit force, and stash the hit for splash.
+    const resolveT0 = startTiming();
     for (const contact of bufferedExternalContacts) {
       if (!contact.totalForceWorld) continue;
       const hitChunk = chunks[contact.nodeIndex];
@@ -1525,34 +1641,59 @@ export async function buildDestructibleCore({
       const ly = -2 * qw * qz * fx + qw * qw * fy + 2 * qw * qx * fz + 2 * qx * qy * fx + qy * qy * fy - 2 * qz * qy * fz - qx * qx * fy - qz * qz * fy
         + 2 * qy * qz * fz;
       const lz = 2 * qw * qy * fx - 2 * qw * qx * fy + qw * qw * fz + 2 * qx * qz * fx + 2 * qy * qz * fy + qz * qz * fz - qx * qx * fz - qy * qy * fz;
-      const scaledForce = { x: lx * effectiveContactStressScale, y: ly * effectiveContactStressScale, z: lz * effectiveContactStressScale };
+      const sfx = lx * effectiveContactStressScale, sfy = ly * effectiveContactStressScale, sfz = lz * effectiveContactStressScale;
 
-      // Apply to hit node at full strength
-      solver.addForce(contact.nodeIndex, hitChunk.baseLocalOffset, scaledForce);
-
-      // Splash: apply attenuated force to neighboring nodes on the same body
-      // Uses spatial grid for O(1) average lookups instead of O(n) full scan
+      // Stash the resolved hit for the buffering pass. The forces themselves are
+      // buffered there (not here) so their order stays byte-identical to the
+      // original interleaved loop — float addition isn't associative, so this
+      // change is purely about *where the time is attributed*, not the result.
       const hitPos = hitChunk.baseLocalOffset;
-      const splashR = SPLASH_RADIUS;
-      if (splashGridDirty) rebuildSplashGrid();
-      const neighbors = collectSplashNeighbors(hitPos.x, hitPos.y, hitPos.z, splashR, hitChunk.bodyHandle!);
+      pushContactStash(contact.nodeIndex, hitChunk.bodyHandle, hitPos.x, hitPos.y, hitPos.z, sfx, sfy, sfz);
+    }
+    stopTiming(resolveT0, 'contactInjectResolveMs');
+
+    // Splash grid is rebuilt once per frame (only when topology changed). Hoisted
+    // out of the per-contact loop so it can be measured on its own.
+    const gridT0 = startTiming();
+    if (stashCount > 0 && splashGridDirty) rebuildSplashGrid();
+    stopTiming(gridT0, 'contactInjectGridMs');
+
+    // Pass 2 — splash: for each stashed hit, find same-body neighbours within the
+    // splash radius and buffer the attenuated force. Uses the spatial grid for
+    // O(1) average lookups instead of an O(n) full scan.
+    const splashT0 = startTiming();
+    for (let si = 0; si < stashCount; si++) {
+      const hitNode = stashNode[si];
+      const bodyHandle = stashBody[si];
+      const sb = si * 3;
+      const hx = stashPos[sb], hy = stashPos[sb + 1], hz = stashPos[sb + 2];
+      const sfx = stashForce[sb], sfy = stashForce[sb + 1], sfz = stashForce[sb + 2];
+      // Hit node at full strength first, then its splash neighbours — exactly the
+      // per-contact order the original single loop used, so the accumulated
+      // per-node force totals are unchanged.
+      pushSolverForce(hitNode, hx, hy, hz, sfx, sfy, sfz);
+      const neighbors = collectSplashNeighbors(hx, hy, hz, splashR, bodyHandle);
       for (let ni = 0; ni < neighbors.length; ni++) {
         const ci = neighbors[ni];
-        if (ci === contact.nodeIndex) continue;
+        if (ci === hitNode) continue;
         const c = chunks[ci];
-        const dx = c.baseLocalOffset.x - hitPos.x;
-        const dy = c.baseLocalOffset.y - hitPos.y;
-        const dz = c.baseLocalOffset.z - hitPos.z;
+        const dx = c.baseLocalOffset.x - hx;
+        const dy = c.baseLocalOffset.y - hy;
+        const dz = c.baseLocalOffset.z - hz;
         const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
         if (dist > splashR) continue;
         const falloff = (1 - dist / splashR);
         const f2 = falloff * falloff; // quadratic falloff
         if (f2 <= 0) continue;
-        solver.addForce(ci, c.baseLocalOffset, {
-          x: scaledForce.x * f2, y: scaledForce.y * f2, z: scaledForce.z * f2,
-        });
+        pushSolverForce(ci, c.baseLocalOffset.x, c.baseLocalOffset.y, c.baseLocalOffset.z, sfx * f2, sfy * f2, sfz * f2);
       }
     }
+    stopTiming(splashT0, 'contactInjectSplashMs');
+
+    // Submit the whole frame's contact forces (one FFI crossing on the fast path).
+    const submitT0 = startTiming();
+    flushForceBatch();
+    stopTiming(submitT0, 'contactInjectSubmitMs');
     stopTiming(contactInjectT0, 'solverContactInjectMs');
 
     if (!shouldSkipSolver) {

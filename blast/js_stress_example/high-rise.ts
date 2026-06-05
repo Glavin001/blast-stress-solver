@@ -18,12 +18,13 @@ import Stats from 'three/addons/libs/stats.module.js';
 import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountShooter } from './shooter-fps.js';
 
 const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
 
 // ── Mutable demo config (driven by the control panel) ──────────
 const CONFIG = {
-  projectile: { radius: 0.6, mass: 2500, speed: 8 },
+  projectile: { radius: 0.6, mass: 2500, speed: 25 },
   solver: {
     gravity: -9.81,
     // Multiplier on the pack's concrete stress limits: >1 = stronger / harder to break,
@@ -57,9 +58,6 @@ const CONFIG = {
 // Captured from the scene pack at load.
 let baseLimits: Record<string, number> = {};
 let packDamage: Record<string, unknown> = {};
-let projectileTtlMs = 3000;
-const STANDOFF = 6; // metres in front of the clicked surface to spawn the ball
-const buildingBox = new THREE.Box3();
 
 function scaledLimits(): Record<string, number> {
   const s = CONFIG.solver.strength;
@@ -162,6 +160,7 @@ const recorder = createRecordingOverlay({
   getProfilerExport: () => profiler.exportData(),
 });
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
+let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 // Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
 let centrifugalEnabled = false;
@@ -175,14 +174,6 @@ async function initScene() {
   const { scenario, defaults } = pack;
   baseLimits = (defaults.solverSettings as Record<string, number>) ?? {};
   packDamage = (defaults.damage as Record<string, unknown>) ?? {};
-  projectileTtlMs = Math.min((defaults.projectile as any)?.ttlMs ?? 3000, 3000);
-
-  buildingBox.makeEmpty();
-  const boundsPoint = new THREE.Vector3();
-  for (const n of scenario.nodes) {
-    buildingBox.expandByPoint(boundsPoint.set(n.centroid.x, n.centroid.y, n.centroid.z));
-  }
-  buildingBox.expandByScalar(1.0);
 
   controls.target.set(defaults.camera.target.x, defaults.camera.target.y, defaults.camera.target.z);
   controls.update();
@@ -253,34 +244,8 @@ async function rebuild() {
   }
 }
 
-// ── Projectile ────────────────────────────────────────────────
-function shootProjectile(ndcX: number, ndcY: number) {
-  const core = coreRef;
-  if (!core) return;
-  const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
-  const dir = raycaster.ray.direction.clone().normalize();
-  // Spawn the ball just in FRONT of where the click ray meets the building, so it
-  // delivers a local hit instead of plowing ~45 m diagonally through the structure.
-  const entry = new THREE.Vector3();
-  if (!raycaster.ray.intersectBox(buildingBox, entry)) return; // clicked empty space
-  const spawn = entry.addScaledVector(dir, -STANDOFF);
-  const speed = CONFIG.projectile.speed;
-  core.enqueueProjectile({
-    position: { x: spawn.x, y: spawn.y, z: spawn.z },
-    velocity: { x: dir.x * speed, y: dir.y * speed, z: dir.z * speed },
-    radius: CONFIG.projectile.radius,
-    mass: CONFIG.projectile.mass,
-    ttl: projectileTtlMs,
-  });
-}
-
-canvas.addEventListener('click', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  shootProjectile(ndcX, ndcY);
-});
+// Shooting (ball + sticky/grenade) is handled by the shared shooter module
+// mounted at boot — the ball spawns from the camera like every other demo.
 
 // ── Control panel wiring ──────────────────────────────────────
 function bindSlider(
@@ -370,6 +335,8 @@ function loop() {
     updateStatus(coreRef);
   }
 
+  shooter?.update();
+
   const t1 = performance.now();
   renderer.render(scene, camera);
   _renderMs += ((performance.now() - t1) - _renderMs) * EMA;
@@ -385,6 +352,14 @@ function onResize() {
 window.addEventListener('resize', onResize);
 
 mountPipelineControls();
+shooter = mountShooter({
+  canvas,
+  camera,
+  controls,
+  scene,
+  getCore: () => coreRef,
+  getBallParams: () => CONFIG.projectile,
+});
 initScene()
   .then(() => loop())
   .catch((err) => {

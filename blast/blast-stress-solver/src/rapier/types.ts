@@ -221,6 +221,22 @@ export type CoreProfilerSample = {
   /** Sub-phase of `solverUpdateMs`: external contact / splash force injection
    *  (force rotation into body-local space + spatial-grid neighbour splash). */
   solverContactInjectMs: number;
+  /** Sub-phase of `solverContactInjectMs`: per-contact body resolution +
+   *  world→local force rotation + buffering the hit-node force (Rapier
+   *  `getRigidBody`/`rotation` round-trips + JS quaternion math). */
+  contactInjectResolveMs: number;
+  /** Sub-phase of `solverContactInjectMs`: rebuilding the splash spatial grid
+   *  (only when topology changed since the last injection). */
+  contactInjectGridMs: number;
+  /** Sub-phase of `solverContactInjectMs`: splash neighbour search + buffering
+   *  the hit and attenuated neighbour forces (spatial-grid lookups, distance
+   *  falloff, flat-buffer writes). */
+  contactInjectSplashMs: number;
+  /** Sub-phase of `solverContactInjectMs`: submitting the buffered forces to the
+   *  WASM solver (the FFI crossing + the C++ per-force work: input→actor lookup
+   *  and the Blast `addForce`). The four contactInject* fields sum to
+   *  `solverContactInjectMs` (minus negligible bookkeeping). */
+  contactInjectSubmitMs: number;
   /** Sub-phase of `solverUpdateMs`: the actual `solver.update()` CGNR solve in
    *  WASM (whole-graph; cost tracks bond count, not body count). */
   solverSolveMs: number;
