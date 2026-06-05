@@ -114,6 +114,22 @@ export function getBodyForColliderHandle(
 }
 
 /**
+ * Compute the relative speed between two already-resolved rigid bodies at a
+ * given world point. Prefer this over {@link computeRelativeSpeed} on hot paths
+ * where the bodies have already been resolved, to avoid re-crossing the WASM
+ * boundary to look the colliders up again.
+ */
+export function relativeSpeedBetweenBodies(
+  b1: RAPIER.RigidBody | null,
+  b2: RAPIER.RigidBody | null,
+  atPoint: Vec3,
+): number {
+  const v1 = bodyPointVelocity(b1, atPoint);
+  const v2 = bodyPointVelocity(b2, atPoint);
+  return Math.hypot(v1.x - v2.x, v1.y - v2.y, v1.z - v2.z);
+}
+
+/**
  * Compute the relative speed between two colliders at a given world point.
  * Used to modulate damage based on impact velocity.
  */
@@ -125,9 +141,7 @@ export function computeRelativeSpeed(
 ): number {
   const b1 = getBodyForColliderHandle(world, h1);
   const b2 = getBodyForColliderHandle(world, h2);
-  const v1 = bodyPointVelocity(b1, atPoint);
-  const v2 = bodyPointVelocity(b2, atPoint);
-  return Math.hypot(v1.x - v2.x, v1.y - v2.y, v1.z - v2.z);
+  return relativeSpeedBetweenBodies(b1, b2, atPoint);
 }
 
 // ─── Coordinate transforms ──────────────────────────────────────────

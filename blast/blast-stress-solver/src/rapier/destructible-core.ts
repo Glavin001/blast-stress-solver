@@ -31,7 +31,7 @@ import { applyCollisionGroupsForBody as applyCollisionGroupsForBodyImpl, type Co
 import { ContactBuffer } from './contactBuffer';
 import {
   computeSpeedFactor,
-  computeRelativeSpeed,
+  relativeSpeedBetweenBodies,
   getBodyForColliderHandle,
   worldPointToBodyLocal,
   chunkWorldCenter as chunkWorldCenterHelper,
@@ -654,15 +654,32 @@ export async function buildDestructibleCore({
   const SPLASH_RADIUS = 2.0;
   const SPLASH_CELL = SPLASH_RADIUS; // cell size = splash radius
   const SPLASH_INV_CELL = 1 / SPLASH_CELL;
-  // Map from "ix,iy,iz" grid key to array of node indices
-  const splashGrid = new Map<string, number[]>();
+  // Bit-packed integer grid keys avoid the per-cell `${ix},${iy},${iz}` string
+  // allocation that previously ran for every cell in a 3D box on every external
+  // contact (heavy transient GC pressure on the injection path). Each axis index
+  // is recentred by SPLASH_KEY_OFFSET (so negatives pack cleanly) and packed in
+  // base-SPLASH_KEY_STRIDE. The stride/offset give a ±65535-cell (±131 km at the
+  // 2 m cell size) range while keeping the composite key below 2^53, so distinct
+  // cells never collide for any realistic local chunk offset.
+  const SPLASH_KEY_STRIDE = 1 << 17; // 131072
+  const SPLASH_KEY_OFFSET = 1 << 16; // 65536 (half-range, recentres negatives)
+  // Map from packed integer grid key to array of node indices
+  const splashGrid = new Map<number, number[]>();
   let splashGridDirty = true; // rebuild on first use and after splits
 
-  function splashGridKey(x: number, y: number, z: number): string {
-    const ix = Math.floor(x * SPLASH_INV_CELL);
-    const iy = Math.floor(y * SPLASH_INV_CELL);
-    const iz = Math.floor(z * SPLASH_INV_CELL);
-    return `${ix},${iy},${iz}`;
+  function splashCellKey(ix: number, iy: number, iz: number): number {
+    const px = ix + SPLASH_KEY_OFFSET;
+    const py = iy + SPLASH_KEY_OFFSET;
+    const pz = iz + SPLASH_KEY_OFFSET;
+    return (px * SPLASH_KEY_STRIDE + py) * SPLASH_KEY_STRIDE + pz;
+  }
+
+  function splashGridKey(x: number, y: number, z: number): number {
+    return splashCellKey(
+      Math.floor(x * SPLASH_INV_CELL),
+      Math.floor(y * SPLASH_INV_CELL),
+      Math.floor(z * SPLASH_INV_CELL),
+    );
   }
 
   function rebuildSplashGrid() {
@@ -693,7 +710,7 @@ export async function buildDestructibleCore({
     for (let ix = minIx; ix <= maxIx; ix++) {
       for (let iy = minIy; iy <= maxIy; iy++) {
         for (let iz = minIz; iz <= maxIz; iz++) {
-          const bucket = splashGrid.get(`${ix},${iy},${iz}`);
+          const bucket = splashGrid.get(splashCellKey(ix, iy, iz));
           if (!bucket) continue;
           for (let bi = 0; bi < bucket.length; bi++) {
             const ci = bucket[bi];
@@ -848,13 +865,11 @@ export async function buildDestructibleCore({
     maxForceMagnitude: number;
     totalForceWorld?: Vec3;
   }> = [];
-  const bufferedInternalContacts: Array<{
-    nodeA: number;
-    nodeB: number;
-    bodyHandle: number;
-    totalForceMagnitude: number;
-    maxForceMagnitude: number;
-  }> = [];
+  // Internal (same-body, node↔node) contacts were previously materialised into a
+  // full object array that nothing consumed except the profiler counter below.
+  // We keep only the count (used by the `bufferedInternalContacts` profiler
+  // metric) and skip building the throwaway objects.
+  let bufferedInternalContactCount = 0;
 
   // --- Buffered contacts for damage rollback replay ---
   const contactReplayBuffer = new ContactBuffer();
@@ -867,31 +882,20 @@ export async function buildDestructibleCore({
     fastSpeedFactor: damageOptions.fastSpeedFactor,
   };
 
-  function getChunkWorldCenter(nodeIndex: number): Vec3 | null {
-    const chunk = chunks[nodeIndex];
-    if (!chunk) return null;
-    const { body } = actorBodyForNode(nodeIndex);
-    if (!body) return null;
-    return chunkWorldCenterHelper(body, chunk.baseLocalOffset);
-  }
-
-  function getWorldPointToActorLocal(nodeIndex: number, worldPoint: Vec3): Vec3 | null {
-    try {
-      const { body } = actorBodyForNode(nodeIndex);
-      if (!body) return null;
-      return worldPointToBodyLocal(body, worldPoint);
-    } catch {
-      return null;
-    }
-  }
-
   function drainContactForces() {
     const t0 = startTiming();
     bufferedExternalContacts.length = 0;
-    bufferedInternalContacts.length = 0;
+    bufferedInternalContactCount = 0;
     contactReplayBuffer.clear();
 
     const dt = lastStepDt;
+    // The full speed-scaling / momentum / local-point / replay-buffer pipeline
+    // exists solely to feed the damage system. When damage is disabled the
+    // stress solver only needs totalForce/maxForce/forceVec, so we skip all of
+    // that per-event WASM round-tripping (relative-speed, world→local transforms,
+    // replay recording). Behaviour is byte-identical because the sole consumer —
+    // damageDrivePass — early-returns when damage is off.
+    const damageOn = damageOptions.enabled;
 
     eventQueue.drainContactForceEvents((ev) => {
       const h1 = ev.collider1();
@@ -904,32 +908,15 @@ export async function buildDestructibleCore({
       const forceVec: Vec3 | undefined = typeof (ev as any).totalForce === 'function'
         ? (ev as any).totalForce() as Vec3
         : undefined;
-      // Extract world contact points (when available from Rapier)
-      const wp = typeof (ev as any).worldContactPoint === 'function'
-        ? (ev as any).worldContactPoint() as Vec3 | undefined
-        : undefined;
-      const wp2 = typeof (ev as any).worldContactPoint2 === 'function'
-        ? (ev as any).worldContactPoint2() as Vec3 | undefined
-        : undefined;
-      const p1 = wp ?? wp2 ?? fallbackContactPoint(world, h1);
-      const p2 = wp2 ?? wp ?? fallbackContactPoint(world, h2);
 
-      const isInternal = (node1 != null && node2 != null);
-      const pForNode1 = node1 != null ? (wp ?? wp2 ?? getChunkWorldCenter(node1) ?? p1) : undefined;
-      const pForNode2 = node2 != null ? (wp2 ?? wp ?? getChunkWorldCenter(node2) ?? p2) : undefined;
-      const relAnchor = pForNode1 ?? pForNode2 ?? p1 ?? p2;
+      // Resolve both bodies exactly once. Needed always for ground-collision
+      // tracking, and reused by the damage pipeline below (relative speed +
+      // momentum boost) instead of re-resolving the colliders.
+      const b1 = getBodyForColliderHandle(world, h1);
+      const b2 = getBodyForColliderHandle(world, h2);
 
-      // Speed-scaled effective magnitude
-      const relSpeed = computeRelativeSpeed(world, h1, h2, relAnchor);
-      const speedFactor = computeSpeedFactor(relSpeed, isInternal, speedScalingOpts);
-      let effMag = (totalForce ?? 0) * speedFactor;
-
-      // Projectile momentum boost
+      // Track ground collisions for optimization modes (damage-independent).
       try {
-        const b1 = getBodyForColliderHandle(world, h1);
-        const b2 = getBodyForColliderHandle(world, h2);
-
-        // Track ground collisions for optimization modes
         if (b1 && b2) {
           const isB1Ground = b1.handle === groundBody.handle;
           const isB2Ground = b2.handle === groundBody.handle;
@@ -947,34 +934,76 @@ export async function buildDestructibleCore({
             }
           }
         }
+      } catch { /* defensive: don't let ground tracking crash contact drain */ }
 
+      // Damage-only derived quantities. Default effMag to the raw force; the
+      // local points stay null. These are only consumed by the replay buffer.
+      let effMag = totalForce ?? 0;
+      let local1: Vec3 | null = null;
+      let local2: Vec3 | null = null;
+
+      if (damageOn) {
+        // Extract world contact points (when available from Rapier)
+        const wp = typeof (ev as any).worldContactPoint === 'function'
+          ? (ev as any).worldContactPoint() as Vec3 | undefined
+          : undefined;
+        const wp2 = typeof (ev as any).worldContactPoint2 === 'function'
+          ? (ev as any).worldContactPoint2() as Vec3 | undefined
+          : undefined;
+        const p1 = wp ?? wp2 ?? fallbackContactPoint(world, h1);
+        const p2 = wp2 ?? wp ?? fallbackContactPoint(world, h2);
+
+        // Resolve each node's owning body once, then reuse it for both the
+        // chunk-center anchor and the world→local transform.
+        const bodyN1 = node1 != null ? actorBodyForNode(node1).body : null;
+        const bodyN2 = node2 != null ? actorBodyForNode(node2).body : null;
+        const chunk1c = node1 != null ? chunks[node1] : undefined;
+        const chunk2c = node2 != null ? chunks[node2] : undefined;
+        const center1 = (bodyN1 && chunk1c) ? chunkWorldCenterHelper(bodyN1, chunk1c.baseLocalOffset) : null;
+        const center2 = (bodyN2 && chunk2c) ? chunkWorldCenterHelper(bodyN2, chunk2c.baseLocalOffset) : null;
+
+        const isInternal = (node1 != null && node2 != null);
+        const pForNode1 = node1 != null ? (wp ?? wp2 ?? center1 ?? p1) : undefined;
+        const pForNode2 = node2 != null ? (wp2 ?? wp ?? center2 ?? p2) : undefined;
+        const relAnchor = pForNode1 ?? pForNode2 ?? p1 ?? p2;
+
+        // Speed-scaled effective magnitude (reusing the already-resolved bodies)
+        const relSpeed = relativeSpeedBetweenBodies(b1, b2, relAnchor);
+        const speedFactor = computeSpeedFactor(relSpeed, isInternal, speedScalingOpts);
+        effMag = (totalForce ?? 0) * speedFactor;
+
+        // Projectile momentum boost
         if (node1 != null || node2 != null) {
-          effMag = applyProjectileMomentumBoost(b1, b2, relSpeed, dt, effMag);
+          try {
+            effMag = applyProjectileMomentumBoost(b1, b2, relSpeed, dt, effMag);
+          } catch { /* defensive: don't let boost logic crash contact drain */ }
         }
-      } catch { /* defensive: don't let boost logic crash contact drain */ }
 
-      // Compute body-local contact points for splash AOE damage
-      const local1 = (node1 != null && pForNode1) ? getWorldPointToActorLocal(node1, pForNode1) : null;
-      const local2 = (node2 != null && pForNode2) ? getWorldPointToActorLocal(node2, pForNode2) : null;
+        // Compute body-local contact points for splash AOE damage
+        if (node1 != null && pForNode1 && bodyN1) {
+          try { local1 = worldPointToBodyLocal(bodyN1, pForNode1); } catch { local1 = null; }
+        }
+        if (node2 != null && pForNode2 && bodyN2) {
+          try { local2 = worldPointToBodyLocal(bodyN2, pForNode2); } catch { local2 = null; }
+        }
+      }
 
-      // --- Buffer contacts for stress solver injection (unchanged logic) ---
+      // --- Buffer contacts for stress solver injection (damage-independent) ---
+      // Replay-buffer recording is gated on damageOn — its only reader is the
+      // damage drive pass.
       if (node1 != null && node2 != null) {
         const chunk1 = chunks[node1];
         const chunk2 = chunks[node2];
         if (chunk1 && chunk2 && chunk1.bodyHandle === chunk2.bodyHandle) {
-          bufferedInternalContacts.push({
-            nodeA: node1,
-            nodeB: node2,
-            bodyHandle: chunk1.bodyHandle!,
-            totalForceMagnitude: totalForce,
-            maxForceMagnitude: maxForce,
-          });
-          // Buffer for damage replay with speed-scaled magnitude
-          contactReplayBuffer.recordInternal({
-            nodeA: node1, nodeB: node2, effMag, dt,
-            localPointA: local1 ?? undefined,
-            localPointB: local2 ?? undefined,
-          });
+          // Internal (same-body) contact: no stress injection; count for profiler.
+          bufferedInternalContactCount += 1;
+          if (damageOn) {
+            contactReplayBuffer.recordInternal({
+              nodeA: node1, nodeB: node2, effMag, dt,
+              localPointA: local1 ?? undefined,
+              localPointB: local2 ?? undefined,
+            });
+          }
         } else {
           if (chunk1) {
             bufferedExternalContacts.push({
@@ -984,10 +1013,12 @@ export async function buildDestructibleCore({
               maxForceMagnitude: maxForce,
               totalForceWorld: forceVec,
             });
-            contactReplayBuffer.recordExternal({
-              nodeIndex: node1, effMag, dt,
-              localPoint: local1 ?? undefined,
-            });
+            if (damageOn) {
+              contactReplayBuffer.recordExternal({
+                nodeIndex: node1, effMag, dt,
+                localPoint: local1 ?? undefined,
+              });
+            }
           }
           if (chunk2) {
             bufferedExternalContacts.push({
@@ -997,10 +1028,12 @@ export async function buildDestructibleCore({
               maxForceMagnitude: maxForce,
               totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
             });
-            contactReplayBuffer.recordExternal({
-              nodeIndex: node2, effMag, dt,
-              localPoint: local2 ?? undefined,
-            });
+            if (damageOn) {
+              contactReplayBuffer.recordExternal({
+                nodeIndex: node2, effMag, dt,
+                localPoint: local2 ?? undefined,
+              });
+            }
           }
         }
       } else if (node1 != null) {
@@ -1013,10 +1046,12 @@ export async function buildDestructibleCore({
             maxForceMagnitude: maxForce,
             totalForceWorld: forceVec,
           });
-          contactReplayBuffer.recordExternal({
-            nodeIndex: node1, effMag, dt,
-            localPoint: local1 ?? undefined,
-          });
+          if (damageOn) {
+            contactReplayBuffer.recordExternal({
+              nodeIndex: node1, effMag, dt,
+              localPoint: local1 ?? undefined,
+            });
+          }
           if (chunk.bodyHandle != null) bodiesCollidedWithGround.add(chunk.bodyHandle);
         }
       } else if (node2 != null) {
@@ -1029,10 +1064,12 @@ export async function buildDestructibleCore({
             maxForceMagnitude: maxForce,
             totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
           });
-          contactReplayBuffer.recordExternal({
-            nodeIndex: node2, effMag, dt,
-            localPoint: local2 ?? undefined,
-          });
+          if (damageOn) {
+            contactReplayBuffer.recordExternal({
+              nodeIndex: node2, effMag, dt,
+              localPoint: local2 ?? undefined,
+            });
+          }
           if (chunk.bodyHandle != null) bodiesCollidedWithGround.add(chunk.bodyHandle);
         }
       }
@@ -2168,7 +2205,7 @@ export async function buildDestructibleCore({
 
     if (activeProfilerSample) {
       activeProfilerSample.bufferedExternalContacts = bufferedExternalContacts.length;
-      activeProfilerSample.bufferedInternalContacts = bufferedInternalContacts.length;
+      activeProfilerSample.bufferedInternalContacts = bufferedInternalContactCount;
     }
 
     const needsResim = damageDrivePass(dt);

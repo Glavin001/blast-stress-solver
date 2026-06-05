@@ -6,8 +6,22 @@ import {
   worldPointToBodyLocal,
   chunkWorldCenter,
   applyProjectileMomentumBoost,
+  relativeSpeedBetweenBodies,
   type SpeedScalingOptions,
 } from '../rapier/contactHelpers';
+
+/** Minimal RigidBody-like stub for velocity helpers (no WASM dependency). */
+function mockBody(
+  linvel: { x: number; y: number; z: number },
+  translation: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 },
+  angvel: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 },
+) {
+  return {
+    linvel: () => linvel,
+    angvel: () => angvel,
+    translation: () => translation,
+  } as any;
+}
 
 const defaultOpts: SpeedScalingOptions = {
   speedMinExternal: 0.5,
@@ -104,6 +118,38 @@ describe('applyQuatToVec3', () => {
     expect(result.x).toBeCloseTo(-1);
     expect(result.y).toBeCloseTo(0);
     expect(result.z).toBeCloseTo(0);
+  });
+});
+
+describe('relativeSpeedBetweenBodies', () => {
+  const atPoint = { x: 0, y: 0, z: 0 };
+
+  it('returns 0 when both bodies are null (resting/unresolved contact)', () => {
+    expect(relativeSpeedBetweenBodies(null, null, atPoint)).toBe(0);
+  });
+
+  it('returns the moving body speed when the other is null', () => {
+    const b = mockBody({ x: 3, y: 4, z: 0 });
+    expect(relativeSpeedBetweenBodies(b, null, atPoint)).toBeCloseTo(5);
+  });
+
+  it('sums opposing linear velocities into the relative speed', () => {
+    const b1 = mockBody({ x: 2, y: 0, z: 0 });
+    const b2 = mockBody({ x: -3, y: 0, z: 0 });
+    // |v1 - v2| = |2 - (-3)| = 5
+    expect(relativeSpeedBetweenBodies(b1, b2, atPoint)).toBeCloseTo(5);
+  });
+
+  it('returns 0 for two bodies moving identically (no relative motion)', () => {
+    const v = { x: 1, y: 2, z: 3 };
+    expect(relativeSpeedBetweenBodies(mockBody(v), mockBody(v), atPoint)).toBeCloseTo(0);
+  });
+
+  it('includes the angular (lever-arm) contribution at an offset point', () => {
+    // Body spinning about +Z at 1 rad/s, evaluated 1 unit out along +X →
+    // tangential velocity ≈ (ω × r) magnitude = 1.
+    const spinning = mockBody({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 1 });
+    expect(relativeSpeedBetweenBodies(spinning, null, { x: 1, y: 0, z: 0 })).toBeCloseTo(1);
   });
 });
 
