@@ -102,7 +102,27 @@ const STYLE_CSS = `
 .bss-fp-stats{margin-top:4px;font-size:10.5px;color:rgba(200,210,240,.7)}
 .bss-fp-stats b{color:#fff}
 .bss-fp.collapsed .bss-fp-body{display:none}
+/* Phones: shrink the panel, drop the secondary chrome, and keep it hugging the
+   bottom edge so it stops covering the scene. Pairs with auto-collapse below. */
+@media (max-width:768px){
+  .bss-fp{left:8px;right:8px;bottom:8px;padding:6px 8px 5px;border-radius:9px}
+  .bss-fp-head{flex-wrap:wrap;gap:6px 8px}
+  .bss-fp-title{font-size:10.5px}
+  .bss-fp-json,.bss-fp-csv{display:none}
+  .bss-fp-canvas{height:84px}
+  .bss-fp-legend{gap:2px 8px;font-size:9.5px}
+  .bss-fp.collapsed .bss-fp-cause{flex-basis:100%;text-align:left;margin-left:0}
+}
 `;
+
+/** True on phone-sized viewports (matches the demos' 768px breakpoint). */
+function isSmallScreen(doc?: Document): boolean {
+  try {
+    return doc?.defaultView?.matchMedia("(max-width: 768px)").matches ?? false;
+  } catch {
+    return false;
+  }
+}
 
 function ensureStyles(doc: Document) {
   if (doc.getElementById(STYLE_ID)) return;
@@ -135,7 +155,9 @@ export function createFrameProfilerOverlay(
     capacity = 180,
     budgetMs = 1000 / 60,
     title = "⚡ Frame profiler — simulation cost / frame",
-    startCollapsed = false,
+    // Default to collapsed on phones, where the panel otherwise buries the scene;
+    // an explicit `startCollapsed` always wins.
+    startCollapsed = isSmallScreen(doc),
     measureOld = false,
     getMeta,
     exportName = "frame-profile",
@@ -174,6 +196,9 @@ export function createFrameProfilerOverlay(
   const jsonBtn = root.querySelector(".bss-fp-json") as HTMLButtonElement;
   const csvBtn = root.querySelector(".bss-fp-csv") as HTMLButtonElement;
   const ctx = canvas.getContext("2d");
+
+  // Reflect the initial collapsed state in the caret glyph.
+  minBtn.textContent = root.classList.contains("collapsed") ? "▴" : "▾";
 
   abInput.checked = measuringOld;
   abInput.addEventListener("change", () => setMeasureOld(abInput.checked));

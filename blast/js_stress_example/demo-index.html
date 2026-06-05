@@ -2,293 +2,468 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>blast-stress-solver — Demos</title>
+    <meta
+      name="description"
+      content="Interactive physics-destruction demos for the NVIDIA Blast stress solver, running in the browser with Rapier & Three.js."
+    />
     <style>
       *, *::before, *::after { box-sizing: border-box; }
+      :root {
+        --bg: #04060f;
+        --bg-soft: rgba(255, 255, 255, 0.03);
+        --bg-soft-hover: rgba(255, 255, 255, 0.06);
+        --border: rgba(255, 255, 255, 0.08);
+        --border-strong: rgba(107, 140, 255, 0.4);
+        --text: #f5f7ff;
+        --text-dim: rgba(200, 210, 240, 0.62);
+        --text-faint: rgba(200, 210, 240, 0.4);
+        --accent: #6b8cff;
+        --max: 1080px;
+      }
+      html { -webkit-text-size-adjust: 100%; }
       body {
         margin: 0;
         min-height: 100vh;
         font-family: "Inter", system-ui, -apple-system, sans-serif;
-        color: #f5f7ff;
-        background: #030510;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        padding: 3rem 1.5rem;
-      }
-      h1 {
-        font-size: 1.8rem;
-        font-weight: 700;
-        margin: 0 0 0.5rem;
-        letter-spacing: -0.02em;
-      }
-      .subtitle {
-        font-size: 0.85rem;
-        color: rgba(200, 210, 240, 0.55);
-        margin: 0 0 2.5rem;
-        max-width: 520px;
-        text-align: center;
+        color: var(--text);
+        background:
+          radial-gradient(1200px 600px at 50% -10%, rgba(60, 80, 180, 0.18), transparent 70%),
+          var(--bg);
         line-height: 1.5;
       }
+      .wrap {
+        width: 100%;
+        max-width: var(--max);
+        margin: 0 auto;
+        padding: clamp(1.5rem, 4vw, 3.5rem) clamp(1rem, 4vw, 2rem) 4rem;
+      }
+
+      /* ── Hero ─────────────────────────────────────────── */
+      .hero { text-align: center; margin-bottom: 2rem; }
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        font-size: 0.7rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 0.3rem 0.75rem;
+        margin-bottom: 1.1rem;
+      }
+      .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: #50c878; box-shadow: 0 0 8px #50c878; }
+      h1 {
+        font-size: clamp(1.9rem, 6vw, 3rem);
+        font-weight: 800;
+        margin: 0 0 0.6rem;
+        letter-spacing: -0.03em;
+        background: linear-gradient(120deg, #ffffff, #aab8ff 70%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .lead {
+        font-size: clamp(0.9rem, 2.4vw, 1.02rem);
+        color: var(--text-dim);
+        margin: 0 auto;
+        max-width: 560px;
+      }
+      .lead code {
+        font-size: 0.85em;
+        background: rgba(255, 255, 255, 0.06);
+        padding: 0.05em 0.35em;
+        border-radius: 4px;
+      }
+
+      /* ── Controls hint ────────────────────────────────── */
+      .hint {
+        margin: 1.5rem auto 0;
+        max-width: 720px;
+        background: var(--bg-soft);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 0.85rem 1.1rem;
+        font-size: 0.8rem;
+        color: var(--text-dim);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem 1.25rem;
+        justify-content: center;
+        text-align: left;
+      }
+      .hint b { color: rgba(220, 228, 255, 0.92); font-weight: 600; }
+      .hint .kbd {
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 0.72rem;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-bottom-width: 2px;
+        border-radius: 5px;
+        padding: 0.05em 0.4em;
+        color: #dde5ff;
+      }
+      .hint span { display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap; }
+
+      /* ── Toolbar (search + filter) ────────────────────── */
+      .toolbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        margin: 2.25rem 0 1.5rem;
+        padding: 0.85rem 0;
+        background: linear-gradient(var(--bg), rgba(4, 6, 15, 0.85) 70%, transparent);
+        backdrop-filter: blur(6px);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: center;
+      }
+      .search {
+        flex: 1 1 220px;
+        position: relative;
+        min-width: 0;
+      }
+      .search input {
+        width: 100%;
+        background: var(--bg-soft);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        color: var(--text);
+        font-size: 0.9rem;
+        padding: 0.6rem 0.75rem 0.6rem 2.1rem;
+        outline: none;
+        transition: border-color 0.15s;
+      }
+      .search input:focus { border-color: var(--border-strong); }
+      .search input::placeholder { color: var(--text-faint); }
+      .search svg { position: absolute; left: 0.7rem; top: 50%; transform: translateY(-50%); opacity: 0.45; }
+      .filters { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+      .chip {
+        font: inherit;
+        font-size: 0.76rem;
+        color: var(--text-dim);
+        background: var(--bg-soft);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 0.42rem 0.8rem;
+        cursor: pointer;
+        white-space: nowrap;
+        transition: background 0.15s, color 0.15s, border-color 0.15s;
+      }
+      .chip:hover { background: var(--bg-soft-hover); color: var(--text); }
+      .chip[aria-pressed="true"] {
+        background: rgba(107, 140, 255, 0.18);
+        border-color: var(--border-strong);
+        color: #cfd8ff;
+      }
+
+      /* ── Grid ─────────────────────────────────────────── */
       .grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-        gap: 1.25rem;
-        width: 100%;
-        max-width: 900px;
+        grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr));
+        gap: 1rem;
       }
       .card {
         display: flex;
         flex-direction: column;
-        background: rgba(255, 255, 255, 0.03);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 12px;
-        padding: 1.5rem;
+        background: var(--bg-soft);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 1.25rem;
         text-decoration: none;
         color: inherit;
         transition: background 0.2s, border-color 0.2s, transform 0.15s;
       }
       .card:hover {
-        background: rgba(255, 255, 255, 0.06);
-        border-color: rgba(107, 140, 255, 0.3);
-        transform: translateY(-2px);
+        background: var(--bg-soft-hover);
+        border-color: var(--border-strong);
+        transform: translateY(-3px);
       }
-      .card-icon { font-size: 2rem; margin-bottom: 0.75rem; }
-      .card h2 { margin: 0 0 0.35rem; font-size: 1rem; font-weight: 600; }
-      .card p {
-        margin: 0;
-        font-size: 0.78rem;
-        color: rgba(200, 210, 240, 0.55);
-        line-height: 1.5;
-        flex: 1;
+      .card:active { transform: translateY(-1px); }
+      .card-top { display: flex; align-items: center; gap: 0.7rem; margin-bottom: 0.6rem; }
+      .card-icon {
+        font-size: 1.5rem;
+        width: 2.6rem;
+        height: 2.6rem;
+        display: grid;
+        place-items: center;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.05);
+        flex: 0 0 auto;
       }
-      .card .tag {
-        display: inline-block;
-        margin-top: 0.75rem;
-        font-size: 0.65rem;
-        padding: 0.2rem 0.5rem;
-        border-radius: 4px;
-        background: rgba(107, 140, 255, 0.1);
-        color: rgba(140, 170, 255, 0.8);
-        align-self: flex-start;
+      .card h2 { margin: 0; font-size: 1rem; font-weight: 650; letter-spacing: -0.01em; }
+      .card p { margin: 0; font-size: 0.8rem; color: var(--text-dim); flex: 1; }
+      .card-tags { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.85rem; }
+      .tag {
+        font-size: 0.64rem;
+        letter-spacing: 0.02em;
+        padding: 0.22rem 0.5rem;
+        border-radius: 5px;
+        background: rgba(107, 140, 255, 0.12);
+        color: rgba(160, 185, 255, 0.9);
       }
-      .tag.new {
-        background: rgba(80, 200, 120, 0.12);
-        color: rgba(120, 220, 160, 0.85);
+      .tag.feat { background: rgba(80, 200, 120, 0.14); color: rgba(130, 225, 165, 0.95); }
+
+      /* ── Section headings ─────────────────────────────── */
+      .section-head {
+        display: flex;
+        align-items: baseline;
+        gap: 0.6rem;
+        margin: 2.5rem 0 1rem;
       }
+      .section-head h3 { margin: 0; font-size: 0.95rem; font-weight: 650; letter-spacing: 0.01em; }
+      .section-head span { font-size: 0.75rem; color: var(--text-faint); }
+
+      .no-results {
+        display: none;
+        text-align: center;
+        color: var(--text-faint);
+        font-size: 0.85rem;
+        padding: 2.5rem 1rem;
+      }
+
+      /* ── Legacy (de-emphasized) ───────────────────────── */
+      .legacy { margin-top: 3.5rem; opacity: 0.72; }
+      .legacy summary {
+        cursor: pointer;
+        list-style: none;
+        font-size: 0.82rem;
+        font-weight: 600;
+        color: var(--text-dim);
+        padding: 0.6rem 0;
+        border-top: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+      .legacy summary::-webkit-details-marker { display: none; }
+      .legacy summary .caret { transition: transform 0.2s; font-size: 0.7rem; opacity: 0.6; }
+      .legacy[open] summary .caret { transform: rotate(90deg); }
+      .legacy summary:hover { color: var(--text); }
+      .legacy-list {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr));
+        gap: 0.6rem;
+        padding: 0.75rem 0 0;
+      }
+      .legacy-item {
+        display: flex;
+        gap: 0.6rem;
+        align-items: flex-start;
+        padding: 0.7rem 0.85rem;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.015);
+        text-decoration: none;
+        color: inherit;
+        transition: background 0.15s, border-color 0.15s;
+      }
+      .legacy-item:hover { background: var(--bg-soft); border-color: rgba(255, 255, 255, 0.14); }
+      .legacy-item .li-icon { font-size: 1.1rem; opacity: 0.8; }
+      .legacy-item h4 { margin: 0 0 0.15rem; font-size: 0.82rem; font-weight: 600; }
+      .legacy-item p { margin: 0; font-size: 0.72rem; color: var(--text-faint); }
+
       footer {
-        margin-top: 3rem;
-        font-size: 0.7rem;
-        color: rgba(200, 210, 240, 0.3);
+        margin-top: 3.5rem;
+        text-align: center;
+        font-size: 0.74rem;
+        color: var(--text-faint);
       }
-      footer a { color: rgba(140, 170, 255, 0.5); text-decoration: none; }
-      footer a:hover { color: rgba(140, 170, 255, 0.8); }
+      footer a { color: rgba(140, 170, 255, 0.6); text-decoration: none; }
+      footer a:hover { color: rgba(140, 170, 255, 0.95); }
+
+      @media (max-width: 560px) {
+        .toolbar { flex-direction: column; align-items: stretch; }
+        .filters { justify-content: flex-start; overflow-x: auto; padding-bottom: 0.2rem; -webkit-overflow-scrolling: touch; }
+        .card { padding: 1.1rem; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .card, .card:hover, .legacy summary .caret { transition: none; transform: none; }
+      }
     </style>
   </head>
   <body>
-    <h1>blast-stress-solver</h1>
-    <p class="subtitle">
-      Interactive demos showcasing the NVIDIA Blast stress solver runtime —
-      physics-based destruction with Rapier &amp; Three.js. Every destruction demo carries a
-      live <strong>⚡ frame-profiler overlay</strong>: a real-time per-phase breakdown of what
-      each frame costs (and what causes a dip below 60&nbsp;fps), with an A/B toggle for the
-      old split planner.
-    </p>
-    <p class="subtitle" style="margin-top:-1.5rem">
-      🎮 Every destruction demo now has a <strong>first-person shooter mode</strong> — toggle it
-      in the right-hand panel, then <strong>WASD</strong> to walk a physics character that climbs
-      on rubble and floors, mouse/arrows to look, and hold <strong>Space</strong> as a
-      <em>jetpack</em> to fly up onto things, with a camera <em>headlamp</em> so you always see where you
-      look. Left-click to shoot; press <strong>1</strong>/<strong>2</strong>/<strong>3</strong>
-      (or <strong>Q</strong>) to switch between a <em>ball projectile</em>, a
-      <em>sticky-explosive launcher</em> (stick charges to pillars, then <strong>F</strong> to
-      detonate them all) and a <em>grenade</em> that explodes on contact. Shooting works in orbit
-      mode too.
-    </p>
-
-    <div class="grid">
-      <!-- Tooling -->
-      <a class="card" href="./session-viewer.html">
-        <div class="card-icon">⏯️</div>
-        <h2>Session Viewer</h2>
-        <p>
-          Import a <code>*.sim.json.gz</code> recording captured by the in-app
-          <strong>⏺ Session recorder</strong> and play it back visually — scrub the
-          timeline, watch fragments split off (coloured per rigid body), and read the
-          live bonds / bodies / projectiles / per-frame cost. No physics, no WASM —
-          pure playback of the recorded trace.
+    <main class="wrap">
+      <header class="hero">
+        <span class="eyebrow"><span class="dot"></span> Live in your browser</span>
+        <h1>blast-stress-solver</h1>
+        <p class="lead">
+          Interactive physics-destruction demos for the NVIDIA Blast stress solver —
+          real-time fracture with <strong>Rapier</strong> &amp; <strong>Three.js</strong>, WASM under the hood.
         </p>
-        <span class="tag new">NEW — recording playback</span>
-      </a>
 
-      <!-- Performance / benchmarking -->
-      <a class="card" href="./split-planner-bench.html">
-        <div class="card-icon">⚡</div>
-        <h2>Split-Planner Benchmark</h2>
-        <p>
-          Live A/B of the fracture split planner: the shipping connected-component
-          planner vs. the old <code>O(N³)</code> dense Hungarian it replaced. Watch the
-          old planner blow past the 60&nbsp;fps frame budget while the new one stays flat —
-          same optimal assignment, hundreds-to-thousands× faster. Pure CPU, no physics.
-        </p>
-        <span class="tag new">NEW — performance</span>
-      </a>
+        <div class="hint">
+          <span>🖱️ <b>Drag</b> to orbit · <b>click</b> to shoot</span>
+          <span>🎮 <span class="kbd">V</span> first-person · <span class="kbd">WASD</span> walk · <span class="kbd">Space</span> jetpack</span>
+          <span>⚙️ Open the panel for weapons, physics &amp; a live <b>frame profiler</b></span>
+        </div>
+      </header>
 
-      <!-- New high-level API demos -->
-      <a class="card" href="./wall-demolition.html">
-        <div class="card-icon">🧱</div>
-        <h2>Wall Demolition</h2>
-        <p>
-          Destructible brick wall using the high-level
-          <code>buildDestructibleCore</code> + <code>createDestructibleThreeBundle</code> APIs.
-          Click to shoot projectiles.
-        </p>
-        <span class="tag new">NEW — rapier + three</span>
-      </a>
+      <nav class="toolbar" aria-label="Filter demos">
+        <div class="search">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input id="search" type="search" placeholder="Search demos…" autocomplete="off" aria-label="Search demos" />
+        </div>
+        <div class="filters" id="filters">
+          <button class="chip" data-filter="all" aria-pressed="true">All</button>
+          <button class="chip" data-filter="destruction" aria-pressed="false">Destruction</button>
+          <button class="chip" data-filter="fracture" aria-pressed="false">Fracture</button>
+          <button class="chip" data-filter="stress" aria-pressed="false">Stress</button>
+          <button class="chip" data-filter="performance" aria-pressed="false">Performance</button>
+          <button class="chip" data-filter="tooling" aria-pressed="false">Tooling</button>
+        </div>
+      </nav>
 
-      <a class="card" href="./tower-collapse.html">
-        <div class="card-icon">🏗️</div>
-        <h2>Tower Collapse</h2>
-        <p>
-          Tall tower with stress-based fracture. Shoot projectiles or increase gravity
-          to trigger cascading collapse. Now with a <strong>live frame profiler</strong>:
-          a real-time per-phase breakdown showing exactly what causes each dip below
-          60&nbsp;fps — plus an A/B toggle to overlay the old split planner's cost.
-        </p>
-        <span class="tag new">NEW — rapier + three + live profiler</span>
-      </a>
+      <div class="section-head"><h3>Demos</h3><span id="count"></span></div>
 
-      <a class="card" href="./fractured-wall.html">
-        <div class="card-icon">💥</div>
-        <h2>Fractured Wall</h2>
-        <p>
-          Voronoi mesh fracturing via three-pinata. Irregular fragments with proximity-based
-          bond detection and stress-driven destruction.
-        </p>
-        <span class="tag new">NEW — fracture + rapier + three</span>
-      </a>
+      <section class="grid" id="grid">
+        <a class="card" href="./mini-city.html" data-cat="destruction" data-tags="city meteor demolition mass composed">
+          <div class="card-top"><div class="card-icon">🏙️</div><h2>Mini-City</h2></div>
+          <p>A grid of independently fractured towers in one physics world. Rain a meteor storm or detonate charges to flatten the whole skyline.</p>
+          <div class="card-tags"><span class="tag feat">Featured</span><span class="tag">mass destruction</span></div>
+        </a>
 
-      <a class="card" href="./fractured-tower.html">
-        <div class="card-icon">&#127959;</div>
-        <h2>Fractured Tower</h2>
-        <p>
-          Multi-floor tower with Voronoi-fractured walls, interior columns, floor plates,
-          and foundation. Type-based bond strength multipliers for realistic progressive collapse.
-        </p>
-        <span class="tag new">NEW — fracture + rapier + three</span>
-      </a>
+        <a class="card" href="./tower-collapse.html" data-cat="destruction" data-tags="tower collapse gravity profiler">
+          <div class="card-top"><div class="card-icon">🏗️</div><h2>Tower Collapse</h2></div>
+          <p>A tall tower that buckles under its own weight or a well-placed shot. Includes the live per-phase frame profiler with an A/B planner toggle.</p>
+          <div class="card-tags"><span class="tag feat">Featured</span><span class="tag">live profiler</span></div>
+        </a>
 
-      <a class="card" href="./high-rise.html">
-        <div class="card-icon">&#127970;</div>
-        <h2>High-Rise Demolition</h2>
-        <p>
-          Mid-rise apartment with a reinforced-concrete flat-slab skeleton and frangible
-          drywall infill, loaded from the same shared scene-pack JSON as the Rust demo.
-          A wrecking ball punches local holes instead of shattering like glass. HUD tracks
-          bonds broken over time.
-        </p>
-        <span class="tag new">NEW — shared JSON + realistic materials</span>
-      </a>
+        <a class="card" href="./high-rise.html" data-cat="destruction" data-tags="high-rise building wrecking ball concrete realistic json">
+          <div class="card-top"><div class="card-icon">🏢</div><h2>High-Rise Demolition</h2></div>
+          <p>A reinforced-concrete skeleton with frangible drywall infill, loaded from the same shared scene JSON as the Rust demo. A wrecking ball punches real holes.</p>
+          <div class="card-tags"><span class="tag feat">Featured</span><span class="tag">realistic materials</span></div>
+        </a>
 
-      <a class="card" href="./centrifugal-spinner.html">
-        <div class="card-icon">&#127744;</div>
-        <h2>Centrifugal Spinner</h2>
-        <p>
-          Free-floating beams spun in zero gravity. Toggle the solver's centrifugal acceleration
-          on and off: with it off they spin forever intact; with it on the inward (centripetal)
-          load crushes their bonds and they shatter from the inside out. A clean A/B of the
-          centrifugal feature.
-        </p>
-        <span class="tag new">NEW — centrifugal stress showcase</span>
-      </a>
+        <a class="card" href="./centrifugal-spinner.html" data-cat="stress" data-tags="centrifugal spinner zero gravity beams centripetal a/b showcase">
+          <div class="card-top"><div class="card-icon">🌀</div><h2>Centrifugal Spinner</h2></div>
+          <p>Free-floating beams spun in zero-g. Flip the solver's centrifugal acceleration on/off: off, they spin forever intact; on, the inward load crushes their bonds and they shatter from the inside out.</p>
+          <div class="card-tags"><span class="tag">centrifugal A/B</span></div>
+        </a>
 
-      <a class="card" href="./cracking.html">
-        <div class="card-icon">&#129529;</div>
-        <h2>Stress Cracks</h2>
-        <p>
-          A concrete cantilever built into a wall. Crank the load and watch stress
-          concentrate at the root &mdash; bonds bloom green&rarr;red as they cross the
-          elastic limit, then rupture and the beam falls. Toggle Tension vs Compression
-          to see the directional stress field live.
-        </p>
-        <span class="tag new">NEW — live stress + directional cracking</span>
-      </a>
+        <a class="card" href="./wall-demolition.html" data-cat="destruction" data-tags="wall brick projectile bonds">
+          <div class="card-top"><div class="card-icon">🧱</div><h2>Wall Demolition</h2></div>
+          <p>A destructible brick wall built on the high-level <code>buildDestructibleCore</code> API. Click to launch projectiles and knock it down.</p>
+          <div class="card-tags"><span class="tag">starter</span></div>
+        </a>
 
-      <a class="card" href="./mini-city.html">
-        <div class="card-icon">&#127961;&#65039;</div>
-        <h2>Mini-City</h2>
-        <p>
-          A grid of independently fractured tower blocks composed into one physics world —
-          many stress-solves sharing a single Rapier scene. Rain a meteor storm or detonate
-          demolition charges to flatten the whole skyline and watch how it performs.
-        </p>
-        <span class="tag new">NEW — composed city + mass destruction</span>
-      </a>
+        <a class="card" href="./fractured-wall.html" data-cat="fracture" data-tags="voronoi pinata wall mesh fragments">
+          <div class="card-top"><div class="card-icon">💥</div><h2>Fractured Wall</h2></div>
+          <p>Voronoi mesh fracturing via three-pinata — irregular fragments with proximity-based bond detection and stress-driven destruction.</p>
+          <div class="card-tags"><span class="tag">voronoi</span></div>
+        </a>
 
-      <a class="card" href="./fractured-bridge.html">
-        <div class="card-icon">&#127753;</div>
-        <h2>Fractured Bridge</h2>
-        <p>
-          Beam bridge with fractured deck slab and support posts on footing supports.
-          Irregular Voronoi fragments with proximity-based bond detection.
-        </p>
-        <span class="tag new">NEW — fracture + rapier + three</span>
-      </a>
+        <a class="card" href="./fractured-tower.html" data-cat="fracture" data-tags="voronoi tower floors columns progressive collapse">
+          <div class="card-top"><div class="card-icon">🏚️</div><h2>Fractured Tower</h2></div>
+          <p>A multi-floor tower with Voronoi-fractured walls, columns, and floor plates. Type-based bond strengths drive a realistic progressive collapse.</p>
+          <div class="card-tags"><span class="tag">voronoi</span></div>
+        </a>
 
-      <a class="card" href="./fracture-policy.html">
-        <div class="card-icon">&#9881;</div>
-        <h2>Fracture Policy</h2>
-        <p>
-          Progressive fracture system with tunable knobs: fracture rate, body creation budget,
-          dynamic body cap, and material grain size. Tune realism vs. performance in real-time.
-        </p>
-        <span class="tag new">NEW — fracture policy</span>
-      </a>
+        <a class="card" href="./fractured-bridge.html" data-cat="fracture" data-tags="bridge deck posts footing voronoi">
+          <div class="card-top"><div class="card-icon">🌉</div><h2>Fractured Bridge</h2></div>
+          <p>A beam bridge with a fractured deck slab and support posts on footings. Irregular Voronoi fragments bonded by proximity.</p>
+          <div class="card-tags"><span class="tag">voronoi</span></div>
+        </a>
 
-      <!-- Existing demos -->
-      <a class="card" href="./bridge-split-demo.html">
-        <div class="card-icon">🌉</div>
-        <h2>Bridge Stress Tester</h2>
-        <p>
-          Full-featured bridge destruction demo with configurable geometry, solver
-          parameters, and real-time stress visualization.
-        </p>
-        <span class="tag">low-level solver</span>
-      </a>
+        <a class="card" href="./cracking.html" data-cat="stress" data-tags="cantilever beam crack tension compression load stress field">
+          <div class="card-top"><div class="card-icon">🧪</div><h2>Stress Cracks</h2></div>
+          <p>A concrete cantilever built into a wall. Crank the load and watch stress concentrate at the root — bonds bloom green→red, then rupture.</p>
+          <div class="card-tags"><span class="tag">live stress</span></div>
+        </a>
 
-      <a class="card" href="./bridge-demo.html">
-        <div class="card-icon">🌉</div>
-        <h2>Bridge Demo (Classic)</h2>
-        <p>
-          Original bridge demo with basic stress visualization.
-        </p>
-        <span class="tag">low-level solver</span>
-      </a>
+        <a class="card" href="./fracture-policy.html" data-cat="performance" data-tags="policy tuning budget grain body cap engine knobs">
+          <div class="card-top"><div class="card-icon">⚙️</div><h2>Fracture Policy</h2></div>
+          <p>The progressive-fracture engine with every knob exposed: fracture rate, body-creation budget, dynamic-body cap, and material grain. Tune realism vs. performance live.</p>
+          <div class="card-tags"><span class="tag">engine</span></div>
+        </a>
 
-      <a class="card" href="./bridge-ext.html">
-        <div class="card-icon">🔬</div>
-        <h2>Extended Stress Demo</h2>
-        <p>
-          Extended solver demo with additional visualization modes and
-          diagnostic tools.
-        </p>
-        <span class="tag">low-level solver</span>
-      </a>
+        <a class="card" href="./split-planner-bench.html" data-cat="performance" data-tags="benchmark planner hungarian split cpu fps">
+          <div class="card-top"><div class="card-icon">⚡</div><h2>Split-Planner Benchmark</h2></div>
+          <p>Live A/B of the fracture split planner — the shipping connected-component planner vs. the old O(N³) Hungarian. Same optimal result, hundreds× faster. Pure CPU.</p>
+          <div class="card-tags"><span class="tag">benchmark</span></div>
+        </a>
 
-      <a class="card" href="./browser-demo.html">
-        <div class="card-icon">🌐</div>
-        <h2>Browser Demo</h2>
-        <p>
-          Minimal browser demo for testing WASM loading and basic solver functionality.
-        </p>
-        <span class="tag">low-level solver</span>
-      </a>
-    </div>
+        <a class="card" href="./session-viewer.html" data-cat="tooling" data-tags="session recording viewer playback replay sim.json import scrub timeline">
+          <div class="card-top"><div class="card-icon">⏯️</div><h2>Session Viewer</h2></div>
+          <p>Import a <code>*.sim.json.gz</code> recording from the in-app ⏺ Session recorder and replay it visually — scrub the timeline, watch fragments split off (coloured per rigid body), and read live bonds / bodies / per-frame cost. No physics, no WASM.</p>
+          <div class="card-tags"><span class="tag feat">New</span><span class="tag">recording playback</span></div>
+        </a>
+      </section>
 
-    <footer>
-      <a href="https://github.com/glavin001/physx">GitHub</a> ·
-      blast-stress-solver
-    </footer>
+      <p class="no-results" id="no-results">No demos match “<span id="nr-term"></span>”.</p>
+
+      <details class="legacy">
+        <summary><span class="caret">▶</span> Legacy &amp; low-level demos</summary>
+        <div class="legacy-list">
+          <a class="legacy-item" href="./bridge-split-demo.html">
+            <span class="li-icon">🌉</span>
+            <div><h4>Bridge Stress Tester</h4><p>Full-featured bridge with configurable geometry &amp; live stress visualization.</p></div>
+          </a>
+          <a class="legacy-item" href="./bridge-demo.html">
+            <span class="li-icon">🌉</span>
+            <div><h4>Bridge Demo (Classic)</h4><p>The original bridge demo with basic stress coloring.</p></div>
+          </a>
+          <a class="legacy-item" href="./bridge-ext.html">
+            <span class="li-icon">🔬</span>
+            <div><h4>Extended Stress Demo</h4><p>Extra visualization modes &amp; diagnostic tools.</p></div>
+          </a>
+          <a class="legacy-item" href="./browser-demo.html">
+            <span class="li-icon">🌐</span>
+            <div><h4>Browser Demo</h4><p>Minimal harness for WASM loading &amp; basic solver functionality.</p></div>
+          </a>
+        </div>
+      </details>
+
+      <footer>
+        <a href="https://github.com/glavin001/physx">GitHub</a> · blast-stress-solver
+      </footer>
+    </main>
+
+    <script>
+      (function () {
+        var grid = document.getElementById('grid');
+        var cards = Array.prototype.slice.call(grid.querySelectorAll('.card'));
+        var search = document.getElementById('search');
+        var filters = document.getElementById('filters');
+        var chips = Array.prototype.slice.call(filters.querySelectorAll('.chip'));
+        var count = document.getElementById('count');
+        var noResults = document.getElementById('no-results');
+        var nrTerm = document.getElementById('nr-term');
+        var activeCat = 'all';
+
+        function apply() {
+          var term = search.value.trim().toLowerCase();
+          var shown = 0;
+          cards.forEach(function (card) {
+            var cat = card.getAttribute('data-cat') || '';
+            var hay = (card.textContent + ' ' + (card.getAttribute('data-tags') || '')).toLowerCase();
+            var matchCat = activeCat === 'all' || cat === activeCat;
+            var matchTerm = !term || hay.indexOf(term) !== -1;
+            var show = matchCat && matchTerm;
+            card.style.display = show ? '' : 'none';
+            if (show) shown++;
+          });
+          count.textContent = shown + (shown === 1 ? ' demo' : ' demos');
+          noResults.style.display = shown === 0 ? 'block' : 'none';
+          nrTerm.textContent = term || activeCat;
+        }
+
+        search.addEventListener('input', apply);
+        chips.forEach(function (chip) {
+          chip.addEventListener('click', function () {
+            activeCat = chip.getAttribute('data-filter');
+            chips.forEach(function (c) { c.setAttribute('aria-pressed', String(c === chip)); });
+            apply();
+          });
+        });
+        apply();
+      })();
+    </script>
   </body>
 </html>

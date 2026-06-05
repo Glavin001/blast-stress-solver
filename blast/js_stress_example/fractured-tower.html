@@ -90,8 +90,8 @@
           </div>
           <div class="config-row">
             <label class="config-label" for="cfg-proj-speed">Speed</label>
-            <input type="range" id="cfg-proj-speed" class="config-slider" min="5" max="80" step="1" value="25" />
-            <span class="config-value"><span id="cfg-proj-speed-value">25</span> m/s</span>
+            <input type="range" id="cfg-proj-speed" class="config-slider" min="5" max="160" step="1" value="45" />
+            <span class="config-value"><span id="cfg-proj-speed-value">45</span> m/s</span>
           </div>
         </section>
 
@@ -116,8 +116,8 @@
           <div class="config-row">
             <label class="config-label" for="cfg-debris-collision">Debris Collision &#9733;</label>
             <select id="cfg-debris-collision" class="config-select">
-              <option value="all">All (full collisions)</option>
-              <option value="noDebrisPairs" selected>No debris pairs</option>
+              <option value="all" selected>All (full collisions)</option>
+              <option value="noDebrisPairs">No debris pairs</option>
               <option value="debrisGroundOnly">Debris &harr; ground only</option>
               <option value="debrisNone">Debris: none</option>
             </select>
@@ -145,8 +145,8 @@
           <div class="config-row">
             <label class="config-label" for="cfg-damping-mode">Small Body Damping &#9733;</label>
             <select id="cfg-damping-mode" class="config-select">
-              <option value="off">Off</option>
-              <option value="always" selected>Always</option>
+              <option value="off" selected>Off</option>
+              <option value="always">Always</option>
               <option value="afterGroundCollision">After ground hit</option>
             </select>
           </div>
@@ -154,8 +154,8 @@
             <label class="config-label" for="cfg-cleanup-mode">Debris Cleanup &#9733;</label>
             <select id="cfg-cleanup-mode" class="config-select">
               <option value="off">Off</option>
-              <option value="always" selected>Always</option>
-              <option value="afterGroundCollision">After ground hit</option>
+              <option value="always">Always</option>
+              <option value="afterGroundCollision" selected>After ground hit</option>
             </select>
           </div>
           <div class="config-row">
@@ -202,25 +202,12 @@
             <div class="status-item"><span class="status-label">Triangles</span><span class="status-value" id="stat-triangles">0</span></div>
           </div>
         </section>
+        <!-- Session recorder docks here (mounted by the demo via recordingOverlay). -->
+        <section class="config-section recorder-section" id="recorder-slot"></section>
       </aside>
     </main>
 
-    <script>
-      (function () {
-        var toggle = document.getElementById('sidebar-toggle');
-        var sidebar = document.getElementById('sidebar');
-        var backdrop = document.getElementById('sidebar-backdrop');
-        var layout = document.querySelector('.layout');
-        var mql = window.matchMedia('(max-width: 768px)');
-        function isMobile() { return mql.matches; }
-        function close() { toggle.classList.remove('active'); if (isMobile()) { sidebar.classList.remove('open'); backdrop.classList.remove('visible'); } else { layout.classList.add('sidebar-hidden'); } }
-        function open() { toggle.classList.add('active'); if (isMobile()) { sidebar.classList.add('open'); backdrop.classList.add('visible'); } else { layout.classList.remove('sidebar-hidden'); } }
-        function isOpen() { return isMobile() ? sidebar.classList.contains('open') : !layout.classList.contains('sidebar-hidden'); }
-        toggle.addEventListener('click', function () { if (isOpen()) close(); else open(); });
-        backdrop.addEventListener('click', close);
-        if (!isMobile()) toggle.classList.add('active');
-      })();
-    </script>
+    <script type="module" src="./dist/demo-shell.js"></script>
     <script type="module" src="./dist/fractured-tower.js"></script>
   </body>
 </html>
