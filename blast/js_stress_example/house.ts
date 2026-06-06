@@ -44,6 +44,10 @@ const CONFIG = {
     // Voronoi-shatter selected parts (three-pinata) instead of boxes: none | walls |
     // wallsRoof | all. Anything but 'none' uses the async builder + WASM auto-bonder.
     fracture: 'none' as HouseFractureMode,
+    // Fracture detail knobs (only matter when fracturing). Defaults are perf-tuned;
+    // raise shards / lower cell size for finer, more detailed breakage at a perf cost.
+    fragmentsPerPiece: 3,
+    fractureCellSize: 1.05,
   },
   projectile: { radius: 0.35, mass: 800, speed: 28 },
   solver: {
@@ -194,8 +198,15 @@ async function initScene() {
   const scenario =
     h.fracture === 'none'
       ? buildHouseScenario(opts)
-      : await buildHouseScenarioAsync({ ...opts, fracture: h.fracture, pinata: pinata as any });
+      : await buildHouseScenarioAsync({
+          ...opts,
+          fracture: h.fracture,
+          fragmentsPerPiece: h.fragmentsPerPiece,
+          fractureCellSize: h.fractureCellSize,
+          pinata: pinata as any,
+        });
 
+  const fractured = h.fracture !== 'none';
   const core = await buildDestructibleCore({
     scenario,
     gravity: CONFIG.solver.gravity,
@@ -207,7 +218,11 @@ async function initScene() {
     friction: CONFIG.physics.friction,
     restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.solver.contactForceScale,
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
+    // Fractured mode spawns many small shards. Stop debris from colliding with OTHER debris
+    // (the per-frame contact flood the profiler flagged), and spread splits across frames so
+    // the first hit doesn't cascade hundreds of new bodies in a single frame.
+    debrisCollisionMode: (fractured ? 'noDebrisPairs' : CONFIG.physics.debrisCollisionMode) as any,
+    fracturePolicy: fractured ? { maxNewBodiesPerFrame: 30, maxColliderMigrationsPerFrame: 60 } : undefined,
     debrisCleanup: {
       mode: CONFIG.optimization.debrisCleanupMode as any,
       debrisTtlMs: CONFIG.optimization.debrisTtlMs,
@@ -300,6 +315,9 @@ selFracture?.addEventListener('change', () => {
   CONFIG.house.fracture = selFracture.value as HouseFractureMode;
   void rebuild();
 });
+// Fracture detail (Reset to apply): higher shards + smaller cell = finer breakage.
+bindSlider('cfg-shards', CONFIG.house, 'fragmentsPerPiece', (v) => v.toFixed(0) + ' / piece');
+bindSlider('cfg-fracture-cell', CONFIG.house, 'fractureCellSize', (v) => v.toFixed(2) + ' m');
 
 // Projectile (live at next throw).
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');

@@ -92,9 +92,20 @@
               <option value="all">All breakable parts</option>
             </select>
           </div>
+          <div class="config-row">
+            <span class="config-label">Shards / piece</span>
+            <input type="range" class="config-slider" id="cfg-shards" min="2" max="8" step="1" value="3" />
+            <span class="config-value" id="cfg-shards-value">3 / piece</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Fracture cell</span>
+            <input type="range" class="config-slider" id="cfg-fracture-cell" min="0.5" max="1.5" step="0.05" value="1.05" />
+            <span class="config-value" id="cfg-fracture-cell-value">1.05 m</span>
+          </div>
           <p class="config-help" style="margin:.4rem 0 0;opacity:.6;font-size:.78rem;">
             Voronoi-shatter selected parts into irregular shards instead of boxes (heavier to
-            build; uses the WASM auto-bonder). Rebuilds on change.
+            build; uses the WASM auto-bonder). More shards / a smaller cell = finer, more
+            detailed breakage at a performance cost. Rebuilds on change / Reset.
           </p>
         </section>
 

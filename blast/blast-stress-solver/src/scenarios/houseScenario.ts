@@ -103,8 +103,15 @@ export type HouseOptions = {
   bondMode?: 'proximity' | 'auto';
   /** Voronoi-shatter selected parts instead of boxes (async builder only). Default 'none'. */
   fracture?: HouseFractureMode;
-  /** Voronoi shards per box when fracturing. Default 4. */
+  /** Voronoi shards per box when fracturing — higher = finer/more detailed. Default 3. */
   fragmentsPerPiece?: number;
+  /**
+   * Base wall/roof cell size (m) used when fracturing, before shattering each cell into
+   * `fragmentsPerPiece` shards. Smaller = finer (more, smaller shards) but more chunks /
+   * contacts to simulate. Default 1.05 (coarsen-then-shatter keeps the count sane). Drop it
+   * toward `panelCell` (~0.6) for much finer fracturing at a performance cost.
+   */
+  fractureCellSize?: number;
   /** Pre-imported three-pinata module (required for `fracture` in browser ESM). */
   pinata?: PinataModule;
   /** Override individual bond-strength multipliers. */
@@ -112,7 +119,7 @@ export type HouseOptions = {
 };
 
 export const DEFAULT_HOUSE_OPTIONS: Required<
-  Omit<HouseOptions, 'multipliers' | 'bondMode' | 'fracture' | 'fragmentsPerPiece' | 'pinata'>
+  Omit<HouseOptions, 'multipliers' | 'bondMode' | 'fracture' | 'fragmentsPerPiece' | 'fractureCellSize' | 'pinata'>
 > & { bondMode: 'proximity' | 'auto' } = {
   width: 10,
   depth: 8,
@@ -387,52 +394,60 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
     }),
   );
 
-  // ── Structural frame: posts ───────────────────────────────────────────────
-  const inset = postSize * 0.5 + 0.02;
-  const frontZ = -hd + inset;
-  const backZ = hd - inset;
-  const leftX = -hw + inset;
-  const rightX = hw - inset;
+  // ── Structural frame: posts sit JUST INSIDE the walls (touching the inner face), so the
+  // frame never interpenetrates the drywall. ───────────────────────────────
+  const postFrontZ = -hd + wallThickness + postSize * 0.5;
+  const postBackZ = hd - wallThickness - postSize * 0.5;
+  const postLeftX = -hw + wallThickness + postSize * 0.5;
+  const postRightX = hw - wallThickness - postSize * 0.5;
+  const plateStrip = wallThickness + postSize; // top-plate width: covers the wall + inset post
+
+  // Ridge-beam geometry (the king posts stop at its underside; its top sits at the roof apex).
+  const roofLenX = width + 0.6;
+  const ridgeBeamH = 0.16;
+  const ridgeBeamZ = 0.1;
+  const ridgeBeamCenterY = ridgeUndersideY - ridgeBeamH * 0.5; // top ≈ roof underside at the ridge
+  const kingTopY = ridgeUndersideY - ridgeBeamH; // king posts stop at the ridge-beam underside
 
   // Eave posts: 4 corners + intermediates along each exterior wall (floor → eave).
-  const cornerXs = [leftX, rightX];
-  const cornerZs = [frontZ, backZ];
-  for (const x of cornerXs) for (const z of cornerZs) push(buildPost(x, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column);
+  for (const x of [postLeftX, postRightX]) for (const z of [postFrontZ, postBackZ]) push(buildPost(x, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column);
   const interXs = [-width * 0.25, width * 0.25];
   const interZs = [-depth * 0.25, depth * 0.25];
-  for (const x of interXs) { push(buildPost(x, frontZ, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); push(buildPost(x, backZ, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); }
-  for (const z of interZs) { push(buildPost(leftX, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); push(buildPost(rightX, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); }
+  for (const x of interXs) { push(buildPost(x, postFrontZ, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); push(buildPost(x, postBackZ, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); }
+  for (const z of interZs) { push(buildPost(postLeftX, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); push(buildPost(postRightX, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); }
 
-  // Ridge "king posts": interior posts on the centerline (z=0) rising floor → ridge. These
-  // (plus the gable-end posts) carry the ridge beam — the dispersed roof support. Any post
-  // that would block the interior doorway is dropped (the neighbours carry that bay).
+  // Ridge "king posts" on the centerline (z=0), floor → ridge-beam underside. The partition
+  // drywall is offset just behind them (below) so they touch instead of interpenetrate.
   const partitionDoor = { center: -1.2, width: 1.0, height: 2.1 };
-  const kingXs = linspace(leftX, rightX, Math.max(2, Math.round(ridgePosts))).filter(
+  const kingHalfRange = hw - plateStrip - postSize * 0.5; // keep king posts clear of the side plates
+  const kingXs = linspace(-kingHalfRange, kingHalfRange, Math.max(2, Math.round(ridgePosts))).filter(
     (x) => Math.abs(x - partitionDoor.center) > partitionDoor.width * 0.5 + postSize,
   );
-  for (const x of kingXs) push(buildPost(x, 0, floorTopY, ridgeUndersideY, postSize, panelCell), HOUSE_PALETTE.column);
+  for (const x of kingXs) push(buildPost(x, 0, floorTopY, kingTopY, postSize, panelCell), HOUSE_PALETTE.column);
 
-  // ── Beams: top-plate ring (on eave posts) + ridge beam (on king posts) ────
-  for (const z of [frontZ, backZ]) {
+  // ── Beams: top-plate ring + ridge beam. Plates cover the wall+post strip and butt at the
+  // corners (front/back plates run full width; side plates fit strictly between them). ──
+  const plateY = plateTopY - plateThickness * 0.5;
+  for (const sign of [-1, 1] as const) {
     push(subdivideBoxFragments({
-      center: { x: 0, y: plateTopY - plateThickness * 0.5, z },
-      size: { x: width, y: plateThickness, z: postSize * 1.05 },
+      center: { x: 0, y: plateY, z: sign * (hd - plateStrip * 0.5) },
+      size: { x: width, y: plateThickness, z: plateStrip },
       divisions: { x: Math.max(2, Math.round(width / panelCell)), y: 1, z: 1 },
       fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
     }), HOUSE_PALETTE.beam);
   }
-  for (const x of [leftX, rightX]) {
+  const sidePlateLen = depth - 2 * plateStrip;
+  for (const sign of [-1, 1] as const) {
     push(subdivideBoxFragments({
-      center: { x, y: plateTopY - plateThickness * 0.5, z: 0 },
-      size: { x: postSize * 1.05, y: plateThickness, z: depth },
-      divisions: { x: 1, y: 1, z: Math.max(2, Math.round(depth / panelCell)) },
+      center: { x: sign * (hw - plateStrip * 0.5), y: plateY, z: 0 },
+      size: { x: plateStrip, y: plateThickness, z: sidePlateLen },
+      divisions: { x: 1, y: 1, z: Math.max(2, Math.round(sidePlateLen / panelCell)) },
       fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
     }), HOUSE_PALETTE.beam);
   }
-  const roofLenX = width + 0.6;
   push(subdivideBoxFragments({
-    center: { x: 0, y: ridgeUndersideY - 0.08, z: 0 },
-    size: { x: roofLenX, y: 0.18, z: 0.18 },
+    center: { x: 0, y: ridgeBeamCenterY, z: 0 },
+    size: { x: roofLenX, y: ridgeBeamH, z: ridgeBeamZ },
     divisions: { x: Math.max(2, Math.round(roofLenX / panelCell)), y: 1, z: 1 },
     fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
   }), HOUSE_PALETTE.beam);
@@ -451,15 +466,18 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
     { center: 0, width: 1.0, sill: 0, height: 2.05 },
     { center: hw * 0.6, width: 1.3, sill: 0.9, height: 1.2 },
   ] }));
-  // Sides (±X): a window each.
+  // Sides (±X): a window each. Run strictly BETWEEN the front/back walls so the corners
+  // (filled by the full-width front/back walls) don't double up.
+  const sideWallLen = depth - 2 * wallThickness;
   for (const sideX of [-hw + wallThickness * 0.5, hw - wallThickness * 0.5]) {
-    dr(buildWallRun({ axis: 'z', fixed: sideX, runCenter: 0, runLength: depth, baseY: floorTopY, height: wallHeight, thickness: wallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
+    dr(buildWallRun({ axis: 'z', fixed: sideX, runCenter: 0, runLength: sideWallLen, baseY: floorTopY, height: wallHeight, thickness: wallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
       { center: -hd * 0.4, width: 1.3, sill: 0.9, height: 1.2 },
     ] }));
   }
-  // Interior partition on the centerline (z=0): living room (front) | kitchen (back), with a
-  // doorway placed in a clear bay between king posts.
-  dr(buildWallRun({ axis: 'x', fixed: 0, runCenter: 0, runLength: width - 2 * inset, baseY: floorTopY, height: wallHeight, thickness: interiorWallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
+  // Interior partition: living room (front) | kitchen (back). Offset just behind the king
+  // posts so they touch instead of interpenetrate; doorway in a clear bay between posts.
+  const partitionZ = postSize * 0.5 + interiorWallThickness * 0.5;
+  dr(buildWallRun({ axis: 'x', fixed: partitionZ, runCenter: 0, runLength: width - 2 * wallThickness, baseY: floorTopY, height: wallHeight, thickness: interiorWallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
     { center: partitionDoor.center, width: partitionDoor.width, sill: 0, height: partitionDoor.height },
   ] }));
 
@@ -478,14 +496,15 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
     }), HOUSE_PALETTE.roof);
   }
 
-  // ── Gable-end drywall triangles — sized so each course fits UNDER the roof ──
-  const gableCourses = 6;
-  const courseH = (ridgeUndersideY - eaveY) / gableCourses;
+  // ── Gable-end drywall triangles: ABOVE the top plate, each course sized so its top stays
+  // UNDER the sloped roof (touching, never poking through). ──
+  const gableCourses = 5;
+  const gableBaseY = plateTopY;
+  const courseH = (ridgeUndersideY - gableBaseY) / gableCourses;
   for (const sideX of [-hw + wallThickness * 0.5, hw - wallThickness * 0.5]) {
     for (let k = 0; k < gableCourses; k++) {
-      const yBot = eaveY + k * courseH;
+      const yBot = gableBaseY + k * courseH;
       const yTop = yBot + courseH;
-      // Half-width so the course TOP corners stay below the sloped roof underside.
       const halfZ = (ridgeUndersideY - yTop) / slopeRatio;
       if (halfZ < 0.12) continue;
       dr(subdivideBoxFragments({
@@ -537,7 +556,7 @@ function addFurniture(
   const tz = -hd * 0.45;
   const wood = 0x9c6b3f;
   push([box(tx, floorTopY + 0.74, tz, 1.3, 0.06, 0.85, 'furniture')], wood);
-  for (const dx of [-0.55, 0.55]) for (const dz of [-0.36, 0.36]) push([box(tx + dx, floorTopY + 0.37, tz + dz, 0.07, 0.74, 0.07, 'furniture')], wood);
+  for (const dx of [-0.55, 0.55]) for (const dz of [-0.36, 0.36]) push([box(tx + dx, floorTopY + 0.355, tz + dz, 0.07, 0.71, 0.07, 'furniture')], wood);
   const chairOffsets: Array<[number, number]> = [[-0.95, 0], [0.95, 0], [0, -0.7], [0, 0.7]];
   chairOffsets.forEach(([ox, oz], i) => {
     const accent = FURNITURE_ACCENTS[i % FURNITURE_ACCENTS.length];
@@ -547,17 +566,17 @@ function addFurniture(
     for (const lx of [-0.17, 0.17]) for (const lz of [-0.17, 0.17]) push([box(cx + lx, floorTopY + 0.225, cz + lz, 0.05, 0.45, 0.05, 'furniture')], accent);
   });
 
-  // Kitchen counter (back half, +Z) against the back wall.
-  const counterZ = hd - wallThickness - 0.3;
-  const counterX = hw * 0.38;
-  push([box(counterX, floorTopY + 0.45, counterZ, 2.2, 0.9, 0.6, 'furniture')], 0xd9dde0);
-  push([box(counterX, floorTopY + 0.92, counterZ, 2.35, 0.06, 0.66, 'furniture')], wood);
-  // Upper wall cabinet (wall-mounted → 'shelf').
-  push([box(counterX, floorTopY + 1.7, hd - wallThickness - 0.18, 1.7, 0.7, 0.34, 'shelf')], 0xb24c4c);
+  // Kitchen counter (back half, +Z), placed in a clear bay so it doesn't sit on a wall post.
+  const counterX = -hw * 0.72;
+  const counterZ = hd - wallThickness - 0.45;
+  push([box(counterX, floorTopY + 0.45, counterZ, 1.8, 0.9, 0.55, 'furniture')], 0xd9dde0);
+  push([box(counterX, floorTopY + 0.92, counterZ, 1.9, 0.06, 0.6, 'furniture')], wood);
+  // Upper wall cabinet (wall-mounted → 'shelf'), back flush against the back wall.
+  push([box(counterX, floorTopY + 1.7, hd - wallThickness - 0.17, 1.6, 0.7, 0.34, 'shelf')], 0xb24c4c);
 
-  // Wall shelves on the left living-room wall.
-  const shelfX = -hw + wallThickness + 0.14;
-  for (const sy of [1.35, 1.8]) push([box(shelfX, floorTopY + sy, -hd * 0.4, 0.26, 0.04, 0.95, 'shelf')], 0x8b5a2b);
+  // Wall shelves on the left living-room wall (back flush to the wall, clear of the posts).
+  const shelfX = -hw + wallThickness + 0.13;
+  for (const sy of [1.35, 1.8]) push([box(shelfX, floorTopY + sy, -1.0, 0.26, 0.04, 0.95, 'shelf')], 0x8b5a2b);
 }
 
 // ── Voronoi shatter (async path) ────────────────────────────────────────────
@@ -588,7 +607,7 @@ function fractureSelected(
       try {
         const shards = fractureGeometry(f.geometry, {
           fragmentCount: Math.max(2, perPiece), voronoiMode: '3D',
-          worldOffset: f.worldPosition, minHalfExtent: 0.03, pinata,
+          worldOffset: f.worldPosition, minHalfExtent: 0.07, pinata,
         });
         if (shards.length) {
           for (const s of shards) { outF.push({ ...s, isSupport: false, fragmentType: t, density: f.density }); outC.push(nodeColors[i]); }
@@ -632,15 +651,27 @@ export function buildHouseScenario(options: HouseOptions = {}): ScenarioDesc {
  * shards and the sloped roof). Falls back to proximity bonds on any failure.
  */
 export async function buildHouseScenarioAsync(options: HouseOptions = {}): Promise<ScenarioDesc> {
-  const o = { ...DEFAULT_HOUSE_OPTIONS, ...options };
-  const collected = collectHouseFragments(o);
-  let { fragments, nodeColors } = collected;
-
   const mode = options.fracture ?? 'none';
   const types = fractureTypesFor(mode);
+
+  // When fracturing, build a COARSER base grid (bigger boxes, fewer courses) before
+  // shattering each box into a few shards. Otherwise we multiply an already-fine grid and
+  // the chunk/contact count explodes — and the per-frame *contact injection* (not the WASM
+  // stress solve, which stays cheap) becomes the bottleneck. Coarse base × few shards keeps
+  // the total piece count close to the unfractured house while still looking shattered.
+  const coarse = types.size > 0
+    ? {
+        panelCell: options.fractureCellSize ?? 1.05,
+        wallCourses: options.wallCourses ?? 3,
+      }
+    : {};
+  const o = { ...DEFAULT_HOUSE_OPTIONS, ...options, ...coarse };
+
+  const collected = collectHouseFragments(o);
+  let { fragments, nodeColors } = collected;
   if (types.size > 0) {
     if (!options.pinata) await ensurePinataLoaded();
-    ({ fragments, nodeColors } = fractureSelected(fragments, nodeColors, types, options.fragmentsPerPiece ?? 4, options.pinata));
+    ({ fragments, nodeColors } = fractureSelected(fragments, nodeColors, types, options.fragmentsPerPiece ?? 3, options.pinata));
   }
 
   // Fractured shards bond best with the WASM auto-bonder; plain boxes are fine with proximity.
