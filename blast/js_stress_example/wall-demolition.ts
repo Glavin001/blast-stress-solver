@@ -330,9 +330,9 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Shared Physics / Optimization controls (debris collision, friction, restitution, damping,
-// cleanup, TTL). Demo-specific contact-force / skip-single stay wired here.
-mountPhysicsControls({ getCore: () => coreRef });
+// Shared Physics / Optimization / Features controls (injected). This demo keeps its own
+// debug button, so the shared debug toggle is excluded.
+mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
 bindCheckbox('cfg-skip-single', CONFIG.physics, 'skipSingleBodies');
 bindSlider('cfg-max-debris-colliders', physicsConfig, 'maxCollidersForDebris', (v) => v.toFixed(0));
