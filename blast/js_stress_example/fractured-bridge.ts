@@ -18,6 +18,7 @@ import {
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { RECOMMENDED_SLEEP, RECOMMENDED_DAMPING } from './demo-optimization-preset.js';
 import { mountShooter } from './shooter-fps.js';
 import { buildFracturedBridgeScenario } from 'blast-stress-solver/scenarios';
 import { FRACTURED_BRIDGE_DEMO_CONFIG as CONFIG } from './fractured-demo-config.js';
@@ -165,11 +166,10 @@ async function initScene() {
       debrisTtlMs: CONFIG.optimization.debrisTtlMs,
       maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
     },
+    ...RECOMMENDED_SLEEP,
     smallBodyDamping: {
       mode: CONFIG.optimization.smallBodyDampingMode as any,
-      colliderCountThreshold: 3,
-      minLinearDamping: 2,
-      minAngularDamping: 2,
+      ...RECOMMENDED_DAMPING,
     },
     ...pipelineCoreOverrides(),
   });

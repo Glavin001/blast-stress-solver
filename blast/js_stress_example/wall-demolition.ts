@@ -17,6 +17,7 @@ import {
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { RECOMMENDED_SLEEP, RECOMMENDED_DAMPING } from './demo-optimization-preset.js';
 import { mountShooter } from './shooter-fps.js';
 import { buildWallScenario } from 'blast-stress-solver/scenarios';
 
@@ -213,8 +214,10 @@ async function initScene() {
     damage: {
       enabled: false,
     },
+    ...RECOMMENDED_SLEEP,
     smallBodyDamping: {
       mode: CONFIG.optimization.smallBodyDampingMode as any,
+      ...RECOMMENDED_DAMPING,
     },
     debrisCleanup: {
       mode: CONFIG.optimization.debrisCleanupMode as any,

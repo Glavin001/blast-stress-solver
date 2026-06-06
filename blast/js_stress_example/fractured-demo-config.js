@@ -1,3 +1,8 @@
+// NOTE: the sleep settings and the numeric small-body damping thresholds (the
+// A/B-validated "recommended" settling preset) live in ./demo-optimization-preset.js
+// and are spread into each demo's buildDestructibleCore call. Only `smallBodyDampingMode`
+// stays here because it is wired to the UI damping-mode dropdown.
+
 export const FRACTURED_WALL_DEMO_CONFIG = {
   key: 'fractured_wall',
   title: 'Fractured Wall',
