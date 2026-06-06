@@ -20,6 +20,7 @@ import {
   buildFoundationFragments,
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
 import { mountShooter } from './shooter-fps.js';
 import { FRACTURED_WALL_DEMO_CONFIG as CONFIG } from './fractured-demo-config.js';
 
@@ -178,23 +179,9 @@ async function initScene() {
     scenario,
     gravity: CONFIG.solver.gravity,
     materialScale: CONFIG.solver.materialScale,
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.physics.contactForceScale,
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
     skipSingleBodies: CONFIG.physics.skipSingleBodies,
-    damage: { enabled: false },
-    debrisCleanup: {
-      mode: CONFIG.optimization.debrisCleanupMode as any,
-      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
-      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
-    },
-    smallBodyDamping: {
-      mode: CONFIG.optimization.smallBodyDampingMode as any,
-      colliderCountThreshold: 3,
-      minLinearDamping: 2,
-      minAngularDamping: 2,
-    },
+    ...physicsCoreOverrides(),
     ...pipelineCoreOverrides(),
   });
 
@@ -214,7 +201,7 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
 
   coreRef = core;
-  core.setSolverCentrifugalEnabled(centrifugalEnabled);
+  core.setSolverCentrifugalEnabled(physicsConfig.centrifugal);
   recorder.attach(core, { scenario, meta: { demo: 'fractured-wall' } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -234,10 +221,6 @@ document.getElementById('btn-reset')?.addEventListener('click', async () => {
   await initScene();
 });
 
-document.getElementById('cfg-centrifugal')?.addEventListener('change', (e) => {
-  centrifugalEnabled = (e.target as HTMLInputElement).checked;
-  coreRef?.setSolverCentrifugalEnabled(centrifugalEnabled);
-});
 
 document.getElementById('btn-debug')?.addEventListener('click', () => {
   showDebug = !showDebug;
@@ -301,24 +284,12 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Physics controls
-bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) => {
-  coreRef?.setDebrisCollisionMode(v as any);
-});
-bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
-bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));
+// Shared Physics / Optimization controls (debris collision, friction, restitution, damping,
+// cleanup, TTL). Demo-specific contact-force / skip-single / max-debris-colliders stay here.
+mountPhysicsControls({ getCore: () => coreRef });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
 bindCheckbox('cfg-skip-single', CONFIG.physics, 'skipSingleBodies');
-
-// Optimization controls
-bindSelect('cfg-damping-mode', CONFIG.optimization, 'smallBodyDampingMode', (v) => {
-  coreRef?.setSmallBodyDamping?.({ mode: v as any });
-});
-bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) => {
-  coreRef?.setDebrisCleanup?.({ mode: v as any, debrisTtlMs: CONFIG.optimization.debrisTtlMs });
-});
-bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 1000).toFixed(1) + 's');
-bindSlider('cfg-max-debris-colliders', CONFIG.optimization, 'maxCollidersForDebris', (v) => v.toFixed(0));
+bindSlider('cfg-max-debris-colliders', physicsConfig, 'maxCollidersForDebris', (v) => v.toFixed(0));
 
 // ── Render loop ───────────────────────────────────────────────
 
