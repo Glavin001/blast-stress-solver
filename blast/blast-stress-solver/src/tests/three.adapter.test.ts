@@ -12,6 +12,7 @@ import {
   buildChunkMeshesFromGeometries,
   buildBatchedChunkMesh,
   buildBatchedChunkMeshFromGeometries,
+  updateBatchedChunkMesh,
 } from '../three/destructible-adapter';
 import { getScenarioFragmentGeometries } from '../three/scenario';
 import type { ChunkData, DestructibleCore, Vec3 } from '../rapier/types';
@@ -212,5 +213,131 @@ describe('getScenarioFragmentGeometries', () => {
     const result = getScenarioFragmentGeometries(scenario as any);
     // May return [] or null/undefined depending on implementation
     expect(result?.length ?? 0).toBe(0);
+  });
+});
+
+describe('updateBatchedChunkMesh (incremental sync)', () => {
+  function makeFakeBatched() {
+    const matrixWrites: number[] = [];
+    const colorWrites: number[] = [];
+    const visibleWrites: Array<[number, boolean]> = [];
+    const mesh = {
+      setMatrixAt: (id: number, _m: THREE.Matrix4) => void matrixWrites.push(id),
+      setColorAt: (id: number, _c: THREE.Color) => void colorWrites.push(id),
+      setVisibleAt: (id: number, v: boolean) => void visibleWrites.push([id, v]),
+    };
+    const clear = () => {
+      matrixWrites.length = 0;
+      colorWrites.length = 0;
+      visibleWrites.length = 0;
+    };
+    return { mesh, matrixWrites, colorWrites, visibleWrites, clear };
+  }
+
+  const sorted = (a: number[]) => a.slice().sort((x, y) => x - y);
+
+  function posChunk(nodeIndex: number, x: number): ChunkData {
+    const c = makeChunk(nodeIndex, { x, y: 0, z: 0 });
+    c.worldPosition = { x, y: 0, z: 0 };
+    c.worldQuaternion = { x: 0, y: 0, z: 0, w: 1 };
+    return c;
+  }
+
+  function instanceMap(n: number): Map<number, number> {
+    const m = new Map<number, number>();
+    for (let i = 0; i < n; i++) m.set(i, i);
+    return m;
+  }
+
+  it('writes everything on the first frame, then nothing while static', () => {
+    const chunks = [posChunk(0, 0), posChunk(1, 2)];
+    const core = makeMockCore(chunks);
+    const fb = makeFakeBatched();
+    const map = instanceMap(2);
+
+    updateBatchedChunkMesh(core, fb.mesh as any, map);
+    expect(sorted(fb.matrixWrites)).toEqual([0, 1]);
+    expect(fb.visibleWrites).toContainEqual([0, true]);
+    expect(fb.visibleWrites).toContainEqual([1, true]);
+    expect(sorted(fb.colorWrites)).toEqual([0, 1]);
+
+    fb.clear();
+    updateBatchedChunkMesh(core, fb.mesh as any, map);
+    expect(fb.matrixWrites).toEqual([]);
+    expect(fb.colorWrites).toEqual([]);
+    expect(fb.visibleWrites).toEqual([]);
+  });
+
+  it('rewrites only the instance whose world pose changed', () => {
+    const chunks = [posChunk(0, 0), posChunk(1, 2)];
+    const core = makeMockCore(chunks);
+    const fb = makeFakeBatched();
+    const map = instanceMap(2);
+
+    updateBatchedChunkMesh(core, fb.mesh as any, map); // prime
+    fb.clear();
+
+    chunks[1].worldPosition = { x: 5, y: 0, z: 0 }; // only chunk 1 moves
+    updateBatchedChunkMesh(core, fb.mesh as any, map);
+    expect(fb.matrixWrites).toEqual([1]);
+  });
+
+  it('hides a destroyed chunk once and then leaves it alone', () => {
+    const chunks = [posChunk(0, 0), posChunk(1, 2)];
+    const core = makeMockCore(chunks);
+    const fb = makeFakeBatched();
+    const map = instanceMap(2);
+
+    updateBatchedChunkMesh(core, fb.mesh as any, map); // prime (both visible)
+    fb.clear();
+
+    chunks[0].destroyed = true;
+    updateBatchedChunkMesh(core, fb.mesh as any, map);
+    expect(fb.visibleWrites).toEqual([[0, false]]);
+    expect(fb.matrixWrites).not.toContain(0);
+
+    fb.clear();
+    updateBatchedChunkMesh(core, fb.mesh as any, map);
+    expect(fb.visibleWrites).toEqual([]); // already hidden — no repeat write
+  });
+
+  it('recolors on health change without movement when damage is enabled', () => {
+    const chunks = [posChunk(0, 0), posChunk(1, 2)];
+    const health = new Map<number, number>([
+      [0, 100],
+      [1, 100],
+    ]);
+    const core = makeMockCore(chunks) as any;
+    core.damageEnabled = true;
+    core.getNodeHealth = (ni: number) => ({
+      health: health.get(ni) ?? 100,
+      maxHealth: 100,
+      destroyed: false,
+    });
+    const fb = makeFakeBatched();
+    const map = instanceMap(2);
+
+    updateBatchedChunkMesh(core, fb.mesh as any, map); // prime
+    fb.clear();
+
+    health.set(0, 40); // chunk 0 weakens but does not move
+    updateBatchedChunkMesh(core, fb.mesh as any, map);
+    expect(fb.colorWrites).toEqual([0]); // only the damaged instance recolored
+    expect(fb.matrixWrites).toEqual([]); // nothing moved
+  });
+
+  it('recolors every instance when the material-color source toggles off', () => {
+    const chunks = [posChunk(0, 0), posChunk(1, 2)];
+    const core = makeMockCore(chunks);
+    const fb = makeFakeBatched();
+    const map = instanceMap(2);
+    const nodeColors = [new THREE.Color(0xff0000), new THREE.Color(0x00ff00)];
+
+    updateBatchedChunkMesh(core, fb.mesh as any, map, { nodeColors }); // prime w/ material colors
+    fb.clear();
+
+    updateBatchedChunkMesh(core, fb.mesh as any, map, {}); // source changed (array → undefined)
+    expect(sorted(fb.colorWrites)).toEqual([0, 1]);
+    expect(fb.matrixWrites).toEqual([]); // recolor only, no movement
   });
 });
