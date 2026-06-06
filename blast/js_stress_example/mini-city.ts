@@ -80,7 +80,7 @@ const CONFIG = {
     // on big cities; identical while intact and on approach. On by default; toggled live.
     lazyIntactColliders: true,
   },
-  features: { debug: false },
+  features: { debug: false, lodTree: false },
 };
 
 // ── Three.js setup ────────────────────────────────────────────
@@ -399,6 +399,44 @@ let cityGroup: THREE.Group | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let rebuilding = false;
 
+// ── Collision-LOD tree visualizer ─────────────────────────────
+// Draws the hierarchical collision groups: a faint white box per building (root) and a colored
+// wireframe box per leaf region — dim blue while dormant (collider disabled / out of broadphase),
+// bright orange once enabled (materialized by a nearby mover). Watch regions light up as you shoot.
+class LodTreeViz {
+  private group = new THREE.Group();
+  private leafBoxes: THREE.LineSegments[] = [];
+  private dormant = new THREE.LineBasicMaterial({ color: 0x2a5cff, transparent: true, opacity: 0.18 });
+  private active = new THREE.LineBasicMaterial({ color: 0xff8a00, transparent: true, opacity: 0.95 });
+  private rootMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.12 });
+  constructor(private scene: THREE.Scene) { this.group.visible = false; scene.add(this.group); }
+  private boxAt(min: any, max: any, mat: THREE.Material): THREE.LineSegments {
+    const w = Math.max(0.05, max.x - min.x), h = Math.max(0.05, max.y - min.y), d = Math.max(0.05, max.z - min.z);
+    const seg = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(w, h, d)), mat);
+    seg.position.set((min.x + max.x) / 2, (min.y + max.y) / 2, (min.z + max.z) / 2);
+    return seg;
+  }
+  rebuild(core: any) {
+    this.group.clear();
+    this.leafBoxes = [];
+    const nodes = core?.getCollisionLodNodes?.() ?? [];
+    for (const n of nodes) {
+      if (n.depth === 0) this.group.add(this.boxAt(n.aabbMin, n.aabbMax, this.rootMat)); // building outline
+      if (n.leaf) { const b = this.boxAt(n.aabbMin, n.aabbMax, this.dormant); this.group.add(b); this.leafBoxes.push(b); }
+    }
+  }
+  update(core: any) {
+    if (!this.group.visible) return;
+    const nodes = (core?.getCollisionLodNodes?.() ?? []).filter((n: any) => n.leaf);
+    for (let i = 0; i < this.leafBoxes.length && i < nodes.length; i++) {
+      this.leafBoxes[i].material = nodes[i].enabled ? this.active : this.dormant;
+    }
+  }
+  setEnabled(on: boolean) { this.group.visible = on; }
+  dispose() { this.scene.remove(this.group); this.group.clear(); }
+}
+let lodViz: LodTreeViz | null = null;
+
 async function initScene() {
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
   if (hint) hint.textContent = 'Building city…';
@@ -451,6 +489,11 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, {
     enabled: CONFIG.features.debug,
   });
+
+  lodViz?.dispose();
+  lodViz = new LodTreeViz(scene);
+  lodViz.rebuild(core);
+  lodViz.setEnabled(CONFIG.features.lodTree);
 
   coreRef = core;
   core.setIslandSolver?.({ enabled: CONFIG.optimization.islandSolver }); // persist the toggle across rebuilds
@@ -722,6 +765,12 @@ document.getElementById('btn-debug')?.addEventListener('click', () => {
   const btn = document.getElementById('btn-debug')!;
   btn.textContent = CONFIG.features.debug ? '◈ Hide Debug' : '◇ Show Debug';
 });
+document.getElementById('btn-lod')?.addEventListener('click', () => {
+  CONFIG.features.lodTree = !CONFIG.features.lodTree;
+  lodViz?.setEnabled(CONFIG.features.lodTree);
+  const btn = document.getElementById('btn-lod')!;
+  btn.textContent = CONFIG.features.lodTree ? '◧ Hide LOD Tree' : '◫ Show LOD Tree';
+});
 
 // ── Render loop ───────────────────────────────────────────────
 const clock = new THREE.Clock();
@@ -749,6 +798,7 @@ function loop() {
     _physicsMs += (performance.now() - t0 - _physicsMs) * EMA;
     visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true });
     rapierDebug?.update();
+    lodViz?.update(coreRef);
     updateStatus(coreRef);
     recorder.render();
   }

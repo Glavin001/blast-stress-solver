@@ -400,6 +400,9 @@ export type DestructibleCore = {
   /** Lazy-collider status: buildings dormant vs hit (≥1 enabled leaf), and total fragments
    *  currently active in the broadphase (the LOD locality metric). */
   getLazyColliderStats?: () => { enabled: boolean; buildingCount: number; dormantCount: number; explodedCount: number; activeLeafFragments: number };
+  /** Snapshot of the collision-LOD tree nodes for visualization/debug (depth, leaf flag, live
+   *  enabled state, building id, fragment count, world-space AABB). */
+  getCollisionLodNodes?: () => Array<{ depth: number; leaf: boolean; enabled: boolean; buildingId: number; fragmentCount: number; aabbMin: Vec3; aabbMax: Vec3 }>;
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

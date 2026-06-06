@@ -2622,6 +2622,27 @@ export async function buildDestructibleCore({
     };
   }
 
+  // Snapshot the LOD tree for visualization/debug: one entry per node with its depth, whether it
+  // is a leaf, its live `enabled` (active-in-broadphase) state, building id, fragment count, and
+  // world-space AABB (the colliders live on the fixed root at the origin, so the AABB is world).
+  function getCollisionLodNodes() {
+    const out: Array<{ depth: number; leaf: boolean; enabled: boolean; buildingId: number; fragmentCount: number; aabbMin: Vec3; aabbMax: Vec3 }> = [];
+    const visit = (node: LodNode, depth: number) => {
+      out.push({
+        depth,
+        leaf: node.children.length === 0,
+        enabled: node.enabled,
+        buildingId: node.buildingId,
+        fragmentCount: node.children.length === 0 ? node.fragments.length : 0,
+        aabbMin: { ...node.aabbMin },
+        aabbMax: { ...node.aabbMax },
+      });
+      for (const ch of node.children) visit(ch, depth + 1);
+    };
+    for (const root of lodRoots) visit(root, 0);
+    return out;
+  }
+
   // Predictive enable pass — runs BEFORE world.step. For each mover, descend the LOD tree and enable
   // only the LEAVES whose AABB its swept box overlaps; non-overlapped subtrees stay dormant. A
   // localized hit therefore materializes only the struck region's colliders. Conservative by
@@ -3220,6 +3241,7 @@ export async function buildDestructibleCore({
     getIslandSolverStats,
     setLazyIntactColliders,
     getLazyColliderStats,
+    getCollisionLodNodes,
     getSolverDebugLines,
     getNodeBonds,
     cutBond,
