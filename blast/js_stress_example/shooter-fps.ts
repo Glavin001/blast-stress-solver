@@ -185,6 +185,12 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     const ud = col.parent()?.userData as { projectile?: boolean; stickyExplosive?: boolean } | undefined;
     return !(ud && (ud.projectile || ud.stickyExplosive));
   };
+  // The chase-camera occlusion ray ignores projectiles/charges (the car itself is
+  // excluded via the cast's exclude-body arg), so only real structure pulls the camera in.
+  const camRayFilter = (col: RAPIER.Collider): boolean => {
+    const ud = col.parent()?.userData as { projectile?: boolean; stickyExplosive?: boolean } | undefined;
+    return !(ud && (ud.projectile || ud.stickyExplosive));
+  };
 
   // Scratch objects (avoid per-frame allocation on the hot path).
   const _ray = new THREE.Raycaster();
@@ -198,6 +204,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   const _v = new THREE.Vector3();
   const _v2 = new THREE.Vector3();
   const _look = new THREE.Vector3();
+  const _camDir = new THREE.Vector3();
   const UP = new THREE.Vector3(0, 1, 0);
 
   // ── Camera headlamp ─────────────────────────────────────────────
@@ -999,6 +1006,13 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
 
     vehicle.applyControls({ throttle, brake: 0, steer, handbrake });
     vehicle.step(dt); // sets wheels + updateVehicle(dt); impulses integrate next core.step
+    // Safety net: if the car tunnels through the ground (rare glitch), drop it back
+    // onto the surface at the spawn instead of losing it to an endless fall.
+    const cp = vehicle.chassisBody().translation();
+    if (!Number.isFinite(cp.y) || cp.y < floorY - 6) {
+      const sp = carSpawnPoint();
+      vehicle.placeAt(sp.position, sp.headingY);
+    }
     vehicle.syncMeshes();
     updateChaseCamera(dt);
 
@@ -1010,6 +1024,8 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
 
   // Third-person follow camera: behind + above the car along its heading,
   // smoothed; mouse drag (while pointer-locked) orbits and decays back to centre.
+  // A ray from the car to the ideal camera spot pulls the camera in when a wall is
+  // in the way, so the car stays visible even while driving through a building.
   function updateChaseCamera(dt: number) {
     if (!vehicle) return;
     const body = vehicle.chassisBody();
@@ -1021,10 +1037,34 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     const ang = yawCar + camOrbitYaw;
     const fx = Math.sin(ang);
     const fz = Math.cos(ang);
+    // Pivot just above the car; ideal camera spot behind + above it.
+    _v2.set(p.x, p.y + cfg.chase.look, p.z);
     _v.set(p.x - fx * cfg.chase.dist, p.y + cfg.chase.height, p.z - fz * cfg.chase.dist);
     if (_v.y < floorY + 0.6) _v.y = floorY + 0.6; // never sink under the ground
-    camera.position.lerp(_v, 1 - Math.exp(-cfg.chase.lerp * dt));
-    _v2.set(p.x, p.y + cfg.chase.look, p.z);
+
+    // Occlusion: pull the camera in to just before any structure between it and the car.
+    const core = getCore();
+    if (core) {
+      const world = core.world as RAPIER.World;
+      _camDir.set(_v.x - _v2.x, _v.y - _v2.y, _v.z - _v2.z);
+      const want = _camDir.length();
+      if (want > 1e-3) {
+        _camDir.multiplyScalar(1 / want);
+        const ray = new RAPIER.Ray(
+          { x: _v2.x, y: _v2.y, z: _v2.z },
+          { x: _camDir.x, y: _camDir.y, z: _camDir.z },
+        );
+        const hit = world.castRay(ray, want, true, undefined, undefined, undefined, body, camRayFilter);
+        if (hit) {
+          const d = Math.max(0.6, hit.timeOfImpact - 0.35); // keep a small gap off the wall
+          _v.set(_v2.x + _camDir.x * d, _v2.y + _camDir.y * d, _v2.z + _camDir.z * d);
+        }
+      }
+    }
+
+    // Snap inward fast (so a wall can't clip across the view) but ease back out slowly.
+    const lerpRate = _v.distanceTo(_v2) < camera.position.distanceTo(_v2) ? 24 : cfg.chase.lerp;
+    camera.position.lerp(_v, 1 - Math.exp(-lerpRate * dt));
     camera.lookAt(_v2);
   }
 

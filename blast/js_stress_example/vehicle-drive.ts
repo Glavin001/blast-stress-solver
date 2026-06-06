@@ -109,6 +109,8 @@ export type VehicleHandle = {
   speedKmh: () => number;
   /** Flip the car upright in place (frees a rolled / stuck car). */
   recover: () => void;
+  /** Teleport to a position + heading with zero velocity (e.g. fell through the world). */
+  placeAt: (position: { x: number; y: number; z: number }, headingY: number) => void;
   /** Remove + dispose the meshes only (safe after the Rapier world is gone). */
   disposeVisuals: () => void;
   /** Full teardown: remove the controller + body from the (live) world, then meshes. */
@@ -354,6 +356,13 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
     chassis.setAngvel({ x: 0, y: 0, z: 0 }, true);
   }
 
+  function placeAt(position: { x: number; y: number; z: number }, headingY: number) {
+    chassis.setTranslation(position, true);
+    chassis.setRotation(yawQuat(headingY), true);
+    chassis.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    chassis.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  }
+
   function disposeVisuals() {
     scene.remove(chassisMesh);
     for (const m of wheelMeshes) scene.remove(m);
@@ -391,6 +400,7 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
     chassisBody: () => chassis,
     speedKmh,
     recover,
+    placeAt,
     disposeVisuals,
     dispose,
   };

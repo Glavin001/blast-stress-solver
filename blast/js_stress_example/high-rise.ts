@@ -44,7 +44,8 @@ const CONFIG = {
     columnsZ: 3,
     // Voronoi-fracture the drywall infill walls (auto-bonded via WASM) instead of
     // the regular box grid. Heavier to build, but the walls shatter realistically.
-    fractureWalls: false,
+    // On by default so the infill walls are bonded shards you can drive through.
+    fractureWalls: true,
     // Voronoi shards per concrete support pillar (column) storey-segment. 1 = solid
     // box (default skeleton); >1 shatters each segment (auto-bonded via WASM).
     pillarFractures: 2,
@@ -54,7 +55,8 @@ const CONFIG = {
     gravity: -9.81,
     // Multiplier on the pack's concrete stress limits: >1 = stronger / harder to break,
     // <1 = more fragile. This is the "material strength" knob (clearer than materialScale).
-    strength: 1.0,
+    // Default 3× so the high-rise stays standing instead of collapsing at the first nudge.
+    strength: 3.0,
     // Couples projectile impacts into the *stress* solver. Kept low by default: the
     // high-rise's stress response is near-bimodal, and a high value lets one hit seed a
     // slow global collapse. Raise it for a more impact-reactive (and collapse-prone) frame.
