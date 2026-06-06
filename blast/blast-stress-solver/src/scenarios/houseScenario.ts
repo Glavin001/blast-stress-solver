@@ -404,8 +404,12 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
   for (const z of interZs) { push(buildPost(leftX, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); push(buildPost(rightX, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); }
 
   // Ridge "king posts": interior posts on the centerline (z=0) rising floor → ridge. These
-  // (plus the gable-end posts) carry the ridge beam — the dispersed roof support.
-  const kingXs = linspace(leftX, rightX, Math.max(2, Math.round(ridgePosts)));
+  // (plus the gable-end posts) carry the ridge beam — the dispersed roof support. Any post
+  // that would block the interior doorway is dropped (the neighbours carry that bay).
+  const partitionDoor = { center: -1.2, width: 1.0, height: 2.1 };
+  const kingXs = linspace(leftX, rightX, Math.max(2, Math.round(ridgePosts))).filter(
+    (x) => Math.abs(x - partitionDoor.center) > partitionDoor.width * 0.5 + postSize,
+  );
   for (const x of kingXs) push(buildPost(x, 0, floorTopY, ridgeUndersideY, postSize, panelCell), HOUSE_PALETTE.column);
 
   // ── Beams: top-plate ring (on eave posts) + ridge beam (on king posts) ────
@@ -453,9 +457,10 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
       { center: -hd * 0.4, width: 1.3, sill: 0.9, height: 1.2 },
     ] }));
   }
-  // Interior partition on the centerline (z=0): living room (front) | kitchen (back), with a doorway.
+  // Interior partition on the centerline (z=0): living room (front) | kitchen (back), with a
+  // doorway placed in a clear bay between king posts.
   dr(buildWallRun({ axis: 'x', fixed: 0, runCenter: 0, runLength: width - 2 * inset, baseY: floorTopY, height: wallHeight, thickness: interiorWallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
-    { center: -hw * 0.45, width: 1.1, sill: 0, height: 2.1 },
+    { center: partitionDoor.center, width: partitionDoor.width, sill: 0, height: partitionDoor.height },
   ] }));
 
   // ── Gabled roof (two sloped planes; everything below fits UNDER it) ────────
