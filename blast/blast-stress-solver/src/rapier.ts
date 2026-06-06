@@ -7,6 +7,7 @@ export * from './rapier/frameProfilerOverlay';
 export * from './rapier/sessionRecorder';
 export * from './rapier/recordingOverlay';
 export * from './rapier/collisionGroups';
+export * from './rapier/collisionTree';
 export * from './rapier/contactBuffer';
 export * from './rapier/contactHelpers';
 export * from './rapier/scenePackLoader';

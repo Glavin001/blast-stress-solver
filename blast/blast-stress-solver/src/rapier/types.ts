@@ -123,6 +123,21 @@ export type ScenarioBond = {
   area: number;
 };
 
+/**
+ * Optional hierarchical collision-LOD grouping, layered ON TOP OF the flat nodes[]/bonds[]
+ * (which remain the authoritative stress graph). Each root is one "building"; internal nodes have
+ * `children`; leaves carry `fragments` (indices into `nodes`). Used only by `lazyIntactColliders`
+ * to descend the collider frontier at the granularity of the structure (building → wall/floor →
+ * fragment) so a localized hit only materializes the struck region's colliders. It is orthogonal
+ * to bonds and CANNOT change which fractures happen. Build one by hand from authoring data, or via
+ * `buildSpatialCollisionTree`. If omitted, the core groups by bond-connected component (one flat
+ * leaf per building) — identical to non-hierarchical behavior.
+ */
+export type CollisionGroup = {
+  children?: CollisionGroup[];
+  fragments?: number[];
+};
+
 export type ScenarioDesc = {
   nodes: ScenarioNode[];
   bonds: ScenarioBond[];
@@ -132,6 +147,8 @@ export type ScenarioDesc = {
   // Optional per-node collider descriptors (one entry per node index). If omitted or entry returns null,
   // the core falls back to a box collider sized from the node (nodeSize).
   colliderDescForNode?: Array<ColliderDescBuilder | null>;
+  // Optional collision-LOD tree (see CollisionGroup). One entry per top-level building.
+  collisionTree?: CollisionGroup[];
 };
 
 export type ChunkData = {
@@ -380,8 +397,9 @@ export type DestructibleCore = {
   /** Toggle collision-dormant intact buildings at runtime (off ⇒ materialize all per-fragment
    *  colliders; on ⇒ collapse still-intact buildings back to proxy hulls). */
   setLazyIntactColliders?: (enabled: boolean) => void;
-  /** Lazy-collider status: how many buildings are dormant (proxy) vs exploded (per-fragment). */
-  getLazyColliderStats?: () => { enabled: boolean; buildingCount: number; dormantCount: number; explodedCount: number };
+  /** Lazy-collider status: buildings dormant vs hit (≥1 enabled leaf), and total fragments
+   *  currently active in the broadphase (the LOD locality metric). */
+  getLazyColliderStats?: () => { enabled: boolean; buildingCount: number; dormantCount: number; explodedCount: number; activeLeafFragments: number };
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

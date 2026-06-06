@@ -59,37 +59,47 @@ live sidebar toggle is the escape hatch if a specific shot needs the all-collide
 
 These properties are pinned by `src/tests/rapier.lazy-colliders.test.ts`.
 
-## Next step: hierarchical `collisionTree` (opt-in)
-Today's descent is binary: a building is fully dormant or fully exploded. For tall/complex
-structures a single corner hit materialises *all* fragments. We have hierarchical authoring
-knowledge (building → wall/floor/column → fragment) we currently discard in the merge.
+## Hierarchical collision LOD via `collisionTree` (implemented)
+The original descent was binary: a building was fully dormant or fully enabled, so one corner hit
+on a tall structure materialised *all* its fragments. The collider frontier now descends a
+**hierarchical LOD tree**, so a localized hit only enables the struck region.
 
 **Opt-in input**, orthogonal to the (unchanged) flat `nodes[]`/`bonds[]`:
 ```ts
 type CollisionGroup = { children?: CollisionGroup[]; fragments?: number[] };
-scenario.collisionTree?: CollisionGroup[];   // one root per building; absent ⇒ union-find fallback
+scenario.collisionTree?: CollisionGroup[];   // one root per building; absent ⇒ bond-component fallback
 ```
-**Active set = a frontier (cut) through the tree.** Precompute each node's AABB (= union of
-descendant fragment AABBs). The predictive test descends **only where movers are**:
+The runtime builds a tree of `LodNode`s (one root per building), each caching its AABB (= union of
+descendant fragment AABBs). `enabled` means "every leaf collider under this node is active". The
+**active set is the frontier** (the enabled cut). `predictiveExplodePass` descends per mover:
 ```
-mover swept-AABB vs building AABBs → for each overlap, vs its element AABBs → enable that
-element's fragment colliders (descend to leaves); prune subtrees with no mover overlap.
+mover swept-AABB vs node AABB → no overlap: prune subtree
+                              → overlap, internal node: recurse into children
+                              → overlap, leaf: enable that leaf's fragment colliders
 ```
-- **Locality:** a corner hit on a 1000-fragment high-rise enables only the struck wall's ~20
-  fragments; cost tracks *damage extent*, not structure size. The test is O(log) per mover.
-- **Same equivalence profile** as today (it also enables before contact): correctness +
-  determinism always; bit-identity for idle/approach/rigid; warm-start chaos only in soft
-  mega-shatters. The hierarchy is a *performance-locality* win, not an equivalence change — and
-  because it's orthogonal to the bond graph, it **cannot** alter fracture output by construction.
-- **Migration:** `buildFracturedTowerScenario` already knows wall/floor/column membership; the
-  merge currently throws it away. Emit a `collisionTree` and migrate mini-city, then others.
+Non-overlapped subtrees stay dormant; fully-enabled subtrees are pruned. Conservative by
+construction (a node AABB encloses all its real colliders) so it never misses.
 
-### Implementation sketch (mostly generalising existing machinery)
-- Replace `IntactBuilding` with a tree node carrying `{ children?, fragments?, aabbMin/Max, active }`.
-- `predictiveExplodePass` recurses the tree per mover instead of scanning a flat building list.
-- `explodeBuilding(node)` enables the node's leaf colliders (or descends one level), reusing
-  `setBuildingCollidersEnabled`.
-- Stats report frontier depth / active-leaf count per building.
+- **Measured locality:** a 4 t projectile into the **high-rise (930 fragments, 30 m tall)** with a
+  spatial tree (`leafMaxFragments: 32`) activates only **58/930 fragments (6 %)** — the struck
+  region — versus 100 % for the binary whole-building enable. The descent is O(log) per mover.
+- **Same equivalence profile:** correctness + determinism always; bit-identity for idle / approach /
+  rigid impacts; warm-start chaos only in soft mega-shatters. The hierarchy is a *performance-
+  locality* win, not an equivalence change — orthogonal to the bond graph, it **cannot** alter
+  fracture output by construction. (Pinned by the `Hierarchical collision LOD` tests.)
+- **Building a tree:** author one by hand, or call the exported `buildSpatialCollisionTree(scenario,
+  { leafMaxFragments })` — a shape-agnostic balanced median-split per bond-connected component (no
+  authoring metadata needed). mini-city uses it (`leafMaxFragments: 24`); absent a tree, the core
+  falls back to one flat leaf per building (the original binary behavior).
+
+### Implementation (in `destructible-core.ts` + `collisionTree.ts`)
+- `LodNode { children, fragments, aabbMin/Max, enabled, buildingId }`; `lodRoots[]` + `buildingOfNode`.
+- `ensureLodRoots` builds from `scenario.collisionTree` (recursively) or the bond-component fallback.
+- `predictiveExplodePass` → `descendForMover` recurses per mover; `enableSubtree`/`disableSubtree`
+  toggle leaf colliders; `getLazyColliderStats` reports `activeLeafFragments` (the locality metric).
+- A fracturing building no longer force-enables its whole self: a splitting fragment gets its
+  collider on its new dynamic body via `flushColliderMigrations`, and the still-bonded remainder
+  stays dormant until a mover (incl. falling debris) actually approaches it — preserving locality.
 
 ## Not pursued (and why)
 - **Merged/trimesh/convex-hull intact colliders:** change the contact set → fail "real-geometry

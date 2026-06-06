@@ -173,3 +173,91 @@ describe.skipIf(!runtimeAvailable)('Lazy intact colliders', () => {
     core.dispose?.();
   });
 });
+
+describe.skipIf(!runtimeAvailable)('Hierarchical collision LOD (collisionTree)', () => {
+  it('a localized hit on a tall structure activates only the struck region (not the whole building)', async () => {
+    const { rapier, scen } = await load();
+    const built = await (scen.buildHighRiseScenarioAsync ?? scen.buildHighRiseScenario)({});
+    const scenario = ((built as any).nodes ? built : (built as any).scenario) as ScenarioDesc;
+    // Opt-in spatial LOD tree: building → balanced sub-regions (≤32 fragments per leaf).
+    scenario.collisionTree = rapier.buildSpatialCollisionTree(scenario, { leafMaxFragments: 32 });
+
+    const core = await rapier.buildDestructibleCore({ scenario, ...OPTS, materialScale: 1e10, lazyIntactColliders: true });
+    const dt = 1 / 60;
+    for (let i = 0; i < 20; i++) core.step(dt);
+    expect(core.getLazyColliderStats!().activeLeafFragments).toBe(0); // fully dormant at rest
+
+    // Hit the lower part horizontally.
+    let ymin = Infinity, ymax = -Infinity;
+    for (const n of scenario.nodes) { ymin = Math.min(ymin, n.centroid.y); ymax = Math.max(ymax, n.centroid.y); }
+    core.enqueueProjectile({ position: { x: 0, y: ymin + (ymax - ymin) * 0.15, z: -40 }, velocity: { x: 0, y: 0, z: 80 }, radius: 0.8, mass: 4000, ttl: 4000 });
+
+    let firstActive = 0;
+    for (let f = 0; f < 60; f++) { core.step(dt); const a = core.getLazyColliderStats!().activeLeafFragments; if (a > 0 && firstActive === 0) firstActive = a; }
+    // Only the struck region descended — a small fraction of the 900+ fragment tower, not all of it.
+    expect(firstActive).toBeGreaterThan(0);
+    expect(firstActive).toBeLessThan(scenario.nodes.length * 0.5);
+
+    core.dispose?.();
+  });
+
+  it('with a tree, a hit on one building leaves the others fully dormant, and is bit-identical to eager (rigid)', async () => {
+    const { rapier, scen } = await load();
+    const template = await scen.buildTowerScenario({ width: 8, depth: 8, floorCount: 3, floorHeight: 3 });
+    // Three towers; hit the middle one.
+    const scenario = mergeCity(template, [{ x: -40, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }, { x: 40, y: 0, z: 0 }]);
+    scenario.collisionTree = rapier.buildSpatialCollisionTree(scenario, { leafMaxFragments: 24 });
+    const dt = 1 / 60;
+    function fire(core: Awaited<ReturnType<typeof rapier.buildDestructibleCore>>) {
+      for (let i = 0; i < 15; i++) core.step(dt);
+      core.enqueueProjectile({ position: { x: 0, y: 5, z: -22 }, velocity: { x: 0, y: 0, z: 90 }, radius: 0.7, mass: 9000, ttl: 3000 });
+      const frames: Array<Array<{ x: number; y: number; z: number } | null>> = [];
+      for (let f = 0; f < 40; f++) { core.step(dt); frames.push(core.chunks.map((c: any) => c.worldPosition ? { ...c.worldPosition } : null)); }
+      return frames;
+    }
+    const lazy = await rapier.buildDestructibleCore({ scenario, ...OPTS, materialScale: 1e10, lazyIntactColliders: true });
+    const eager = await rapier.buildDestructibleCore({ scenario, ...OPTS, materialScale: 1e10, lazyIntactColliders: false });
+    const lf = fire(lazy), ef = fire(eager);
+
+    const lz = lazy.getLazyColliderStats!();
+    expect(lz.buildingCount).toBe(3);
+    expect(lz.explodedCount).toBeGreaterThanOrEqual(1);
+    expect(lz.dormantCount).toBeGreaterThanOrEqual(1); // ≥1 untouched tower stayed fully dormant
+    // The hit tower only partially descended: fewer active fragments than a whole tower.
+    expect(lz.activeLeafFragments).toBeLessThan(template.nodes.length);
+
+    let maxDelta = 0;
+    for (let f = 0; f < lf.length; f++)
+      for (let i = 0; i < lf[f].length; i++) {
+        const a = lf[f][i], b = ef[f][i];
+        if (a && b) maxDelta = Math.max(maxDelta, Math.abs(a.x - b.x), Math.abs(a.y - b.y), Math.abs(a.z - b.z));
+      }
+    expect(lazy.getRigidBodyCount()).toBe(eager.getRigidBodyCount()); // topology identical
+    expect(maxDelta).toBeLessThan(1e-6);                               // and bit-identical (rigid)
+
+    lazy.dispose?.(); eager.dispose?.();
+  });
+
+  it('honors an explicit hand-authored collisionTree (descends only the overlapped leaf)', async () => {
+    const { rapier, scen } = await load();
+    const template = await scen.buildTowerScenario({ width: 8, depth: 8, floorCount: 3, floorHeight: 3 });
+    const scenario = mergeCity(template, [{ x: -40, y: 0, z: 0 }, { x: 40, y: 0, z: 0 }]);
+    // Author one root per tower (split by node-index range), so a hit on tower 0 cannot touch tower 1.
+    const half = template.nodes.length;
+    const range = (a: number, b: number) => Array.from({ length: b - a }, (_, i) => a + i);
+    scenario.collisionTree = [
+      { fragments: range(0, half) },
+      { fragments: range(half, half * 2) },
+    ];
+    const core = await rapier.buildDestructibleCore({ scenario, ...OPTS, materialScale: 1e10, lazyIntactColliders: true });
+    const dt = 1 / 60;
+    for (let i = 0; i < 15; i++) core.step(dt);
+    expect(core.getLazyColliderStats!().buildingCount).toBe(2);
+    core.enqueueProjectile({ position: { x: -40, y: 5, z: -22 }, velocity: { x: 0, y: 0, z: 90 }, radius: 0.7, mass: 9000, ttl: 3000 });
+    for (let f = 0; f < 30; f++) core.step(dt);
+    const lz = core.getLazyColliderStats!();
+    expect(lz.explodedCount).toBe(1);  // only the struck root
+    expect(lz.dormantCount).toBe(1);   // the other authored root stayed dormant
+    core.dispose?.();
+  });
+});

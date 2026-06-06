@@ -22,7 +22,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import * as pinata from '@dgreenheck/three-pinata';
-import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay, buildSpatialCollisionTree } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
@@ -163,7 +163,7 @@ function updateStatus(core: any) {
   const isl = core.getIslandSolverStats?.();
   setText('stat-islands', isl?.enabled ? `${isl.islandsSkipped}/${isl.islandCount} skipped` : 'off');
   const lz = core.getLazyColliderStats?.();
-  setText('stat-lazy', lz?.enabled ? `${lz.dormantCount} dormant / ${lz.explodedCount} hit` : 'off');
+  setText('stat-lazy', lz?.enabled ? `${lz.dormantCount} dormant / ${lz.explodedCount} hit · ${lz.activeLeafFragments} active` : 'off');
 }
 function updatePerf() {
   setText('stat-physics-ms', _physicsMs.toFixed(1) + ' ms');
@@ -404,6 +404,10 @@ async function initScene() {
   if (hint) hint.textContent = 'Building city…';
 
   const scenario = await buildCity();
+  // Hierarchical collision-LOD: split each building into balanced sub-regions so a localized hit
+  // only materializes the struck region's colliders (the rest stay dormant). Orthogonal to the bond
+  // graph — cannot change fracture output; only consumed when lazyIntactColliders is on.
+  (scenario as any).collisionTree = buildSpatialCollisionTree(scenario, { leafMaxFragments: 24 });
   console.log(
     `Mini-city: ${buildings.length} buildings, ${scenario.nodes.length} nodes, ${scenario.bonds.length} bonds`,
   );

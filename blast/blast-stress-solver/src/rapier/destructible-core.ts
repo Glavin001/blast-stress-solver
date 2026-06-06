@@ -642,8 +642,19 @@ export async function buildDestructibleCore({
   // When on, an intact building (a connected component of the initial bond graph) carries ONE
   // cheap convex-hull proxy collider on the fixed root instead of one collider per fragment.
   let lazyIntactCollidersEnabled = !!lazyIntactColliders;
-  type IntactBuilding = { id: number; nodeIndices: number[]; aabbMin: Vec3; aabbMax: Vec3; exploded: boolean };
-  const intactBuildings: IntactBuilding[] = [];
+  // Collision-LOD tree. Each root is a building; internal nodes group sub-regions; leaves carry
+  // fragments. `enabled` = "every leaf collider under this node is active in the broadphase". A
+  // dormant building has all leaves disabled; a mover descends the tree (predictiveExplodePass) and
+  // enables only the overlapped leaves, so a localized hit materializes only the struck region's
+  // colliders. Sourced from scenario.collisionTree, else one flat leaf per bond-connected component.
+  type LodNode = {
+    children: LodNode[];
+    fragments: number[];
+    aabbMin: Vec3; aabbMax: Vec3;
+    enabled: boolean;
+    buildingId: number;
+  };
+  const lodRoots: LodNode[] = [];
   const buildingOfNode = new Int32Array(scenario.nodes.length).fill(-1);
 
   // Create a single per-fragment collider for `chunk` on the fixed root — the real (intact/
@@ -683,9 +694,9 @@ export async function buildDestructibleCore({
     };
 
     // Always create the real per-fragment collider (identical handles/order to the eager path, so
-    // an exploded building's contacts solve bit-for-bit the same). In lazy mode these are then
-    // DISABLED (excluded from the broadphase — far cheaper) and a sensor proxy stands in until the
-    // building is hit, at which point the real colliders are simply re-enabled.
+    // an enabled building's contacts solve bit-for-bit the same). In lazy mode these are then
+    // DISABLED (excluded from the broadphase — far cheaper) and re-enabled per-region, just in time,
+    // when a mover approaches (see predictiveExplodePass).
     createIntactFragmentCollider(chunk);
     registerNodeBodyLink(nodeIndex, chunk.bodyHandle);
     chunks.push(chunk);
@@ -2222,16 +2233,11 @@ export async function buildDestructibleCore({
     // is where the cached actor list (used by the batched gravity path) must be
     // invalidated.
     if (splitEvents.length > 0) solverActorsDirty = true;
-    // Safety net (lazy intact colliders): if a building fractures from a non-contact cause (e.g.
-    // gravity) while still dormant, materialize its real colliders first so the split has
-    // colliders to migrate. Idempotent — the contact path has usually already exploded it.
-    if (lazyIntactCollidersEnabled && splitEvents.length > 0) {
-      for (const split of splitEvents) {
-        for (const child of split.children) {
-          if (child.nodes && child.nodes.length) ensureBuildingExplodedForNode(child.nodes[0]);
-        }
-      }
-    }
+    // Note (lazy intact colliders): we do NOT enable the rest of a building when one of its
+    // fragments fractures — that would defeat per-region locality. A splitting fragment's collider
+    // is (re)created enabled on its new dynamic body by flushColliderMigrations regardless of LOD
+    // state; the still-bonded remainder stays dormant until a mover (incl. falling debris) actually
+    // approaches it, at which point predictiveExplodePass enables just that region.
     for (const split of splitEvents) {
       const parentActorIndex = split.parentActorIndex;
       const parentEntry = actorMap.get(parentActorIndex);
@@ -2463,15 +2469,15 @@ export async function buildDestructibleCore({
     return false;
   }
 
-  // ── Lazy intact building proxies + just-in-time explode ──
+  // ── Lazy intact colliders: hierarchical LOD tree + just-in-time enable ──
 
-  // Compute a building's world-space AABB from its fragments' AABBs (static while intact). Used as
-  // the conservative enclosing volume for the predictive enable test: every fragment's real
-  // collider (a convex hull) fits inside its fragment AABB, so the building AABB encloses all of
-  // them — a mover cannot touch any real collider without first overlapping the building AABB.
-  function computeBuildingAabb(building: IntactBuilding) {
+  // A leaf fragment's real collider (a convex hull) fits inside its fragment AABB, so a node's AABB
+  // (union of descendant fragment AABBs) conservatively encloses all of its real colliders — a
+  // mover cannot touch any of them without first overlapping the node AABB. Hence the predictive
+  // test can prune whole subtrees and still never miss.
+  function aabbOfFragments(fragments: number[]): { aabbMin: Vec3; aabbMax: Vec3 } {
     let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-    for (const ni of building.nodeIndices) {
+    for (const ni of fragments) {
       const c = chunks[ni];
       if (!c) continue;
       const ox = c.localOffset.x, oy = c.localOffset.y, oz = c.localOffset.z;
@@ -2479,14 +2485,44 @@ export async function buildDestructibleCore({
       if (ox - hx < minX) minX = ox - hx; if (oy - hy < minY) minY = oy - hy; if (oz - hz < minZ) minZ = oz - hz;
       if (ox + hx > maxX) maxX = ox + hx; if (oy + hy > maxY) maxY = oy + hy; if (oz + hz > maxZ) maxZ = oz + hz;
     }
-    building.aabbMin = { x: minX, y: minY, z: minZ };
-    building.aabbMax = { x: maxX, y: maxY, z: maxZ };
+    return { aabbMin: { x: minX, y: minY, z: minZ }, aabbMax: { x: maxX, y: maxY, z: maxZ } };
   }
 
-  // Group nodes into buildings = connected components of the initial bond graph (supports
-  // included, so a foundation keeps its tower as one physical building). Computed once and reused.
-  function ensureBuildingGroups() {
-    if (intactBuildings.length > 0) return;
+  // Build a runtime LodNode (recursively) from an authored CollisionGroup, assigning every
+  // descendant fragment to `buildingId`. AABBs are unioned bottom-up.
+  function buildLodNodeFromGroup(group: { children?: unknown[]; fragments?: number[] }, buildingId: number): LodNode {
+    const childGroups = (group.children ?? []) as Array<{ children?: unknown[]; fragments?: number[] }>;
+    if (childGroups.length > 0) {
+      const children = childGroups.map((g) => buildLodNodeFromGroup(g, buildingId));
+      let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      for (const ch of children) {
+        if (ch.aabbMin.x < minX) minX = ch.aabbMin.x; if (ch.aabbMin.y < minY) minY = ch.aabbMin.y; if (ch.aabbMin.z < minZ) minZ = ch.aabbMin.z;
+        if (ch.aabbMax.x > maxX) maxX = ch.aabbMax.x; if (ch.aabbMax.y > maxY) maxY = ch.aabbMax.y; if (ch.aabbMax.z > maxZ) maxZ = ch.aabbMax.z;
+      }
+      return { children, fragments: [], aabbMin: { x: minX, y: minY, z: minZ }, aabbMax: { x: maxX, y: maxY, z: maxZ }, enabled: false, buildingId };
+    }
+    const fragments = (group.fragments ?? []) as number[];
+    for (const ni of fragments) if (ni >= 0 && ni < buildingOfNode.length) buildingOfNode[ni] = buildingId;
+    const { aabbMin, aabbMax } = aabbOfFragments(fragments);
+    return { children: [], fragments: fragments.slice(), aabbMin, aabbMax, enabled: false, buildingId };
+  }
+
+  // Build the LOD roots. Source: an explicit `scenario.collisionTree` if present; otherwise one flat
+  // leaf per bond-connected component (supports included) — i.e. the non-hierarchical behavior.
+  function ensureLodRoots() {
+    if (lodRoots.length > 0) return;
+    const explicit = (scenario as { collisionTree?: Array<{ children?: unknown[]; fragments?: number[] }> }).collisionTree;
+    if (explicit && explicit.length > 0) {
+      explicit.forEach((g) => { lodRoots.push(buildLodNodeFromGroup(g, lodRoots.length)); });
+      // Any node not referenced by the tree becomes its own single-fragment building (robustness).
+      for (let i = 0; i < buildingOfNode.length; i++) {
+        if (buildingOfNode[i] !== -1) continue;
+        const id = lodRoots.length;
+        buildingOfNode[i] = id;
+        lodRoots.push(buildLodNodeFromGroup({ fragments: [i] }, id));
+      }
+      return;
+    }
     const n = scenario.nodes.length;
     const parent = new Int32Array(n);
     for (let i = 0; i < n; i++) parent[i] = i;
@@ -2499,26 +2535,23 @@ export async function buildDestructibleCore({
       const r0 = find(b.node0), r1 = find(b.node1);
       if (r0 !== r1) parent[r0] = r1;
     }
-    const rootToBuilding = new Map<number, IntactBuilding>();
+    const rootToFragments = new Map<number, number[]>();
     for (let i = 0; i < n; i++) {
       const r = find(i);
-      let bld = rootToBuilding.get(r);
-      if (!bld) {
-        bld = { id: intactBuildings.length, nodeIndices: [], aabbMin: { x: 0, y: 0, z: 0 }, aabbMax: { x: 0, y: 0, z: 0 }, exploded: false };
-        rootToBuilding.set(r, bld);
-        intactBuildings.push(bld);
-      }
-      bld.nodeIndices.push(i);
-      buildingOfNode[i] = bld.id;
+      let arr = rootToFragments.get(r);
+      if (!arr) { arr = []; rootToFragments.set(r, arr); }
+      arr.push(i);
     }
-    for (const bld of intactBuildings) computeBuildingAabb(bld);
+    for (const fragments of rootToFragments.values()) {
+      lodRoots.push(buildLodNodeFromGroup({ fragments }, lodRoots.length));
+    }
   }
 
-  // Enable/disable a building's real per-fragment colliders that still sit on the fixed root.
-  // Disabling removes them from the broadphase (cheap) without destroying them, so their handles
-  // — and thus the contact-solve order — are preserved for an output-identical explode.
-  function setBuildingCollidersEnabled(bld: IntactBuilding, enabled: boolean) {
-    for (const ni of bld.nodeIndices) {
+  // Enable/disable one leaf's real per-fragment colliders that still sit on the fixed root.
+  // Disabling removes them from the broadphase (cheap) without destroying them, so their handles —
+  // and thus the contact-solve order — are preserved for an output-identical enable.
+  function setLeafCollidersEnabled(node: LodNode, enabled: boolean) {
+    for (const ni of node.fragments) {
       const c = chunks[ni];
       if (!c || c.colliderHandle == null || c.bodyHandle !== rootBody.handle) continue;
       const col = world.getCollider(c.colliderHandle);
@@ -2526,77 +2559,84 @@ export async function buildDestructibleCore({
     }
   }
 
-  function buildIntactBuildings() {
-    ensureBuildingGroups();
-    for (const bld of intactBuildings) setBuildingCollidersEnabled(bld, false); // dormant: colliders off
+  // Enable every leaf collider under `node` and mark the whole subtree enabled (idempotent).
+  function enableSubtree(node: LodNode) {
+    if (node.enabled) return;
+    if (node.children.length === 0) { setLeafCollidersEnabled(node, true); node.enabled = true; return; }
+    for (const ch of node.children) enableSubtree(ch);
+    node.enabled = true;
   }
 
-  // Convert a still-fully-intact building back to a dormant proxy (used by the live toggle).
-  // A building with any detached/destroyed/migrated chunk can't be re-merged, so it stays eager.
-  function dormantizeBuilding(bld: IntactBuilding) {
-    for (const ni of bld.nodeIndices) {
+  // Disable a whole subtree back to dormant (used by the live toggle / re-merge).
+  function disableSubtree(node: LodNode) {
+    if (node.children.length === 0) { setLeafCollidersEnabled(node, false); node.enabled = false; return; }
+    for (const ch of node.children) disableSubtree(ch);
+    node.enabled = false;
+  }
+
+  // True iff every fragment under `node` is still intact on the fixed root (so it may go dormant).
+  function subtreeFullyIntact(node: LodNode): boolean {
+    if (node.children.length > 0) return node.children.every(subtreeFullyIntact);
+    for (const ni of node.fragments) {
       const c = chunks[ni];
-      if (!c || !c.active || c.destroyed || c.bodyHandle !== rootBody.handle) { bld.exploded = true; return; }
+      if (!c || !c.active || c.destroyed || c.bodyHandle !== rootBody.handle) return false;
     }
-    setBuildingCollidersEnabled(bld, false);
-    bld.exploded = false;
+    return true;
+  }
+
+  function buildIntactBuildings() {
+    ensureLodRoots();
+    for (const root of lodRoots) disableSubtree(root); // dormant: all leaf colliders off
   }
 
   function setLazyIntactColliders(enabled: boolean) {
     if (!!enabled === lazyIntactCollidersEnabled) return;
     lazyIntactCollidersEnabled = !!enabled;
     if (!lazyIntactCollidersEnabled) {
-      // → eager: enable every building's real colliders now.
-      for (const bld of intactBuildings) explodeBuilding(bld.id);
+      for (const root of lodRoots) enableSubtree(root);          // → eager: enable everything now
     } else {
-      // → lazy: disable still-intact buildings' colliders (they re-enable on approach).
-      ensureBuildingGroups();
-      for (const bld of intactBuildings) dormantizeBuilding(bld);
+      ensureLodRoots();
+      for (const root of lodRoots) if (subtreeFullyIntact(root)) disableSubtree(root); // → lazy
     }
     rebuildColliderToNodeMap();
   }
 
   function getLazyColliderStats() {
-    let dormant = 0, exploded = 0;
-    for (const bld of intactBuildings) { if (bld.exploded) exploded++; else dormant++; }
+    let dormant = 0, hit = 0, activeLeafFragments = 0;
+    const visit = (node: LodNode): boolean => {
+      if (node.children.length === 0) {
+        if (node.enabled) { activeLeafFragments += node.fragments.length; return true; }
+        return false;
+      }
+      let any = false;
+      for (const ch of node.children) if (visit(ch)) any = true;
+      return any;
+    };
+    for (const root of lodRoots) { if (visit(root)) hit++; else dormant++; }
     return {
       enabled: lazyIntactCollidersEnabled,
-      buildingCount: intactBuildings.length,
+      buildingCount: lodRoots.length,
       dormantCount: dormant,
-      explodedCount: exploded,
+      explodedCount: hit,        // buildings with ≥1 enabled leaf (partially or fully descended)
+      activeLeafFragments,       // total fragments currently active in the broadphase
     };
   }
 
-  // Re-enable a building's real per-fragment colliders (idempotent). The colliders already exist
-  // (created at init, just disabled), so re-enabling preserves their handles and the contact-solve
-  // order — and because no extra (proxy) colliders ever exist, the world the solver sees is
-  // bit-for-bit the eager world. Enabling a building no mover touches is a physics no-op.
-  function explodeBuilding(buildingId: number) {
-    const bld = intactBuildings[buildingId];
-    if (!bld || bld.exploded) return;
-    setBuildingCollidersEnabled(bld, true);
-    bld.exploded = true;
-  }
-
-  // Explode the building owning `nodeIndex` if it is still dormant (a no-op otherwise).
-  function ensureBuildingExplodedForNode(nodeIndex: number) {
-    if (!lazyIntactCollidersEnabled) return;
-    const id = buildingOfNode[nodeIndex];
-    if (id >= 0 && !intactBuildings[id]?.exploded) explodeBuilding(id);
-  }
-
-  // Predictive enable pass — runs BEFORE world.step. Any dormant building whose AABB is overlapped
-  // by a mover's swept bounding box (current → predicted-next position, padded by radius + skin) is
-  // exploded (its real colliders enabled) so the upcoming step resolves the impact on real geometry.
-  // Conservative by construction: a mover cannot reach a building's real colliders (all inside the
-  // building AABB) without its swept box overlapping that AABB first, so we never miss. A false
-  // positive (enabling a building the mover ends up missing) is a physics no-op, so output is
-  // bit-identical to eager either way — there is no probe, rollback, or extra collider.
+  // Predictive enable pass — runs BEFORE world.step. For each mover, descend the LOD tree and enable
+  // only the LEAVES whose AABB its swept box overlaps; non-overlapped subtrees stay dormant. A
+  // localized hit therefore materializes only the struck region's colliders. Conservative by
+  // construction (node AABB encloses its real colliders) so it never misses; enabling a leaf no
+  // mover touches is a physics no-op, so output is unchanged either way — no probe, no rollback.
   const PREDICTIVE_SKIN = 1.0; // metres of slack beyond radius + one step of travel
-  function aabbOverlapsBuilding(bld: IntactBuilding, mnx: number, mny: number, mnz: number, mxx: number, mxy: number, mxz: number): boolean {
-    return mxx >= bld.aabbMin.x && mnx <= bld.aabbMax.x
-      && mxy >= bld.aabbMin.y && mny <= bld.aabbMax.y
-      && mxz >= bld.aabbMin.z && mnz <= bld.aabbMax.z;
+  function descendForMover(node: LodNode, mnx: number, mny: number, mnz: number, mxx: number, mxy: number, mxz: number) {
+    if (node.enabled) return; // whole subtree already active
+    if (mxx < node.aabbMin.x || mnx > node.aabbMax.x
+      || mxy < node.aabbMin.y || mny > node.aabbMax.y
+      || mxz < node.aabbMin.z || mnz > node.aabbMax.z) return; // no overlap → prune
+    if (node.children.length === 0) { enableSubtree(node); return; } // overlapped leaf → enable it
+    let allEnabled = true;
+    for (const ch of node.children) { descendForMover(ch, mnx, mny, mnz, mxx, mxy, mxz); if (!ch.enabled) allEnabled = false; }
+    if (allEnabled) node.enabled = true; // propagate so a fully-active subtree is pruned next time
   }
   function considerMoverForExplode(px: number, py: number, pz: number, vx: number, vy: number, vz: number, dt: number, radius: number) {
     // Swept box from current to predicted-next centre, padded by radius + skin (covers gravity/CCD).
@@ -2606,15 +2646,12 @@ export async function buildDestructibleCore({
     const nx = px + vx * dt, ny = py + vy * dt, nz = pz + vz * dt;
     const mnx = Math.min(px, nx) - ex, mny = Math.min(py, ny) - ey, mnz = Math.min(pz, nz) - ez;
     const mxx = Math.max(px, nx) + ex, mxy = Math.max(py, ny) + ey, mxz = Math.max(pz, nz) + ez;
-    for (const bld of intactBuildings) {
-      if (bld.exploded) continue;
-      if (aabbOverlapsBuilding(bld, mnx, mny, mnz, mxx, mxy, mxz)) explodeBuilding(bld.id);
-    }
+    for (const root of lodRoots) descendForMover(root, mnx, mny, mnz, mxx, mxy, mxz);
   }
   function predictiveExplodePass(dt: number) {
-    if (!lazyIntactCollidersEnabled || intactBuildings.length === 0) return;
+    if (!lazyIntactCollidersEnabled || lodRoots.length === 0) return;
     let anyDormant = false;
-    for (const b of intactBuildings) if (!b.exploded) { anyDormant = true; break; }
+    for (const r of lodRoots) if (!r.enabled) { anyDormant = true; break; }
     if (!anyDormant) return;
     // Projectiles.
     for (const p of projectiles) {
