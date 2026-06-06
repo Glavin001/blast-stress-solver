@@ -28,6 +28,7 @@ import {
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
 import { mountShooter } from './shooter-fps.js';
 import { buildFracturedTowerScenario } from 'blast-stress-solver/scenarios';
 
@@ -406,22 +407,8 @@ async function initScene() {
     scenario,
     gravity: CONFIG.solver.gravity,
     materialScale: CONFIG.solver.materialScale,
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.physics.contactForceScale,
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
-    damage: { enabled: false },
-    debrisCleanup: {
-      mode: CONFIG.optimization.debrisCleanupMode as any,
-      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
-      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
-    },
-    smallBodyDamping: {
-      mode: CONFIG.optimization.smallBodyDampingMode as any,
-      colliderCountThreshold: 3,
-      minLinearDamping: 2,
-      minAngularDamping: 2,
-    },
+    ...physicsCoreOverrides(),
     ...pipelineCoreOverrides(),
   });
 
@@ -673,26 +660,12 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1) + ' m/sÂ
   }
 }
 
-// Physics (live)
-bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) =>
-  coreRef?.setDebrisCollisionMode(v as any),
-);
-bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
-bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));
-
-// Optimization (live)
-bindSelect('cfg-damping-mode', CONFIG.optimization, 'smallBodyDampingMode', (v) =>
-  coreRef?.setSmallBodyDamping?.({ mode: v as any }),
-);
-bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) =>
-  coreRef?.setDebrisCleanup?.({ mode: v as any, debrisTtlMs: CONFIG.optimization.debrisTtlMs }),
-);
-bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 1000).toFixed(1) + 's', (v) =>
-  coreRef?.setDebrisCleanup?.({
-    mode: CONFIG.optimization.debrisCleanupMode as any,
-    debrisTtlMs: v,
-  }),
-);
+// Shared Physics / Optimization controls (mini-city keeps its island-solver toggle + debug button).
+mountPhysicsControls({
+  getCore: () => coreRef,
+  onRebuild: () => void rebuild(),
+  include: { centrifugal: false, debug: false },
+});
 bindToggle('cfg-island-solver', CONFIG.optimization, 'islandSolver', (v) =>
   coreRef?.setIslandSolver?.({ enabled: v }),
 );

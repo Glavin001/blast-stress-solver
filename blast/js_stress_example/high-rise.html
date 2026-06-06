@@ -153,78 +153,7 @@
           </div>
         </section>
 
-        <!-- Physics -->
-        <section class="config-section">
-          <h2 class="section-title">Physics <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-centrifugal">Centrifugal (spin self-fracture) &#9733;</label>
-            <input type="checkbox" id="cfg-centrifugal" />
-          </div>
-          <div class="config-row">
-            <span class="config-label">Debris Collision &#9733;</span>
-            <select id="cfg-debris-collision" class="config-select">
-              <option value="all" selected>All (full collisions)</option>
-              <option value="noDebrisPairs">No debris pairs</option>
-              <option value="debrisGroundOnly">Debris &harr; ground only</option>
-              <option value="debrisNone">Debris: none</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Friction</span>
-            <input type="range" class="config-slider" id="cfg-friction" min="0" max="2" step="0.05" value="0.25" />
-            <span class="config-value" id="cfg-friction-value">0.25</span>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Restitution</span>
-            <input type="range" class="config-slider" id="cfg-restitution" min="0" max="1" step="0.05" value="0" />
-            <span class="config-value" id="cfg-restitution-value">0.00</span>
-          </div>
-        </section>
-
-        <!-- Optimization (live) -->
-        <section class="config-section">
-          <h2 class="section-title">Optimization <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <span class="config-label">Small Body Damping &#9733;</span>
-            <select id="cfg-damping-mode" class="config-select">
-              <option value="off" selected>Off</option>
-              <option value="always">Always</option>
-              <option value="afterGroundCollision">After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Debris Cleanup &#9733;</span>
-            <select id="cfg-cleanup-mode" class="config-select">
-              <option value="off">Off</option>
-              <option value="always">Always</option>
-              <option value="afterGroundCollision" selected>After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Debris TTL &#9733;</span>
-            <input type="range" class="config-slider" id="cfg-debris-ttl" min="1000" max="30000" step="500" value="10000" />
-            <span class="config-value" id="cfg-debris-ttl-value">10.0s</span>
-          </div>
-        </section>
-
-        <!-- Features -->
-        <section class="config-section">
-          <h2 class="section-title">Features</h2>
-          <label class="toggle-row">
-            <input type="checkbox" id="opt-damage" />
-            <span class="toggle-text">
-              Custom damage system
-              <small>Per-chunk health/splash. Off by default (it can over-soften the frame). Toggling rebuilds the scene.</small>
-            </span>
-          </label>
-          <label class="toggle-row">
-            <input type="checkbox" id="opt-debug" />
-            <span class="toggle-text">
-              Debug wireframe
-              <small>Show Rapier colliders &amp; bond lines</small>
-            </span>
-          </label>
-        </section>
+        <!-- Physics / Optimization / Features sections are injected by physics-controls.ts -->
 
         <!-- Status -->
         <section class="status-panel">

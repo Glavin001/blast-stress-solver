@@ -27,6 +27,7 @@ import {
   type HouseFractureMode,
 } from 'blast-stress-solver/scenarios';
 import { mountShooter } from './shooter-fps.js';
+import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
 
 // Pre-register three-pinata so the synchronous Voronoi fracturer resolves in the browser
 // ESM environment (used only when the "Fracture" option is on).
@@ -61,13 +62,8 @@ const CONFIG = {
     iterations: 24,
     graphReduction: 0,
   },
-  physics: { debrisCollisionMode: 'all', friction: 0.5, restitution: 0 },
-  optimization: {
-    smallBodyDampingMode: 'off',
-    debrisCleanupMode: 'afterGroundCollision',
-    debrisTtlMs: 10000,
-    maxCollidersForDebris: 3,
-  },
+  // Physics / Optimization / Features (debris collision, friction, restitution, small-body
+  // damping, debris cleanup, custom damage, debug) come from the shared physics-controls.ts.
   features: { materialColors: true, debug: false },
 };
 
@@ -215,25 +211,15 @@ async function initScene() {
       maxSolverIterationsPerFrame: CONFIG.solver.iterations,
       graphReductionLevel: CONFIG.solver.graphReduction,
     },
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.solver.contactForceScale,
-    // Fractured mode spawns many small shards. Stop debris from colliding with OTHER debris
-    // (the per-frame contact flood the profiler flagged), and spread splits across frames so
-    // the first hit doesn't cascade hundreds of new bodies in a single frame.
-    debrisCollisionMode: (fractured ? 'noDebrisPairs' : CONFIG.physics.debrisCollisionMode) as any,
-    fracturePolicy: fractured ? { maxNewBodiesPerFrame: 30, maxColliderMigrationsPerFrame: 60 } : undefined,
-    debrisCleanup: {
-      mode: CONFIG.optimization.debrisCleanupMode as any,
-      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
-      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
-    },
-    smallBodyDamping: {
-      mode: CONFIG.optimization.smallBodyDampingMode as any,
-      colliderCountThreshold: 3,
-      minLinearDamping: 2,
-      minAngularDamping: 2,
-    },
+    // Shared Physics/Optimization/Features controls (debris collision, friction, restitution,
+    // small-body damping, debris cleanup/TTL, custom damage) — see physics-controls.ts.
+    ...physicsCoreOverrides(),
+    // Fractured mode spawns many small shards: force debris↔debris collisions off and cap the
+    // per-frame split churn (this overrides the shared "Debris Collision" control while on).
+    ...(fractured
+      ? { debrisCollisionMode: 'noDebrisPairs' as const, fracturePolicy: { maxNewBodiesPerFrame: 30, maxColliderMigrationsPerFrame: 60 } }
+      : {}),
   });
 
   const group = new THREE.Group();
@@ -331,11 +317,9 @@ bindSlider('cfg-iterations', CONFIG.solver, 'iterations', (v) => v.toFixed(0));
 bindSlider('cfg-graph-reduction', CONFIG.solver, 'graphReduction', (v) => v.toFixed(0));
 bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1) + ' m/s²', (v) => coreRef?.setGravity(v));
 
-// Physics.
-bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
-bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));
-
-// Features.
+// Material colors (house-specific). Friction/restitution, debris collision, small-body
+// damping, debris cleanup/TTL, custom damage and the debug wireframe are all provided by the
+// shared sections injected by mountPhysicsControls below.
 const optColors = document.getElementById('opt-material-colors') as HTMLInputElement | null;
 if (optColors) optColors.checked = CONFIG.features.materialColors;
 optColors?.addEventListener('change', () => {
@@ -343,11 +327,11 @@ optColors?.addEventListener('change', () => {
   visualsRef?.setMaterialColors(CONFIG.features.materialColors);
 });
 
-const optDebug = document.getElementById('opt-debug') as HTMLInputElement | null;
-if (optDebug) optDebug.checked = CONFIG.features.debug;
-optDebug?.addEventListener('change', () => {
-  CONFIG.features.debug = !!optDebug.checked;
-  rapierDebug?.setEnabled(CONFIG.features.debug);
+mountPhysicsControls({
+  getCore: () => coreRef,
+  onDebug: (on) => { CONFIG.features.debug = on; rapierDebug?.setEnabled(on); },
+  onRebuild: () => { void rebuild(); },
+  include: { centrifugal: false }, // a house doesn't spin
 });
 
 document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });

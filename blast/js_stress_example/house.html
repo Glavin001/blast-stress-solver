@@ -156,25 +156,16 @@
 
         <!-- Solver / physics -->
         <section class="config-section">
-          <h2 class="section-title">Physics <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <h2 class="section-title">Solver <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
           <div class="config-row">
             <span class="config-label">Gravity &#9733;</span>
             <input type="range" class="config-slider" id="cfg-gravity" min="-30" max="0" step="0.5" value="-9.81" />
             <span class="config-value" id="cfg-gravity-value">-9.8 m/s&sup2;</span>
           </div>
-          <div class="config-row">
-            <span class="config-label">Friction</span>
-            <input type="range" class="config-slider" id="cfg-friction" min="0" max="2" step="0.05" value="0.5" />
-            <span class="config-value" id="cfg-friction-value">0.50</span>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Restitution</span>
-            <input type="range" class="config-slider" id="cfg-restitution" min="0" max="1" step="0.05" value="0" />
-            <span class="config-value" id="cfg-restitution-value">0.00</span>
-          </div>
         </section>
 
-        <!-- Features -->
+        <!-- View (house-specific). The Physics / Optimization / Features sections are injected
+             by the shared physics-controls.ts. -->
         <section class="config-section">
           <h2 class="section-title">View</h2>
           <label class="toggle-row">
@@ -182,13 +173,6 @@
             <span class="toggle-text">
               Material colors
               <small>On: realistic per-material colors (debris keeps its color). Off: the standard orange/gray physics-state view (dynamic = orange, static = gray).</small>
-            </span>
-          </label>
-          <label class="toggle-row">
-            <input type="checkbox" id="opt-debug" />
-            <span class="toggle-text">
-              Debug wireframe
-              <small>Show Rapier colliders &amp; bond lines</small>
             </span>
           </label>
         </section>

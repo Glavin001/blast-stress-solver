@@ -27,6 +27,8 @@
     "split-bridge-stress.ts",
     "shooter-fps.ts",
     "vehicle-drive.ts",
+    "physics-controls.ts",
+    "pipeline-controls.ts",
     "demo-shell.ts",
     "wall-demolition.ts",
     "tower-collapse.ts",
