@@ -139,15 +139,22 @@ export function mountPhysicsControls(opts: PhysicsControlsOptions): void {
         : '') +
       '</section>' : '';
 
-    // Insert the new sections, in order, right after the demo's last existing config
-    // section (so they land before the Status/Performance panels + recorder slot).
+    // Drop the standard sections after the demo's own config controls but before its action
+    // buttons / Status panels — matching each demo's original layout. A top-of-panel Reset bar
+    // (e.g. high-rise) has no config-section before it, so it's skipped as an anchor.
     const wrap = document.createElement('div');
     wrap.innerHTML = physics + optimization + features;
     const frag = document.createDocumentFragment();
     while (wrap.firstChild) frag.appendChild(wrap.firstChild);
-    const sections = sidebar.querySelectorAll('.config-section');
-    const last = sections[sections.length - 1];
-    if (last && last.parentElement) last.parentElement.insertBefore(frag, last.nextSibling);
+    let anchor: Element | null = null;
+    let seenConfig = false;
+    for (const el of Array.from(sidebar.children)) {
+      if (el.classList.contains('config-section') && el.id !== 'recorder-slot') { seenConfig = true; continue; }
+      if (el.classList.contains('status-panel')) { anchor = el; break; }
+      if (el.classList.contains('control-actions') && seenConfig) { anchor = el; break; }
+    }
+    anchor = anchor ?? document.getElementById('recorder-slot');
+    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(frag, anchor);
     else sidebar.appendChild(frag);
     }
 

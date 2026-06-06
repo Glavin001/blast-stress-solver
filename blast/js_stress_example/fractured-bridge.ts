@@ -261,9 +261,10 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Shared Physics / Optimization controls (debris collision, friction, restitution, damping,
-// cleanup, TTL). Demo-specific contact-force stays wired here.
-mountPhysicsControls({ getCore: () => coreRef });
+// Shared Physics / Optimization / Features controls (debris collision, friction, restitution,
+// damping, cleanup, TTL, centrifugal). Demo keeps its own Show Debug button, so debug is excluded.
+// Demo-specific contact-force stays wired here.
+mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
 
 // ── Render loop ──────────────────────────────────────────────

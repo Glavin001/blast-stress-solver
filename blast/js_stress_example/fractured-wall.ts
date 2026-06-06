@@ -134,8 +134,6 @@ let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
-// Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
-let centrifugalEnabled = false;
 
 async function initScene() {
   const { span, height, thickness, fragmentCount, deckMass } = CONFIG.wall;
@@ -284,9 +282,10 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Shared Physics / Optimization controls (debris collision, friction, restitution, damping,
-// cleanup, TTL). Demo-specific contact-force / skip-single / max-debris-colliders stay here.
-mountPhysicsControls({ getCore: () => coreRef });
+// Shared Physics / Optimization / Features controls (debris collision, friction, restitution,
+// damping, cleanup, TTL, centrifugal). Demo keeps its own Show Debug button, so debug is excluded.
+// Demo-specific contact-force / skip-single / max-debris-colliders stay below.
+mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
 bindCheckbox('cfg-skip-single', CONFIG.physics, 'skipSingleBodies');
 bindSlider('cfg-max-debris-colliders', physicsConfig, 'maxCollidersForDebris', (v) => v.toFixed(0));
