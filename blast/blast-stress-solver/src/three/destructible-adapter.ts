@@ -26,6 +26,15 @@ export type ChunkMeshBuildOptions = {
   clearGroups?: boolean;
   /** Dispose external source geometries on `dispose()`. Default: false. */
   disposeSourceGeometries?: boolean;
+  /**
+   * Optional per-node base ("material") colors, indexed by `chunk.nodeIndex`. When
+   * provided (and the per-chunk damage overlay is off), chunks render in their material
+   * color instead of the fixed/kinematic/dynamic physics-state colors — so a demo can
+   * show realistic materials. Pass `undefined` (or omit) to fall back to the standard
+   * state coloring; toggling the two is how demos flip between "material" and
+   * "collision/state" views at runtime without rebuilding.
+   */
+  nodeColors?: THREE.Color[];
 };
 
 export type BatchedChunkMeshOptions = ChunkMeshBuildOptions & {
@@ -157,7 +166,11 @@ function makeDefaultMaterials(materials?: { deck?: THREE.Material; support?: THR
 }
 
 /**
- * Apply color based on damage health or rigid body type.
+ * Resolve a chunk's color. Precedence:
+ *   1. Damage overlay (if enabled): green→red health gradient.
+ *   2. Material `baseColor` (if provided): the chunk's material color, kept even after
+ *      it breaks free (debris is darkened a touch so motion still reads).
+ *   3. Physics state: kinematic (blue) / fixed (gray) / dynamic (orange).
  * Mutates and returns the provided color instance.
  */
 export function applyChunkColor(opts: {
@@ -165,8 +178,10 @@ export function applyChunkColor(opts: {
   chunk: ChunkLike;
   body: RigidBodyLike;
   color: THREE.Color;
+  /** Material color for "material" view. Omit/null → standard state coloring. */
+  baseColor?: THREE.Color | null;
 }): THREE.Color {
-  const { core, chunk, body, color } = opts;
+  const { core, chunk, body, color, baseColor } = opts;
 
   const damageEnabled = core.damageEnabled === true;
   const healthGetter = core.getNodeHealth;
@@ -179,11 +194,25 @@ export function applyChunkColor(opts: {
     }
   }
 
+  if (baseColor) {
+    color.copy(baseColor);
+    if (body.isDynamic()) color.multiplyScalar(0.82);
+    return color;
+  }
+
   if (body.isKinematic()) color.setHex(KINEMATIC_COLOR);
   else if (body.isFixed()) color.setHex(FIXED_COLOR);
   else if (body.isDynamic()) color.setHex(DYNAMIC_COLOR);
 
   return color;
+}
+
+/** Per-node base color lookup (by chunk.nodeIndex), or null when colors aren't supplied. */
+function baseColorForNode(
+  nodeColors: THREE.Color[] | undefined,
+  nodeIndex: number,
+): THREE.Color | null {
+  return nodeColors ? nodeColors[nodeIndex] ?? null : null;
 }
 
 export function buildChunkMeshes(
@@ -371,7 +400,13 @@ function buildBatchedChunkMeshInternal(
     batchedMesh.setMatrixAt(instanceId, _matrix);
     batchedMesh.setVisibleAt(instanceId, !chunk.destroyed);
     if (typeof batchedMesh.setColorAt === 'function') {
-      batchedMesh.setColorAt(instanceId, _batchedDefaultColor);
+      const baseColor = baseColorForNode(options?.nodeColors, chunk.nodeIndex);
+      if (body) {
+        applyChunkColor({ core, chunk, body, color: _colorTmp, baseColor });
+        batchedMesh.setColorAt(instanceId, _colorTmp);
+      } else {
+        batchedMesh.setColorAt(instanceId, baseColor ?? _batchedDefaultColor);
+      }
     }
   }
 
@@ -404,7 +439,12 @@ function buildBatchedChunkMeshInternal(
   };
 }
 
-export function updateChunkMeshes(core: DestructibleCore, meshes: THREE.Mesh[]) {
+export function updateChunkMeshes(
+  core: DestructibleCore,
+  meshes: THREE.Mesh[],
+  options?: { nodeColors?: THREE.Color[] },
+) {
+  const nodeColors = options?.nodeColors;
   const tmp = new THREE.Vector3();
   const quat = new THREE.Quaternion();
   const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV !== 'production' : true;
@@ -446,7 +486,8 @@ export function updateChunkMeshes(core: DestructibleCore, meshes: THREE.Mesh[]) 
 
     const material = toMeshStandardMaterial(mesh.material);
     if (material) {
-      applyChunkColor({ core, chunk, body, color: material.color });
+      const baseColor = baseColorForNode(nodeColors, chunk.nodeIndex);
+      applyChunkColor({ core, chunk, body, color: material.color, baseColor });
     }
   }
 }
@@ -457,9 +498,12 @@ export function updateBatchedChunkMesh(
   chunkToInstanceId: Map<number, number>,
   options?: {
     updateBVH?: boolean;
+    /** Per-node material colors (by chunk.nodeIndex). Omit for state coloring. */
+    nodeColors?: THREE.Color[];
   },
 ) {
   const updateBVH = options?.updateBVH ?? false;
+  const nodeColors = options?.nodeColors;
 
   for (let i = 0; i < core.chunks.length; i += 1) {
     const chunk = core.chunks[i];
@@ -497,7 +541,8 @@ export function updateBatchedChunkMesh(
     batchedMesh.setVisibleAt(instanceId, true);
 
     if (typeof batchedMesh.setColorAt === 'function') {
-      applyChunkColor({ core, chunk, body, color: _colorTmp });
+      const baseColor = baseColorForNode(nodeColors, chunk.nodeIndex);
+      applyChunkColor({ core, chunk, body, color: _colorTmp, baseColor });
       batchedMesh.setColorAt(instanceId, _colorTmp);
     }
 
