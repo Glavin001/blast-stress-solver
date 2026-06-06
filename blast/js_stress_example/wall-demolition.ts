@@ -17,6 +17,7 @@ import {
   applyAutoBondingToScenario,
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
 import { mountShooter } from './shooter-fps.js';
 import { buildWallScenario } from 'blast-stress-solver/scenarios';
 
@@ -195,35 +196,22 @@ async function initScene() {
   );
 
   console.log('[wall-demolition] buildDestructibleCore config:', {
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode,
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
+    debrisCollisionMode: physicsConfig.debrisCollisionMode,
+    friction: physicsConfig.friction,
+    restitution: physicsConfig.restitution,
     contactForceScale: CONFIG.physics.contactForceScale,
     skipSingleBodies: CONFIG.physics.skipSingleBodies,
-    smallBodyDampingMode: CONFIG.optimization.smallBodyDampingMode,
-    debrisCleanupMode: CONFIG.optimization.debrisCleanupMode,
+    smallBodyDampingMode: physicsConfig.smallBodyDampingMode,
+    debrisCleanupMode: physicsConfig.debrisCleanupMode,
   });
 
   const core = await buildDestructibleCore({
     scenario,
     gravity: CONFIG.solver.gravity,
     materialScale: CONFIG.solver.materialScale,
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.physics.contactForceScale,
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
     skipSingleBodies: CONFIG.physics.skipSingleBodies,
-    damage: {
-      enabled: false,
-    },
-    smallBodyDamping: {
-      mode: CONFIG.optimization.smallBodyDampingMode as any,
-    },
-    debrisCleanup: {
-      mode: CONFIG.optimization.debrisCleanupMode as any,
-      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
-      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
-    },
+    ...physicsCoreOverrides(),
     ...pipelineCoreOverrides(),
   });
 
@@ -244,7 +232,7 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
 
   coreRef = core;
-  core.setSolverCentrifugalEnabled(centrifugalEnabled);
+  core.setSolverCentrifugalEnabled(physicsConfig.centrifugal);
   recorder.attach(core, { scenario, meta: { demo: 'wall-demolition', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -264,11 +252,6 @@ document.getElementById('btn-reset')?.addEventListener('click', async () => {
   visualsRef = null;
   // Rebuild
   await initScene();
-});
-
-document.getElementById('cfg-centrifugal')?.addEventListener('change', (e) => {
-  centrifugalEnabled = (e.target as HTMLInputElement).checked;
-  coreRef?.setSolverCentrifugalEnabled(centrifugalEnabled);
 });
 
 document.getElementById('btn-debug')?.addEventListener('click', () => {
@@ -347,24 +330,12 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Physics controls
-bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) => {
-  coreRef?.setDebrisCollisionMode(v as any);
-});
-bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
-bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));
+// Shared Physics / Optimization controls (debris collision, friction, restitution, damping,
+// cleanup, TTL). Demo-specific contact-force / skip-single stay wired here.
+mountPhysicsControls({ getCore: () => coreRef });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
 bindCheckbox('cfg-skip-single', CONFIG.physics, 'skipSingleBodies');
-
-// Optimization controls
-bindSelect('cfg-damping-mode', CONFIG.optimization, 'smallBodyDampingMode', (v) => {
-  coreRef?.setSmallBodyDamping({ mode: v as any });
-});
-bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) => {
-  coreRef?.setDebrisCleanup({ mode: v as any, debrisTtlMs: CONFIG.optimization.debrisTtlMs });
-});
-bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 1000).toFixed(1) + 's');
-bindSlider('cfg-max-debris-colliders', CONFIG.optimization, 'maxCollidersForDebris', (v) => v.toFixed(0));
+bindSlider('cfg-max-debris-colliders', physicsConfig, 'maxCollidersForDebris', (v) => v.toFixed(0));
 
 // ── Render loop ───────────────────────────────────────────────
 
