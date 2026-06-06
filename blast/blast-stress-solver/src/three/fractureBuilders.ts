@@ -415,3 +415,58 @@ export function subdivideBoxFragments(options: SubdivideBoxOptions): FragmentInf
   }
   return fragments;
 }
+
+export type RotatedBoxGridOptions = SubdivideBoxOptions & {
+  /**
+   * Rigid rotation applied to the whole grid after it is built, about a horizontal
+   * axis ('x' or 'z') through `pivot` (defaults to `center`). Each chunk keeps a
+   * single tilted BoxGeometry — i.e. a convex shape (8 vertices) — so the runtime
+   * still gives it a cheap convex-hull (or cuboid) collider, never a trimesh.
+   * Used for pitched roof planes and gable triangles.
+   */
+  rotation?: { axis: 'x' | 'z'; angle: number; pivot?: Vec3 };
+};
+
+/**
+ * Like {@link subdivideBoxFragments}, but optionally tilts the whole grid about a
+ * horizontal axis. Each produced chunk is still a single (now rotated) box, so the
+ * scenario assembler builds a convex-hull collider from its 8 corners — keeping
+ * sloped roofs/gables Rapier-efficient (convex), never a concave trimesh.
+ *
+ * The chunk's BoxGeometry is centered at the origin, so rotating it in place tilts
+ * the box; the chunk centroid is rotated about `pivot`; and halfExtents are recomputed
+ * from the rotated bounding box (used for broadphase + support cuboids).
+ */
+export function buildRotatedBoxGridFragments(options: RotatedBoxGridOptions): FragmentInfo[] {
+  const fragments = subdivideBoxFragments(options);
+  const rot = options.rotation;
+  if (!rot || Math.abs(rot.angle) < 1e-6) return fragments;
+
+  const pivot = rot.pivot ?? options.center;
+  const m = new THREE.Matrix4();
+  if (rot.axis === 'x') m.makeRotationX(rot.angle);
+  else m.makeRotationZ(rot.angle);
+
+  const pv = new THREE.Vector3(pivot.x, pivot.y, pivot.z);
+  const tmp = new THREE.Vector3();
+  const size = new THREE.Vector3();
+
+  return fragments.map((f) => {
+    // Tilt the box in place (its BoxGeometry is centered at the origin).
+    f.geometry.applyMatrix4(m);
+    f.geometry.computeBoundingBox();
+    (f.geometry.boundingBox as THREE.Box3).getSize(size);
+
+    // Rotate the chunk centroid about the pivot.
+    tmp
+      .set(f.worldPosition.x - pv.x, f.worldPosition.y - pv.y, f.worldPosition.z - pv.z)
+      .applyMatrix4(m)
+      .add(pv);
+
+    return {
+      ...f,
+      worldPosition: { x: tmp.x, y: tmp.y, z: tmp.z },
+      halfExtents: { x: size.x * 0.5, y: size.y * 0.5, z: size.z * 0.5 },
+    };
+  });
+}

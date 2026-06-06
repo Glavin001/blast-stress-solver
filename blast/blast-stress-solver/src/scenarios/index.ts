@@ -18,6 +18,7 @@ export type { FracturedBridgeOptions } from './fracturedBridgeScenario';
 
 export {
   buildHighRiseScenario,
+  buildHighRiseScenarioAsync,
   DEFAULT_HIGH_RISE_OPTIONS,
   HIGH_RISE_BOND_MULTIPLIERS,
   DEFAULT_HIGH_RISE_MULTIPLIERS,
@@ -32,3 +33,19 @@ export {
   DEFAULT_SPINNING_BEAMS_OPTIONS,
 } from './spinningBeamsScenario';
 export type { SpinningBeamsOptions } from './spinningBeamsScenario';
+
+export {
+  buildHouseScenario,
+  buildHouseScenarioAsync,
+  DEFAULT_HOUSE_OPTIONS,
+  DEFAULT_HOUSE_MULTIPLIERS,
+  HOUSE_BOND_MULTIPLIERS,
+  HOUSE_PALETTE,
+  makeHouseBondMultiplier,
+  HOUSE_WOOD_DENSITY,
+  HOUSE_DRYWALL_DENSITY,
+  HOUSE_ROOF_DENSITY,
+  HOUSE_FOUNDATION_DENSITY,
+  HOUSE_FURNITURE_DENSITY,
+} from './houseScenario';
+export type { HouseOptions, HouseMultipliers, HouseFractureMode } from './houseScenario';
