@@ -16,7 +16,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import { buildDestructibleCore } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
@@ -113,6 +113,14 @@ let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
 
+// Standard session recorder (● Record / ⬇ Save) + live frame profiler.
+const profiler = createFrameProfilerOverlay();
+const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
+  exportName: 'centrifugal-spinner-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
+
 async function initScene() {
   const scenario = buildSpinningBeamsScenario({
     beams: CONFIG.beams,
@@ -161,6 +169,8 @@ async function initScene() {
 
   coreRef = core;
   visualsRef = visuals;
+  recorder.attach(core, { scenario, meta: { demo: 'centrifugal-spinner', config: CONFIG } });
+  profiler.attach(core);
 }
 
 /** Drive every live dynamic body at the configured spin about +Y, so beams keep tumbling. */
@@ -252,6 +262,8 @@ const clock = new THREE.Clock();
 
 function loop() {
   requestAnimationFrame(loop);
+  profiler.render();
+  recorder.render();
   stats.begin();
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();
