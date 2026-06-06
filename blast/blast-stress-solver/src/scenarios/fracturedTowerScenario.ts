@@ -168,6 +168,20 @@ export async function buildFracturedTowerScenario(
   // ── Collect all fragments ──────────────────────────────────
   const allFragments: FragmentInfo[] = [];
 
+  // ── Collision-LOD authoring ──
+  // Record each structural element (one wall / column / slab) as a contiguous fragment range,
+  // tagged with its floor. Because buildScenarioFromFragments emits one node per fragment in
+  // order, these ranges ARE node-index ranges, so we can emit a semantic collisionTree
+  // (building → floor → element → fragments) for free. A localized hit then descends only the
+  // struck floor → struck element, waking just that element's fragments.
+  type ElGroup = { floor: number; start: number; count: number };
+  const elementGroups: ElGroup[] = [];
+  const pushElement = (floor: number, frags: FragmentInfo[]) => {
+    const start = allFragments.length;
+    for (const f of frags) allFragments.push(f);
+    if (allFragments.length > start) elementGroups.push({ floor, start, count: allFragments.length - start });
+  };
+
   // Walls + columns for each floor section
   for (let floorIdx = 0; floorIdx < floorHeights.length - 1; floorIdx++) {
     const wallBottomY = floorIdx === 0
@@ -180,7 +194,7 @@ export async function buildFracturedTowerScenario(
     const sideWallSpan = depth - thickness * 2;
 
     // Front wall
-    allFragments.push(...buildWallFragments({
+    pushElement(floorIdx, buildWallFragments({
       span: width, height: wallHeight, thickness,
       fragmentCount: fragmentCountPerWall,
       centerX: 0, centerZ: -halfDepth + thickness * 0.5,
@@ -188,7 +202,7 @@ export async function buildFracturedTowerScenario(
     }));
 
     // Back wall
-    allFragments.push(...buildWallFragments({
+    pushElement(floorIdx, buildWallFragments({
       span: width, height: wallHeight, thickness,
       fragmentCount: fragmentCountPerWall,
       centerX: 0, centerZ: halfDepth - thickness * 0.5,
@@ -196,7 +210,7 @@ export async function buildFracturedTowerScenario(
     }));
 
     // Left wall (rotated 90 degrees)
-    allFragments.push(...buildWallFragments({
+    pushElement(floorIdx, buildWallFragments({
       span: sideWallSpan, height: wallHeight, thickness,
       fragmentCount: fragmentCountPerWall,
       centerX: -halfWidth + thickness * 0.5, centerZ: 0,
@@ -204,16 +218,16 @@ export async function buildFracturedTowerScenario(
     }));
 
     // Right wall (rotated 90 degrees)
-    allFragments.push(...buildWallFragments({
+    pushElement(floorIdx, buildWallFragments({
       span: sideWallSpan, height: wallHeight, thickness,
       fragmentCount: fragmentCountPerWall,
       centerX: halfWidth - thickness * 0.5, centerZ: 0,
       rotationY: Math.PI * 0.5, baseY: wallBottomY, pinata,
     }));
 
-    // Interior columns for this floor section
+    // Interior columns for this floor section (each column is its own element)
     for (const colPos of columnPositions) {
-      allFragments.push(...buildColumnFragments({
+      pushElement(floorIdx, buildColumnFragments({
         sizeX: columnSize, sizeZ: columnSize, height: wallHeight,
         fragmentCount: fragmentCountPerColumn,
         centerX: colPos.x, baseY: wallBottomY, centerZ: colPos.z, pinata,
@@ -223,7 +237,7 @@ export async function buildFracturedTowerScenario(
 
   // Floor plates (skip ground floor — covered by foundation)
   for (let floorIdx = 1; floorIdx < floorHeights.length - 1; floorIdx++) {
-    allFragments.push(...buildFloorFragments({
+    pushElement(floorIdx, buildFloorFragments({
       spanX: width, spanZ: depth, thickness: floorThickness,
       fragmentCount: fragmentCountPerFloor,
       centerX: 0, centerY: floorHeights[floorIdx], centerZ: 0, pinata,
@@ -233,19 +247,19 @@ export async function buildFracturedTowerScenario(
   // Roof plate at the top
   const lastWallTopY = floorHeights[floorCount] - floorThickness * 0.5;
   const roofY = lastWallTopY + floorThickness * 0.5;
-  allFragments.push(...buildFloorFragments({
+  pushElement(floorCount, buildFloorFragments({
     spanX: width, spanZ: depth, thickness: floorThickness,
     fragmentCount: fragmentCountPerFloor,
     centerX: 0, centerY: roofY, centerZ: 0, pinata,
   }));
 
-  // Grid foundation
+  // Grid foundation (its own group, below all floors)
   const { fragments: foundationFragments } = buildGridFoundationFragments({
     width, depth,
     height: foundationHeight,
     groundClearance,
   });
-  allFragments.push(...foundationFragments);
+  pushElement(-1, foundationFragments);
 
   // ── Build scenario ─────────────────────────────────────────
   const dims = { x: width, y: totalHeight, z: depth };
@@ -277,6 +291,26 @@ export async function buildFracturedTowerScenario(
     floorCount, floorHeight,
     fragmentCountPerWall, fragmentCountPerFloor, fragmentCountPerColumn,
   };
+
+  // Emit the semantic collision-LOD tree: one root (building) → one node per floor → one leaf per
+  // structural element (wall / column / slab), each holding its fractured fragments. Consumed by
+  // `lazyIntactColliders` so a localized hit only materializes the struck element. Orthogonal to
+  // the bond graph — cannot change fracture output.
+  const byFloor = new Map<number, ElGroup[]>();
+  for (const g of elementGroups) {
+    const arr = byFloor.get(g.floor);
+    if (arr) arr.push(g); else byFloor.set(g.floor, [g]);
+  }
+  const floorKeys = [...byFloor.keys()].sort((a, b) => a - b);
+  const range = (start: number, count: number) => {
+    const out: number[] = new Array(count);
+    for (let i = 0; i < count; i++) out[i] = start + i;
+    return out;
+  };
+  const floorNodes = floorKeys.map((fk) => ({
+    children: byFloor.get(fk)!.map((g) => ({ fragments: range(g.start, g.count) })),
+  }));
+  scenario.collisionTree = [{ children: floorNodes }];
 
   return scenario;
 }
