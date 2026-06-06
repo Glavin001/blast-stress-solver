@@ -90,9 +90,13 @@ export function mountPhysicsControls(opts: PhysicsControlsOptions): void {
   const rebuild = opts.onRebuild ?? (() => (document.getElementById('btn-reset') as HTMLButtonElement | null)?.click());
 
   const mount = () => {
-    const sidebar = document.getElementById('sidebar');
-    if (!sidebar || document.getElementById('cfg-physics-section')) return;
+    const sidebar = document.getElementById('sidebar') as (HTMLElement & { __physWired?: boolean }) | null;
+    if (!sidebar || sidebar.__physWired) return;
+    sidebar.__physWired = true;
 
+    // If a demo still carries its inline Physics/Optimization rows, wire those in place;
+    // otherwise inject the standard sections (the DRY path for demos that drop the markup).
+    if (!document.getElementById('cfg-debris-collision')) {
     const physics =
       `<section class="config-section" id="cfg-physics-section"><h2 class="section-title">Physics ${LIVE}</h2>` +
       (inc.centrifugal
@@ -145,6 +149,7 @@ export function mountPhysicsControls(opts: PhysicsControlsOptions): void {
     const last = sections[sections.length - 1];
     if (last && last.parentElement) last.parentElement.insertBefore(frag, last.nextSibling);
     else sidebar.appendChild(frag);
+    }
 
     wireControls(opts.getCore, opts.onDebug, rebuild, inc);
   };

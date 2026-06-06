@@ -22,6 +22,7 @@ import {
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
 import { buildSpinningBeamsScenario } from 'blast-stress-solver/scenarios';
+import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
 
 // ── Config ────────────────────────────────────────────────────
 
@@ -145,9 +146,9 @@ async function initScene() {
     // bodies awake/undamped so they keep spinning.
     fracturePolicy: { idleSkip: false },
     sleepMode: 'off',
-    smallBodyDamping: { mode: 'off' },
-    debrisCleanup: { mode: 'off' },
-    damage: { enabled: false },
+    // Shared Physics/Optimization controls (debris cleanup is forced 'off' via defaults below —
+    // spinning debris in zero-g should persist).
+    ...physicsCoreOverrides(),
   });
 
   core.setSolverCentrifugalEnabled(CONFIG.centrifugal);
@@ -234,6 +235,14 @@ function bindCheckbox(id: string, obj: Record<string, any>, key: string, onChang
 
 // Live: toggling centrifugal applies immediately to the running core.
 bindCheckbox('cfg-centrifugal', CONFIG, 'centrifugal', (v) => coreRef?.setSolverCentrifugalEnabled(v));
+
+// Shared Physics / Optimization controls (this demo keeps its own spin + debug toggles).
+mountPhysicsControls({
+  getCore: () => coreRef,
+  onRebuild: () => void rebuild(),
+  include: { centrifugal: false, debug: false, damage: false },
+  defaults: { debrisCleanupMode: 'off' }, // keep spinning debris in zero-g
+});
 // Live: spin rate is read every frame in applySpin().
 bindSlider('cfg-spin', CONFIG, 'spin', (v) => v.toFixed(0));
 // Scene shape + bond strength rebuild the scene on release ('change') so they apply live.
