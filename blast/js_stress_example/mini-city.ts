@@ -190,11 +190,19 @@ function mulberry32(a: number) {
 // centroid, so only centroids (and bond indices) need offsetting.
 type Part = { scenario: ScenarioDesc; offset: Vec3; massMultiplier?: number };
 
+// Offset every fragment index in a CollisionGroup subtree by `base` (deep copy, no mutation of the
+// shared template tree) so the per-tower authored hierarchy survives the merge into one scenario.
+function offsetCollisionGroup(g: any, base: number): any {
+  if (g.children) return { children: g.children.map((c: any) => offsetCollisionGroup(c, base)) };
+  return { fragments: (g.fragments as number[]).map((i) => i + base) };
+}
+
 function mergeScenarios(parts: Part[]): ScenarioDesc {
   const nodes: any[] = [];
   const bonds: any[] = [];
   const fragmentSizes: any[] = [];
   const fragmentGeometries: any[] = [];
+  const collisionTree: any[] = [];
   let base = 0;
 
   for (const { scenario, offset, massMultiplier = 1 } of parts) {
@@ -230,6 +238,11 @@ function mergeScenarios(parts: Part[]): ScenarioDesc {
       });
     }
 
+    // Carry each tower's authored collision-LOD tree, offsetting its fragment indices into the
+    // merged node array (one root per building).
+    const tree = (scenario as any).collisionTree as any[] | undefined;
+    if (tree) for (const root of tree) collisionTree.push(offsetCollisionGroup(root, base));
+
     base += scenario.nodes.length;
   }
 
@@ -237,6 +250,7 @@ function mergeScenarios(parts: Part[]): ScenarioDesc {
     nodes,
     bonds,
     parameters: { fragmentSizes, fragmentGeometries },
+    ...(collisionTree.length ? { collisionTree } : {}),
   } as ScenarioDesc;
 }
 
@@ -442,10 +456,13 @@ async function initScene() {
   if (hint) hint.textContent = 'Building city…';
 
   const scenario = await buildCity();
-  // Hierarchical collision-LOD: split each building into balanced sub-regions so a localized hit
-  // only materializes the struck region's colliders (the rest stay dormant). Orthogonal to the bond
-  // graph — cannot change fracture output; only consumed when lazyIntactColliders is on.
-  (scenario as any).collisionTree = buildSpatialCollisionTree(scenario, { leafMaxFragments: 24 });
+  // Hierarchical collision-LOD so a localized hit only materializes the struck region's colliders.
+  // mergeScenarios carries each tower's AUTHORED tree (building → floor → wall/slab/column →
+  // fragments) from buildFracturedTowerScenario; if that's ever absent we fall back to a generic
+  // spatial split. Orthogonal to the bond graph — cannot change fracture output.
+  if (!(scenario as any).collisionTree) {
+    (scenario as any).collisionTree = buildSpatialCollisionTree(scenario, { leafMaxFragments: 24 });
+  }
   console.log(
     `Mini-city: ${buildings.length} buildings, ${scenario.nodes.length} nodes, ${scenario.bonds.length} bonds`,
   );

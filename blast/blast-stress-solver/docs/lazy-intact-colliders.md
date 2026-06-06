@@ -87,10 +87,16 @@ construction (a node AABB encloses all its real colliders) so it never misses.
   rigid impacts; warm-start chaos only in soft mega-shatters. The hierarchy is a *performance-
   locality* win, not an equivalence change — orthogonal to the bond graph, it **cannot** alter
   fracture output by construction. (Pinned by the `Hierarchical collision LOD` tests.)
-- **Building a tree:** author one by hand, or call the exported `buildSpatialCollisionTree(scenario,
-  { leafMaxFragments })` — a shape-agnostic balanced median-split per bond-connected component (no
-  authoring metadata needed). mini-city uses it (`leafMaxFragments: 24`); absent a tree, the core
-  falls back to one flat leaf per building (the original binary behavior).
+- **Building a tree (two ways):**
+  - **Authored / semantic (preferred when the structure is known).** `buildFracturedTowerScenario`
+    now emits `scenario.collisionTree` straight from authoring: **building → floor → element (each
+    wall / column / slab) → fractured fragments**. A localized hit descends to the struck floor →
+    struck wall and wakes just that element (~one wall ≈ **5 %** of the building, measured).
+    mini-city's `mergeScenarios` offsets + concatenates each tower's tree into the merged scenario.
+  - **Spatial fallback (no metadata).** `buildSpatialCollisionTree(scenario, { leafMaxFragments })`
+    — a shape-agnostic balanced median-split per bond-connected component; works for any structure.
+    mini-city uses it only if no authored tree is present.
+  - Absent any tree, the core uses one flat leaf per building (the original binary behavior).
 
 ### Implementation (in `destructible-core.ts` + `collisionTree.ts`)
 - `LodNode { children, fragments, aabbMin/Max, enabled, buildingId }`; `lodRoots[]` + `buildingOfNode`.
