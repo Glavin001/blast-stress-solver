@@ -46,7 +46,7 @@ import { ensurePinataLoaded, fractureGeometry, type PinataModule } from '../thre
 // ── Material densities (kg/m^3) ─────────────────────────────────────────────
 export const HOUSE_WOOD_DENSITY = 600; // framing lumber (posts / beams)
 export const HOUSE_DRYWALL_DENSITY = 700; // drywall infill panels
-export const HOUSE_ROOF_DENSITY = 480; // sheathing + shingles
+export const HOUSE_ROOF_DENSITY = 560; // sheathing + shingles (heavy enough to want to fall)
 export const HOUSE_FOUNDATION_DENSITY = 2200; // concrete slab/footing
 export const HOUSE_FURNITURE_DENSITY = 480; // light wood furniture
 
@@ -174,15 +174,15 @@ export const DEFAULT_HOUSE_MULTIPLIERS: HouseMultipliers = {
   floorFloor: 10,
   floorBeam: 6,
   frameFrame: 16, // post↔beam / beam↔beam — the stiff wood frame
-  roofRoof: 1.3, // sheathing continuity: moderate, so it can't cantilever rigidly
-  roofBeam: 6, // ridge / top plate carry the roof (structural)
+  roofRoof: 1.0, // sheathing continuity: low, so the roof can't span/cantilever as a rigid plate
+  roofBeam: 6, // ridge / top plate carry the roof (the structural load path)
   roofColumn: 6, // king post directly under the ridge
-  roofWall: 0.4, // roof barely tied to the (drywall) gable skin
-  wallWall: 1.2, // drywall panel-to-panel continuity (weak)
-  wallColumn: 0.5, // drywall hung on a post (non-structural)
-  wallBeam: 0.4, // drywall hung on the plate
-  wallFloor: 2.0, // bottom plate keeps drywall standing
-  wallFoundation: 1.5,
+  roofWall: 0.35, // roof rests lightly on the gable skin — which is too weak to carry it
+  wallWall: 0.6, // drywall panel-to-panel continuity (weak, non-structural)
+  wallColumn: 0.35, // drywall hung on a post
+  wallBeam: 0.3, // drywall hung on the plate
+  wallFloor: 1.0, // drywall bottom plate — holds the panel's own weight, not a roof
+  wallFoundation: 1.0,
   shelfWall: 3.0, // shelves cling to their wall
   shelfOther: 2.0,
   furnitureFloor: 0.02, // barely resting — any contact frees & shoves the piece
