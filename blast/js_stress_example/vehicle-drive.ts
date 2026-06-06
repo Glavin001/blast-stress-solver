@@ -38,10 +38,9 @@ export type VehicleControls = {
 };
 
 export type VehicleTuning = {
-  engineForce: number; // N applied to the drive wheels at full throttle
-  brakeForce: number; // N applied to every wheel under (hand)brake
-  idleBrake: number; // gentle N when coasting so the car rolls to a stop
-  reverseFactor: number; // reverse engine force = engineForce * this
+  engineForce: number; // N applied to the drive wheels at full throttle (and braking)
+  brakeForce: number; // N wheel brake used only to hold the car once stopped
+  idleBrake: number; // gentle N to hold the car still when parked
   maxSpeed: number; // m/s soft cap (engine cuts out above this)
   maxSteer: number; // rad lock-to-lock half-angle
   steerRate: number; // rad/s steering slew (toward target / back to centre)
@@ -53,6 +52,7 @@ export type VehicleTuning = {
   // Chassis box (half-extents) + mass
   chassisHalf: { x: number; y: number; z: number };
   chassisMass: number;
+  comY: number; // centre-of-mass Y offset below the chassis centre (anti-flip)
   connectionY: number; // wheel hard-point Y in chassis-local space (below centre)
   // Suspension / friction (Rapier WheelTuning)
   suspensionStiffness: number;
@@ -65,11 +65,10 @@ export type VehicleTuning = {
 };
 
 export const DEFAULT_TUNING: VehicleTuning = {
-  engineForce: 4000,
-  brakeForce: 2000,
+  engineForce: 12000,
+  brakeForce: 5000,
   idleBrake: 40,
-  reverseFactor: 0.5,
-  maxSpeed: 32,
+  maxSpeed: 45, // m/s soft cap (~162 km/h)
   maxSteer: 0.6,
   steerRate: 3.5,
   wheelBase: 1.6,
@@ -78,6 +77,7 @@ export const DEFAULT_TUNING: VehicleTuning = {
   suspensionRestLength: 0.3,
   chassisHalf: { x: 0.9, y: 0.3, z: 1.7 },
   chassisMass: 1200,
+  comY: -0.5,
   connectionY: -0.25,
   suspensionStiffness: 80,
   maxSuspensionForce: 12000,
@@ -96,6 +96,8 @@ const DRIVE_WHEELS = [2, 3];
 
 export type VehicleHandle = {
   applyControls: (c: VehicleControls) => void;
+  /** Live-tune the car (e.g. top speed / engine power / steering) from the UI. */
+  setTuning: (partial: Partial<VehicleTuning>) => void;
   /** Map the stored controls onto the wheels and advance the controller. */
   step: (dt: number) => void;
   /** Sync the chassis + wheel meshes from the physics state. */
@@ -138,10 +140,23 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
   const t: VehicleTuning = { ...DEFAULT_TUNING, ...(opts.tuning ?? {}) };
 
   // ── Chassis rigid body + collider ───────────────────────────────
+  // Box inertia + a low centre of mass: without it the rear-drive torque (and
+  // ramming) rears the car up and flips it over backwards. Mass lives on the
+  // body (low CoM) so the collider is density-0 (collision shape only).
+  const m = t.chassisMass;
+  const w2 = t.chassisHalf.x * 2;
+  const h2 = t.chassisHalf.y * 2;
+  const d2 = t.chassisHalf.z * 2;
+  const inertia = {
+    x: (m / 12) * (h2 * h2 + d2 * d2),
+    y: (m / 12) * (w2 * w2 + d2 * d2),
+    z: (m / 12) * (w2 * w2 + h2 * h2),
+  };
   const chassis = world.createRigidBody(
     RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(opts.position.x, opts.position.y, opts.position.z)
       .setRotation(yawQuat(opts.headingY))
+      .setAdditionalMassProperties(m, { x: 0, y: t.comY, z: 0 }, inertia, { x: 0, y: 0, z: 0, w: 1 })
       .setLinearDamping(0.1)
       .setAngularDamping(0.5)
       .setCcdEnabled(true) // don't tunnel through thin walls at speed
@@ -149,7 +164,7 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
   );
   world.createCollider(
     RAPIER.ColliderDesc.cuboid(t.chassisHalf.x, t.chassisHalf.y, t.chassisHalf.z)
-      .setMass(t.chassisMass)
+      .setDensity(0) // mass comes from the body's low-CoM additional mass properties
       .setFriction(0.7)
       .setRestitution(0)
       // Report contact forces so ramming feeds the structure's damage path,
@@ -184,14 +199,18 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
       t.wheelRadius,
     );
   }
-  for (let i = 0; i < 4; i++) {
-    vehicle.setWheelSuspensionStiffness(i, t.suspensionStiffness);
-    vehicle.setWheelMaxSuspensionForce(i, t.maxSuspensionForce);
-    vehicle.setWheelSuspensionCompression(i, t.suspensionCompression);
-    vehicle.setWheelSuspensionRelaxation(i, t.suspensionRelaxation);
-    vehicle.setWheelMaxSuspensionTravel(i, t.maxSuspensionTravel);
-    vehicle.setWheelFrictionSlip(i, t.frictionSlip);
-    vehicle.setWheelSideFrictionStiffness(i, t.sideFrictionStiffness);
+  applyWheelTuning();
+
+  function applyWheelTuning() {
+    for (let i = 0; i < 4; i++) {
+      vehicle.setWheelSuspensionStiffness(i, t.suspensionStiffness);
+      vehicle.setWheelMaxSuspensionForce(i, t.maxSuspensionForce);
+      vehicle.setWheelSuspensionCompression(i, t.suspensionCompression);
+      vehicle.setWheelSuspensionRelaxation(i, t.suspensionRelaxation);
+      vehicle.setWheelMaxSuspensionTravel(i, t.maxSuspensionTravel);
+      vehicle.setWheelFrictionSlip(i, t.frictionSlip);
+      vehicle.setWheelSideFrictionStiffness(i, t.sideFrictionStiffness);
+    }
   }
 
   // ── Meshes (chassis box + four wheels) ──────────────────────────
@@ -240,6 +259,13 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
     controls.handbrake = c.handbrake;
   }
 
+  function setTuning(partial: Partial<VehicleTuning>) {
+    Object.assign(t, partial);
+    // engine/brake/steer/maxSpeed are read each step(); re-apply the wheel
+    // (suspension/friction) params in case those changed too.
+    applyWheelTuning();
+  }
+
   function step(dt: number) {
     // Steering: slew toward the target lock; recentre when released.
     const target = THREE.MathUtils.clamp(controls.steer, -1, 1) * t.maxSteer;
@@ -250,17 +276,22 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
     // Engine / brake.
     const speed = vehicle.currentVehicleSpeed(); // signed m/s (+ forward)
     let engine = 0;
-    let brake = controls.handbrake ? t.brakeForce : 0;
-    if (!controls.handbrake) {
-      if (controls.throttle > 0.001) {
-        engine = speed < t.maxSpeed ? t.engineForce * controls.throttle : 0;
-      } else if (controls.throttle < -0.001) {
-        // Brake first if we're still rolling forward, then reverse.
-        if (speed > 1.0) brake = t.brakeForce;
-        else engine = t.engineForce * t.reverseFactor * controls.throttle;
-      } else {
-        brake = t.idleBrake; // gentle coast-down
-      }
+    let brake = 0;
+    // Braking uses reverse ENGINE force, not wheel locking. Locking the wheels at
+    // speed makes this raycast vehicle pitch up and flip/launch; engine force is
+    // applied longitudinally at the contacts (the same path as throttle) and stays
+    // stable at any speed. A wheel brake is only used to hold the car once stopped.
+    if (controls.handbrake) {
+      if (Math.abs(speed) > 0.5) engine = -Math.sign(speed) * t.engineForce;
+      else brake = t.brakeForce;
+    } else if (controls.throttle > 0.001) {
+      // Forward (engine cuts out above the top-speed cap; the car coasts down).
+      engine = speed < t.maxSpeed ? t.engineForce * controls.throttle : 0;
+    } else if (controls.throttle < -0.001) {
+      // S = brake then reverse, all via engine force (reverse capped slower).
+      engine = speed > -t.maxSpeed * 0.5 ? t.engineForce * controls.throttle : 0;
+    } else if (Math.abs(speed) < 0.5) {
+      brake = t.idleBrake; // light hold so it doesn't creep when parked
     }
     for (const i of DRIVE_WHEELS) vehicle.setWheelEngineForce(i, engine);
     for (let i = 0; i < 4; i++) vehicle.setWheelBrake(i, brake);
@@ -347,6 +378,7 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
 
   return {
     applyControls,
+    setTuning,
     step,
     syncMeshes,
     chassisBody: () => chassis,

@@ -145,6 +145,8 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     blast: { radius: 7, strength: 55, up: 0.4 },
     // Third-person chase camera (drive mode).
     chase: { dist: 6.5, height: 2.8, look: 0.9, lerp: 6 },
+    // Live-tunable car properties (sidebar sliders; pushed via vehicle.setTuning).
+    car: { maxSpeed: 45, engineForce: 12000, maxSteer: 0.6 },
   };
 
   // ── Runtime state ───────────────────────────────────────────────
@@ -243,6 +245,15 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       '<span class="toggle-text">Drive a vehicle' +
       '<small>Hop in a car: WASD / arrows drive &amp; steer · Space handbrake · ' +
       '<b>R</b> flips it upright · mouse looks around. Ram the buildings! Press <b>C</b> to toggle.</small></span></label>' +
+      '<div class="config-row"><label class="config-label" for="cfg-car-speed">Car top speed</label>' +
+      '<input type="range" id="cfg-car-speed" class="config-slider" min="10" max="90" step="5" value="45" />' +
+      '<span class="config-value" id="cfg-car-speed-value">162 km/h</span></div>' +
+      '<div class="config-row"><label class="config-label" for="cfg-car-power">Car engine power</label>' +
+      '<input type="range" id="cfg-car-power" class="config-slider" min="2000" max="24000" step="1000" value="12000" />' +
+      '<span class="config-value" id="cfg-car-power-value">12000 N</span></div>' +
+      '<div class="config-row"><label class="config-label" for="cfg-car-steer">Car steering</label>' +
+      '<input type="range" id="cfg-car-steer" class="config-slider" min="0.3" max="1" step="0.05" value="0.6" />' +
+      '<span class="config-value" id="cfg-car-steer-value">34°</span></div>' +
       '<label class="toggle-row"><input type="checkbox" id="cfg-headlamp" checked />' +
       '<span class="toggle-text">Headlamp' +
       '<small>Camera-mounted light — always lights wherever you are and look.</small></span></label>' +
@@ -295,6 +306,10 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     bindSlider(section, '#cfg-blast-radius', (v) => { cfg.blast.radius = v; }, (v) => v.toFixed(1) + ' m');
     bindSlider(section, '#cfg-blast-strength', (v) => { cfg.blast.strength = v; }, (v) => v.toFixed(0) + '×');
     bindSlider(section, '#cfg-sticky-speed', (v) => { cfg.sticky.speed = v; }, (v) => v.toFixed(0) + ' m/s');
+    // Car tuning — pushed straight into the live vehicle (no respawn needed).
+    bindSlider(section, '#cfg-car-speed', (v) => { cfg.car.maxSpeed = v; vehicle?.setTuning({ maxSpeed: v }); }, (v) => (v * 3.6).toFixed(0) + ' km/h');
+    bindSlider(section, '#cfg-car-power', (v) => { cfg.car.engineForce = v; vehicle?.setTuning({ engineForce: v }); }, (v) => v.toFixed(0) + ' N');
+    bindSlider(section, '#cfg-car-steer', (v) => { cfg.car.maxSteer = v; vehicle?.setTuning({ maxSteer: v }); }, (v) => ((v * 180) / Math.PI).toFixed(0) + '°');
 
     section.querySelector('#cfg-detonate')!.addEventListener('click', () => detonateAll());
     refreshUi();
@@ -437,6 +452,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       scene,
       position: sp.position,
       headingY: sp.headingY,
+      tuning: cfg.car,
     });
     vehicleCore = core;
   }
@@ -970,9 +986,11 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     let throttle = 0;
     if (keys.has('KeyW') || keys.has('ArrowUp')) throttle += 1;
     if (keys.has('KeyS') || keys.has('ArrowDown')) throttle -= 1;
+    // Steer relative to the chase camera: A/left turns the car left on screen
+    // (toward world +X, which is screen-left because the camera looks down +Z).
     let steer = 0;
-    if (keys.has('KeyD') || keys.has('ArrowRight')) steer += 1;
-    if (keys.has('KeyA') || keys.has('ArrowLeft')) steer -= 1;
+    if (keys.has('KeyA') || keys.has('ArrowLeft')) steer += 1;
+    if (keys.has('KeyD') || keys.has('ArrowRight')) steer -= 1;
     const handbrake = keys.has('Space');
 
     vehicle.applyControls({ throttle, brake: 0, steer, handbrake });
