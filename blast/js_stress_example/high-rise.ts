@@ -20,6 +20,7 @@ import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverla
 import { createDestructibleThreeBundle, RapierDebugRenderer, setPinataModule } from 'blast-stress-solver/three';
 import { buildHighRiseScenario, buildHighRiseScenarioAsync, type HighRiseOptions } from 'blast-stress-solver/scenarios';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
 import { mountShooter } from './shooter-fps.js';
 
 // The scene defaults (camera, material limits, contact-damage tuning) still come from
@@ -190,8 +191,6 @@ const recorder = createRecordingOverlay({
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
-// Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
-let centrifugalEnabled = false;
 let rebuilding = false;
 
 async function initScene() {
@@ -242,22 +241,11 @@ async function initScene() {
       maxSolverIterationsPerFrame: CONFIG.solver.iterations,
       graphReductionLevel: CONFIG.solver.graphReduction,
     },
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.solver.contactForceScale,
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
-    damage: { ...packDamage, enabled: CONFIG.features.damage } as any,
-    debrisCleanup: {
-      mode: CONFIG.optimization.debrisCleanupMode as any,
-      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
-      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
-    },
-    smallBodyDamping: {
-      mode: CONFIG.optimization.smallBodyDampingMode as any,
-      colliderCountThreshold: 3,
-      minLinearDamping: 2,
-      minAngularDamping: 2,
-    },
+    // Shared Physics/Optimization/Features controls (physics-controls.ts).
+    ...physicsCoreOverrides(),
+    // ...but keep the scene-pack's per-chunk damage tuning when the toggle is on.
+    damage: { ...packDamage, enabled: physicsConfig.damage } as any,
     ...pipelineCoreOverrides(),
   });
 
@@ -273,10 +261,10 @@ async function initScene() {
   });
 
   rapierDebug?.dispose();
-  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: CONFIG.features.debug });
+  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: physicsConfig.debug });
 
   coreRef = core;
-  core.setSolverCentrifugalEnabled(centrifugalEnabled);
+  core.setSolverCentrifugalEnabled(physicsConfig.centrifugal);
   recorder.attach(core, { scenario, meta: { demo: 'high-rise', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -360,32 +348,11 @@ bindSlider('cfg-iterations', CONFIG.solver, 'iterations', (v) => v.toFixed(0));
 bindSlider('cfg-graph-reduction', CONFIG.solver, 'graphReduction', (v) => v.toFixed(0));
 bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1) + ' m/s²', (v) => coreRef?.setGravity(v));
 
-// Physics
-document.getElementById('cfg-centrifugal')?.addEventListener('change', (e) => {
-  centrifugalEnabled = (e.target as HTMLInputElement).checked;
-  coreRef?.setSolverCentrifugalEnabled(centrifugalEnabled);
-});
-bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) => coreRef?.setDebrisCollisionMode(v as any));
-bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
-bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));
-
-// Optimization (live)
-bindSelect('cfg-damping-mode', CONFIG.optimization, 'smallBodyDampingMode', (v) => coreRef?.setSmallBodyDamping?.({ mode: v as any }));
-bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) =>
-  coreRef?.setDebrisCleanup?.({ mode: v as any, debrisTtlMs: CONFIG.optimization.debrisTtlMs }));
-bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 1000).toFixed(1) + 's', (v) =>
-  coreRef?.setDebrisCleanup?.({ mode: CONFIG.optimization.debrisCleanupMode as any, debrisTtlMs: v }));
-
-// Features
-const optDamage = document.getElementById('opt-damage') as HTMLInputElement | null;
-if (optDamage) optDamage.checked = CONFIG.features.damage;
-optDamage?.addEventListener('change', () => { CONFIG.features.damage = !!optDamage.checked; void rebuild(); });
-
-const optDebug = document.getElementById('opt-debug') as HTMLInputElement | null;
-if (optDebug) optDebug.checked = CONFIG.features.debug;
-optDebug?.addEventListener('change', () => {
-  CONFIG.features.debug = !!optDebug.checked;
-  rapierDebug?.setEnabled(CONFIG.features.debug);
+// Physics / Optimization / Features — the shared module wires high-rise's existing inline rows.
+mountPhysicsControls({
+  getCore: () => coreRef,
+  onDebug: (on) => rapierDebug?.setEnabled(on),
+  onRebuild: () => void rebuild(),
 });
 
 document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });
@@ -404,7 +371,7 @@ function loop() {
     const t0 = performance.now();
     coreRef.step(dt);
     _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
-    visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true });
+    visualsRef.update({ debug: physicsConfig.debug, updateBVH: false, updateProjectiles: true });
     rapierDebug?.update();
     updateStatus(coreRef);
   }
