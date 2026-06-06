@@ -56,6 +56,14 @@ export type ShooterOptions = {
   floorY?: number;
   /** Eye height above the floor, in metres. Default 1.7. */
   eyeHeight?: number;
+  /**
+   * Player capsule half-height (cylinder half, excluding the two radius caps), metres.
+   * Total standing height ≈ 2*(playerHalfHeight + playerRadius). Default 0.6 (a ~1.9 m
+   * avatar). For human-scale interiors pass a smaller value (e.g. 0.5 ≈ 1.6 m).
+   */
+  playerHalfHeight?: number;
+  /** Player capsule radius (half the shoulder width), metres. Default 0.35. */
+  playerRadius?: number;
 };
 
 export type ShooterHandle = {
@@ -158,7 +166,12 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   // A capsule that physically collides with floors, debris and structures, so
   // you can walk on rubble and clamber on top of things. Created in the core's
   // world when first-person mode turns on; recreated after a Reset (new world).
-  const CAPSULE = { halfHeight: 0.6, radius: 0.35 };
+  // Size defaults to a tall avatar (good for the big demolition demos); a demo with
+  // human-scale interiors (e.g. the house) can pass a smaller, real-world capsule.
+  const CAPSULE = {
+    halfHeight: opts.playerHalfHeight ?? 0.6,
+    radius: opts.playerRadius ?? 0.35,
+  };
   const EYE_ABOVE_CENTER = CAPSULE.halfHeight + CAPSULE.radius + 0.05; // eye ≈ capsule top
   let charBody: RAPIER.RigidBody | null = null;
   let charCollider: RAPIER.Collider | null = null;

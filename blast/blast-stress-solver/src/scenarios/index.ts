@@ -48,4 +48,4 @@ export {
   HOUSE_FOUNDATION_DENSITY,
   HOUSE_FURNITURE_DENSITY,
 } from './houseScenario';
-export type { HouseOptions, HouseMultipliers } from './houseScenario';
+export type { HouseOptions, HouseMultipliers, HouseFractureMode } from './houseScenario';

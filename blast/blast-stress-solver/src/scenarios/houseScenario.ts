@@ -1,34 +1,35 @@
 /**
  * Single-storey wood-framed HOUSE scenario — a realistic, low-poly, walkable home that
- * battle-tests the stress solver on a genuinely heterogeneous, civil-engineering-style
- * structure (rather than a uniform box).
+ * battle-tests the stress solver on a genuinely heterogeneous, *structurally realistic*
+ * body (rather than a uniform box that floats when you knock its walls out).
  *
- * It is built as ONE body (one ScenarioDesc) from many composable box "chunks", but the
- * bonds between them are tuned per material so it fails *non-uniformly*:
+ * Structural model (this is the important part — it gives a real load path):
  *
- *   - A static FOUNDATION (mass 0) anchors a FLOOR slab to the ground.
- *   - Wood-framed EXTERIOR WALLS with real door + window openings, an INTERIOR partition
- *     splitting a living room and kitchen, a ring of top-plate BEAMS, a few interior
- *     POSTS (columns) and ceiling tie-BEAMS — the load path floor → wall → plate → roof.
- *   - A pitched, gabled ROOF (two sloped planes + ridge beam + gable-end triangles) that
- *     is bonded *moderately* to the frame, so a hit caves the roof differently than it
- *     blows out a wall.
- *   - FURNITURE (table, chairs, kitchen counter, wall shelves) that is part of the same
- *     body but barely attached to the floor: the furniture↔floor bond is near-zero, so
- *     any contact frees a piece and shoves it; wall-mounted SHELVES are bonded more
- *     firmly to their wall.
+ *   - A static FOUNDATION (mass 0) anchors a FLOOR slab.
+ *   - A wood POST-AND-BEAM FRAME is the load path: vertical posts (corner + intermediate
+ *     wall posts to the eave, plus interior "king posts" that rise to the ridge), tied by
+ *     a top-plate ring BEAM at the eave and a RIDGE beam at the apex. Posts → beams → roof
+ *     and posts → floor → foundation carry all the weight.
+ *   - The pitched gabled ROOF rests on the ridge beam (held by the king posts + gable
+ *     ends) and on the top-plate (held by the wall posts). It is NOT a self-supporting
+ *     rigid plate: roof↔roof bonds are only moderate, so an unsupported span sags and
+ *     fails instead of floating — knock out the posts under it and that bay collapses.
+ *   - DRYWALL wall panels are non-structural infill hung weakly on the frame between the
+ *     posts (with door/window openings). Blowing them out does NOT bring the house down;
+ *     they carry almost no load. This is the cosmetic-vs-structural distinction.
+ *   - FURNITURE (table, chairs, counter, shelves) is part of the body but barely attached
+ *     to the floor, so any contact frees a piece; shelves cling a bit to their wall.
  *
- * Every chunk is a single convex box, so the runtime gives it a cheap cuboid / convex-hull
- * collider (never a concave trimesh); multi-part pieces (a table = top + 4 legs) are a
- * manual convex decomposition bonded together — Rapier's recommended approach for complex
- * dynamic objects.
+ * Every chunk is a single convex box → the runtime gives it a cheap cuboid / convex-hull
+ * collider (never a concave trimesh); multi-part pieces are a convex decomposition. With
+ * the async builder + `fracture`, selected parts are Voronoi-shattered (three-pinata) into
+ * irregular shards instead of boxes, for nicer-looking breakage.
  *
  * Material strength is expressed through bond *area* (stress = impulse / area), since the
- * solver's stress limits are global — see {@link makeHouseBondMultiplier}. Mirrors the
- * high-rise composer (highRiseScenario.ts) end to end.
+ * solver's stress limits are global — see {@link makeHouseBondMultiplier}.
  */
 import * as THREE from 'three';
-import type { ScenarioDesc } from '../rapier/types';
+import type { ScenarioDesc, ScenarioBond } from '../rapier/types';
 import type { FragmentInfo, FragmentType } from '../three/fracture';
 import {
   applyBondStrengthMultipliers,
@@ -40,36 +41,39 @@ import {
   buildScenarioFromFragments,
   buildScenarioFromFragmentsAsync,
 } from '../three/scenarioFromFragments';
+import { ensurePinataLoaded, fractureGeometry, type PinataModule } from '../three/pinataFracture';
 
 // ── Material densities (kg/m^3) ─────────────────────────────────────────────
-export const HOUSE_WOOD_DENSITY = 600; // framing lumber / posts / beams
-export const HOUSE_DRYWALL_DENSITY = 700; // drywall / sheathed wall panels
-export const HOUSE_ROOF_DENSITY = 420; // sheathing + shingles
+export const HOUSE_WOOD_DENSITY = 600; // framing lumber (posts / beams)
+export const HOUSE_DRYWALL_DENSITY = 700; // drywall infill panels
+export const HOUSE_ROOF_DENSITY = 480; // sheathing + shingles
 export const HOUSE_FOUNDATION_DENSITY = 2200; // concrete slab/footing
 export const HOUSE_FURNITURE_DENSITY = 480; // light wood furniture
 
 // ── Realistic-but-distinct material palette (hex). Structural defaults live here so the
-//    demo and any other consumer share one source of truth; furniture pieces carry their
-//    own per-piece accent colors (see collectHouseFragments). ───────────────────────────
+//    demo and any consumer share one source of truth; furniture carries per-piece accents.
 export const HOUSE_PALETTE: Record<string, number> = {
   foundation: 0x8d8a86, // concrete
   floor: 0xc2a878, // wood floor
-  wall: 0xe8e2d4, // off-white drywall
-  beam: 0x8b5a2b, // wood frame (top plate / ridge / ties)
-  column: 0x7a4a22, // darker wood posts
+  wall: 0xe8e2d4, // off-white drywall (non-structural)
+  beam: 0x8b5a2b, // wood frame (top plate / ridge)
+  column: 0x7a4a22, // wood posts (structural)
   roof: 0x77503c, // warm shingle brown
   furniture: 0x9c6b3f,
   shelf: 0x8b5a2b,
 };
+
+/** Which parts get Voronoi-shattered (async builder only). */
+export type HouseFractureMode = 'none' | 'walls' | 'wallsRoof' | 'all';
 
 export type HouseOptions = {
   /** Footprint width along X (m). Default 10. */
   width?: number;
   /** Footprint depth along Z (m). Default 8. */
   depth?: number;
-  /** Eave (wall) height from floor to top plate (m). Default 2.7. */
+  /** Eave (wall) height from floor to top plate (m). Default 2.6. */
   wallHeight?: number;
-  /** Exterior wall thickness (m). Default 0.15. */
+  /** Exterior wall (drywall) thickness (m). Default 0.15. */
   wallThickness?: number;
   /** Interior partition thickness (m). Default 0.1. */
   interiorWallThickness?: number;
@@ -77,9 +81,11 @@ export type HouseOptions = {
   floorThickness?: number;
   /** Static foundation thickness (m). Default 0.4. */
   foundationThickness?: number;
-  /** Top-plate / ring-beam thickness (m). Default 0.12. */
+  /** Top-plate / ring-beam thickness (m). Default 0.14. */
   plateThickness?: number;
-  /** Ridge rise above the eave (m). Default 1.8. */
+  /** Structural post cross-section (m). Default 0.18. */
+  postSize?: number;
+  /** Ridge rise above the eave (m). Default 1.6. */
   roofRise?: number;
   /** Roof eave overhang past the wall (m). Default 0.45. */
   eaveOverhang?: number;
@@ -89,76 +95,108 @@ export type HouseOptions = {
   panelCell?: number;
   /** Vertical wall courses. Default 5. */
   wallCourses?: number;
-  /** Include interior furniture (table, chairs, counter, shelves). Default true. */
+  /** Number of interior "king posts" under the ridge (incl. the gable ends). Default 5. */
+  ridgePosts?: number;
+  /** Include interior furniture. Default true. */
   furniture?: boolean;
-  /** Bond detection: 'proximity' (pure-JS, default) or 'auto' (WASM, needs async builder). */
+  /** Bond detection: 'proximity' (pure-JS, default) or 'auto' (WASM, async builder). */
   bondMode?: 'proximity' | 'auto';
+  /** Voronoi-shatter selected parts instead of boxes (async builder only). Default 'none'. */
+  fracture?: HouseFractureMode;
+  /** Voronoi shards per box when fracturing. Default 4. */
+  fragmentsPerPiece?: number;
+  /** Pre-imported three-pinata module (required for `fracture` in browser ESM). */
+  pinata?: PinataModule;
   /** Override individual bond-strength multipliers. */
   multipliers?: Partial<HouseMultipliers>;
 };
 
 export const DEFAULT_HOUSE_OPTIONS: Required<
-  Omit<HouseOptions, 'multipliers' | 'bondMode'>
+  Omit<HouseOptions, 'multipliers' | 'bondMode' | 'fracture' | 'fragmentsPerPiece' | 'pinata'>
 > & { bondMode: 'proximity' | 'auto' } = {
   width: 10,
   depth: 8,
-  wallHeight: 2.7,
+  wallHeight: 2.6,
   wallThickness: 0.15,
   interiorWallThickness: 0.1,
   floorThickness: 0.18,
   foundationThickness: 0.4,
-  plateThickness: 0.12,
-  roofRise: 1.8,
+  plateThickness: 0.14,
+  postSize: 0.18,
+  roofRise: 1.6,
   eaveOverhang: 0.45,
   roofThickness: 0.12,
   panelCell: 0.62,
   wallCourses: 5,
+  ridgePosts: 5,
   furniture: true,
   bondMode: 'proximity',
 };
 
 // ── Bond-strength table (multipliers on bond AREA → effective strength) ─────
+//
+// The structural load path (foundation → post → beam → roof, and post → floor) is STRONG;
+// drywall is non-structural and hangs weakly on the frame; the roof is carried by the
+// beams/posts and only moderately bonded to itself; furniture barely rests on the floor.
 export type HouseMultipliers = {
-  furnitureFloor: number;
-  furnitureWall: number;
-  furnitureFurniture: number;
-  shelfWall: number;
-  shelfOther: number;
+  // Anchor + frame (structural — the load path that holds the house up).
+  foundationColumn: number;
+  foundationFloor: number;
+  foundationOther: number;
+  floorColumn: number;
+  floorFloor: number;
+  floorBeam: number;
+  frameFrame: number; // post↔beam, beam↔beam, post↔post
+  // Roof (carried by the frame; only moderately self-bonded).
   roofRoof: number;
   roofBeam: number;
+  roofColumn: number;
   roofWall: number;
-  foundationFloor: number;
-  foundationFrame: number;
-  floorFloor: number;
-  floorWall: number;
-  floorFrame: number;
-  frameFrame: number;
-  beamWall: number;
+  // Drywall (non-structural cosmetic infill — weak everywhere).
   wallWall: number;
+  wallColumn: number;
+  wallBeam: number;
+  wallFloor: number;
+  wallFoundation: number;
+  // Contents.
+  shelfWall: number;
+  shelfOther: number;
+  furnitureFloor: number;
+  furnitureFurniture: number;
+  furnitureOther: number;
 };
 
 export const DEFAULT_HOUSE_MULTIPLIERS: HouseMultipliers = {
+  foundationColumn: 28, // posts anchored to the ground — strongest joint
+  foundationFloor: 30,
+  foundationOther: 12,
+  floorColumn: 18, // post base on the slab
+  floorFloor: 10,
+  floorBeam: 6,
+  frameFrame: 16, // post↔beam / beam↔beam — the stiff wood frame
+  roofRoof: 1.3, // sheathing continuity: moderate, so it can't cantilever rigidly
+  roofBeam: 6, // ridge / top plate carry the roof (structural)
+  roofColumn: 6, // king post directly under the ridge
+  roofWall: 0.4, // roof barely tied to the (drywall) gable skin
+  wallWall: 1.2, // drywall panel-to-panel continuity (weak)
+  wallColumn: 0.5, // drywall hung on a post (non-structural)
+  wallBeam: 0.4, // drywall hung on the plate
+  wallFloor: 2.0, // bottom plate keeps drywall standing
+  wallFoundation: 1.5,
+  shelfWall: 3.0, // shelves cling to their wall
+  shelfOther: 2.0,
   furnitureFloor: 0.02, // barely resting — any contact frees & shoves the piece
-  furnitureWall: 0.5, // counter lightly against a wall
   furnitureFurniture: 3.0, // holds a chair/table together until hit
-  shelfWall: 6.0, // wall-mounted shelves cling to their wall
-  shelfOther: 3.0,
-  roofRoof: 2.5, // sheathing plane continuity
-  roofBeam: 1.5, // roof ↔ ridge/top plate — caves differently than a wall
-  roofWall: 1.2, // roof ↔ gable wall
-  foundationFloor: 30.0, // strongest: slab anchored to ground (no liftoff)
-  foundationFrame: 20.0, // sill anchor of walls/posts to foundation
-  floorFloor: 10.0, // slab diaphragm
-  floorWall: 8.0, // bottom plate: wall sits on floor
-  floorFrame: 14.0, // floor ↔ post/beam base
-  frameFrame: 12.0, // wood frame joints (post↔beam, beam↔beam)
-  beamWall: 8.0, // top plate ↔ studs
-  wallWall: 4.0, // stud/sheathing baseline
+  furnitureOther: 0.3,
 };
 
 const isFrame = (t?: FragmentType) => t === 'beam' || t === 'column';
 
-/** Build the house bond-strength multiplier function (resolve weak/special pairs first). */
+/**
+ * Build the house bond-strength multiplier. Resolve contents → drywall → roof → frame, so
+ * a "drywall ↔ anything" joint always stays weak (non-structural) and a "roof ↔ frame"
+ * joint is the structural one that carries the roof.
+ */
 export function makeHouseBondMultiplier(
   overrides?: Partial<HouseMultipliers>,
 ): BondStrengthMultiplierFn {
@@ -168,32 +206,41 @@ export function makeHouseBondMultiplier(
       (t0 === a && t1 === b) || (t0 === b && t1 === a);
     const has = (a: FragmentType) => t0 === a || t1 === a;
 
-    // Furniture & shelves first, so any "<something> ↔ furniture" stays weak/special.
+    // Contents.
     if (has('furniture') || has('shelf')) {
       if (pair('furniture', 'floor')) return M.furnitureFloor;
       if (t0 === 'furniture' && t1 === 'furniture') return M.furnitureFurniture;
       if (has('shelf')) return has('wall') ? M.shelfWall : M.shelfOther;
-      return M.furnitureWall; // furniture ↔ wall / frame / roof: light attachment
+      return M.furnitureOther;
     }
 
-    // Roof bonds (moderate; weaker than the frame so the roof caves on its own).
+    // Drywall infill is non-structural — every drywall joint is weak.
+    if (has('wall')) {
+      if (t0 === 'wall' && t1 === 'wall') return M.wallWall;
+      if (has('roof')) return M.roofWall;
+      if (has('column')) return M.wallColumn;
+      if (has('beam')) return M.wallBeam;
+      if (has('floor')) return M.wallFloor;
+      if (has('foundation')) return M.wallFoundation;
+      return M.wallWall;
+    }
+
+    // Roof skin (carried by the frame).
     if (has('roof')) {
       if (t0 === 'roof' && t1 === 'roof') return M.roofRoof;
-      if (isFrame(t0) || isFrame(t1)) return M.roofBeam;
-      return M.roofWall;
+      if (has('beam')) return M.roofBeam;
+      if (has('column')) return M.roofColumn;
+      return M.roofRoof;
     }
 
-    // Base anchoring.
+    // Structural load path.
+    if (pair('foundation', 'column')) return M.foundationColumn;
     if (pair('foundation', 'floor')) return M.foundationFloor;
-    if (has('foundation')) return M.foundationFrame;
-
-    // Wood frame load path.
+    if (has('foundation')) return M.foundationOther;
+    if (pair('floor', 'column')) return M.floorColumn;
     if (t0 === 'floor' && t1 === 'floor') return M.floorFloor;
-    if (pair('floor', 'wall')) return M.floorWall;
-    if (pair('floor', 'beam') || pair('floor', 'column')) return M.floorFrame;
+    if (has('floor')) return M.floorBeam;
     if (isFrame(t0) && isFrame(t1)) return M.frameFrame;
-    if (pair('beam', 'wall') || pair('column', 'wall')) return M.beamWall;
-    if (t0 === 'wall' && t1 === 'wall') return M.wallWall;
 
     return 1.0;
   };
@@ -204,18 +251,11 @@ export const HOUSE_BOND_MULTIPLIERS: BondStrengthMultiplierFn = makeHouseBondMul
 // ── Geometry assembly ───────────────────────────────────────────────────────
 
 type Vec3 = { x: number; y: number; z: number };
-type WallRunOpening = {
-  /** Center along the run (X for a front/back wall, Z for a side wall), in meters. */
-  center: number;
-  width: number;
-  /** Sill height above the wall base (m); 0 for a door. */
-  sill: number;
-  height: number;
-};
+type WallRunOpening = { center: number; width: number; sill: number; height: number };
 
+type MergedOptions = typeof DEFAULT_HOUSE_OPTIONS;
 type CollectedHouse = {
   fragments: FragmentInfo[];
-  /** Per-fragment accent color (hex) or undefined to let the palette pick by type. */
   nodeColors: (number | undefined)[];
   dims: Record<string, number>;
 };
@@ -224,31 +264,31 @@ function overlaps1D(aMin: number, aMax: number, bMin: number, bMax: number): boo
   return aMin < bMax && bMin < aMax;
 }
 
+function linspace(min: number, max: number, n: number): number[] {
+  if (n <= 1) return [(min + max) * 0.5];
+  const step = (max - min) / (n - 1);
+  return Array.from({ length: n }, (_v, i) => min + step * i);
+}
+
 /**
- * Build a vertical wall run (along X or Z) as a grid of box chunks, skipping any cell that
- * overlaps a door/window opening. The grid naturally leaves a header course above each
- * opening and an apron below a window, so no separate lintel is needed. Remaining chunks
- * stay flush with their neighbors, so the proximity/auto bonder reconnects them around the
- * hole.
+ * Build a vertical wall run (drywall infill) as a grid of box chunks, skipping any cell
+ * overlapping a door/window opening. The grid naturally leaves a header course above each
+ * opening and an apron below a window.
  */
 function buildWallRun(opts: {
   axis: 'x' | 'z';
-  /** Perpendicular world position: z for an x-run, x for a z-run. */
   fixed: number;
-  /** Center along the run. */
   runCenter: number;
   runLength: number;
   baseY: number;
   height: number;
   thickness: number;
-  fragmentType: FragmentType;
   density: number;
   panelCell: number;
   courses: number;
   openings?: WallRunOpening[];
 }): FragmentInfo[] {
-  const { axis, fixed, runCenter, runLength, baseY, height, thickness, fragmentType, density } =
-    opts;
+  const { axis, fixed, runCenter, runLength, baseY, height, thickness, density } = opts;
   const cols = Math.max(1, Math.round(runLength / opts.panelCell));
   const rows = Math.max(1, opts.courses);
   const cellU = runLength / cols;
@@ -261,7 +301,6 @@ function buildWallRun(opts: {
     const cu = uMin + cellU * (iu + 0.5);
     for (let iv = 0; iv < rows; iv++) {
       const cv = baseY + cellV * (iv + 0.5);
-      // Skip cells that overlap any opening.
       const skip = openings.some((o) =>
         overlaps1D(cu - cellU * 0.5, cu + cellU * 0.5, o.center - o.width * 0.5, o.center + o.width * 0.5) &&
         overlaps1D(cv - cellV * 0.5, cv + cellV * 0.5, baseY + o.sill, baseY + o.sill + o.height),
@@ -271,15 +310,13 @@ function buildWallRun(opts: {
       const worldPosition: Vec3 =
         axis === 'x' ? { x: cu, y: cv, z: fixed } : { x: fixed, y: cv, z: cu };
       const size: Vec3 =
-        axis === 'x'
-          ? { x: cellU, y: cellV, z: thickness }
-          : { x: thickness, y: cellV, z: cellU };
+        axis === 'x' ? { x: cellU, y: cellV, z: thickness } : { x: thickness, y: cellV, z: cellU };
       out.push({
         worldPosition,
         halfExtents: { x: size.x * 0.5, y: size.y * 0.5, z: size.z * 0.5 },
         geometry: new THREE.BoxGeometry(size.x, size.y, size.z),
         isSupport: false,
-        fragmentType,
+        fragmentType: 'wall',
         density,
       });
     }
@@ -287,22 +324,23 @@ function buildWallRun(opts: {
   return out;
 }
 
-function collectHouseFragments(o: Required<Omit<HouseOptions, 'multipliers' | 'bondMode'>>): CollectedHouse {
+/** A single structural post (column) from baseY up to topY, subdivided vertically. */
+function buildPost(cx: number, cz: number, baseY: number, topY: number, size: number, panelCell: number): FragmentInfo[] {
+  const h = topY - baseY;
+  return subdivideBoxFragments({
+    center: { x: cx, y: (baseY + topY) * 0.5, z: cz },
+    size: { x: size, y: h, z: size },
+    divisions: { x: 1, y: Math.max(1, Math.round(h / Math.max(panelCell, 0.5))), z: 1 },
+    fragmentType: 'column',
+    density: HOUSE_WOOD_DENSITY,
+  });
+}
+
+function collectHouseFragments(o: MergedOptions): CollectedHouse {
   const {
-    width,
-    depth,
-    wallHeight,
-    wallThickness,
-    interiorWallThickness,
-    floorThickness,
-    foundationThickness,
-    plateThickness,
-    roofRise,
-    eaveOverhang,
-    roofThickness,
-    panelCell,
-    wallCourses,
-    furniture,
+    width, depth, wallHeight, wallThickness, interiorWallThickness, floorThickness,
+    foundationThickness, plateThickness, postSize, roofRise, eaveOverhang, roofThickness,
+    panelCell, wallCourses, ridgePosts, furniture,
   } = o;
 
   const fragments: FragmentInfo[] = [];
@@ -311,209 +349,155 @@ function collectHouseFragments(o: Required<Omit<HouseOptions, 'multipliers' | 'b
   const hd = depth * 0.5;
 
   const push = (fs: FragmentInfo[], color?: number) => {
-    for (const f of fs) {
-      fragments.push(f);
-      nodeColors.push(color);
-    }
+    for (const f of fs) { fragments.push(f); nodeColors.push(color); }
   };
 
-  // ── Foundation: static (mass 0) tiles directly under the floor ────────────
+  // Datum: floor top = 0 (lifted onto the runtime ground at the end).
   const floorTopY = 0;
   const floorBottomY = floorTopY - floorThickness;
   const foundationTopY = floorBottomY;
   const foundationBottomY = foundationTopY - foundationThickness;
+  const eaveY = wallHeight;
+
+  // Roof geometry — derive so the underside meets the top plate at the eave (small bite for
+  // a real contact bond) and rises to the ridge; everything tucks UNDER the roof.
+  const plateTopY = wallHeight + plateThickness;
+  const eaveBite = 0.02;
+  const roofCenterAtWall = plateTopY - eaveBite + roofThickness * 0.5;
+  const ridgeCenterY = roofCenterAtWall + roofRise;
+  const ridgeUndersideY = ridgeCenterY - roofThickness * 0.5;
+  const slope = Math.atan2(roofRise, hd);
+  const slopeRatio = roofRise / hd; // dy per dz of the roof centerline
+
+  // ── Foundation (static) + floor slab ──────────────────────────────────────
   push(
     subdivideBoxFragments({
       center: { x: 0, y: (foundationTopY + foundationBottomY) * 0.5, z: 0 },
       size: { x: width, y: foundationThickness, z: depth },
       divisions: { x: Math.max(3, Math.round(width / 2.5)), y: 1, z: Math.max(2, Math.round(depth / 2.5)) },
-      fragmentType: 'foundation',
-      isSupport: true,
+      fragmentType: 'foundation', isSupport: true,
     }),
   );
-
-  // ── Floor slab the player walks on ────────────────────────────────────────
   push(
     subdivideBoxFragments({
       center: { x: 0, y: (floorTopY + floorBottomY) * 0.5, z: 0 },
       size: { x: width, y: floorThickness, z: depth },
       divisions: { x: Math.max(3, Math.round(width / 1.8)), y: 1, z: Math.max(3, Math.round(depth / 1.8)) },
-      fragmentType: 'floor',
-      density: HOUSE_FOUNDATION_DENSITY,
+      fragmentType: 'floor', density: HOUSE_FOUNDATION_DENSITY,
     }),
   );
 
-  // ── Exterior walls (with openings) ────────────────────────────────────────
-  const wallBaseY = floorTopY;
-  const frontZ = -hd + wallThickness * 0.5;
-  const backZ = hd - wallThickness * 0.5;
-  const leftX = -hw + wallThickness * 0.5;
-  const rightX = hw - wallThickness * 0.5;
+  // ── Structural frame: posts ───────────────────────────────────────────────
+  const inset = postSize * 0.5 + 0.02;
+  const frontZ = -hd + inset;
+  const backZ = hd - inset;
+  const leftX = -hw + inset;
+  const rightX = hw - inset;
 
-  // Front wall (−Z): front door centered + two flanking windows.
-  push(
-    buildWallRun({
-      axis: 'x', fixed: frontZ, runCenter: 0, runLength: width, baseY: wallBaseY,
-      height: wallHeight, thickness: wallThickness, fragmentType: 'wall',
-      density: HOUSE_DRYWALL_DENSITY, panelCell, courses: wallCourses,
-      openings: [
-        { center: 0, width: 1.1, sill: 0, height: 2.12 },
-        { center: -hw * 0.62, width: 1.2, sill: 0.9, height: 1.2 },
-        { center: hw * 0.62, width: 1.2, sill: 0.9, height: 1.2 },
-      ],
-    }),
-  );
-  // Back wall (+Z): back door to the kitchen + a window.
-  push(
-    buildWallRun({
-      axis: 'x', fixed: backZ, runCenter: 0, runLength: width, baseY: wallBaseY,
-      height: wallHeight, thickness: wallThickness, fragmentType: 'wall',
-      density: HOUSE_DRYWALL_DENSITY, panelCell, courses: wallCourses,
-      openings: [
-        { center: hw * 0.55, width: 1.0, sill: 0, height: 2.05 },
-        { center: -hw * 0.5, width: 1.3, sill: 0.9, height: 1.2 },
-      ],
-    }),
-  );
-  // Side walls (±X): one window each.
-  for (const sideX of [leftX, rightX]) {
-    push(
-      buildWallRun({
-        axis: 'z', fixed: sideX, runCenter: 0, runLength: depth, baseY: wallBaseY,
-        height: wallHeight, thickness: wallThickness, fragmentType: 'wall',
-        density: HOUSE_DRYWALL_DENSITY, panelCell, courses: wallCourses,
-        openings: [{ center: -hd * 0.35, width: 1.3, sill: 0.9, height: 1.2 }],
-      }),
-    );
-  }
+  // Eave posts: 4 corners + intermediates along each exterior wall (floor → eave).
+  const cornerXs = [leftX, rightX];
+  const cornerZs = [frontZ, backZ];
+  for (const x of cornerXs) for (const z of cornerZs) push(buildPost(x, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column);
+  const interXs = [-width * 0.25, width * 0.25];
+  const interZs = [-depth * 0.25, depth * 0.25];
+  for (const x of interXs) { push(buildPost(x, frontZ, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); push(buildPost(x, backZ, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); }
+  for (const z of interZs) { push(buildPost(leftX, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); push(buildPost(rightX, z, floorTopY, eaveY, postSize, panelCell), HOUSE_PALETTE.column); }
 
-  // ── Interior partition: living room (front) | kitchen (back), with a doorway ─
-  const partitionZ = hd * 0.12;
-  push(
-    buildWallRun({
-      axis: 'x', fixed: partitionZ, runCenter: 0, runLength: width - 2 * wallThickness,
-      baseY: wallBaseY, height: wallHeight, thickness: interiorWallThickness,
-      fragmentType: 'wall', density: HOUSE_DRYWALL_DENSITY, panelCell, courses: wallCourses,
-      openings: [{ center: -hw * 0.5, width: 1.0, sill: 0, height: 2.1 }],
-    }),
-  );
+  // Ridge "king posts": interior posts on the centerline (z=0) rising floor → ridge. These
+  // (plus the gable-end posts) carry the ridge beam — the dispersed roof support.
+  const kingXs = linspace(leftX, rightX, Math.max(2, Math.round(ridgePosts)));
+  for (const x of kingXs) push(buildPost(x, 0, floorTopY, ridgeUndersideY, postSize, panelCell), HOUSE_PALETTE.column);
 
-  // ── Frame: top-plate ring beams, interior posts, ceiling tie-beams ────────
-  const plateCenterY = wallHeight + plateThickness * 0.5;
-  // Front/back plates (span X).
+  // ── Beams: top-plate ring (on eave posts) + ridge beam (on king posts) ────
   for (const z of [frontZ, backZ]) {
-    push(
-      subdivideBoxFragments({
-        center: { x: 0, y: plateCenterY, z },
-        size: { x: width, y: plateThickness, z: wallThickness * 1.2 },
-        divisions: { x: Math.max(2, Math.round(width / panelCell)), y: 1, z: 1 },
-        fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
-      }),
-    );
+    push(subdivideBoxFragments({
+      center: { x: 0, y: plateTopY - plateThickness * 0.5, z },
+      size: { x: width, y: plateThickness, z: postSize * 1.05 },
+      divisions: { x: Math.max(2, Math.round(width / panelCell)), y: 1, z: 1 },
+      fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
+    }), HOUSE_PALETTE.beam);
   }
-  // Side plates (span Z).
   for (const x of [leftX, rightX]) {
-    push(
-      subdivideBoxFragments({
-        center: { x, y: plateCenterY, z: 0 },
-        size: { x: wallThickness * 1.2, y: plateThickness, z: depth },
-        divisions: { x: 1, y: 1, z: Math.max(2, Math.round(depth / panelCell)) },
-        fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
-      }),
-    );
+    push(subdivideBoxFragments({
+      center: { x, y: plateTopY - plateThickness * 0.5, z: 0 },
+      size: { x: postSize * 1.05, y: plateThickness, z: depth },
+      divisions: { x: 1, y: 1, z: Math.max(2, Math.round(depth / panelCell)) },
+      fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
+    }), HOUSE_PALETTE.beam);
   }
-  // Ceiling tie-beams (span Z) at a few X stations — visible "joists" tying the long walls.
-  for (const x of [-width * 0.25, 0, width * 0.25]) {
-    push(
-      subdivideBoxFragments({
-        center: { x, y: wallHeight - 0.06, z: 0 },
-        size: { x: 0.12, y: 0.12, z: depth - 2 * wallThickness },
-        divisions: { x: 1, y: 1, z: Math.max(2, Math.round(depth / panelCell)) },
-        fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
-      }),
-    );
-  }
-  // Interior support posts along the partition line.
-  for (const x of [-width * 0.25, width * 0.25]) {
-    push(
-      subdivideBoxFragments({
-        center: { x, y: wallBaseY + wallHeight * 0.5, z: partitionZ },
-        size: { x: 0.16, y: wallHeight, z: 0.16 },
-        divisions: { x: 1, y: Math.max(2, Math.round(wallHeight / panelCell)), z: 1 },
-        fragmentType: 'column', density: HOUSE_WOOD_DENSITY,
-      }),
-    );
-  }
+  const roofLenX = width + 0.6;
+  push(subdivideBoxFragments({
+    center: { x: 0, y: ridgeUndersideY - 0.08, z: 0 },
+    size: { x: roofLenX, y: 0.18, z: 0.18 },
+    divisions: { x: Math.max(2, Math.round(roofLenX / panelCell)), y: 1, z: 1 },
+    fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
+  }), HOUSE_PALETTE.beam);
 
-  // ── Gabled roof (two sloped planes + ridge beam + gable triangles) ────────
-  const plateTopY = wallHeight + plateThickness;
-  const eaveBite = 0.02; // roof underside dips into the plate so a real contact bond forms
-  const roofCenterAtWall = plateTopY - eaveBite + roofThickness * 0.5; // centerline y at the wall line
-  const ridgeCenterY = roofCenterAtWall + roofRise; // centerline y at the ridge
-  const slope = Math.atan2(roofRise, hd); // pitch from horizontal
-  const cosS = Math.cos(slope);
-  const roofLenX = width + 0.6; // small rake overhang past the gable ends
-  const horizHalfRun = hd + eaveOverhang;
-  const slopeLen = horizHalfRun / cosS; // slab length from ridge to eave tip
+  // ── Drywall infill walls (non-structural) with door + window openings ─────
+  const drywall = HOUSE_DRYWALL_DENSITY;
+  const dr = (fs: FragmentInfo[]) => push(fs, HOUSE_PALETTE.wall);
+  // Front (−Z): centered front door + two flanking windows.
+  dr(buildWallRun({ axis: 'x', fixed: -hd + wallThickness * 0.5, runCenter: 0, runLength: width, baseY: floorTopY, height: wallHeight, thickness: wallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
+    { center: 0, width: 1.2, sill: 0, height: 2.1 },
+    { center: -hw * 0.6, width: 1.2, sill: 0.9, height: 1.2 },
+    { center: hw * 0.6, width: 1.2, sill: 0.9, height: 1.2 },
+  ] }));
+  // Back (+Z): centered back door + a window.
+  dr(buildWallRun({ axis: 'x', fixed: hd - wallThickness * 0.5, runCenter: 0, runLength: width, baseY: floorTopY, height: wallHeight, thickness: wallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
+    { center: 0, width: 1.0, sill: 0, height: 2.05 },
+    { center: hw * 0.6, width: 1.3, sill: 0.9, height: 1.2 },
+  ] }));
+  // Sides (±X): a window each.
+  for (const sideX of [-hw + wallThickness * 0.5, hw - wallThickness * 0.5]) {
+    dr(buildWallRun({ axis: 'z', fixed: sideX, runCenter: 0, runLength: depth, baseY: floorTopY, height: wallHeight, thickness: wallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
+      { center: -hd * 0.4, width: 1.3, sill: 0.9, height: 1.2 },
+    ] }));
+  }
+  // Interior partition on the centerline (z=0): living room (front) | kitchen (back), with a doorway.
+  dr(buildWallRun({ axis: 'x', fixed: 0, runCenter: 0, runLength: width - 2 * inset, baseY: floorTopY, height: wallHeight, thickness: interiorWallThickness, density: drywall, panelCell, courses: wallCourses, openings: [
+    { center: -hw * 0.45, width: 1.1, sill: 0, height: 2.1 },
+  ] }));
+
+  // ── Gabled roof (two sloped planes; everything below fits UNDER it) ────────
+  const slopeLen = (hd + eaveOverhang) / Math.cos(slope);
   const roofCols = Math.max(2, Math.round(roofLenX / panelCell));
   const roofRows = Math.max(2, Math.round(slopeLen / panelCell));
-  const ridgePivot: Vec3 = { x: 0, y: ridgeCenterY, z: 0 };
-
+  const ridgePivot: Vec3 = { x: 0, y: ridgeUndersideY, z: 0 };
   for (const sign of [-1, 1] as const) {
-    // Flat slab from ridge (z=0) outward, then tilt about the ridge so the far edge drops.
-    push(
-      buildRotatedBoxGridFragments({
-        center: { x: 0, y: ridgeCenterY, z: sign * slopeLen * 0.5 },
-        size: { x: roofLenX, y: roofThickness, z: slopeLen },
-        divisions: { x: roofCols, y: 1, z: roofRows },
-        fragmentType: 'roof',
-        density: HOUSE_ROOF_DENSITY,
-        rotation: { axis: 'x', angle: sign * slope, pivot: ridgePivot },
-      }),
-    );
+    push(buildRotatedBoxGridFragments({
+      center: { x: 0, y: ridgeUndersideY + roofThickness * 0.5, z: sign * slopeLen * 0.5 },
+      size: { x: roofLenX, y: roofThickness, z: slopeLen },
+      divisions: { x: roofCols, y: 1, z: roofRows },
+      fragmentType: 'roof', density: HOUSE_ROOF_DENSITY,
+      rotation: { axis: 'x', angle: sign * slope, pivot: ridgePivot },
+    }), HOUSE_PALETTE.roof);
   }
-  // Ridge beam straddling the apex.
-  push(
-    subdivideBoxFragments({
-      center: { x: 0, y: ridgeCenterY, z: 0 },
-      size: { x: roofLenX, y: 0.16, z: 0.16 },
-      divisions: { x: Math.max(2, Math.round(roofLenX / panelCell)), y: 1, z: 1 },
-      fragmentType: 'beam', density: HOUSE_WOOD_DENSITY,
-    }),
-  );
-  // Gable-end triangles above the ±X short walls (stepped courses shrinking to the ridge).
-  const gableCourses = 4;
-  const gableH = ridgeCenterY - wallHeight;
+
+  // ── Gable-end drywall triangles — sized so each course fits UNDER the roof ──
+  const gableCourses = 6;
+  const courseH = (ridgeUndersideY - eaveY) / gableCourses;
   for (const sideX of [-hw + wallThickness * 0.5, hw - wallThickness * 0.5]) {
     for (let k = 0; k < gableCourses; k++) {
-      const yMid = wallHeight + (k + 0.5) * (gableH / gableCourses);
-      const halfZ = hd * (ridgeCenterY - yMid) / gableH;
-      if (halfZ < 0.15) continue;
-      push(
-        subdivideBoxFragments({
-          center: { x: sideX, y: yMid, z: 0 },
-          size: { x: wallThickness, y: gableH / gableCourses, z: 2 * halfZ },
-          divisions: { x: 1, y: 1, z: Math.max(1, Math.round((2 * halfZ) / panelCell)) },
-          fragmentType: 'wall', density: HOUSE_DRYWALL_DENSITY,
-        }),
-      );
+      const yBot = eaveY + k * courseH;
+      const yTop = yBot + courseH;
+      // Half-width so the course TOP corners stay below the sloped roof underside.
+      const halfZ = (ridgeUndersideY - yTop) / slopeRatio;
+      if (halfZ < 0.12) continue;
+      dr(subdivideBoxFragments({
+        center: { x: sideX, y: (yBot + yTop) * 0.5, z: 0 },
+        size: { x: wallThickness, y: courseH, z: 2 * halfZ },
+        divisions: { x: 1, y: 1, z: Math.max(1, Math.round((2 * halfZ) / panelCell)) },
+        fragmentType: 'wall', density: drywall,
+      }));
     }
   }
 
-  // ── Furniture (a convex decomposition of small boxes per piece) ───────────
-  if (furniture) {
-    addFurniture(push, { width, depth, hw, hd, partitionZ, floorTopY, wallThickness });
-  }
+  // ── Furniture ─────────────────────────────────────────────────────────────
+  if (furniture) addFurniture(push, { hw, hd, floorTopY, wallThickness });
 
-  // Lift the whole house so the *dynamic* floor slab rests ON the runtime's static ground
-  // collider (its top is at y=0) instead of overlapping it: after the shift the foundation
-  // (static) is buried below ground, the floor bottom sits at y=0, and the only "step" into
-  // the house is the floor thickness (well within the FPS controller's auto-step). The
-  // shift is uniform, so all relative geometry/bonds are unchanged.
+  // Lift the whole house so the dynamic floor rests ON the runtime ground (top at y=0).
   const liftY = floorThickness;
-  for (const f of fragments) {
-    f.worldPosition = { ...f.worldPosition, y: f.worldPosition.y + liftY };
-  }
+  for (const f of fragments) f.worldPosition = { ...f.worldPosition, y: f.worldPosition.y + liftY };
 
   return {
     fragments,
@@ -521,6 +505,7 @@ function collectHouseFragments(o: Required<Omit<HouseOptions, 'multipliers' | 'b
     dims: {
       width, depth, wallHeight,
       floorTopY: floorTopY + liftY,
+      eaveY: eaveY + liftY,
       ridgeY: ridgeCenterY + liftY,
       foundationBottomY: foundationBottomY + liftY,
       plateTopY: plateTopY + liftY,
@@ -528,112 +513,133 @@ function collectHouseFragments(o: Required<Omit<HouseOptions, 'multipliers' | 'b
   };
 }
 
-// Furniture accent colors, rotated per piece for a colorful interior.
 const FURNITURE_ACCENTS = [0xc0473b, 0x3b6fc0, 0x3ba35a, 0xd6a73a, 0x9b59b6, 0xe07b39];
 
 function addFurniture(
   push: (fs: FragmentInfo[], color?: number) => void,
-  g: { width: number; depth: number; hw: number; hd: number; partitionZ: number; floorTopY: number; wallThickness: number },
+  g: { hw: number; hd: number; floorTopY: number; wallThickness: number },
 ) {
-  const { hw, hd, partitionZ, floorTopY, wallThickness } = g;
+  const { hw, hd, floorTopY, wallThickness } = g;
   const box = (cx: number, cy: number, cz: number, sx: number, sy: number, sz: number, type: FragmentType): FragmentInfo => ({
     worldPosition: { x: cx, y: cy, z: cz },
     halfExtents: { x: sx * 0.5, y: sy * 0.5, z: sz * 0.5 },
     geometry: new THREE.BoxGeometry(sx, sy, sz),
-    isSupport: false,
-    fragmentType: type,
-    density: HOUSE_FURNITURE_DENSITY,
+    isSupport: false, fragmentType: type, density: HOUSE_FURNITURE_DENSITY,
   });
 
-  // Dining table + 4 chairs in the living room (front half, −Z of the partition).
-  const tx = hw * 0.45;
+  // Dining table + 4 chairs in the living room (front half, −Z).
+  const tx = hw * 0.42;
   const tz = -hd * 0.45;
   const wood = 0x9c6b3f;
-  const tableTopY = 0.76;
-  push([box(tx, floorTopY + tableTopY, tz, 1.3, 0.06, 0.85, 'furniture')], wood);
-  for (const dx of [-0.55, 0.55]) {
-    for (const dz of [-0.36, 0.36]) {
-      push([box(tx + dx, floorTopY + 0.37, tz + dz, 0.07, 0.74, 0.07, 'furniture')], wood);
-    }
-  }
-  const chairOffsets: Array<[number, number, number]> = [
-    [-0.95, 0, 0], [0.95, 0, 0], [0, 0, -0.7], [0, 0, 0.7],
-  ];
-  chairOffsets.forEach(([ox, , oz], i) => {
+  push([box(tx, floorTopY + 0.74, tz, 1.3, 0.06, 0.85, 'furniture')], wood);
+  for (const dx of [-0.55, 0.55]) for (const dz of [-0.36, 0.36]) push([box(tx + dx, floorTopY + 0.37, tz + dz, 0.07, 0.74, 0.07, 'furniture')], wood);
+  const chairOffsets: Array<[number, number]> = [[-0.95, 0], [0.95, 0], [0, -0.7], [0, 0.7]];
+  chairOffsets.forEach(([ox, oz], i) => {
     const accent = FURNITURE_ACCENTS[i % FURNITURE_ACCENTS.length];
-    const cx = tx + ox;
-    const cz = tz + oz;
-    push([box(cx, floorTopY + 0.46, cz, 0.42, 0.05, 0.42, 'furniture')], accent); // seat
-    push([box(cx, floorTopY + 0.72, cz - 0.18, 0.42, 0.5, 0.05, 'furniture')], accent); // back
-    for (const lx of [-0.17, 0.17]) {
-      for (const lz of [-0.17, 0.17]) {
-        push([box(cx + lx, floorTopY + 0.225, cz + lz, 0.05, 0.45, 0.05, 'furniture')], accent); // legs
-      }
-    }
+    const cx = tx + ox, cz = tz + oz;
+    push([box(cx, floorTopY + 0.46, cz, 0.42, 0.05, 0.42, 'furniture')], accent);
+    push([box(cx, floorTopY + 0.72, cz - 0.18, 0.42, 0.5, 0.05, 'furniture')], accent);
+    for (const lx of [-0.17, 0.17]) for (const lz of [-0.17, 0.17]) push([box(cx + lx, floorTopY + 0.225, cz + lz, 0.05, 0.45, 0.05, 'furniture')], accent);
   });
 
   // Kitchen counter (back half, +Z) against the back wall.
   const counterZ = hd - wallThickness - 0.3;
-  const counterX = hw * 0.4;
-  push([box(counterX, floorTopY + 0.45, counterZ, 2.2, 0.9, 0.6, 'furniture')], 0xd9dde0); // carcass
-  push([box(counterX, floorTopY + 0.92, counterZ, 2.35, 0.06, 0.66, 'furniture')], wood); // countertop
-  // Upper wall cabinet (wall-mounted → 'shelf', clings to the wall).
-  push([box(counterX, floorTopY + 1.75, hd - wallThickness - 0.18, 1.7, 0.7, 0.34, 'shelf')], 0xb24c4c);
+  const counterX = hw * 0.38;
+  push([box(counterX, floorTopY + 0.45, counterZ, 2.2, 0.9, 0.6, 'furniture')], 0xd9dde0);
+  push([box(counterX, floorTopY + 0.92, counterZ, 2.35, 0.06, 0.66, 'furniture')], wood);
+  // Upper wall cabinet (wall-mounted → 'shelf').
+  push([box(counterX, floorTopY + 1.7, hd - wallThickness - 0.18, 1.7, 0.7, 0.34, 'shelf')], 0xb24c4c);
 
   // Wall shelves on the left living-room wall.
-  const shelfX = -hw + wallThickness + 0.13;
-  for (const sy of [1.4, 1.85]) {
-    push([box(shelfX, floorTopY + sy, -hd * 0.4, 0.26, 0.04, 0.95, 'shelf')], 0x8b5a2b);
-  }
+  const shelfX = -hw + wallThickness + 0.14;
+  for (const sy of [1.35, 1.8]) push([box(shelfX, floorTopY + sy, -hd * 0.4, 0.26, 0.04, 0.95, 'shelf')], 0x8b5a2b);
+}
 
-  void partitionZ;
+// ── Voronoi shatter (async path) ────────────────────────────────────────────
+
+function fractureTypesFor(mode: HouseFractureMode): Set<FragmentType> {
+  switch (mode) {
+    case 'walls': return new Set<FragmentType>(['wall']);
+    case 'wallsRoof': return new Set<FragmentType>(['wall', 'roof']);
+    case 'all': return new Set<FragmentType>(['wall', 'roof', 'floor', 'beam', 'column', 'furniture', 'shelf']);
+    default: return new Set<FragmentType>();
+  }
+}
+
+/** Replace each box of a selected type with Voronoi shards (keeping type/density/color). */
+function fractureSelected(
+  fragments: FragmentInfo[],
+  nodeColors: (number | undefined)[],
+  types: Set<FragmentType>,
+  perPiece: number,
+  pinata?: PinataModule,
+): { fragments: FragmentInfo[]; nodeColors: (number | undefined)[] } {
+  const outF: FragmentInfo[] = [];
+  const outC: (number | undefined)[] = [];
+  for (let i = 0; i < fragments.length; i++) {
+    const f = fragments[i];
+    const t = f.fragmentType;
+    if (!f.isSupport && t && types.has(t)) {
+      try {
+        const shards = fractureGeometry(f.geometry, {
+          fragmentCount: Math.max(2, perPiece), voronoiMode: '3D',
+          worldOffset: f.worldPosition, minHalfExtent: 0.03, pinata,
+        });
+        if (shards.length) {
+          for (const s of shards) { outF.push({ ...s, isSupport: false, fragmentType: t, density: f.density }); outC.push(nodeColors[i]); }
+          continue;
+        }
+      } catch { /* fall through to the original box */ }
+    }
+    outF.push(f); outC.push(nodeColors[i]);
+  }
+  return { fragments: outF, nodeColors: outC };
 }
 
 // ── Public builders ─────────────────────────────────────────────────────────
 
-function finalize(scenario: ScenarioDesc, o: HouseOptions, collected: CollectedHouse): ScenarioDesc {
-  const fragmentTypes = collected.fragments.map((f) => f.fragmentType);
+function finalize(
+  scenario: ScenarioDesc, options: HouseOptions,
+  fragments: FragmentInfo[], nodeColors: (number | undefined)[], dims: Record<string, number>,
+): ScenarioDesc {
+  const fragmentTypes = fragments.map((f) => f.fragmentType);
   scenario.bonds = applyBondStrengthMultipliers(
-    scenario.bonds,
-    fragmentTypes,
-    makeHouseBondMultiplier(o.multipliers),
+    scenario.bonds as ScenarioBond[], fragmentTypes, makeHouseBondMultiplier(options.multipliers),
   );
-  scenario.parameters = {
-    ...scenario.parameters,
-    house: {
-      ...collected.dims,
-      fragmentTypes,
-      nodeColors: collected.nodeColors,
-    },
-  };
+  scenario.parameters = { ...scenario.parameters, house: { ...dims, fragmentTypes, nodeColors } };
   return scenario;
 }
 
 /**
- * Build the house scenario synchronously with the pure-JS proximity bonder. Every chunk is
- * a box, so no WASM/Voronoi is needed. For more accurate bonds on the sloped roof contacts
- * use {@link buildHouseScenarioAsync} with `bondMode: 'auto'`.
+ * Build the house synchronously with the pure-JS proximity bonder (all-boxes). For Voronoi
+ * fracturing or WASM auto-bonding use {@link buildHouseScenarioAsync}.
  */
 export function buildHouseScenario(options: HouseOptions = {}): ScenarioDesc {
   const o = { ...DEFAULT_HOUSE_OPTIONS, ...options };
-  const collected = collectHouseFragments(o);
-  const scenario = buildScenarioFromFragments(collected.fragments, {
-    areaNormalization: 'none',
-  });
-  return finalize(scenario, options, collected);
+  const { fragments, nodeColors, dims } = collectHouseFragments(o);
+  const scenario = buildScenarioFromFragments(fragments, { areaNormalization: 'none' });
+  return finalize(scenario, options, fragments, nodeColors, dims);
 }
 
 /**
- * Async house builder. Adds `bondMode: 'auto'` — the WASM triangle-overlap bonder, which is
- * more robust for the pitched roof's sloped contacts than the JS proximity heuristic. Falls
- * back to proximity bonds on any failure.
+ * Async house builder. Adds `fracture` (Voronoi-shatter selected parts via three-pinata)
+ * and `bondMode: 'auto'` (WASM triangle-overlap bonding, more robust for the irregular
+ * shards and the sloped roof). Falls back to proximity bonds on any failure.
  */
 export async function buildHouseScenarioAsync(options: HouseOptions = {}): Promise<ScenarioDesc> {
   const o = { ...DEFAULT_HOUSE_OPTIONS, ...options };
   const collected = collectHouseFragments(o);
-  const scenario = await buildScenarioFromFragmentsAsync(collected.fragments, {
-    bondMode: o.bondMode ?? 'auto',
-    areaNormalization: 'none',
-  });
-  return finalize(scenario, options, collected);
+  let { fragments, nodeColors } = collected;
+
+  const mode = options.fracture ?? 'none';
+  const types = fractureTypesFor(mode);
+  if (types.size > 0) {
+    if (!options.pinata) await ensurePinataLoaded();
+    ({ fragments, nodeColors } = fractureSelected(fragments, nodeColors, types, options.fragmentsPerPiece ?? 4, options.pinata));
+  }
+
+  // Fractured shards bond best with the WASM auto-bonder; plain boxes are fine with proximity.
+  const bondMode = options.bondMode ?? (types.size > 0 ? 'auto' : 'proximity');
+  const scenario = await buildScenarioFromFragmentsAsync(fragments, { bondMode, areaNormalization: 'none' });
+  return finalize(scenario, options, fragments, nodeColors, collected.dims);
 }

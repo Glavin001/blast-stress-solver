@@ -16,10 +16,21 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
+import * as pinata from '@dgreenheck/three-pinata';
 import { buildDestructibleCore } from 'blast-stress-solver/rapier';
-import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
-import { buildHouseScenario, HOUSE_PALETTE, type HouseOptions } from 'blast-stress-solver/scenarios';
+import { createDestructibleThreeBundle, RapierDebugRenderer, setPinataModule } from 'blast-stress-solver/three';
+import {
+  buildHouseScenario,
+  buildHouseScenarioAsync,
+  HOUSE_PALETTE,
+  type HouseOptions,
+  type HouseFractureMode,
+} from 'blast-stress-solver/scenarios';
 import { mountShooter } from './shooter-fps.js';
+
+// Pre-register three-pinata so the synchronous Voronoi fracturer resolves in the browser
+// ESM environment (used only when the "Fracture" option is on).
+setPinataModule(pinata as any);
 
 // ── Mutable demo config (driven by the control panel) ──────────
 const CONFIG = {
@@ -27,9 +38,12 @@ const CONFIG = {
   house: {
     width: 10,
     depth: 8,
-    wallHeight: 2.7,
-    roofRise: 1.8,
+    wallHeight: 2.6,
+    roofRise: 1.6,
     furniture: true,
+    // Voronoi-shatter selected parts (three-pinata) instead of boxes: none | walls |
+    // wallsRoof | all. Anything but 'none' uses the async builder + WASM auto-bonder.
+    fracture: 'none' as HouseFractureMode,
   },
   projectile: { radius: 0.35, mass: 800, speed: 28 },
   solver: {
@@ -168,7 +182,10 @@ async function initScene() {
     roofRise: h.roofRise,
     furniture: h.furniture,
   };
-  const scenario = buildHouseScenario(opts);
+  const scenario =
+    h.fracture === 'none'
+      ? buildHouseScenario(opts)
+      : await buildHouseScenarioAsync({ ...opts, fracture: h.fracture, pinata: pinata as any });
 
   const core = await buildDestructibleCore({
     scenario,
@@ -265,6 +282,14 @@ optFurniture?.addEventListener('change', () => {
   void rebuild();
 });
 
+// Voronoi fracture selector (opt-in; uses the async builder + WASM auto-bonder).
+const selFracture = document.getElementById('cfg-fracture') as HTMLSelectElement | null;
+if (selFracture) selFracture.value = CONFIG.house.fracture;
+selFracture?.addEventListener('change', () => {
+  CONFIG.house.fracture = selFracture.value as HouseFractureMode;
+  void rebuild();
+});
+
 // Projectile (live at next throw).
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
 bindSlider('cfg-proj-mass', CONFIG.projectile, 'mass', (v) => v.toLocaleString() + ' kg');
@@ -338,8 +363,11 @@ shooter = mountShooter({
   scene,
   getCore: () => coreRef,
   getBallParams: () => CONFIG.projectile,
-  floorY: 0, // floor slab top
-  eyeHeight: 1.7,
+  floorY: 0, // outside ground level (the player steps up onto the floor slab)
+  eyeHeight: 1.6,
+  // Real-world avatar: ≈1.6 m tall, ≈0.56 m wide — fits comfortably through the doors.
+  playerHalfHeight: 0.5,
+  playerRadius: 0.28,
 });
 initScene()
   .then(() => loop())

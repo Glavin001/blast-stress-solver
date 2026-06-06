@@ -69,6 +69,22 @@ describe('house composer', () => {
     expect(roofToFrame.length, 'roof should bond to the ridge/plate or gable wall').toBeGreaterThan(0);
   });
 
+  it('has interior king posts that rise to support the ridge', () => {
+    const ridgeY = (scenario.parameters as any).house.ridgeY as number;
+    // King posts (columns) reach up near the ridge — the dispersed roof support.
+    const tallColumns = scenario.nodes.filter(
+      (n, i) => types[i] === 'column' && n.centroid.y > ridgeY - 1.0,
+    );
+    expect(tallColumns.length).toBeGreaterThan(0);
+    // The roof load path runs through the frame beams (ridge / top plate).
+    const roofBeam = scenario.bonds.filter((b) => {
+      const a = types[b.node0];
+      const c = types[b.node1];
+      return (a === 'roof' && c === 'beam') || (a === 'beam' && c === 'roof');
+    });
+    expect(roofBeam.length).toBeGreaterThan(0);
+  });
+
   it('assigns realistic heterogeneous masses (heavy floor slab, light roof/furniture)', () => {
     const density = (t: string) => {
       const i = types.indexOf(t);
@@ -100,7 +116,7 @@ describe('house composer', () => {
   });
 });
 
-describe('house bond-strength model (intent)', () => {
+describe('house bond-strength model (structural intent)', () => {
   const m = makeHouseBondMultiplier();
 
   it('furniture is barely attached to the floor, far weaker than the foundation anchor', () => {
@@ -112,14 +128,27 @@ describe('house bond-strength model (intent)', () => {
     expect(m('shelf', 'wall')).toBeGreaterThan(m('wall', 'wall'));
   });
 
-  it('the roof is bonded, but weaker than the wood frame (so it caves on its own)', () => {
-    expect(m('roof', 'beam')).toBeGreaterThan(0);
-    expect(m('roof', 'beam')).toBeLessThan(m('beam', 'column'));
-    expect(m('roof', 'beam')).toBeLessThan(m('beam', 'wall'));
+  it('drywall is non-structural: its joints are far weaker than the wood frame', () => {
+    // The load path post↔beam and post↔foundation must dwarf any drywall joint.
+    expect(m('column', 'beam')).toBeGreaterThan(m('wall', 'column') * 10);
+    expect(m('foundation', 'column')).toBeGreaterThan(m('wall', 'beam') * 10);
+    expect(m('wall', 'column')).toBeLessThan(1);
+    expect(m('wall', 'beam')).toBeLessThan(1);
+  });
+
+  it('the roof is carried by the frame but is not a rigid self-supporting plate', () => {
+    // Roof attaches to the frame (beam/post) far more strongly than to itself, so an
+    // unsupported span sags/fails instead of floating.
+    expect(m('roof', 'beam')).toBeGreaterThan(m('roof', 'roof') * 2);
+    expect(m('roof', 'column')).toBeGreaterThan(m('roof', 'roof') * 2);
+    // ...yet the roof↔frame joint is still weaker than the primary load path.
+    expect(m('roof', 'beam')).toBeLessThan(m('column', 'beam'));
+    expect(m('roof', 'beam')).toBeLessThan(m('foundation', 'column'));
   });
 
   it('is symmetric in argument order', () => {
     expect(m('roof', 'beam')).toBe(m('beam', 'roof'));
     expect(m('furniture', 'floor')).toBe(m('floor', 'furniture'));
+    expect(m('wall', 'column')).toBe(m('column', 'wall'));
   });
 });
