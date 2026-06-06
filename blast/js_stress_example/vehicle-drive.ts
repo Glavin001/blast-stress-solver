@@ -65,25 +65,27 @@ export type VehicleTuning = {
 };
 
 export const DEFAULT_TUNING: VehicleTuning = {
-  engineForce: 12000,
-  brakeForce: 5000,
+  engineForce: 16000,
+  brakeForce: 6000,
   idleBrake: 40,
   maxSpeed: 45, // m/s soft cap (~162 km/h)
   maxSteer: 0.6,
   steerRate: 3.5,
-  wheelBase: 1.6,
-  wheelTrack: 0.85,
-  wheelRadius: 0.35,
-  suspensionRestLength: 0.3,
-  chassisHalf: { x: 0.9, y: 0.3, z: 1.7 },
-  chassisMass: 1200,
-  comY: -0.5,
-  connectionY: -0.25,
+  // Lifted monster-truck geometry: big tyres + long suspension so it climbs over
+  // foundation lips / debris instead of catching on them.
+  wheelBase: 1.7,
+  wheelTrack: 0.95,
+  wheelRadius: 0.6, // big off-road tyres
+  suspensionRestLength: 0.5, // lifted ride height
+  chassisHalf: { x: 0.95, y: 0.35, z: 1.8 },
+  chassisMass: 2500, // heavy truck — rams harder (live-tunable in the panel)
+  comY: -0.6, // low centre of mass keeps the lifted truck from flipping
+  connectionY: -0.2,
   suspensionStiffness: 80,
-  maxSuspensionForce: 12000,
+  maxSuspensionForce: 30000, // hold the heavier truck on its springs
   suspensionCompression: 0.83,
   suspensionRelaxation: 20,
-  maxSuspensionTravel: 0.2,
+  maxSuspensionTravel: 0.35,
   frictionSlip: 1.8,
   sideFrictionStiffness: 1.0,
 };
@@ -140,23 +142,10 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
   const t: VehicleTuning = { ...DEFAULT_TUNING, ...(opts.tuning ?? {}) };
 
   // ── Chassis rigid body + collider ───────────────────────────────
-  // Box inertia + a low centre of mass: without it the rear-drive torque (and
-  // ramming) rears the car up and flips it over backwards. Mass lives on the
-  // body (low CoM) so the collider is density-0 (collision shape only).
-  const m = t.chassisMass;
-  const w2 = t.chassisHalf.x * 2;
-  const h2 = t.chassisHalf.y * 2;
-  const d2 = t.chassisHalf.z * 2;
-  const inertia = {
-    x: (m / 12) * (h2 * h2 + d2 * d2),
-    y: (m / 12) * (w2 * w2 + d2 * d2),
-    z: (m / 12) * (w2 * w2 + h2 * h2),
-  };
   const chassis = world.createRigidBody(
     RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(opts.position.x, opts.position.y, opts.position.z)
       .setRotation(yawQuat(opts.headingY))
-      .setAdditionalMassProperties(m, { x: 0, y: t.comY, z: 0 }, inertia, { x: 0, y: 0, z: 0, w: 1 })
       .setLinearDamping(0.1)
       .setAngularDamping(0.5)
       .setCcdEnabled(true) // don't tunnel through thin walls at speed
@@ -173,6 +162,23 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
       .setContactForceEventThreshold(0),
     chassis,
   );
+  applyMassProperties();
+
+  // Box inertia + a low centre of mass: without it the rear-drive torque (and
+  // ramming) rears the truck up and flips it over backwards. Mass lives on the
+  // body (low CoM, density-0 collider) and is re-applied live by the weight slider.
+  function applyMassProperties() {
+    const m = t.chassisMass;
+    const w2 = t.chassisHalf.x * 2;
+    const h2 = t.chassisHalf.y * 2;
+    const d2 = t.chassisHalf.z * 2;
+    const inertia = {
+      x: (m / 12) * (h2 * h2 + d2 * d2),
+      y: (m / 12) * (w2 * w2 + d2 * d2),
+      z: (m / 12) * (w2 * w2 + h2 * h2),
+    };
+    chassis.setAdditionalMassProperties(m, { x: 0, y: t.comY, z: 0 }, inertia, { x: 0, y: 0, z: 0, w: 1 }, true);
+  }
 
   // ── Raycast vehicle controller + four wheels ────────────────────
   const vehicle = world.createVehicleController(chassis);
@@ -229,7 +235,7 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
   chassisMesh.add(cabin);
   scene.add(chassisMesh);
 
-  const wheelGeo = new THREE.CylinderGeometry(t.wheelRadius, t.wheelRadius, 0.3, 20);
+  const wheelGeo = new THREE.CylinderGeometry(t.wheelRadius, t.wheelRadius, 0.45, 20);
   wheelGeo.rotateZ(Math.PI / 2); // cylinder axis → local X (the axle)
   const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111418, roughness: 0.8 });
   const wheelMeshes: THREE.Mesh[] = [];
@@ -261,8 +267,9 @@ export function createVehicle(opts: CreateVehicleOptions): VehicleHandle {
 
   function setTuning(partial: Partial<VehicleTuning>) {
     Object.assign(t, partial);
-    // engine/brake/steer/maxSpeed are read each step(); re-apply the wheel
-    // (suspension/friction) params in case those changed too.
+    // engine/brake/steer/maxSpeed are read each step(); re-apply mass (weight
+    // slider) + wheel (suspension/friction) params in case those changed too.
+    applyMassProperties();
     applyWheelTuning();
   }
 

@@ -143,10 +143,10 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     mouseSensitivity: 0.0022, // rad / pixel
     sticky: { radius: 0.28, mass: 60, speed: 44, ttl: 30 },
     blast: { radius: 7, strength: 55, up: 0.4 },
-    // Third-person chase camera (drive mode).
-    chase: { dist: 6.5, height: 2.8, look: 0.9, lerp: 6 },
+    // Third-person chase camera (drive mode). Raised for the lifted truck.
+    chase: { dist: 7.5, height: 3.4, look: 1.2, lerp: 6 },
     // Live-tunable car properties (sidebar sliders; pushed via vehicle.setTuning).
-    car: { maxSpeed: 45, engineForce: 12000, maxSteer: 0.6 },
+    car: { maxSpeed: 45, engineForce: 16000, chassisMass: 2500, maxSteer: 0.6 },
   };
 
   // ── Runtime state ───────────────────────────────────────────────
@@ -249,8 +249,11 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       '<input type="range" id="cfg-car-speed" class="config-slider" min="10" max="90" step="5" value="45" />' +
       '<span class="config-value" id="cfg-car-speed-value">162 km/h</span></div>' +
       '<div class="config-row"><label class="config-label" for="cfg-car-power">Car engine power</label>' +
-      '<input type="range" id="cfg-car-power" class="config-slider" min="2000" max="24000" step="1000" value="12000" />' +
-      '<span class="config-value" id="cfg-car-power-value">12000 N</span></div>' +
+      '<input type="range" id="cfg-car-power" class="config-slider" min="2000" max="30000" step="1000" value="16000" />' +
+      '<span class="config-value" id="cfg-car-power-value">16000 N</span></div>' +
+      '<div class="config-row"><label class="config-label" for="cfg-car-mass">Car weight (ram power)</label>' +
+      '<input type="range" id="cfg-car-mass" class="config-slider" min="800" max="8000" step="100" value="2500" />' +
+      '<span class="config-value" id="cfg-car-mass-value">2.5 t</span></div>' +
       '<div class="config-row"><label class="config-label" for="cfg-car-steer">Car steering</label>' +
       '<input type="range" id="cfg-car-steer" class="config-slider" min="0.3" max="1" step="0.05" value="0.6" />' +
       '<span class="config-value" id="cfg-car-steer-value">34°</span></div>' +
@@ -309,6 +312,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     // Car tuning — pushed straight into the live vehicle (no respawn needed).
     bindSlider(section, '#cfg-car-speed', (v) => { cfg.car.maxSpeed = v; vehicle?.setTuning({ maxSpeed: v }); }, (v) => (v * 3.6).toFixed(0) + ' km/h');
     bindSlider(section, '#cfg-car-power', (v) => { cfg.car.engineForce = v; vehicle?.setTuning({ engineForce: v }); }, (v) => v.toFixed(0) + ' N');
+    bindSlider(section, '#cfg-car-mass', (v) => { cfg.car.chassisMass = v; vehicle?.setTuning({ chassisMass: v }); }, (v) => (v / 1000).toFixed(1) + ' t');
     bindSlider(section, '#cfg-car-steer', (v) => { cfg.car.maxSteer = v; vehicle?.setTuning({ maxSteer: v }); }, (v) => ((v * 180) / Math.PI).toFixed(0) + '°');
 
     section.querySelector('#cfg-detonate')!.addEventListener('click', () => detonateAll());
@@ -432,7 +436,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     const x = target.x + _v.x * dist;
     const z = target.z + _v.z * dist;
     return {
-      position: { x, y: floorY + 0.95, z }, // 0.95 ≈ wheel-on-ground ride height
+      position: { x, y: floorY + 1.5, z }, // lifted ride height (big wheels + long suspension)
       headingY: Math.atan2(target.x - x, target.z - z),
     };
   }
