@@ -32,6 +32,7 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import type { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { DestructibleCore } from 'blast-stress-solver/rapier';
+import { createVehicle, type VehicleHandle } from './vehicle-drive.js';
 
 export type BallParams = { radius: number; mass: number; speed: number };
 
@@ -71,6 +72,8 @@ export type ShooterHandle = {
   update: () => void;
   setFpsEnabled: (on: boolean) => void;
   isFpsEnabled: () => boolean;
+  setDriveEnabled: (on: boolean) => void;
+  isDriveEnabled: () => boolean;
   setMode: (mode: ShootMode) => void;
   detonateAll: () => void;
 };
@@ -137,6 +140,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   // ── Tunable state (mutated by the sidebar) ──────────────────────
   const cfg = {
     fps: false,
+    drive: false, // vehicle driving mode (mutually exclusive with fps)
     mode: 'ball' as ShootMode,
     headlamp: true, // camera-mounted light so the view is always lit
     walkSpeed: 9, // m/s
@@ -147,6 +151,10 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     mouseSensitivity: 0.0022, // rad / pixel
     sticky: { radius: 0.28, mass: 60, speed: 44, ttl: 30 },
     blast: { radius: 7, strength: 55, up: 0.4 },
+    // Third-person chase camera (drive mode). Raised for the lifted truck.
+    chase: { dist: 7.5, height: 3.4, look: 1.2, lerp: 6 },
+    // Live-tunable car properties (sidebar sliders; pushed via vehicle.setTuning).
+    car: { maxSpeed: 45, engineForce: 16000, chassisMass: 2500, maxSteer: 0.6 },
   };
 
   // ── Runtime state ───────────────────────────────────────────────
@@ -161,6 +169,13 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   let grounded = true;
   let pointerLocked = false;
   let lastT = performance.now();
+
+  // ── Rapier raycast vehicle (the drive-mode car) ─────────────────
+  // Spawned in the core's world when drive mode turns on; recreated after a
+  // Reset (new world), torn down when drive mode turns off. See vehicle-drive.ts.
+  let vehicle: VehicleHandle | null = null;
+  let vehicleCore: DestructibleCore | null = null; // world the car lives in
+  let camOrbitYaw = 0; // mouse-look offset around the car (decays back to centre)
 
   // ── Rapier kinematic character controller (the FPS body) ────────
   // A capsule that physically collides with floors, debris and structures, so
@@ -183,6 +198,12 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     const ud = col.parent()?.userData as { projectile?: boolean; stickyExplosive?: boolean } | undefined;
     return !(ud && (ud.projectile || ud.stickyExplosive));
   };
+  // The chase-camera occlusion ray ignores projectiles/charges (the car itself is
+  // excluded via the cast's exclude-body arg), so only real structure pulls the camera in.
+  const camRayFilter = (col: RAPIER.Collider): boolean => {
+    const ud = col.parent()?.userData as { projectile?: boolean; stickyExplosive?: boolean } | undefined;
+    return !(ud && (ud.projectile || ud.stickyExplosive));
+  };
 
   // Scratch objects (avoid per-frame allocation on the hot path).
   const _ray = new THREE.Raycaster();
@@ -196,6 +217,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   const _v = new THREE.Vector3();
   const _v2 = new THREE.Vector3();
   const _look = new THREE.Vector3();
+  const _camDir = new THREE.Vector3();
   const UP = new THREE.Vector3(0, 1, 0);
 
   // ── Camera headlamp ─────────────────────────────────────────────
@@ -221,6 +243,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
 
   // ── Sidebar controls (injected like pipeline-controls) ──────────
   let fpsCheckbox: HTMLInputElement | null = null;
+  let driveCheckbox: HTMLInputElement | null = null;
   let headlampCheckbox: HTMLInputElement | null = null;
   let modeSelect: HTMLSelectElement | null = null;
   let armedCountEl: HTMLElement | null = null;
@@ -238,6 +261,22 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       '<span class="toggle-text">First-person mode' +
       '<small>WASD walk · arrows / mouse look · hold Space = jetpack (fly up) · ' +
       'click shoots. Walk on debris &amp; floors. Press <b>V</b> to toggle.</small></span></label>' +
+      '<label class="toggle-row"><input type="checkbox" id="cfg-drive" />' +
+      '<span class="toggle-text">Drive a vehicle' +
+      '<small>Hop in a car: WASD / arrows drive &amp; steer · Space handbrake · ' +
+      '<b>R</b> flips it upright · mouse looks around. Ram the buildings! Press <b>C</b> to toggle.</small></span></label>' +
+      '<div class="config-row"><label class="config-label" for="cfg-car-speed">Car top speed</label>' +
+      '<input type="range" id="cfg-car-speed" class="config-slider" min="10" max="90" step="5" value="45" />' +
+      '<span class="config-value" id="cfg-car-speed-value">162 km/h</span></div>' +
+      '<div class="config-row"><label class="config-label" for="cfg-car-power">Car engine power</label>' +
+      '<input type="range" id="cfg-car-power" class="config-slider" min="2000" max="30000" step="1000" value="16000" />' +
+      '<span class="config-value" id="cfg-car-power-value">16000 N</span></div>' +
+      '<div class="config-row"><label class="config-label" for="cfg-car-mass">Car weight (ram power)</label>' +
+      '<input type="range" id="cfg-car-mass" class="config-slider" min="800" max="8000" step="100" value="2500" />' +
+      '<span class="config-value" id="cfg-car-mass-value">2.5 t</span></div>' +
+      '<div class="config-row"><label class="config-label" for="cfg-car-steer">Car steering</label>' +
+      '<input type="range" id="cfg-car-steer" class="config-slider" min="0.3" max="1" step="0.05" value="0.6" />' +
+      '<span class="config-value" id="cfg-car-steer-value">34°</span></div>' +
       '<label class="toggle-row"><input type="checkbox" id="cfg-headlamp" checked />' +
       '<span class="toggle-text">Headlamp' +
       '<small>Camera-mounted light — always lights wherever you are and look.</small></span></label>' +
@@ -267,12 +306,16 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     else sidebar.insertBefore(section, sidebar.firstChild);
 
     fpsCheckbox = section.querySelector('#cfg-fps');
+    driveCheckbox = section.querySelector('#cfg-drive');
     headlampCheckbox = section.querySelector('#cfg-headlamp');
     modeSelect = section.querySelector('#cfg-shoot-mode');
     armedCountEl = section.querySelector('#cfg-armed');
 
     fpsCheckbox!.checked = cfg.fps;
     fpsCheckbox!.addEventListener('change', () => setFpsEnabled(fpsCheckbox!.checked));
+
+    driveCheckbox!.checked = cfg.drive;
+    driveCheckbox!.addEventListener('change', () => setDriveEnabled(driveCheckbox!.checked));
 
     headlampCheckbox!.checked = cfg.headlamp;
     headlampCheckbox!.addEventListener('change', () => {
@@ -286,6 +329,11 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     bindSlider(section, '#cfg-blast-radius', (v) => { cfg.blast.radius = v; }, (v) => v.toFixed(1) + ' m');
     bindSlider(section, '#cfg-blast-strength', (v) => { cfg.blast.strength = v; }, (v) => v.toFixed(0) + '×');
     bindSlider(section, '#cfg-sticky-speed', (v) => { cfg.sticky.speed = v; }, (v) => v.toFixed(0) + ' m/s');
+    // Car tuning — pushed straight into the live vehicle (no respawn needed).
+    bindSlider(section, '#cfg-car-speed', (v) => { cfg.car.maxSpeed = v; vehicle?.setTuning({ maxSpeed: v }); }, (v) => (v * 3.6).toFixed(0) + ' km/h');
+    bindSlider(section, '#cfg-car-power', (v) => { cfg.car.engineForce = v; vehicle?.setTuning({ engineForce: v }); }, (v) => v.toFixed(0) + ' N');
+    bindSlider(section, '#cfg-car-mass', (v) => { cfg.car.chassisMass = v; vehicle?.setTuning({ chassisMass: v }); }, (v) => (v / 1000).toFixed(1) + ' t');
+    bindSlider(section, '#cfg-car-steer', (v) => { cfg.car.maxSteer = v; vehicle?.setTuning({ maxSteer: v }); }, (v) => ((v * 180) / Math.PI).toFixed(0) + '°');
 
     section.querySelector('#cfg-detonate')!.addEventListener('click', () => detonateAll());
     refreshUi();
@@ -311,11 +359,19 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
 
   function refreshUi() {
     if (fpsCheckbox) fpsCheckbox.checked = cfg.fps;
+    if (driveCheckbox) driveCheckbox.checked = cfg.drive;
     if (headlampCheckbox) headlampCheckbox.checked = cfg.headlamp;
     if (modeSelect) modeSelect.value = cfg.mode;
     const armed = countArmed();
     if (armedCountEl) armedCountEl.textContent = String(armed);
     crosshair.style.display = cfg.fps ? 'block' : 'none';
+    if (cfg.drive) {
+      // Live speed is refreshed each frame by updateDrive(); this is the resting text.
+      badge.innerHTML =
+        '<span class="shooter-badge-mode">🚗 Drive</span>' +
+        '<span class="shooter-badge-dim"> · WASD drive · Space brake · R flip · C exit</span>';
+      return;
+    }
     const modeLabel =
       cfg.mode === 'ball' ? '① Ball' : cfg.mode === 'sticky' ? '② Sticky explosive' : '③ Grenade';
     const fpsLabel = cfg.fps ? (pointerLocked ? 'on' : 'on — click to look') : 'off';
@@ -347,6 +403,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     }
     cfg.fps = on;
     if (on) {
+      setDriveEnabled(false); // the two player modes are mutually exclusive
       controls.enabled = false;
       // Face the structure (yaw from the current orbit view). The character body
       // spawns near here and drives the camera from then on.
@@ -364,6 +421,74 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       if (pointerLocked && document.pointerLockElement === canvas) document.exitPointerLock();
     }
     refreshUi();
+  }
+
+  // ── Drive mode (Rapier raycast vehicle) ─────────────────────────
+  function setDriveEnabled(on: boolean) {
+    if (on === cfg.drive) {
+      refreshUi();
+      return;
+    }
+    cfg.drive = on;
+    if (on) {
+      setFpsEnabled(false); // mutually exclusive with first-person
+      controls.enabled = false;
+      camOrbitYaw = 0;
+      const core = getCore();
+      if (core) ensureVehicle(core); // also re-spawned lazily by updateDrive
+    } else {
+      disposeVehicle();
+      controls.enabled = true;
+      if (pointerLocked && document.pointerLockElement === canvas) document.exitPointerLock();
+    }
+    refreshUi();
+  }
+
+  // Ground-level spawn near where the orbit camera was looking, facing the
+  // structure. Local +Z is the car's forward, so heading = atan2(dirX, dirZ).
+  function carSpawnPoint(): { position: Vec3; headingY: number } {
+    const target = controls.target;
+    _v.set(camera.position.x - target.x, 0, camera.position.z - target.z);
+    let dist = _v.length();
+    if (dist < 1e-3) _v.set(0, 0, 1), (dist = 1);
+    _v.normalize();
+    dist = Math.min(Math.max(dist, 12), 40);
+    const x = target.x + _v.x * dist;
+    const z = target.z + _v.z * dist;
+    return {
+      position: { x, y: floorY + 1.5, z }, // lifted ride height (big wheels + long suspension)
+      headingY: Math.atan2(target.x - x, target.z - z),
+    };
+  }
+
+  function ensureVehicle(core: DestructibleCore) {
+    if (vehicle && vehicleCore === core) return;
+    if (vehicle && vehicleCore !== core) {
+      // Refs belong to a stale (disposed) world after a Reset — drop the visuals
+      // without touching the dead world, then respawn below.
+      vehicle.disposeVisuals();
+      vehicle = null;
+      vehicleCore = null;
+    }
+    const sp = carSpawnPoint();
+    vehicle = createVehicle({
+      world: core.world as RAPIER.World,
+      scene,
+      position: sp.position,
+      headingY: sp.headingY,
+      tuning: cfg.car,
+    });
+    vehicleCore = core;
+  }
+
+  function disposeVehicle() {
+    if (vehicle) {
+      // Live world at toggle-off time → full teardown; dispose() also removes meshes.
+      if (vehicleCore === getCore()) vehicle.dispose();
+      else vehicle.disposeVisuals();
+    }
+    vehicle = null;
+    vehicleCore = null;
   }
 
   // Ground-level spawn near where the orbit camera was looking.
@@ -875,6 +1000,87 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     camera.position.set(nx, ny + EYE_ABOVE_CENTER, nz);
   }
 
+  // ── Drive update (raycast vehicle + chase camera) ───────────────
+  function updateDrive(dt: number) {
+    const core = getCore();
+    if (!core) return; // no world yet (e.g. mid-rebuild)
+    ensureVehicle(core);
+    if (!vehicle) return;
+
+    let throttle = 0;
+    if (keys.has('KeyW') || keys.has('ArrowUp')) throttle += 1;
+    if (keys.has('KeyS') || keys.has('ArrowDown')) throttle -= 1;
+    // Steer relative to the chase camera: A/left turns the car left on screen
+    // (toward world +X, which is screen-left because the camera looks down +Z).
+    let steer = 0;
+    if (keys.has('KeyA') || keys.has('ArrowLeft')) steer += 1;
+    if (keys.has('KeyD') || keys.has('ArrowRight')) steer -= 1;
+    const handbrake = keys.has('Space');
+
+    vehicle.applyControls({ throttle, brake: 0, steer, handbrake });
+    vehicle.step(dt); // sets wheels + updateVehicle(dt); impulses integrate next core.step
+    // Safety net: if the car tunnels through the ground (rare glitch), drop it back
+    // onto the surface at the spawn instead of losing it to an endless fall.
+    const cp = vehicle.chassisBody().translation();
+    if (!Number.isFinite(cp.y) || cp.y < floorY - 6) {
+      const sp = carSpawnPoint();
+      vehicle.placeAt(sp.position, sp.headingY);
+    }
+    vehicle.syncMeshes();
+    updateChaseCamera(dt);
+
+    // Live speedometer in the on-screen badge.
+    badge.innerHTML =
+      '<span class="shooter-badge-mode">🚗 Drive</span>' +
+      `<span class="shooter-badge-dim"> · ${Math.round(Math.abs(vehicle.speedKmh()))} km/h · R flip · C exit</span>`;
+  }
+
+  // Third-person follow camera: behind + above the car along its heading,
+  // smoothed; mouse drag (while pointer-locked) orbits and decays back to centre.
+  // A ray from the car to the ideal camera spot pulls the camera in when a wall is
+  // in the way, so the car stays visible even while driving through a building.
+  function updateChaseCamera(dt: number) {
+    if (!vehicle) return;
+    const body = vehicle.chassisBody();
+    const p = body.translation();
+    const r = body.rotation();
+    // Yaw only, so the camera stays upright even when the car pitches/rolls.
+    const yawCar = Math.atan2(2 * (r.w * r.y + r.x * r.z), 1 - 2 * (r.y * r.y + r.z * r.z));
+    camOrbitYaw *= Math.max(0, 1 - 3 * dt);
+    const ang = yawCar + camOrbitYaw;
+    const fx = Math.sin(ang);
+    const fz = Math.cos(ang);
+    // Pivot just above the car; ideal camera spot behind + above it.
+    _v2.set(p.x, p.y + cfg.chase.look, p.z);
+    _v.set(p.x - fx * cfg.chase.dist, p.y + cfg.chase.height, p.z - fz * cfg.chase.dist);
+    if (_v.y < floorY + 0.6) _v.y = floorY + 0.6; // never sink under the ground
+
+    // Occlusion: pull the camera in to just before any structure between it and the car.
+    const core = getCore();
+    if (core) {
+      const world = core.world as RAPIER.World;
+      _camDir.set(_v.x - _v2.x, _v.y - _v2.y, _v.z - _v2.z);
+      const want = _camDir.length();
+      if (want > 1e-3) {
+        _camDir.multiplyScalar(1 / want);
+        const ray = new RAPIER.Ray(
+          { x: _v2.x, y: _v2.y, z: _v2.z },
+          { x: _camDir.x, y: _camDir.y, z: _camDir.z },
+        );
+        const hit = world.castRay(ray, want, true, undefined, undefined, undefined, body, camRayFilter);
+        if (hit) {
+          const d = Math.max(0.6, hit.timeOfImpact - 0.35); // keep a small gap off the wall
+          _v.set(_v2.x + _camDir.x * d, _v2.y + _camDir.y * d, _v2.z + _camDir.z * d);
+        }
+      }
+    }
+
+    // Snap inward fast (so a wall can't clip across the view) but ease back out slowly.
+    const lerpRate = _v.distanceTo(_v2) < camera.position.distanceTo(_v2) ? 24 : cfg.chase.lerp;
+    camera.position.lerp(_v, 1 - Math.exp(-lerpRate * dt));
+    camera.lookAt(_v2);
+  }
+
   // ── Per-frame entry point ───────────────────────────────────────
   function update() {
     const now = performance.now();
@@ -889,6 +1095,7 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     }
 
     if (cfg.fps) updateCamera(dt);
+    else if (cfg.drive) updateDrive(dt);
     if (core) updateStickies(core);
     if (core) updateBlastFields(core);
     updateTransient(now);
@@ -915,6 +1122,13 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     charCollider = null;
     charController = null;
     charCore = null;
+    // Same for the car: remove its meshes (the bodies died with the old world);
+    // updateDrive respawns it in the new world if drive mode is still on.
+    if (vehicle) {
+      vehicle.disposeVisuals();
+      vehicle = null;
+      vehicleCore = null;
+    }
     blastFields.length = 0;
     for (const s of stickies) removeSticky(s);
     stickies.length = 0;
@@ -943,6 +1157,16 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   }
 
   canvas.addEventListener('click', (e: MouseEvent) => {
+    if (cfg.drive) {
+      // Grab the pointer so the mouse can orbit the chase camera; no shooting.
+      if (!pointerLocked) {
+        try {
+          const p = canvas.requestPointerLock() as unknown as Promise<void> | undefined;
+          if (p && typeof p.catch === 'function') p.catch(() => { /* ignore */ });
+        } catch { /* ignore */ }
+      }
+      return;
+    }
     if (cfg.fps) {
       if (!pointerLocked) {
         // requestPointerLock returns a promise in newer browsers; swallow a
@@ -968,7 +1192,14 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
   });
 
   document.addEventListener('mousemove', (e: MouseEvent) => {
-    if (!cfg.fps || !pointerLocked) return;
+    if (!pointerLocked) return;
+    if (cfg.drive) {
+      // Orbit the chase camera around the car (decays back behind it).
+      camOrbitYaw -= e.movementX * cfg.mouseSensitivity;
+      camOrbitYaw = Math.min(Math.max(camOrbitYaw, -1.2), 1.2);
+      return;
+    }
+    if (!cfg.fps) return;
     yaw -= e.movementX * cfg.mouseSensitivity;
     pitch -= e.movementY * cfg.mouseSensitivity;
     pitch = Math.min(Math.max(pitch, -1.5), 1.5);
@@ -976,6 +1207,12 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
 
   window.addEventListener('keydown', (e: KeyboardEvent) => {
     if (isTyping()) return;
+    // R flips the car upright — only while driving, so it doesn't shadow other keys.
+    if (cfg.drive && e.code === 'KeyR') {
+      vehicle?.recover();
+      e.preventDefault();
+      return;
+    }
     switch (e.code) {
       case 'Digit1': setMode('ball'); return;
       case 'Digit2': setMode('sticky'); return;
@@ -983,8 +1220,9 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
       case 'KeyQ': cycleMode(); return;
       case 'KeyF': detonateAll(); return;
       case 'KeyV': setFpsEnabled(!cfg.fps); return;
+      case 'KeyC': setDriveEnabled(!cfg.drive); return;
     }
-    if (cfg.fps) {
+    if (cfg.fps || cfg.drive) {
       // Movement / look keys — track and stop the page from scrolling.
       if (
         e.code === 'KeyW' || e.code === 'KeyA' || e.code === 'KeyS' || e.code === 'KeyD' ||
@@ -1011,6 +1249,8 @@ export function mountShooter(opts: ShooterOptions): ShooterHandle {
     update,
     setFpsEnabled,
     isFpsEnabled: () => cfg.fps,
+    setDriveEnabled,
+    isDriveEnabled: () => cfg.drive,
     setMode,
     detonateAll,
   };
