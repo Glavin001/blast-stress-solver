@@ -3,7 +3,7 @@ import { loadStressSolver } from '../stress.js';
 import { buildBridgeScenario } from '../extBridgeScenario.js';
 
 export async function buildBridgeShared({ gravity = -9.81, strengthScale = 0.05 } = {}) {
-  await RAPIER.init?.();
+  await RAPIER.init();
   const runtime = await loadStressSolver();
   const scenario = buildBridgeScenario();
 

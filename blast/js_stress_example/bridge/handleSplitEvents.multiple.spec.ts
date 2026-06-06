@@ -19,7 +19,7 @@ function makeChunk(nodeIndex: number, size = { x: 1, y: 1, z: 1 }, isSupport = f
 
 describe('handleSplitEvents scenarios', () => {
   beforeAll(async () => {
-    await RAPIER.init?.();
+    await RAPIER.init();
   });
 
   it('keeps parent body when parent actor appears among children', () => {

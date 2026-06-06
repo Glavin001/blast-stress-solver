@@ -158,7 +158,7 @@ async function init() {
   console.warn = ((orig) => (...args) => { logHook('warn', ...args); orig(...args); })(console.warn.bind(console));
   console.error = ((orig) => (...args) => { logHook('error', ...args); orig(...args); })(console.error.bind(console));
 
-  await RAPIER.init?.();
+  await RAPIER.init();
   const runtime = await loadStressSolver();
 
   const { scene, renderer, camera, controls } = initThree();

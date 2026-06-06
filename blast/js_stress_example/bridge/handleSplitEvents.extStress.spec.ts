@@ -21,7 +21,7 @@ function makeBridgeChunk(nodeIndex: number, centroid: { x:number;y:number;z:numb
 
 describe('handleSplitEvents with ExtStressSolver-generated splits', () => {
   beforeAll(async () => {
-    await RAPIER.init?.();
+    await RAPIER.init();
   });
 
   it('generates organic splits via the shared bridge simulation', async () => {

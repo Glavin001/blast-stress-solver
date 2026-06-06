@@ -81,7 +81,7 @@ const controlsUI = {
 
 async function init() {
   try {
-  await RAPIER.init?.();
+  await RAPIER.init();
     const runtime = await loadStressSolver();
   const world = new RAPIER.World(new RAPIER.Vector3(0, GRAVITY_DEFAULT, 0));
   const { scene, renderer, camera, controls } = initThree();

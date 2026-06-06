@@ -21,7 +21,7 @@ function makeChunk(nodeIndex: number, size = { x: 1, y: 1, z: 1 }) {
 // This test reproduces a large split similar to the browser scenario: ~96 parent chunks -> ~32 children.
 describe('handleSplitEvents large bridge scenario', () => {
   beforeAll(async () => {
-    await RAPIER.init?.();
+    await RAPIER.init();
   });
 
   it('applies many child splits and survives world.step without panic', () => {

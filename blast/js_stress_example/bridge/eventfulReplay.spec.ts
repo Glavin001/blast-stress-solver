@@ -31,7 +31,7 @@ function buildGrid(nX: number, nY: number, spacing = 0.6) {
 }
 
 describe('Eventful replay (contacts+predefined splits)', () => {
-  beforeAll(async () => { await RAPIER.init?.(); });
+  beforeAll(async () => { await RAPIER.init(); });
 
   it('replays multiple splits under continuous contact events without panic for 2000 ticks', () => {
     const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });

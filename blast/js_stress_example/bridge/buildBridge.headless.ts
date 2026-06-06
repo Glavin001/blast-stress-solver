@@ -194,7 +194,7 @@ interface BuildBridgeSharedOptions {
 }
 
 export async function buildBridgeShared(options: BuildBridgeSharedOptions = {}): Promise<BridgeCore> {
-  await RAPIER.init?.();
+  await RAPIER.init();
   const runtime = await loadStressSolver();
   const scenario = buildBridgeScenario();
   const world = new RAPIER.World({ x: 0, y: options.gravity ?? -9.81, z: 0 });

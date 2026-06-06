@@ -27,7 +27,7 @@ let clock;
 let animationId;
 
 async function init() {
-  await RAPIER.init?.();
+  await RAPIER.init();
   setupThree();
   createWorld();
   createTestBridge();

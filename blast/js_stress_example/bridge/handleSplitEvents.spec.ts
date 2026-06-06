@@ -20,7 +20,7 @@ function makeChunk(nodeIndex: number, size = { x: 1, y: 1, z: 1 }, isSupport = f
 
 describe('handleSplitEvents (Rapier integration)', () => {
   beforeAll(async () => {
-    await RAPIER.init?.();
+    await RAPIER.init();
   });
 
   it('migrates colliders from parent body to new child bodies and updates actorMap', () => {

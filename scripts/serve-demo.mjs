@@ -103,11 +103,29 @@ function resolveAliasedPath(pathname) {
     return null
 }
 
+// Compatibility shim: wraps rapier3d-simd and adds a no-op init() so callers
+// written against rapier3d-compat's API continue to work without modification.
+// rapier3d-simd initialises itself via a static WASM ESM import at module
+// evaluation time, so init() truly has nothing to do.
+const RAPIER_COMPAT_SHIM = `\
+import RAPIER_SIMD from "/vendor/rapier/rapier.js";
+export * from "/vendor/rapier/rapier.js";
+export async function init() {}
+const RAPIER = Object.assign(Object.create(null), RAPIER_SIMD, { init: async () => {} });
+export default RAPIER;
+`
+
 const server = createServer(async (req, res) => {
     try {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
         const rawPathname = url.pathname
         const pathname = decodeURIComponent(url.pathname)
+
+        if (pathname === '/vendor/rapier-compat.js') {
+            res.writeHead(200, { 'Content-Type': 'text/javascript; charset=UTF-8' })
+            res.end(RAPIER_COMPAT_SHIM)
+            return
+        }
 
         let resolvedPath = resolve(projectRoot, `.${pathname}`)
         let fileStat

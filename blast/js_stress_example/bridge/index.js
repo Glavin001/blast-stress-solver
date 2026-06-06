@@ -11,7 +11,7 @@ import { GRAVITY_DEFAULT } from './constants.js';
 import { toleranceFromExponent } from './utils.js';
 
 async function init() {
-  await RAPIER.init?.();
+  await RAPIER.init();
   const stressRuntime = await loadStressSolver();
 
   const world = new RAPIER.World(new RAPIER.Vector3(0, GRAVITY_DEFAULT, 0));
