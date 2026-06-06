@@ -17,7 +17,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import * as pinata from '@dgreenheck/three-pinata';
-import { buildDestructibleCore } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle, RapierDebugRenderer, setPinataModule } from 'blast-stress-solver/three';
 import {
   buildHouseScenario,
@@ -160,6 +160,15 @@ let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let rebuilding = false;
 
+// Standard session recorder (● Record / ⬇ Save) + live frame profiler, shared by all
+// destruction demos so bug reports / perf captures are consistent across pages.
+const profiler = createFrameProfilerOverlay();
+const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
+  exportName: 'house-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
+
 /** Map the scenario's per-node fragment types + furniture accents → render colors. */
 function buildNodeColors(scenario: any): THREE.Color[] {
   const house = scenario.parameters?.house ?? {};
@@ -230,6 +239,8 @@ async function initScene() {
 
   coreRef = core;
   visualsRef = visuals;
+  recorder.attach(core, { scenario, meta: { demo: 'house', config: CONFIG } });
+  profiler.attach(core);
   initialBonds = core.getActiveBondsCount();
   baselineY = avgDynamicY(core);
   if (hint) hint.textContent = 'Click to throw a ball · Press V to walk inside (WASD + mouse)';
@@ -327,6 +338,8 @@ document.getElementById('btn-reset')?.addEventListener('click', () => { void reb
 const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
+  profiler.render();
+  recorder.render();
   stats.begin();
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();
