@@ -23,29 +23,11 @@ echo "Building TypeScript in js_stress_example..."
 echo "Bundling standalone demos (split-planner-bench)..."
 (cd "$DEMO_SRC" && npx -y esbuild split-planner-bench.ts --bundle --outfile=dist/split-planner-bench.js --format=esm || true)
 
-# Ensure blast-stress-solver dev deps (tsup, three-pinata) are installed, then
-# rebuild its JS bundles from the current source tree so the vendored copy always
-# reflects this commit. The deploy otherwise reuses whatever dist/ the build cache
-# holds, which can be stale (e.g. an old debug-overlay bundle), so source-level
-# fixes silently never reach the demos.
+# Ensure blast-stress-solver dev deps (three-pinata) are installed for vendor copy
 BSS_DIR="$ROOT/blast/blast-stress-solver"
-if [ -d "$BSS_DIR" ]; then
-  if [ ! -x "$BSS_DIR/node_modules/.bin/tsup" ] || [ ! -d "$BSS_DIR/node_modules/@dgreenheck/three-pinata" ]; then
-    echo "Installing blast-stress-solver dependencies for vendor assets..."
-    (cd "$BSS_DIR" && npm install --ignore-scripts 2>/dev/null || true)
-  fi
-
-  # Refresh the JS bundles only. --no-clean keeps the prebuilt WASM runtime in
-  # place (it is expensive to rebuild and is reused from dist); --no-dts skips the
-  # type emit the browser does not need. Guarded on a complete dist/ existing so we
-  # never produce a JS-only dist without its WASM. Falls back to existing bundles.
-  if [ -f "$BSS_DIR/dist/stress_solver.wasm" ] && [ -x "$BSS_DIR/node_modules/.bin/tsup" ]; then
-    echo "Refreshing blast-stress-solver JS bundles from source..."
-    (cd "$BSS_DIR" && ./node_modules/.bin/tsup --config tsup.config.ts --no-clean --no-dts) \
-      || echo "WARN: blast-stress-solver rebuild failed; vendoring existing dist bundles"
-  else
-    echo "WARN: blast-stress-solver dist/ or tsup unavailable; vendoring existing bundles as-is"
-  fi
+if [ -d "$BSS_DIR" ] && [ ! -d "$BSS_DIR/node_modules/@dgreenheck/three-pinata" ]; then
+  echo "Installing blast-stress-solver dependencies for vendor assets..."
+  (cd "$BSS_DIR" && npm install --ignore-scripts 2>/dev/null || true)
 fi
 
 # ── Demo pages ──────────────────────────────────────────────
