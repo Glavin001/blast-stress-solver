@@ -49,6 +49,14 @@ const CONFIG = {
     // 0 = keep parts whole.
     fractureCellSize: 0.6,
     bondMaxSeparation: 0.12, // m — max surface gap auto-bonding treats as contact
+    // Per-role attachment strength (Reset to apply). Cargo/accessories start weak
+    // so they shed readily; the frame is the strong skeleton.
+    bondStrength: { frame: 1, wheel: 1, panel: 1, cargo: 0.5, accessory: 0.4 } as Record<VehiclePartRole, number>,
+  },
+  // Live breaking knobs (no Reset needed).
+  breaking: {
+    impactSensitivity: 1.0, // scales how easily a direct hit detaches a part
+    shedOnMotion: 1.0, // how readily cargo/accessories tear off a violently moving body
   },
   projectile: {
     radius: 0.25,
@@ -191,6 +199,11 @@ let _impactCuts = 0;
 // ground without shedding parts. A drop from height lands well after this.
 let sceneSettleUntil = 0;
 
+// Effective detach threshold, scaled by the live impact-sensitivity knob
+// (higher sensitivity → lower threshold → easier to break off).
+const thrOf = (role: VehiclePartRole) =>
+  IMPACT_DETACH_THRESHOLD[role] / Math.max(0.05, CONFIG.breaking.impactSensitivity);
+
 function handleImpact(e: { nodeIndex: number; force: number; otherBodyHandle: number }) {
   const roles = nodeRolesRef;
   const cents = nodeCentroidsRef;
@@ -199,7 +212,7 @@ function handleImpact(e: { nodeIndex: number; force: number; otherBodyHandle: nu
   if (performance.now() < sceneSettleUntil) return; // let it settle on spawn
   const role = roles[e.nodeIndex];
   if (!role) return;
-  const thr = IMPACT_DETACH_THRESHOLD[role];
+  const thr = thrOf(role);
   if (e.force < thr) return;
 
   // Detach the struck part (cut its bonds → it falls off as debris, keeps mesh).
@@ -219,7 +232,7 @@ function handleImpact(e: { nodeIndex: number; force: number; otherBodyHandle: nu
       if (j === e.nodeIndex) continue;
       const rj = roles[j];
       if (!rj || ROLE_RANK[rj] > rank) continue; // only same-or-weaker
-      if (e.force < IMPACT_DETACH_THRESHOLD[rj]) continue;
+      if (e.force < thrOf(rj)) continue;
       const cj = cents[j];
       const dx = c0.x - cj.x, dy = c0.y - cj.y, dz = c0.z - cj.z;
       const d2 = dx * dx + dy * dy + dz * dz;
@@ -228,6 +241,46 @@ function handleImpact(e: { nodeIndex: number; force: number; otherBodyHandle: nu
     cand.sort((a, b) => a.d2 - b.d2);
     for (let k = 0; k < Math.min(maxSplash, cand.length); k++) {
       if (core.cutNodeBonds(cand[k].j)) _impactCuts++;
+    }
+  }
+}
+
+// Inertial shedding: a free body that's flung/spun hard doesn't stress its bonds
+// in the solver, but physically the loosely-lashed cargo would tear off. So when
+// a body carrying cargo/accessories moves or spins violently, progressively cut
+// those weak parts' bonds (they fly off as debris). "Shed on motion" scales it.
+// Base "violence" (m/s-equivalent) at which each role starts to tear loose.
+const INERTIAL_SHED_BASE: Partial<Record<VehiclePartRole, number>> = { cargo: 9, accessory: 6 };
+
+function processInertialShedding() {
+  const roles = nodeRolesRef;
+  const core = coreRef;
+  if (!roles || !core) return;
+  if (performance.now() < sceneSettleUntil) return;
+  const sens = CONFIG.breaking.shedOnMotion;
+  if (sens <= 0) return;
+
+  // "Violence" per body = linear speed + a weighting of angular speed (spin).
+  const violence = new Map<number, number>();
+  for (const ch of core.chunks as any[]) {
+    if (!ch.active || ch.bodyHandle == null || violence.has(ch.bodyHandle)) continue;
+    const body = core.world.getRigidBody(ch.bodyHandle);
+    if (!body || body.isFixed?.()) continue;
+    const v = body.linvel();
+    const w = body.angvel();
+    violence.set(ch.bodyHandle, Math.hypot(v.x, v.y, v.z) + Math.hypot(w.x, w.y, w.z) * 1.2);
+  }
+
+  for (let i = 0; i < core.chunks.length; i++) {
+    const ch = (core.chunks as any[])[i];
+    if (!ch.active || ch.bodyHandle == null) continue;
+    const role = roles[i];
+    const base = INERTIAL_SHED_BASE[role];
+    if (base === undefined) continue; // only cargo/accessories tear off from motion
+    const vv = violence.get(ch.bodyHandle) ?? 0;
+    const thr = base / sens;
+    if (vv > thr && Math.random() < Math.min(0.4, 0.05 * (vv / thr - 1))) {
+      if (core.cutNodeBonds(i)) _impactCuts++;
     }
   }
 }
@@ -265,6 +318,7 @@ async function initScene(dropHeight = 0) {
     totalMass: CONFIG.vehicle.totalMass,
     fractureCellSize: CONFIG.vehicle.fractureCellSize,
     bondMaxSeparation: CONFIG.vehicle.bondMaxSeparation,
+    roleStrength: CONFIG.vehicle.bondStrength,
     pinata,
     groundGap: 0.03 + Math.max(0, dropHeight),
   });
@@ -406,6 +460,20 @@ bindSlider('cfg-fracture', CONFIG.vehicle, 'fractureCellSize', (v) =>
 );
 bindSlider('cfg-bond-sep', CONFIG.vehicle, 'bondMaxSeparation', (v) => v.toFixed(2) + ' m');
 
+// Bond strength hierarchy — per-role attachment (Reset to apply).
+const strengthFmt = (v: number) => `${v.toFixed(2)}×`;
+bindSlider('cfg-bs-frame', CONFIG.vehicle.bondStrength, 'frame', strengthFmt);
+bindSlider('cfg-bs-wheel', CONFIG.vehicle.bondStrength, 'wheel', strengthFmt);
+bindSlider('cfg-bs-panel', CONFIG.vehicle.bondStrength, 'panel', strengthFmt);
+bindSlider('cfg-bs-cargo', CONFIG.vehicle.bondStrength, 'cargo', strengthFmt);
+bindSlider('cfg-bs-accessory', CONFIG.vehicle.bondStrength, 'accessory', strengthFmt);
+
+// Breaking sensitivity — LIVE (no Reset).
+bindSlider('cfg-impact-sens', CONFIG.breaking, 'impactSensitivity', (v) => v.toFixed(2) + '×');
+bindSlider('cfg-shed-motion', CONFIG.breaking, 'shedOnMotion', (v) =>
+  v <= 0 ? 'off' : v.toFixed(2) + '×',
+);
+
 // Projectile (immediate)
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
 bindSlider('cfg-proj-mass', CONFIG.projectile, 'mass', (v) => v.toLocaleString() + ' kg');
@@ -428,11 +496,13 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Detached debris collides with the GROUND only — not with each other or the
-// intact body. Fractured/split chunks have overlapping convex hulls (fine while
-// welded into one body), so when many detach at once, debris-vs-body penetration
-// would otherwise resolve as a violent explosion. Ground-only keeps it stable.
-physicsConfig.debrisCollisionMode = 'debrisGroundOnly';
+// Detached debris bounces off the intact body and the ground, but NOT off other
+// debris. Fractured/split chunks have overlapping convex hulls, so allowing
+// debris-vs-debris contact lets a pile of just-detached overlapping chunks resolve
+// their penetration as a violent explosion. 'noDebrisPairs' keeps debris lively
+// (cargo bounces off the car) while removing that failure mode. Verified stable
+// under heavy destruction by scripts/soak-vehicle.mjs.
+physicsConfig.debrisCollisionMode = 'noDebrisPairs';
 
 // Shared Physics / Optimization / Features controls.
 mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
@@ -455,6 +525,7 @@ function loop() {
   if (coreRef && visualsRef) {
     const t0 = performance.now();
     coreRef.step(dt);
+    processInertialShedding(); // cargo tears off a flung/spinning body
     _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
 
     visualsRef.update({ debug: showDebug, updateBVH: false, updateProjectiles: true });

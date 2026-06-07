@@ -72,16 +72,35 @@ The decomposition pipeline (in `glb-vehicle.ts`) is:
 Pieces are coloured by role so the hierarchy is visible (toggle **Color: Role /
 State** to instead see intact-vs-detached state).
 
+## Breaking model
+
+Breaking is **not** stress-driven (a free body barely stresses its bonds on a
+hit). Two controlled paths drive it instead:
+
+- **Direct impact** (`onImpact`): a hit past a role-based force threshold cuts the
+  struck part's bonds (it detaches and falls), with a small bounded splash.
+- **Inertial shedding:** when a body carrying cargo/accessories is flung or spun
+  hard, those weakly-lashed parts progressively tear off and bounce away — so a
+  car that's hit and goes tumbling sheds its payload, not just the part you hit.
+
+Detached debris uses `debrisCollisionMode: 'noDebrisPairs'` — it bounces off the
+car and ground but not off other debris (overlapping just-detached chunks colliding
+with each other is what caused the early "explosion").
+
 ## Controls
 
-- **Total Mass**, **Fracture Cell Size** (~chunk size for large structural parts;
-  0 = keep whole), **Bond Reach** (max surface gap auto-bonding treats as contact)
-  — vehicle build (needs *Reset*).
+Tuning GUI in the sidebar:
+- **Bond Strength by Role** — per-role attachment strength (frame / wheel / panel /
+  cargo / accessory), the main hierarchy knobs (needs *Reset*). Cargo/accessories
+  start weak so they shed readily.
+- **Breaking Sensitivity (live)** — *Impact break ease* (how easily a direct hit
+  detaches a part) and *Shed on motion* (how readily cargo tears off a flung/
+  spinning car). Both apply immediately, no Reset.
+- **Total Mass**, **Fracture Cell Size**, **Bond Reach** — vehicle build (*Reset*).
 - **Projectile** radius / mass / speed — live.
-- **Material Scale** — global toughness; **Gravity** (needs *Reset*).
-- **Contact Force Scale** — how hard impacts hit the stress graph (needs *Reset*).
-- Shared **Physics / Optimization** controls (friction, restitution, debris
-  cleanup, …) plus the live frame profiler and session recorder.
+- **Material Scale** (kept high so the car is solid at rest) / **Gravity** (*Reset*).
+- Shared **Physics / Optimization** controls plus the live frame profiler and
+  session recorder.
 
 ## The decomposition tool
 

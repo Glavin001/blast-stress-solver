@@ -387,6 +387,12 @@ export type BuildVehicleScenarioOptions = {
    * cm; default 0.06.
    */
   bondMaxSeparation?: number;
+  /**
+   * Per-role attachment-strength scale, multiplied into every bond touching a
+   * part of that role (so e.g. roleStrength.cargo = 0.5 halves how strongly all
+   * cargo is held). Default 1 for each. This is the main "make cargo weaker" knob.
+   */
+  roleStrength?: Partial<Record<VehiclePartRole, number>>;
 };
 
 export type VehicleScenarioResult = {
@@ -543,7 +549,10 @@ export async function buildVehicleScenario(
   // stitch bonds we may add for connectivity.
   const baseArea = medianArea(scenario.bonds) || 0.1;
 
-  // Scale each bond by its role-pair (or same-part internal) multiplier.
+  // Scale each bond by its role-pair (or same-part internal) multiplier, then by
+  // the per-role attachment-strength knobs (both endpoints).
+  const rs = options.roleStrength ?? {};
+  const rsOf = (r: VehiclePartRole) => (rs[r] ?? 1);
   for (const bond of scenario.bonds) {
     const a = meta[bond.node0];
     const b = meta[bond.node1];
@@ -552,7 +561,7 @@ export async function buildVehicleScenario(
       a.partId === b.partId
         ? INTERNAL_ROLE_MULTIPLIER[a.role]
         : interRoleMultiplier(a.role, b.role);
-    bond.area = Math.max(bond.area * mult, 1e-6);
+    bond.area = Math.max(bond.area * mult * rsOf(a.role) * rsOf(b.role), 1e-6);
   }
 
   // Guarantee the bond graph is a single connected component, otherwise an
