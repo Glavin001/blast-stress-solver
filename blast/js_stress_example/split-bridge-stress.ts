@@ -2026,18 +2026,16 @@ function stressLinesToWorld(
     return best;
   };
 
-  const poses = new Map<any, { q: THREE.Quaternion; t: THREE.Vector3 }>();
-  const poseFor = (chunkIndex: number) => {
-    let bh = chunkIndex >= 0 && chunks[chunkIndex] ? chunks[chunkIndex].bodyHandle : null;
-    if (bh == null) bh = rootBodyHandle;
-    let p = poses.get(bh);
-    if (p) return p;
-    let body = world.getRigidBody(bh);
-    if (!body && bh !== rootBodyHandle) body = world.getRigidBody(rootBodyHandle);
-    if (!body) return null;
-    const t = body.translation();
-    const r = body.rotation();
-    p = { q: new THREE.Quaternion(r.x, r.y, r.z, r.w), t: new THREE.Vector3(t.x, t.y, t.z) };
+  const poses = new Map<any, { q: THREE.Quaternion; t: THREE.Vector3 } | null>();
+  const poseForBody = (bh: any) => {
+    if (poses.has(bh)) return poses.get(bh)!;
+    const body = world.getRigidBody(bh);
+    let p: { q: THREE.Quaternion; t: THREE.Vector3 } | null = null;
+    if (body) {
+      const t = body.translation();
+      const r = body.rotation();
+      p = { q: new THREE.Quaternion(r.x, r.y, r.z, r.w), t: new THREE.Vector3(t.x, t.y, t.z) };
+    }
     poses.set(bh, p);
     return p;
   };
@@ -2045,12 +2043,19 @@ function stressLinesToWorld(
   const v = new THREE.Vector3();
   const out: any[] = [];
   for (const line of debugLines) {
-    const p0pose = poseFor(nearest(line.p0.x, line.p0.y, line.p0.z));
-    const p1pose = poseFor(nearest(line.p1.x, line.p1.y, line.p1.z));
-    if (!p0pose || !p1pose) continue;
-    v.set(line.p0.x, line.p0.y, line.p0.z).applyQuaternion(p0pose.q).add(p0pose.t);
+    const ch0 = chunks[nearest(line.p0.x, line.p0.y, line.p0.z)];
+    const ch1 = chunks[nearest(line.p1.x, line.p1.y, line.p1.z)];
+    // Only draw a bond that sits on ONE live, non-destroyed body — skip bonds that
+    // span two fragments or reference a destroyed/hidden chunk. Those produced the
+    // stray lines floating with nothing attached.
+    if (!ch0 || !ch1 || ch0.destroyed || ch1.destroyed) continue;
+    const bh = ch0.bodyHandle;
+    if (bh == null || bh !== ch1.bodyHandle) continue;
+    const pose = poseForBody(bh);
+    if (!pose) continue;
+    v.set(line.p0.x, line.p0.y, line.p0.z).applyQuaternion(pose.q).add(pose.t);
     const a = { x: v.x, y: v.y, z: v.z };
-    v.set(line.p1.x, line.p1.y, line.p1.z).applyQuaternion(p1pose.q).add(p1pose.t);
+    v.set(line.p1.x, line.p1.y, line.p1.z).applyQuaternion(pose.q).add(pose.t);
     const b = { x: v.x, y: v.y, z: v.z };
     out.push({ p0: a, p1: b, color0: line.color0, color1: line.color1 });
   }

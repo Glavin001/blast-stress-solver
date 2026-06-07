@@ -127,15 +127,21 @@ export class SolverDebugLinesHelper {
     // Snapshot the current body poses (fresh every frame)
     this.updateBodyPoses(core);
 
-    // Transform and write lines to GPU buffers
-    this.transformLines(core, lines, lineCount);
+    // Transform and write lines to GPU buffers. Returns how many were actually
+    // written — bonds that can't be placed on a single live rigid body are skipped.
+    const drawn = this.transformLines(core, lines, lineCount);
+    this.geometry.setDrawRange(0, drawn * 2);
+
+    if (drawn === 0) {
+      this.object.visible = false;
+      return;
+    }
 
     // Mark buffers for upload
     const posAttr = this.geometry.getAttribute('position') as THREE.BufferAttribute;
     const colAttr = this.geometry.getAttribute('color') as THREE.BufferAttribute;
     posAttr.needsUpdate = true;
     colAttr.needsUpdate = true;
-    this.geometry.setDrawRange(0, lineCount * 2);
 
     this.object.visible = true;
   }
@@ -291,24 +297,20 @@ export class SolverDebugLinesHelper {
     this.bodyPoseMap.set(core.rootBodyHandle, this.rootPose);
   }
 
-  private poseForChunk(core: DestructibleCore, chunkIndex: number): Pose {
-    if (chunkIndex < 0) return this.rootPose;
-    const chunk = core.chunks[chunkIndex];
-    const bh = chunk?.bodyHandle;
-    if (bh == null) return this.rootPose;
-
-    const cached = this.bodyPoseMap.get(bh);
+  /** Current world pose of a rigid body, cached per frame. Null if it can't be resolved. */
+  private poseForBody(core: DestructibleCore, bodyHandle: number): Pose | null {
+    const cached = this.bodyPoseMap.get(bodyHandle);
     if (cached) return cached;
 
-    const body = core.world.getRigidBody(bh);
-    if (!body) return this.rootPose;
+    const body = core.world.getRigidBody(bodyHandle);
+    if (!body) return null;
 
     const pose = this.getPooledPose(this.bodyPoolIndex++);
     const tr = body.translation();
     const rot = body.rotation();
     pose.t.set(tr.x, tr.y, tr.z);
     pose.q.set(rot.x, rot.y, rot.z, rot.w);
-    this.bodyPoseMap.set(bh, pose);
+    this.bodyPoseMap.set(bodyHandle, pose);
     return pose;
   }
 
@@ -325,37 +327,55 @@ export class SolverDebugLinesHelper {
   // Private: Transform lines to world space and write to GPU buffers
   // =========================================================================
 
-  private transformLines(core: DestructibleCore, lines: DebugLine[], lineCount: number): void {
+  private transformLines(core: DestructibleCore, lines: DebugLine[], lineCount: number): number {
+    let written = 0;
     for (let i = 0; i < lineCount; i++) {
+      const c0 = this.lineChunk0[i];
+      const c1 = this.lineChunk1[i];
+      const chunk0 = c0 >= 0 ? core.chunks[c0] : undefined;
+      const chunk1 = c1 >= 0 ? core.chunks[c1] : undefined;
+      if (!chunk0 || !chunk1) continue;
+
+      // A bond's stress is only meaningful within ONE rigid body, and the overlay
+      // should only ever appear on geometry you can see. Skip a line if either
+      // endpoint sits on a destroyed chunk (its mesh is hidden) or if the two
+      // endpoints resolve to different bodies (a bond that has broken / is mid-split).
+      // Drawing those was what produced stray green lines floating in mid-air with
+      // nothing attached: e.g. an un-cut bond on a destroyed chunk whose body had
+      // flown off, or a bond stretched between a settled fragment and a flying one.
+      if (chunk0.destroyed || chunk1.destroyed) continue;
+      const bh = chunk0.bodyHandle;
+      if (bh == null || bh !== chunk1.bodyHandle) continue;
+
+      const pose = this.poseForBody(core, bh);
+      if (!pose) continue;
+
       const line = lines[i];
+      const base = written * 6;
 
-      // Each endpoint follows its OWN chunk's current rigid body.
-      const pose0 = this.poseForChunk(core, this.lineChunk0[i]);
-      const pose1 = this.poseForChunk(core, this.lineChunk1[i]);
-
-      const base = i * 6;
-
-      // Endpoint 0
-      this.v.set(line.p0.x, line.p0.y, line.p0.z).applyQuaternion(pose0.q).add(pose0.t);
+      // Both endpoints share the owning body's pose.
+      this.v.set(line.p0.x, line.p0.y, line.p0.z).applyQuaternion(pose.q).add(pose.t);
       this.positions[base] = this.v.x;
       this.positions[base + 1] = this.v.y;
       this.positions[base + 2] = this.v.z;
 
-      // Endpoint 1
-      this.v.set(line.p1.x, line.p1.y, line.p1.z).applyQuaternion(pose1.q).add(pose1.t);
+      this.v.set(line.p1.x, line.p1.y, line.p1.z).applyQuaternion(pose.q).add(pose.t);
       this.positions[base + 3] = this.v.x;
       this.positions[base + 4] = this.v.y;
       this.positions[base + 5] = this.v.z;
 
       // Write colors (inline extraction)
-      const c0 = line.color0;
-      const c1 = line.color1 ?? c0;
-      this.colors[base] = ((c0 >> 16) & 0xff) / 255;
-      this.colors[base + 1] = ((c0 >> 8) & 0xff) / 255;
-      this.colors[base + 2] = (c0 & 0xff) / 255;
-      this.colors[base + 3] = ((c1 >> 16) & 0xff) / 255;
-      this.colors[base + 4] = ((c1 >> 8) & 0xff) / 255;
-      this.colors[base + 5] = (c1 & 0xff) / 255;
+      const col0 = line.color0;
+      const col1 = line.color1 ?? col0;
+      this.colors[base] = ((col0 >> 16) & 0xff) / 255;
+      this.colors[base + 1] = ((col0 >> 8) & 0xff) / 255;
+      this.colors[base + 2] = (col0 & 0xff) / 255;
+      this.colors[base + 3] = ((col1 >> 16) & 0xff) / 255;
+      this.colors[base + 4] = ((col1 >> 8) & 0xff) / 255;
+      this.colors[base + 5] = (col1 & 0xff) / 255;
+
+      written++;
     }
+    return written;
   }
 }
