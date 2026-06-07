@@ -53,6 +53,15 @@ export type BuildDestructibleCoreOptions = {
   debrisCollisionMode?: DebrisCollisionMode;
   damage?: DamageOptions & { autoDetachOnDestroy?: boolean; autoCleanupPhysics?: boolean };
   onNodeDestroyed?: (e: { nodeIndex: number; actorIndex: number; reason: 'impact'|'manual' }) => void;
+  /**
+   * Called for each external contact impact on a node (projectile or ground hit),
+   * with the contact force magnitude. Lets a consumer drive custom impact response
+   * (e.g. detaching weak parts via cutNodeBonds) without the damage system's
+   * destroy-and-vanish behaviour. Only fired when `force >= onImpactMinForce`.
+   */
+  onImpact?: (e: { nodeIndex: number; force: number; otherBodyHandle: number }) => void;
+  /** Minimum contact force to fire `onImpact` (filters resting contacts). Default 0. */
+  onImpactMinForce?: number;
   resimulateOnFracture?: boolean;
   maxResimulationPasses?: number;
   /** Rollback strategy for resimulation.
@@ -192,6 +201,8 @@ export async function buildDestructibleCore({
   debrisCollisionMode,
   damage,
   onNodeDestroyed,
+  onImpact,
+  onImpactMinForce = 0,
   resimulateOnFracture = true,
   maxResimulationPasses = 1,
   snapshotMode = 'perBody',
@@ -1270,6 +1281,9 @@ export async function buildDestructibleCore({
             });
           }
           if (chunk.bodyHandle != null) bodiesCollidedWithGround.add(chunk.bodyHandle);
+          if (onImpact && totalForce >= onImpactMinForce) {
+            try { onImpact({ nodeIndex: node1, force: totalForce, otherBodyHandle: b2?.handle ?? -1 }); } catch {}
+          }
         }
       } else if (node2 != null) {
         const chunk = chunks[node2];
@@ -1288,6 +1302,9 @@ export async function buildDestructibleCore({
             });
           }
           if (chunk.bodyHandle != null) bodiesCollidedWithGround.add(chunk.bodyHandle);
+          if (onImpact && totalForce >= onImpactMinForce) {
+            try { onImpact({ nodeIndex: node2, force: totalForce, otherBodyHandle: b1?.handle ?? -1 }); } catch {}
+          }
         }
       }
     });

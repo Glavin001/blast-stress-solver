@@ -43,7 +43,7 @@ const MODEL_URL = './assets/buggy.glb';
 
 const CONFIG = {
   vehicle: {
-    totalMass: 1500,
+    totalMass: 1800,
     // Fracture large concave structural parts into ~this many metres per chunk so
     // their colliders are tight (a whole roll cage as one convex hull is a blob).
     // 0 = keep parts whole.
@@ -51,14 +51,17 @@ const CONFIG = {
     bondMaxSeparation: 0.12, // m — max surface gap auto-bonding treats as contact
   },
   projectile: {
-    radius: 0.3,
-    mass: 1500,
-    speed: 45,
+    radius: 0.25,
+    mass: 150,
+    speed: 38,
     ttlMs: 8000,
   },
   solver: {
     gravity: -9.81,
-    materialScale: 1e10,
+    // High on purpose: the stress solver should hold the car rock-solid under
+    // gravity. All breaking is driven by the controlled onImpact path, not stress,
+    // so a free body never sags or sheds parts just sitting/settling.
+    materialScale: 1e12,
   },
   physics: {
     contactForceScale: 30,
@@ -145,8 +148,8 @@ function updateStatus(core: any) {
   el('stat-bodies')!.textContent = String(core.getRigidBodyCount());
   el('stat-bonds')!.textContent = String(core.getActiveBondsCount());
   el('stat-projectiles')!.textContent = String(core.projectiles.length);
-  const detached = core.chunks.filter((c: any) => c.detached).length;
-  el('stat-detached')!.textContent = `${detached} / ${core.chunks.length}`;
+  // Parts shed via impact (cutNodeBonds doesn't set chunk.detached, so track cuts).
+  el('stat-detached')!.textContent = `${_impactCuts} / ${core.chunks.length}`;
 }
 
 // ── Main ──────────────────────────────────────────────────────
@@ -160,6 +163,74 @@ let colorByRole = true;
 
 // Cached parsed model so Reset / Drop rebuild without re-fetching 8 MB.
 let gltfScene: THREE.Object3D | null = null;
+
+// Per-node role + centroid for the impact handler (free-body breaking).
+let nodeRolesRef: VehiclePartRole[] | null = null;
+let nodeCentroidsRef: Array<{ x: number; y: number; z: number }> | null = null;
+
+// Impact → detach response. A free-floating car barely stresses its bonds under a
+// hit, so instead we detach weak parts locally on impact: when a node is struck
+// hard enough for its role, cut its bonds (it falls off as debris, keeping its
+// mesh) and splash to nearby same-or-weaker parts for a harder hit. Frame/wheels
+// need a much harder hit; cargo/accessories shed easily.
+// Contact-force (N) needed to tear a part of each role off. Calibrated against
+// observed impacts: a ~4 m drop lands wheels at ~7–13 kN, a fast heavy projectile
+// hits much harder. Cargo/accessories shed easily; wheels only pop off on a hard
+// hit (and as a whole unit); the frame only lets go under a catastrophic blow.
+const IMPACT_DETACH_THRESHOLD: Record<VehiclePartRole, number> = {
+  accessory: 500,
+  cargo: 1500,
+  panel: 5000,
+  wheel: 16000,
+  frame: 22000,
+};
+// Weaker (lower) parts shed before stronger ones in a splash.
+const ROLE_RANK: Record<VehiclePartRole, number> = { accessory: 0, cargo: 1, panel: 2, wheel: 3, frame: 4 };
+let _impactCuts = 0;
+// Ignore impacts briefly after (re)build so the vehicle can settle onto the
+// ground without shedding parts. A drop from height lands well after this.
+let sceneSettleUntil = 0;
+
+function handleImpact(e: { nodeIndex: number; force: number; otherBodyHandle: number }) {
+  const roles = nodeRolesRef;
+  const cents = nodeCentroidsRef;
+  const core = coreRef;
+  if (!roles || !cents || !core) return;
+  if (performance.now() < sceneSettleUntil) return; // let it settle on spawn
+  const role = roles[e.nodeIndex];
+  if (!role) return;
+  const thr = IMPACT_DETACH_THRESHOLD[role];
+  if (e.force < thr) return;
+
+  // Detach the struck part (cut its bonds → it falls off as debris, keeps mesh).
+  if (core.cutNodeBonds(e.nodeIndex)) _impactCuts++;
+
+  // Harder hits shed a small local cluster of same-or-weaker parts (splash),
+  // tightly bounded in both radius and count so one hit can't level the vehicle.
+  const over = Math.min(4, e.force / thr);
+  if (over > 1.5) {
+    const radius = 0.25 + 0.06 * over; // ~0.34 .. 0.49 m
+    const r2 = radius * radius;
+    const maxSplash = Math.round(1 + over); // ~3 .. 5 extra parts
+    const c0 = cents[e.nodeIndex];
+    const rank = ROLE_RANK[role];
+    const cand: Array<{ j: number; d2: number }> = [];
+    for (let j = 0; j < roles.length; j++) {
+      if (j === e.nodeIndex) continue;
+      const rj = roles[j];
+      if (!rj || ROLE_RANK[rj] > rank) continue; // only same-or-weaker
+      if (e.force < IMPACT_DETACH_THRESHOLD[rj]) continue;
+      const cj = cents[j];
+      const dx = c0.x - cj.x, dy = c0.y - cj.y, dz = c0.z - cj.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < r2) cand.push({ j, d2 });
+    }
+    cand.sort((a, b) => a.d2 - b.d2);
+    for (let k = 0; k < Math.min(maxSplash, cand.length); k++) {
+      if (core.cutNodeBonds(cand[k].j)) _impactCuts++;
+    }
+  }
+}
 
 const profiler = createFrameProfilerOverlay();
 const recorder = createRecordingOverlay({
@@ -190,13 +261,18 @@ async function initScene(dropHeight = 0) {
   // rebuilds never accumulate transforms.
   const { parts, bounds } = extractVehicleParts(root);
 
-  const { scenario, nodeColors, summary } = await buildVehicleScenario(parts, bounds, {
+  const { scenario, nodeColors, nodeRoles, summary } = await buildVehicleScenario(parts, bounds, {
     totalMass: CONFIG.vehicle.totalMass,
     fractureCellSize: CONFIG.vehicle.fractureCellSize,
     bondMaxSeparation: CONFIG.vehicle.bondMaxSeparation,
     pinata,
     groundGap: 0.03 + Math.max(0, dropHeight),
   });
+  nodeRolesRef = nodeRoles;
+  nodeCentroidsRef = scenario.nodes.map((n: any) => n.centroid);
+  _impactCuts = 0;
+  // Grace window: settle a resting spawn (~0.1 s) or let a height-drop fall first.
+  sceneSettleUntil = performance.now() + (dropHeight > 0 ? 350 : 600);
 
   console.log(
     `Destructible vehicle: ${summary.parts} parts → ${summary.nodes} nodes, ${summary.bonds} bonds`,
@@ -209,6 +285,8 @@ async function initScene(dropHeight = 0) {
     materialScale: CONFIG.solver.materialScale,
     contactForceScale: CONFIG.physics.contactForceScale,
     skipSingleBodies: CONFIG.physics.skipSingleBodies,
+    onImpact: handleImpact,
+    onImpactMinForce: 1,
     ...physicsCoreOverrides(),
     ...pipelineCoreOverrides(),
   });
