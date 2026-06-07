@@ -39,6 +39,7 @@ import {
   applyProjectileMomentumBoost,
   type SpeedScalingOptions,
 } from './contactHelpers';
+import { isBuildingRenderIntact } from './collisionTree';
 
 export type BuildDestructibleCoreOptions = {
   scenario: ScenarioDesc;
@@ -2674,8 +2675,12 @@ export async function buildDestructibleCore({
         };
       });
     }
-    for (let i = 0; i < lodRoots.length; i++) {
-      buildingRenderStatesCache[i].intact = subtreeFullyIntact(lodRoots[i]);
+    // Render-intact = the building still reads as one solid shell. Body-model agnostic (see
+    // isBuildingRenderIntact) — unlike subtreeFullyIntact, which is tied to the single root body
+    // and so reported every per-building-body city as "not intact" (proxy never engaged).
+    for (let i = 0; i < buildingRenderStatesCache.length; i++) {
+      const s = buildingRenderStatesCache[i];
+      s.intact = isBuildingRenderIntact(s.fragments, chunks);
     }
     return buildingRenderStatesCache;
   }

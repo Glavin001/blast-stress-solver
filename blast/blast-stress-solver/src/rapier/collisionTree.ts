@@ -75,3 +75,34 @@ export function buildSpatialCollisionTree(
   for (const indices of components.values()) roots.push(split(indices));
   return roots;
 }
+
+/** Minimal per-fragment state {@link isBuildingRenderIntact} needs. */
+export type IntactChunkState = {
+  active: boolean;
+  destroyed?: boolean;
+  bodyHandle: number | null;
+};
+
+/**
+ * Is a building still visually intact (one solid shell), for render LOD?
+ *
+ * True iff every member fragment is alive, none destroyed, and they all still share ONE rigid
+ * body — a fracture splits a building's fragments across multiple bodies, so a single shared
+ * body means it hasn't broken yet. Deliberately body-model agnostic: it works whether the whole
+ * city sits on one fixed root body or each building is its own body (it only asks whether the
+ * fragments still agree on a body), so a renderer can collapse an intact building to one proxy box.
+ */
+export function isBuildingRenderIntact(
+  fragments: readonly number[],
+  chunks: ReadonlyArray<IntactChunkState | undefined>,
+): boolean {
+  if (fragments.length === 0) return false;
+  let refBody = -1;
+  for (const ni of fragments) {
+    const c = chunks[ni];
+    if (!c || c.active === false || c.destroyed || c.bodyHandle == null) return false;
+    if (refBody === -1) refBody = c.bodyHandle;
+    else if (c.bodyHandle !== refBody) return false;
+  }
+  return true;
+}
