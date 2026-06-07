@@ -128,8 +128,29 @@ exports (`buildScenarioFromFragmentsAsync`, `fractureGeometryAsync`,
 - Voronoi fracture (three-pinata) runs on meshes that may be non-manifold; it's
   guarded with a per-part fallback to "keep whole", so a model that doesn't
   fracture cleanly still works.
-- **Impact breaking on a free body still needs tuning.** Unlike the anchored
-  wall/tower demos, a free-floating car absorbs a hit as motion more than internal
-  stress, so projectiles currently shove it more than they shear bonds. The
-  damage-system path (contact → local node health → bond loss) is the next step for
-  satisfying "hit it and a piece flies off" behaviour.
+- **Impact breaking is contact-driven.** A free-floating car barely stresses its
+  bonds on impact, so breaking is driven by the core's `onImpact` callback: a hit
+  past a role-based force threshold cuts the struck part's bonds (it detaches and
+  falls), with a small bounded splash. `materialScale` is kept high so the stress
+  solver holds the car rock-solid under gravity; all breaking goes through the
+  impact path.
+- **Debris collides with the ground only** (`debrisCollisionMode:
+  'debrisGroundOnly'`). Fractured/split chunks have overlapping convex hulls;
+  fine while welded into one body, but when many detach at once, debris-vs-body
+  penetration would otherwise resolve as a violent explosion. Ground-only keeps it
+  stable (the trade-off is that shed parts fall through each other rather than
+  piling).
+
+## Headless QA
+
+`scripts/soak-vehicle.mjs` drives the demo in headless Chromium through settle /
+light shots / heavy shots / drop and asserts the sim never "explodes" (no body
+exceeds ~120 m/s; `window.__vehicleDemo.metrics()` reports max speed, spread and a
+count of bodies above 60 m/s). Run it before asking a human to QA in a browser:
+
+```bash
+# with the demo built and served (npm start at the repo root, or npm run serve:demos)
+cd blast/js_stress_example
+npx playwright install chromium   # once
+node scripts/soak-vehicle.mjs     # exits non-zero if any scenario blows up
+```

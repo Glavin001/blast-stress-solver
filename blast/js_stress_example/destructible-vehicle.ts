@@ -428,6 +428,12 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
+// Detached debris collides with the GROUND only — not with each other or the
+// intact body. Fractured/split chunks have overlapping convex hulls (fine while
+// welded into one body), so when many detach at once, debris-vs-body penetration
+// would otherwise resolve as a violent explosion. Ground-only keeps it stable.
+physicsConfig.debrisCollisionMode = 'debrisGroundOnly';
+
 // Shared Physics / Optimization / Features controls.
 mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
@@ -491,6 +497,26 @@ window.addEventListener('resize', onResize);
   setDebug(colliders: boolean, bonds: boolean) {
     showDebug = !!bonds;
     rapierDebug?.setEnabled(!!colliders);
+  },
+  // Stability probe for headless soak tests: max linear speed and max distance
+  // from origin across dynamic bodies (an explosion spikes both), plus counts.
+  metrics() {
+    const core = coreRef;
+    if (!core) return null;
+    let maxSpeed = 0, maxDist = 0, dyn = 0, fast = 0;
+    const w: any = core.world;
+    w.forEachRigidBody((rb: any) => {
+      if (rb.isFixed?.()) return;
+      const v = rb.linvel();
+      const sp = Math.hypot(v.x, v.y, v.z);
+      const t = rb.translation();
+      const d = Math.hypot(t.x, t.y, t.z);
+      if (sp > maxSpeed) maxSpeed = sp;
+      if (d > maxDist) maxDist = d;
+      if (sp > 60) fast++; // way above projectile speed → exploding debris
+      dyn++;
+    });
+    return { maxSpeed, maxDist, fastBodies: fast, dynamicBodies: dyn, bodies: core.getRigidBodyCount(), shed: _impactCuts };
   },
 };
 
