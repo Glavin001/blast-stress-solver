@@ -26,6 +26,7 @@
 import * as THREE from 'three';
 import {
   buildScenarioFromFragments,
+  buildScenarioFromFragmentsAsync,
   fractureGeometryAsync,
   recenterGeometry,
   type FragmentInfo,
@@ -151,73 +152,201 @@ const _box = new THREE.Box3();
 const _v = new THREE.Vector3();
 
 /**
- * Walk a loaded glTF scene and return one VehiclePart per mesh, with geometry
- * baked to world space. Oversized planes (the source scene's ground/backdrop)
- * are dropped. Roles are assigned after the whole-vehicle bounds are known.
+ * Split a triangle mesh into its connected components (topological islands).
+ *
+ * Artists routinely model several physically-separate shapes (e.g. the tubes of
+ * a roll cage) as a single mesh. Treated as one node, the runtime builds ONE
+ * convex-hull collider that spans the gaps between those shapes — a nonsensical
+ * blob. Splitting first means each real shape becomes its own piece with a tight
+ * hull, and auto-bonding can reconnect the ones that actually touch.
+ *
+ * Vertices are welded by quantized position so coincident-but-duplicated verts
+ * (common in GLB exports) count as connected, while shapes separated by a gap
+ * become distinct geometries. Tiny stray islands are merged into the nearest
+ * kept island to avoid a flood of micro-nodes.
  */
-export function extractVehicleParts(root: THREE.Object3D): {
-  parts: VehiclePart[];
-  bounds: VehicleBounds;
-} {
-  root.updateMatrixWorld(true);
+export function splitConnectedComponents(
+  geometry: THREE.BufferGeometry,
+  opts: { weldTol?: number; minTriangles?: number; maxComponents?: number } = {},
+): THREE.BufferGeometry[] {
+  const weldTol = opts.weldTol ?? 1e-4;
+  const minTriangles = opts.minTriangles ?? 6;
+  const maxComponents = opts.maxComponents ?? 24;
 
-  type Raw = Omit<VehiclePart, 'role'>;
-  const raw: Raw[] = [];
+  const pos = geometry.getAttribute('position') as THREE.BufferAttribute | undefined;
+  if (!pos) return [geometry];
+  const index = geometry.getIndex();
+  const triCount = Math.floor((index ? index.count : pos.count) / 3);
+  if (triCount < 2) return [geometry];
+  const vert = (i: number) => (index ? index.getX(i) : i);
+
+  // Weld vertices by quantized position → canonical id.
+  const inv = 1 / weldTol;
+  const canonOf = new Int32Array(pos.count);
+  const keyToCanon = new Map<string, number>();
+  let canonCount = 0;
+  for (let i = 0; i < pos.count; i++) {
+    const key =
+      Math.round(pos.getX(i) * inv) + '_' +
+      Math.round(pos.getY(i) * inv) + '_' +
+      Math.round(pos.getZ(i) * inv);
+    let c = keyToCanon.get(key);
+    if (c === undefined) { c = canonCount++; keyToCanon.set(key, c); }
+    canonOf[i] = c;
+  }
+
+  // Union-find over canonical verts, unioning the 3 verts of each triangle.
+  const parent = new Int32Array(canonCount);
+  for (let i = 0; i < canonCount; i++) parent[i] = i;
+  const find = (x: number): number => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  const union = (a: number, b: number) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; };
+  for (let t = 0; t < triCount; t++) {
+    const a = canonOf[vert(t * 3)], b = canonOf[vert(t * 3 + 1)], c = canonOf[vert(t * 3 + 2)];
+    union(a, b); union(b, c);
+  }
+
+  // Group triangle indices by component root.
+  const groups = new Map<number, number[]>();
+  for (let t = 0; t < triCount; t++) {
+    const root = find(canonOf[vert(t * 3)]);
+    let g = groups.get(root);
+    if (!g) { g = []; groups.set(root, g); }
+    g.push(t);
+  }
+  if (groups.size <= 1) return [geometry];
+
+  const nrm = geometry.getAttribute('normal') as THREE.BufferAttribute | undefined;
+  const buildGeom = (tris: number[]): THREE.BufferGeometry => {
+    const positions = new Float32Array(tris.length * 9);
+    const normals = nrm ? new Float32Array(tris.length * 9) : null;
+    let o = 0;
+    for (const t of tris) {
+      for (let k = 0; k < 3; k++) {
+        const v = vert(t * 3 + k);
+        positions[o] = pos.getX(v); positions[o + 1] = pos.getY(v); positions[o + 2] = pos.getZ(v);
+        if (normals) { normals[o] = nrm!.getX(v); normals[o + 1] = nrm!.getY(v); normals[o + 2] = nrm!.getZ(v); }
+        o += 3;
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    if (normals) g.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+    else g.computeVertexNormals();
+    return g;
+  };
+  const centroidOf = (tris: number[]): THREE.Vector3 => {
+    const c = new THREE.Vector3();
+    for (const t of tris) for (let k = 0; k < 3; k++) {
+      const v = vert(t * 3 + k);
+      c.x += pos.getX(v); c.y += pos.getY(v); c.z += pos.getZ(v);
+    }
+    return c.multiplyScalar(1 / (tris.length * 3));
+  };
+
+  // Keep the largest components; merge tiny/overflow ones into the nearest kept.
+  const sorted = [...groups.values()].sort((a, b) => b.length - a.length);
+  const kept: number[][] = [];
+  const keptCentroids: THREE.Vector3[] = [];
+  for (const tris of sorted) {
+    if (kept.length < maxComponents && (tris.length >= minTriangles || kept.length === 0)) {
+      kept.push(tris.slice());
+      keptCentroids.push(centroidOf(tris));
+    } else {
+      const c = centroidOf(tris);
+      let best = 0, bestD = Infinity;
+      for (let i = 0; i < keptCentroids.length; i++) {
+        const d = c.distanceToSquared(keptCentroids[i]);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      for (const t of tris) kept[best].push(t);
+    }
+  }
+  if (kept.length <= 1) return [geometry];
+  return kept.map(buildGeom);
+}
+
+/**
+ * Walk a loaded glTF scene and return VehicleParts with geometry baked to world
+ * space. Each mesh is split into its connected-component islands (so separate
+ * shapes sharing a mesh become separate pieces). Oversized planes (the source
+ * scene's ground/backdrop) are dropped. Each island inherits its parent mesh's
+ * role so classification stays semantic.
+ */
+export function extractVehicleParts(
+  root: THREE.Object3D,
+  opts: { splitComponents?: boolean } = {},
+): { parts: VehiclePart[]; bounds: VehicleBounds } {
+  root.updateMatrixWorld(true);
+  const splitComponents = opts.splitComponents ?? true;
+
+  // Collect baked meshes first (need vehicle-wide info to drop the ground plane).
+  type MeshRec = { name: string; baked: THREE.BufferGeometry; center: THREE.Vector3; size: THREE.Vector3; color: THREE.Color };
+  const meshes: MeshRec[] = [];
   root.traverse((obj) => {
     const mesh = obj as THREE.Mesh;
     if (!mesh.isMesh || !mesh.geometry) return;
-
-    const geometry = mesh.geometry.clone();
-    geometry.applyMatrix4(mesh.matrixWorld); // bake world transform
-    geometry.computeBoundingBox();
-    const bbox = geometry.boundingBox as THREE.Box3;
+    const baked = mesh.geometry.clone();
+    baked.applyMatrix4(mesh.matrixWorld);
+    baked.computeBoundingBox();
+    const bbox = baked.boundingBox as THREE.Box3;
     const size = new THREE.Vector3();
     const center = new THREE.Vector3();
     bbox.getSize(size);
     bbox.getCenter(center);
-
-    // material base colour (best-effort)
     let color = new THREE.Color(0xb0b0b0);
     const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-    if (mat && (mat as THREE.MeshStandardMaterial).color) {
-      color = (mat as THREE.MeshStandardMaterial).color.clone();
-    }
-
-    raw.push({ name: mesh.name || `part_${raw.length}`, geometry, center, size, materialColor: color });
+    if (mat && (mat as THREE.MeshStandardMaterial).color) color = (mat as THREE.MeshStandardMaterial).color.clone();
+    meshes.push({ name: mesh.name || `part_${meshes.length}`, baked, center, size, color });
   });
 
-  // whole-vehicle bounds, excluding any oversized ground/backdrop plane
-  _box.makeEmpty();
-  let carMaxDim = 0;
-  for (const r of raw) carMaxDim = Math.max(carMaxDim, r.size.x, r.size.y, r.size.z);
-  // first pass to estimate car length without the ground plane
+  // Drop any oversized ground/backdrop plane (much bigger than the vehicle).
+  let maxDim = 0;
+  for (const m of meshes) maxDim = Math.max(maxDim, m.size.x, m.size.y, m.size.z);
   let estLen = 0;
-  for (const r of raw) {
-    const m = Math.max(r.size.x, r.size.y, r.size.z);
-    if (m < carMaxDim) estLen = Math.max(estLen, m);
+  for (const m of meshes) {
+    const d = Math.max(m.size.x, m.size.y, m.size.z);
+    if (d < maxDim) estLen = Math.max(estLen, d);
   }
   const groundThreshold = Math.max(estLen * 3, 20);
+  const kept = meshes.filter((m) => {
+    if (Math.max(m.size.x, m.size.y, m.size.z) > groundThreshold) { m.baked.dispose(); return false; }
+    return true;
+  });
 
-  const kept: Raw[] = [];
-  for (const r of raw) {
-    if (Math.max(r.size.x, r.size.y, r.size.z) > groundThreshold) {
-      r.geometry.dispose();
-      continue; // ground plane / backdrop
-    }
-    kept.push(r);
-    _box.expandByPoint(r.center.clone().sub(_v.copy(r.size).multiplyScalar(0.5)));
-    _box.expandByPoint(r.center.clone().add(_v.copy(r.size).multiplyScalar(0.5)));
+  // Whole-vehicle bounds (from kept mesh bboxes) — used for classification and placement.
+  _box.makeEmpty();
+  for (const m of kept) {
+    _box.expandByPoint(m.center.clone().sub(_v.copy(m.size).multiplyScalar(0.5)));
+    _box.expandByPoint(m.center.clone().add(_v.copy(m.size).multiplyScalar(0.5)));
   }
+  const bounds: VehicleBounds = { lo: _box.min.clone(), size: _box.getSize(new THREE.Vector3()) };
 
-  const bounds: VehicleBounds = {
-    lo: _box.min.clone(),
-    size: _box.getSize(new THREE.Vector3()),
-  };
+  // Classify each mesh, then split it into physical islands — EXCEPT roles that
+  // should stay cohesive units (wheels are rubbery; they fall off whole rather
+  // than separating into tire/rim/nuts). The frame is the key case for splitting
+  // (welded but physically-separate cage tubes). Each island keeps its mesh role.
+  const parts: VehiclePart[] = [];
+  const makePart = (name: string, geometry: THREE.BufferGeometry, center: THREE.Vector3, size: THREE.Vector3, color: THREE.Color, role: VehiclePartRole) =>
+    parts.push({ name, geometry, center, size, materialColor: color, role });
 
-  const parts: VehiclePart[] = kept.map((r) => ({
-    ...r,
-    role: classifyVehiclePart(r.name, r.size, r.center, bounds),
-  }));
+  for (const m of kept) {
+    const role = classifyVehiclePart(m.name, m.size, m.center, bounds);
+    const doSplit = splitComponents && !NO_SPLIT_ROLES.has(role);
+    const islands = doSplit ? splitConnectedComponents(m.baked) : [m.baked];
+    if (islands.length === 1 && islands[0] === m.baked) {
+      makePart(m.name, m.baked, m.center.clone(), m.size.clone(), m.color, role);
+    } else {
+      m.baked.dispose(); // replaced by per-island geometries
+      islands.forEach((g, i) => {
+        g.computeBoundingBox();
+        const s = new THREE.Vector3();
+        const c = new THREE.Vector3();
+        (g.boundingBox as THREE.Box3).getSize(s);
+        (g.boundingBox as THREE.Box3).getCenter(c);
+        makePart(`${m.name}#${i}`, g, c, s, m.color, role);
+      });
+    }
+  }
 
   return { parts, bounds };
 }
@@ -228,18 +357,36 @@ export type BuildVehicleScenarioOptions = {
   /** Total mass (kg) spread across all parts by volume. Default 1500. */
   totalMass?: number;
   /**
-   * Voronoi-fracture structural parts (frame/panel/wheel) into this many chunks
-   * each so a hard hit shatters them. 0 (default) keeps every part intact —
-   * robust, and still sheds cargo / breaks the skeleton joints. Chunks of the
-   * same part get strong internal bonds so light hits keep the shell together.
+   * Voronoi-fracture *large* connected structural parts (frame/panel/wheel whose
+   * longest side exceeds ~the cell size) into chunks roughly this many metres
+   * across. This is essential for concave welded shapes like a roll cage: kept
+   * whole, their ONE convex-hull collider spans the whole vehicle (a nonsensical
+   * blob) and auto-bonds to everything from a central point. Fracturing gives
+   * each chunk a tight local hull + local bonds, and chunks of the same part get
+   * strong internal bonds so the shell holds together until hit hard. Set to 0 to
+   * disable (parts kept whole). Default 0.6 m.
    */
-  structuralFractureChunks?: number;
+  fractureCellSize?: number;
   /** Pre-loaded three-pinata module (required only when fracturing). */
   pinata?: Parameters<typeof fractureGeometryAsync>[1]['pinata'];
   /** Lift so the lowest point sits at this Y (rest on the ground). Default 0.03. */
   groundGap?: number;
   /** Re-centre the vehicle on X/Z to the world origin. Default true. */
   centerOnOrigin?: boolean;
+  /**
+   * Bond detection strategy:
+   * - 'auto' (default): WASM triangle-surface bonding (createBondsFromTriangles) —
+   *   connects parts where their meshes actually touch, with real contact
+   *   area/normal/location. This is what makes the hierarchy come apart correctly.
+   * - 'proximity': fast JS centroid/AABB-overlap bonding (fallback, no WASM).
+   */
+  bondMode?: 'auto' | 'proximity';
+  /**
+   * Max gap (m) between two parts' surfaces still treated as a contact bond, used
+   * by 'auto' (average) bonding. Artist meshes touch/interpenetrate within a few
+   * cm; default 0.06.
+   */
+  bondMaxSeparation?: number;
 };
 
 export type VehicleScenarioResult = {
@@ -258,7 +405,16 @@ export type VehicleScenarioResult = {
 
 type FragMeta = { partId: number; role: VehiclePartRole };
 
-const STRUCTURAL_ROLES: ReadonlySet<VehiclePartRole> = new Set<VehiclePartRole>(['frame', 'panel', 'wheel']);
+// Roles eligible for Voronoi fracture when a part is large + concave. The frame
+// (welded roll cage / chassis) is the main case; large flat panels too. Wheels,
+// cargo and accessories are cohesive roundish/boxy props whose convex hull is
+// already a fine collider, so they stay whole (and don't shatter unrealistically).
+const FRACTURE_ROLES: ReadonlySet<VehiclePartRole> = new Set<VehiclePartRole>(['frame', 'panel']);
+
+// Roles kept as ONE cohesive piece (never split into connected-component islands).
+// A wheel is rubbery — it should fall off as a unit, not separate into tire / rim /
+// nuts — so its whole mesh becomes a single (cylinder-ish hull) piece.
+const NO_SPLIT_ROLES: ReadonlySet<VehiclePartRole> = new Set<VehiclePartRole>(['wheel']);
 
 /**
  * Build a destructible ScenarioDesc from classified vehicle parts.
@@ -270,7 +426,7 @@ export async function buildVehicleScenario(
   options: BuildVehicleScenarioOptions = {},
 ): Promise<VehicleScenarioResult> {
   const totalMass = options.totalMass ?? 1500;
-  const fractureChunks = Math.max(0, Math.round(options.structuralFractureChunks ?? 0));
+  const fractureCell = Math.max(0, options.fractureCellSize ?? 0.6);
   const groundGap = options.groundGap ?? 0.03;
   const centerOnOrigin = options.centerOnOrigin ?? true;
 
@@ -287,16 +443,29 @@ export async function buildVehicleScenario(
   for (let partId = 0; partId < parts.length; partId++) {
     const part = parts[partId];
 
-    // Optionally Voronoi-fracture structural parts into chunks. The part geometry
-    // is already baked into world space, and fractureGeometry preserves that frame
-    // (fragment.worldPosition = worldOffset + pieceWorldPos), so we pass only the
-    // global vehicle offset and use the returned worldPosition directly.
+    // Voronoi-fracture LARGE connected structural parts into chunks. The part
+    // geometry is already baked into world space, and fractureGeometry preserves
+    // that frame (fragment.worldPosition = worldOffset + pieceWorldPos), so we
+    // pass only the global vehicle offset and use the returned worldPosition.
+    const partMaxDim = Math.max(part.size.x, part.size.y, part.size.z);
+    const shouldFracture =
+      fractureCell > 0 &&
+      FRACTURE_ROLES.has(part.role) &&
+      !!options.pinata &&
+      partMaxDim > Math.max(0.9, fractureCell * 1.6);
     let fractured = false;
-    if (fractureChunks > 1 && STRUCTURAL_ROLES.has(part.role) && options.pinata) {
+    if (shouldFracture) {
+      // Chunk count scales with the part's VOLUME so big parts break down to ~cell
+      // size while small ones get only a few — with a floor by longest dimension so
+      // long thin members (cage tubes) still get cut into segments along their length.
+      const cell = fractureCell;
+      const byVolume = (part.size.x * part.size.y * part.size.z) / (cell * cell * cell);
+      const byLongest = partMaxDim / cell;
+      const chunkCount = Math.max(3, Math.min(32, Math.round(Math.max(byVolume, byLongest))));
       try {
         const chunks = await fractureGeometryAsync(part.geometry, {
           pinata: options.pinata,
-          fragmentCount: fractureChunks,
+          fragmentCount: chunkCount,
           voronoiMode: '3D',
           worldOffset: { x: offset.x, y: offset.y, z: offset.z },
         });
@@ -339,20 +508,36 @@ export async function buildVehicleScenario(
     meta.push({ partId, role: part.role });
   }
 
-  // Detect bonds by proximity (the parts overlap/touch, so this connects them),
-  // and normalise areas to a consistent base so the role multipliers — not the
-  // incidental overlap geometry — drive relative joint strength.
-  const scenario = buildScenarioFromFragments(fragments, {
-    totalMass,
-    areaNormalization: 'uniform',
-    dimensions: { x: bounds.size.x, y: bounds.size.y, z: bounds.size.z },
-    bondDetectionOptions: {
-      // Be generous: strapped cargo can rest with a small visible gap.
-      toleranceFactor: 0.25,
-      minGapTolerance: 0.02,
-      minOverlapRatio: 0.12,
-    },
-  });
+  // Bond the parts. Default: WASM triangle-surface auto-bonding — it connects
+  // parts where their meshes actually touch (wheel↔axle↔frame, cargo↔the surface
+  // it rests on) with real contact area/normal/location, so the assembly comes
+  // apart along real seams instead of a centroid star. areaNormalization 'none'
+  // keeps the real contact areas; role multipliers below set material strength.
+  const bondMode = options.bondMode ?? 'auto';
+  const bondMaxSeparation = options.bondMaxSeparation ?? 0.06;
+  const dimensions = { x: bounds.size.x, y: bounds.size.y, z: bounds.size.z };
+  const proximityOptions = {
+    // Fallback proximity detection (also used if auto-bonding yields nothing).
+    toleranceFactor: 0.25,
+    minGapTolerance: 0.02,
+    minOverlapRatio: 0.12,
+  };
+  const scenario =
+    bondMode === 'auto'
+      ? await buildScenarioFromFragmentsAsync(fragments, {
+          totalMass,
+          bondMode: 'auto',
+          areaNormalization: 'none', // keep real triangle-contact areas
+          dimensions,
+          bondDetectionOptions: proximityOptions,
+          autoBondingOptions: { mode: 'average', maxSeparation: bondMaxSeparation, label: 'vehicle' },
+        })
+      : buildScenarioFromFragments(fragments, {
+          totalMass,
+          areaNormalization: 'uniform',
+          dimensions,
+          bondDetectionOptions: proximityOptions,
+        });
 
   // A representative base area (median of the normalised areas) used for the
   // stitch bonds we may add for connectivity.
@@ -372,7 +557,43 @@ export async function buildVehicleScenario(
 
   // Guarantee the bond graph is a single connected component, otherwise an
   // isolated part would split off and drop on the first solver step.
-  stitchConnectivity(scenario, fragments, meta, baseArea);
+  const stitched = stitchConnectivity(scenario, fragments, meta, baseArea);
+
+  // ── Diagnostics ───────────────────────────────────────────────────────────
+  // Bond distribution by role pair (verifies sensible connectivity).
+  const bondsByRolePair: Record<string, number> = {};
+  for (const bond of scenario.bonds) {
+    const a = meta[bond.node0]?.role;
+    const b = meta[bond.node1]?.role;
+    if (!a || !b) continue;
+    const key = [a, b].sort().join('↔');
+    bondsByRolePair[key] = (bondsByRolePair[key] ?? 0) + 1;
+  }
+  let undefMeta = 0;
+  let maxNode = -1;
+  for (const bond of scenario.bonds) {
+    if (!meta[bond.node0] || !meta[bond.node1]) undefMeta++;
+    maxNode = Math.max(maxNode, bond.node0, bond.node1);
+  }
+  console.log(
+    '[glb-vehicle] bonds by role pair:', JSON.stringify(bondsByRolePair),
+    `| total=${scenario.bonds.length} nodes=${scenario.nodes.length} meta=${meta.length} maxNodeIdx=${maxNode} undefMeta=${undefMeta}`,
+  );
+  // Orphan stitches (centroid bonds) — these are the long "star" debug lines.
+  console.log(`[glb-vehicle] orphan stitches added: ${stitched}`);
+  // Parts whose collider spans a large fraction of the vehicle (likely a single
+  // mesh holding multiple disconnected shapes — e.g. wheel-nuts across wheels).
+  const carLen = Math.max(bounds.size.x, bounds.size.z) || 1;
+  const spanning = fragments
+    .map((f, i) => ({ i, role: meta[i].role, span: 2 * Math.max(f.halfExtents.x, f.halfExtents.y, f.halfExtents.z) }))
+    .filter((p) => p.span > 0.45 * carLen)
+    .sort((a, b) => b.span - a.span);
+  if (spanning.length) {
+    console.log(
+      `[glb-vehicle] ${spanning.length} spanning parts (>${(0.45 * carLen).toFixed(2)}m):`,
+      spanning.slice(0, 10).map((p) => `node${p.i}/${p.role}=${p.span.toFixed(2)}m`).join(', '),
+    );
+  }
 
   // Per-node colours + roles for the hierarchy view / HUD.
   const nodeColors: THREE.Color[] = meta.map((m) => new THREE.Color(ROLE_COLORS[m.role]));
@@ -415,9 +636,10 @@ function stitchConnectivity(
   fragments: FragmentInfo[],
   meta: FragMeta[],
   baseArea: number,
-): void {
+): number {
   const n = fragments.length;
-  if (n <= 1) return;
+  if (n <= 1) return 0;
+  let added = 0;
   const parent = Array.from({ length: n }, (_, i) => i);
   const find = (x: number): number => (parent[x] === x ? x : (parent[x] = find(parent[x])));
   const union = (a: number, b: number) => {
@@ -431,7 +653,7 @@ function stitchConnectivity(
     const r = find(i);
     (comps.get(r) ?? comps.set(r, []).get(r)!).push(i);
   }
-  if (comps.size <= 1) return;
+  if (comps.size <= 1) return 0;
 
   // Largest component is the "main" body; attach the rest to it (or to the
   // growing connected set) by nearest fragment pair.
@@ -465,8 +687,10 @@ function stitchConnectivity(
         normal: { x: dx / len, y: dy / len, z: dz / len },
         area: Math.max(baseArea * mult, 1e-6),
       });
+      added++;
       // merge the group into the connected set
       for (const i of group) connected.push(i);
     }
   }
+  return added;
 }

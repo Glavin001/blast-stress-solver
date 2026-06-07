@@ -44,7 +44,11 @@ const MODEL_URL = './assets/buggy.glb';
 const CONFIG = {
   vehicle: {
     totalMass: 1500,
-    structuralFractureChunks: 0, // 0 = parts stay intact (robust); >1 = shatter structural parts
+    // Fracture large concave structural parts into ~this many metres per chunk so
+    // their colliders are tight (a whole roll cage as one convex hull is a blob).
+    // 0 = keep parts whole.
+    fractureCellSize: 0.6,
+    bondMaxSeparation: 0.12, // m — max surface gap auto-bonding treats as contact
   },
   projectile: {
     radius: 0.3,
@@ -188,7 +192,8 @@ async function initScene(dropHeight = 0) {
 
   const { scenario, nodeColors, summary } = await buildVehicleScenario(parts, bounds, {
     totalMass: CONFIG.vehicle.totalMass,
-    structuralFractureChunks: CONFIG.vehicle.structuralFractureChunks,
+    fractureCellSize: CONFIG.vehicle.fractureCellSize,
+    bondMaxSeparation: CONFIG.vehicle.bondMaxSeparation,
     pinata,
     groundGap: 0.03 + Math.max(0, dropHeight),
   });
@@ -318,9 +323,10 @@ function bindCheckbox(id: string, obj: Record<string, any>, key: string) {
 
 // Vehicle config (needs Reset)
 bindSlider('cfg-mass', CONFIG.vehicle, 'totalMass', (v) => v.toLocaleString() + ' kg');
-bindSlider('cfg-fracture', CONFIG.vehicle, 'structuralFractureChunks', (v) =>
-  v < 2 ? 'off (parts intact)' : `${v} chunks/part`,
+bindSlider('cfg-fracture', CONFIG.vehicle, 'fractureCellSize', (v) =>
+  v <= 0 ? 'off (parts whole)' : `${v.toFixed(2)} m/chunk`,
 );
+bindSlider('cfg-bond-sep', CONFIG.vehicle, 'bondMaxSeparation', (v) => v.toFixed(2) + ' m');
 
 // Projectile (immediate)
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
@@ -392,6 +398,23 @@ function onResize() {
   camera.updateProjectionMatrix();
 }
 window.addEventListener('resize', onResize);
+
+// Debug hook for headless inspection / controlled camera angles.
+(window as any).__vehicleDemo = {
+  get camera() { return camera; },
+  get controls() { return controls; },
+  get core() { return coreRef; },
+  get visuals() { return visualsRef; },
+  setView(pos: [number, number, number], target: [number, number, number] = [0, 0.7, 0]) {
+    camera.position.set(pos[0], pos[1], pos[2]);
+    controls.target.set(target[0], target[1], target[2]);
+    controls.update();
+  },
+  setDebug(colliders: boolean, bonds: boolean) {
+    showDebug = !!bonds;
+    rapierDebug?.setEnabled(!!colliders);
+  },
+};
 
 // ── Boot ──────────────────────────────────────────────────────
 

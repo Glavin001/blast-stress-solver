@@ -25,13 +25,33 @@ yet a hard enough hit destroys everything.*
 
 This demo does exactly that:
 
-- **Decompose.** The GLB's meshes become physics nodes. The source ground plane
-  is dropped automatically.
-- **Classify.** Every part is tagged with a structural **role** from its name,
-  size and position (see `classifyVehiclePart`). For the bundled buggy that
-  yields: 7 *frame*, 4 *wheel*, 2 *panel*, 19 *cargo*, 3 *accessory*.
-- **Bond hierarchy.** Parts are bonded by proximity, then every bond's strength
-  (its area — `stress = force / area`) is scaled by the **role pair**:
+The decomposition pipeline (in `glb-vehicle.ts`) is:
+
+1. **Split into physical pieces.** Each GLB mesh is split into its connected
+   components (topological islands), so several physically-separate shapes that an
+   artist modelled as one object (e.g. the welded-but-separate tubes of a roll
+   cage) become independent pieces — each with its own *tight* collider instead of
+   one convex hull spanning the gaps. Wheels are kept whole (a rubbery wheel should
+   fall off as a unit, not separate into tire/rim/nuts). The source ground plane is
+   dropped automatically.
+2. **Classify.** Every piece is tagged with a structural **role** from its parent
+   mesh's name, size and position (see `classifyVehiclePart`): *frame*, *wheel*,
+   *panel*, *cargo*, *accessory*.
+3. **Fracture (volume-scaled).** Large, concave structural pieces (frame / panel)
+   are Voronoi-fractured into chunks roughly `fractureCellSize` metres across — the
+   chunk count scales with the piece's **volume** (big parts → many chunks, small
+   parts → few), with a floor by longest dimension so long thin cage tubes still
+   get cut into segments. This is essential: a whole concave roll cage kept intact
+   has ONE convex-hull collider that's a nonsensical car-sized blob. Wheels, cargo
+   and accessories are *not* fractured (they're cohesive props; a wheel shouldn't
+   shatter like glass).
+4. **Bond by real contact.** The pieces are bonded with the WASM auto-bonder
+   (`createBondsFromTriangles`), which finds where their meshes actually touch and
+   gives each bond a real contact area, normal and location — so the assembly comes
+   apart along real seams (wheel↔frame at the hub, cargo↔the surface it rests on)
+   instead of a centroid star.
+5. **Apply the strength hierarchy.** Every bond's strength (its area —
+   `stress = force / area`) is scaled by the **role pair**:
 
   | joint | ×area | meaning |
   |---|---:|---|
@@ -42,23 +62,23 @@ This demo does exactly that:
   | frame/panel/wheel ↔ **cargo** | 0.2–0.3 | lashed-on payload — weak, sheds first |
   | anything ↔ **accessory** | 0.1–0.18 | loose bits (chain, bucket) — first to go |
 
-  Chunks of the *same* part (when you turn fracturing on) get strong **internal**
-  bonds so the shell stays together under light hits.
+  Chunks of the *same* fractured part get strong **internal** bonds so the shell
+  holds together until hit hard.
 
 - **Destroy.** Click to shoot, or **Drop from Height**. A light hit knocks the
   barrels/crates off while the cage holds; raise the projectile mass/speed (or
   lower the **Material Scale**) and the skeleton itself lets go.
 
-Parts are coloured by role so the hierarchy is visible (toggle **Color: Role /
+Pieces are coloured by role so the hierarchy is visible (toggle **Color: Role /
 State** to instead see intact-vs-detached state).
 
 ## Controls
 
-- **Total Mass** / **Shatter Structural Parts** — vehicle build (needs *Reset*).
-  "Shatter" Voronoi-fractures the frame/panel/wheel parts into N chunks each so a
-  hard hit shatters them (0 = parts stay intact, the robust default).
+- **Total Mass**, **Fracture Cell Size** (~chunk size for large structural parts;
+  0 = keep whole), **Bond Reach** (max surface gap auto-bonding treats as contact)
+  — vehicle build (needs *Reset*).
 - **Projectile** radius / mass / speed — live.
-- **Material Scale** — global toughness (live); **Gravity** (needs *Reset*).
+- **Material Scale** — global toughness; **Gravity** (needs *Reset*).
 - **Contact Force Scale** — how hard impacts hit the stress graph (needs *Reset*).
 - Shared **Physics / Optimization** controls (friction, restitution, debris
   cleanup, …) plus the live frame profiler and session recorder.
@@ -88,19 +108,28 @@ new model. The heuristics in the CLI are intentionally mirrored by
    tables, and `totalMass` to taste.
 
 `glb-vehicle.ts` only uses already-published `blast-stress-solver/three`
-exports (`buildScenarioFromFragments`, `fractureGeometryAsync`,
+exports (`buildScenarioFromFragmentsAsync`, `fractureGeometryAsync`,
 `recenterGeometry`), so it builds with esbuild/tsc without rebuilding the WASM.
 
 ## Notes & limitations
 
 - The bundled GLB has **no textures** (the source export is geometry-only), so
   flat role-colouring is also the most informative view.
-- Colliders are per-part **boxes** sized to each part's bounds (matching the
-  other fractured demos). Passing a Rapier module to `buildScenarioFromFragments`
-  would upgrade these to convex hulls — a natural follow-up for rounder wheels.
-- Bond detection scans every part's vertices, so the first load / Reset of the
-  high-poly model takes ~1–3 s. Decimating the collider/bond geometry (while
-  keeping full-res for rendering) is the obvious optimization.
-- Per-part Voronoi fracture (the "Shatter" slider) runs three-pinata on meshes
-  that may be non-manifold; it's guarded with a per-part fallback to "keep
-  intact", so a model that doesn't fracture cleanly still works.
+- Colliders are one **convex hull per piece** (built by the runtime from each
+  piece's geometry). Splitting + fracturing first is what makes those hulls tight;
+  a concave piece kept whole would get one blob hull. Genuinely concave pieces that
+  we *don't* fracture (some props) still get a loose hull — a convex-decomposition
+  pass (e.g. CoACD/VHACD) would tighten those, at the cost of a heavyweight WASM
+  dependency and multi-hull-per-node support in the core.
+- Splitting + auto-bonding + fracturing scans/processes a lot of triangles, so the
+  first load / Reset of the high-poly model takes a few seconds. Decimating the
+  collider/bond geometry (while keeping full-res for rendering) is the obvious
+  optimization.
+- Voronoi fracture (three-pinata) runs on meshes that may be non-manifold; it's
+  guarded with a per-part fallback to "keep whole", so a model that doesn't
+  fracture cleanly still works.
+- **Impact breaking on a free body still needs tuning.** Unlike the anchored
+  wall/tower demos, a free-floating car absorbs a hit as motion more than internal
+  stress, so projectiles currently shove it more than they shear bonds. The
+  damage-system path (contact → local node health → bond loss) is the next step for
+  satisfying "hit it and a piece flies off" behaviour.
