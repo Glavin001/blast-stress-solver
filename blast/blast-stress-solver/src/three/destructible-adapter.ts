@@ -548,10 +548,14 @@ export function updateBatchedChunkMesh(
     nodeColors?: THREE.Color[];
     /** Rewrite every instance this frame, bypassing the unchanged-pose skip. */
     forceFullUpdate?: boolean;
+    /** Mask (by instanceId) of fragments hidden by an external LOD layer (e.g. an intact-building
+     *  proxy box stands in for them). Non-zero → the fragment instance is forced invisible. */
+    instanceHidden?: Uint8Array;
   },
 ) {
   const updateBVH = options?.updateBVH ?? false;
   const nodeColors = options?.nodeColors;
+  const instanceHidden = options?.instanceHidden;
   const forceFull = options?.forceFullUpdate === true;
   const canColor = typeof batchedMesh.setColorAt === 'function';
   // Health-based coloring only applies when damage is enabled; capture the getter once.
@@ -578,7 +582,11 @@ export function updateBatchedChunkMesh(
     // Visibility is derived purely from chunk state — debris cleanup marks removed chunks
     // `destroyed`/inactive — so the dormant fast path never has to touch the physics body.
     const handle = chunk.bodyHandle;
-    const wantVisible = !chunk.destroyed && chunk.active !== false && handle != null;
+    const wantVisible =
+      !chunk.destroyed &&
+      chunk.active !== false &&
+      handle != null &&
+      !(instanceHidden !== undefined && instanceHidden[instanceId] !== 0);
     if (!wantVisible) {
       if (cache.visible[instanceId] !== 0) {
         batchedMesh.setVisibleAt(instanceId, false);

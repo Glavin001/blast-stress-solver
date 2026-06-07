@@ -403,6 +403,10 @@ export type DestructibleCore = {
   /** Snapshot of the collision-LOD tree nodes for visualization/debug (depth, leaf flag, live
    *  enabled state, building id, fragment count, world-space AABB). */
   getCollisionLodNodes?: () => Array<{ depth: number; leaf: boolean; enabled: boolean; buildingId: number; fragmentCount: number; aabbMin: Vec3; aabbMax: Vec3 }>;
+  /** Per-building render-LOD state: stable AABB + member fragment node indices, plus a live
+   *  `intact` flag (true while the whole building is still un-split/un-destroyed on the root).
+   *  Lets a renderer collapse an intact building to one proxy box. Tree is built on demand. */
+  getBuildingRenderStates?: () => Array<{ buildingId: number; intact: boolean; aabbMin: Vec3; aabbMax: Vec3; fragments: number[] }>;
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;

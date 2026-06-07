@@ -2643,6 +2643,43 @@ export async function buildDestructibleCore({
     return out;
   }
 
+  // Per-building render-LOD state for a renderer that draws a still-intact building as a single
+  // proxy box instead of all its fragment instances. The member fragment list and the AABB are
+  // stable (computed once and reused); `intact` is refreshed on every call and is true only while
+  // every fragment is still un-split and un-destroyed on the fixed root — i.e. the building still
+  // looks like its original solid shell, so the box proxy is faithful. Independent of the lazy
+  // collider toggle: the tree is materialized on demand.
+  let buildingRenderStatesCache:
+    | Array<{ buildingId: number; intact: boolean; aabbMin: Vec3; aabbMax: Vec3; fragments: number[] }>
+    | null = null;
+  function getBuildingRenderStates() {
+    ensureLodRoots();
+    if (!buildingRenderStatesCache || buildingRenderStatesCache.length !== lodRoots.length) {
+      const collect = (node: LodNode, out: number[]) => {
+        if (node.children.length === 0) {
+          for (const f of node.fragments) out.push(f);
+          return;
+        }
+        for (const ch of node.children) collect(ch, out);
+      };
+      buildingRenderStatesCache = lodRoots.map((root) => {
+        const fragments: number[] = [];
+        collect(root, fragments);
+        return {
+          buildingId: root.buildingId,
+          intact: true,
+          aabbMin: { ...root.aabbMin },
+          aabbMax: { ...root.aabbMax },
+          fragments,
+        };
+      });
+    }
+    for (let i = 0; i < lodRoots.length; i++) {
+      buildingRenderStatesCache[i].intact = subtreeFullyIntact(lodRoots[i]);
+    }
+    return buildingRenderStatesCache;
+  }
+
   // Predictive enable pass — runs BEFORE world.step. For each mover, descend the LOD tree and enable
   // only the LEAVES whose AABB its swept box overlaps; non-overlapped subtrees stay dormant. A
   // localized hit therefore materializes only the struck region's colliders. Conservative by
@@ -3242,6 +3279,7 @@ export async function buildDestructibleCore({
     setLazyIntactColliders,
     getLazyColliderStats,
     getCollisionLodNodes,
+    getBuildingRenderStates,
     getSolverDebugLines,
     getNodeBonds,
     cutBond,
