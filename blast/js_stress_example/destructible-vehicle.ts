@@ -1,0 +1,412 @@
+/**
+ * Destructible Vehicle Demo
+ *
+ * Loads a GLB model (a junkyard buggy), decomposes it into its named parts,
+ * classifies each part into a structural role (frame / wheel / panel / cargo /
+ * accessory) and wires it up as ONE destructible body with a *hierarchy* of bond
+ * strengths:
+ *
+ *   frame↔frame  (roll cage / chassis)  strongest  ── keeps the shell together
+ *   frame↔wheel  (hub / axle)           very strong
+ *   frame↔panel                         strong
+ *   …↔cargo / …↔accessory               weak       ── strapped-on payload sheds first
+ *
+ * So a light hit knocks the barrels and crates off while the cage holds; a hard
+ * enough hit (or a big drop) shatters the skeleton itself. Click to shoot, or hit
+ * "Drop from height". Parts are coloured by role so the hierarchy is visible.
+ *
+ * The decomposition + bond hierarchy live in ./glb-vehicle.ts; this file is just
+ * the scene/render/UI shell (mirrors fractured-wall.ts).
+ */
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import Stats from 'three/addons/libs/stats.module.js';
+import * as pinata from '@dgreenheck/three-pinata';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
+import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
+import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
+import { mountShooter } from './shooter-fps.js';
+import {
+  extractVehicleParts,
+  buildVehicleScenario,
+  ROLE_COLORS,
+  ROLE_LABELS,
+  type VehiclePartRole,
+} from './glb-vehicle.js';
+
+// ── Config ────────────────────────────────────────────────────
+
+const MODEL_URL = './assets/buggy.glb';
+
+const CONFIG = {
+  vehicle: {
+    totalMass: 1500,
+    structuralFractureChunks: 0, // 0 = parts stay intact (robust); >1 = shatter structural parts
+  },
+  projectile: {
+    radius: 0.3,
+    mass: 1500,
+    speed: 45,
+    ttlMs: 8000,
+  },
+  solver: {
+    gravity: -9.81,
+    materialScale: 1e10,
+  },
+  physics: {
+    contactForceScale: 30,
+    skipSingleBodies: false,
+  },
+};
+
+// ── Three.js setup ────────────────────────────────────────────
+
+const canvas = document.getElementById('demo-canvas') as HTMLCanvasElement;
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0d13);
+scene.fog = new THREE.FogExp2(0x0a0d13, 0.02);
+
+const camera = new THREE.PerspectiveCamera(52, canvas.clientWidth / canvas.clientHeight, 0.1, 200);
+camera.position.set(6.5, 3.6, 7.5);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.7, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.update();
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.45);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffeedd, 1.05);
+dirLight.position.set(8, 14, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -12;
+dirLight.shadow.camera.right = 12;
+dirLight.shadow.camera.top = 12;
+dirLight.shadow.camera.bottom = -6;
+scene.add(dirLight);
+
+const rimLight = new THREE.DirectionalLight(0x88aaff, 0.3);
+rimLight.position.set(-8, 6, -10);
+scene.add(rimLight);
+
+// Ground plane (visual; the solver has its own collision ground at y=0)
+const groundMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(80, 80),
+  new THREE.MeshStandardMaterial({ color: 0x1a1e2f, roughness: 0.9, metalness: 0.05 }),
+);
+groundMesh.rotation.x = -Math.PI / 2;
+groundMesh.position.y = 0;
+groundMesh.receiveShadow = true;
+scene.add(groundMesh);
+
+// ── Stats panel ───────────────────────────────────────────────
+
+const stats = new Stats();
+stats.dom.style.position = 'absolute';
+stats.dom.style.top = '0';
+stats.dom.style.left = '0';
+(document.querySelector('.viewport') as HTMLElement)?.appendChild(stats.dom);
+
+// ── Perf tracking ─────────────────────────────────────────────
+
+let _physicsMs = 0;
+let _renderMs = 0;
+const EMA = 0.12;
+
+function updatePerfStats() {
+  const el = (id: string) => document.getElementById(id);
+  el('stat-physics-ms')!.textContent = _physicsMs.toFixed(1) + ' ms';
+  el('stat-render-ms')!.textContent = _renderMs.toFixed(1) + ' ms';
+  el('stat-draw-calls')!.textContent = String(renderer.info.render.calls);
+  el('stat-triangles')!.textContent = renderer.info.render.triangles.toLocaleString();
+}
+
+// ── Status HUD ────────────────────────────────────────────────
+
+function updateStatus(core: any) {
+  const el = (id: string) => document.getElementById(id);
+  el('stat-bodies')!.textContent = String(core.getRigidBodyCount());
+  el('stat-bonds')!.textContent = String(core.getActiveBondsCount());
+  el('stat-projectiles')!.textContent = String(core.projectiles.length);
+  const detached = core.chunks.filter((c: any) => c.detached).length;
+  el('stat-detached')!.textContent = `${detached} / ${core.chunks.length}`;
+}
+
+// ── Main ──────────────────────────────────────────────────────
+
+let coreRef: Awaited<ReturnType<typeof buildDestructibleCore>> | null = null;
+let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
+let shooter: ReturnType<typeof mountShooter> | null = null;
+let rapierDebug: RapierDebugRenderer | null = null;
+let showDebug = false;
+let colorByRole = true;
+
+// Cached parsed model so Reset / Drop rebuild without re-fetching 8 MB.
+let gltfScene: THREE.Object3D | null = null;
+
+const profiler = createFrameProfilerOverlay();
+const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
+  exportName: 'destructible-vehicle-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
+
+function setHint(text: string) {
+  const hint = document.querySelector('.viewport-hint');
+  if (hint) hint.textContent = text;
+}
+
+async function ensureModelLoaded(): Promise<THREE.Object3D> {
+  if (gltfScene) return gltfScene;
+  setHint('Loading model…');
+  const loader = new GLTFLoader();
+  const gltf = await loader.loadAsync(MODEL_URL);
+  gltfScene = gltf.scene;
+  return gltfScene;
+}
+
+/** Build (or rebuild) the destructible vehicle. `dropHeight` lifts it for a drop test. */
+async function initScene(dropHeight = 0) {
+  const root = await ensureModelLoaded();
+
+  // Fresh parts every build — extract clones + bakes geometry, so repeated
+  // rebuilds never accumulate transforms.
+  const { parts, bounds } = extractVehicleParts(root);
+
+  const { scenario, nodeColors, summary } = await buildVehicleScenario(parts, bounds, {
+    totalMass: CONFIG.vehicle.totalMass,
+    structuralFractureChunks: CONFIG.vehicle.structuralFractureChunks,
+    pinata,
+    groundGap: 0.03 + Math.max(0, dropHeight),
+  });
+
+  console.log(
+    `Destructible vehicle: ${summary.parts} parts → ${summary.nodes} nodes, ${summary.bonds} bonds`,
+    summary.roleCounts,
+  );
+
+  const core = await buildDestructibleCore({
+    scenario,
+    gravity: CONFIG.solver.gravity,
+    materialScale: CONFIG.solver.materialScale,
+    contactForceScale: CONFIG.physics.contactForceScale,
+    skipSingleBodies: CONFIG.physics.skipSingleBodies,
+    ...physicsCoreOverrides(),
+    ...pipelineCoreOverrides(),
+  });
+
+  const group = new THREE.Group();
+  scene.add(group);
+
+  const visuals = createDestructibleThreeBundle({
+    core,
+    scenario,
+    root: group,
+    // Individual meshes (not BatchedMesh): only ~dozens of parts, some high-poly,
+    // so per-mesh is simpler and avoids batched vertex-capacity limits.
+    useBatchedMesh: false,
+    includeDebugLines: true,
+    nodeColors,
+    materialColors: colorByRole,
+  });
+
+  rapierDebug?.dispose();
+  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
+
+  coreRef = core;
+  core.setSolverCentrifugalEnabled(physicsConfig.centrifugal);
+  recorder.attach(core, { scenario, meta: { demo: 'destructible-vehicle' } });
+  profiler.attach(core);
+  visualsRef = visuals;
+
+  renderLegend(summary.roleCounts);
+  setHint(
+    dropHeight > 0
+      ? 'Dropped! Click to shoot · drag to orbit'
+      : 'Click to shoot · drag to orbit · cargo sheds first, the cage holds',
+  );
+}
+
+function disposeCurrent() {
+  visualsRef?.dispose();
+  // Remove the visuals group from the scene.
+  if (visualsRef?.object?.parent) visualsRef.object.parent.remove(visualsRef.object);
+  coreRef?.dispose();
+  coreRef = null;
+  visualsRef = null;
+}
+
+// ── Role legend ───────────────────────────────────────────────
+
+function renderLegend(roleCounts: Record<VehiclePartRole, number>) {
+  const host = document.getElementById('role-legend');
+  if (!host) return;
+  const order: VehiclePartRole[] = ['frame', 'wheel', 'panel', 'cargo', 'accessory'];
+  host.innerHTML = order
+    .filter((r) => roleCounts[r] > 0)
+    .map((r) => {
+      const hex = '#' + ROLE_COLORS[r].toString(16).padStart(6, '0');
+      return (
+        `<div class="legend-row">` +
+        `<span class="legend-swatch" style="background:${hex}"></span>` +
+        `<span class="legend-label">${ROLE_LABELS[r]}</span>` +
+        `<span class="legend-count">${roleCounts[r]}</span>` +
+        `</div>`
+      );
+    })
+    .join('');
+}
+
+// ── UI wiring ─────────────────────────────────────────────────
+
+document.getElementById('btn-reset')?.addEventListener('click', async () => {
+  disposeCurrent();
+  await initScene(0);
+});
+
+document.getElementById('btn-drop')?.addEventListener('click', async () => {
+  disposeCurrent();
+  await initScene(4.0);
+});
+
+document.getElementById('btn-debug')?.addEventListener('click', () => {
+  showDebug = !showDebug;
+  rapierDebug?.setEnabled(showDebug);
+  document.getElementById('btn-debug')!.textContent = showDebug ? '◈ Hide Debug' : '◇ Show Debug';
+});
+
+document.getElementById('btn-color')?.addEventListener('click', () => {
+  colorByRole = !colorByRole;
+  visualsRef?.setMaterialColors(colorByRole);
+  document.getElementById('btn-color')!.textContent = colorByRole ? '🎨 Color: Role' : '🎨 Color: State';
+});
+
+function bindSlider(id: string, obj: Record<string, any>, key: string, fmt?: (v: number) => string) {
+  const slider = document.getElementById(id) as HTMLInputElement | null;
+  const display = document.getElementById(id + '-value');
+  if (!slider) return;
+  slider.value = String(obj[key]);
+  if (display) display.textContent = fmt ? fmt(obj[key]) : String(obj[key]);
+  slider.addEventListener('input', () => {
+    const v = parseFloat(slider.value);
+    obj[key] = v;
+    if (display) display.textContent = fmt ? fmt(v) : String(v);
+  });
+}
+
+function bindCheckbox(id: string, obj: Record<string, any>, key: string) {
+  const checkbox = document.getElementById(id) as HTMLInputElement | null;
+  if (!checkbox) return;
+  checkbox.checked = !!obj[key];
+  checkbox.addEventListener('change', () => {
+    obj[key] = checkbox.checked;
+  });
+}
+
+// Vehicle config (needs Reset)
+bindSlider('cfg-mass', CONFIG.vehicle, 'totalMass', (v) => v.toLocaleString() + ' kg');
+bindSlider('cfg-fracture', CONFIG.vehicle, 'structuralFractureChunks', (v) =>
+  v < 2 ? 'off (parts intact)' : `${v} chunks/part`,
+);
+
+// Projectile (immediate)
+bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
+bindSlider('cfg-proj-mass', CONFIG.projectile, 'mass', (v) => v.toLocaleString() + ' kg');
+bindSlider('cfg-proj-speed', CONFIG.projectile, 'speed', (v) => v.toFixed(0) + ' m/s');
+
+// Solver (immediate-ish; gravity needs Reset)
+bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
+{
+  const slider = document.getElementById('cfg-material') as HTMLInputElement | null;
+  const display = document.getElementById('cfg-material-value');
+  if (slider) {
+    const exp = Math.log10(CONFIG.solver.materialScale);
+    slider.value = String(exp);
+    if (display) display.textContent = `1e${exp.toFixed(0)}`;
+    slider.addEventListener('input', () => {
+      const e = parseFloat(slider.value);
+      CONFIG.solver.materialScale = Math.pow(10, e);
+      if (display) display.textContent = `1e${e.toFixed(1)}`;
+    });
+  }
+}
+
+// Shared Physics / Optimization / Features controls.
+mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
+bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
+bindCheckbox('cfg-skip-single', CONFIG.physics, 'skipSingleBodies');
+
+// ── Render loop ───────────────────────────────────────────────
+
+const clock = new THREE.Clock();
+
+function loop() {
+  requestAnimationFrame(loop);
+  profiler.render();
+  recorder.render();
+  stats.begin();
+
+  const dt = Math.min(clock.getDelta(), 1 / 30);
+  controls.update();
+
+  if (coreRef && visualsRef) {
+    const t0 = performance.now();
+    coreRef.step(dt);
+    _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
+
+    visualsRef.update({ debug: showDebug, updateBVH: false, updateProjectiles: true });
+    rapierDebug?.update();
+    updateStatus(coreRef);
+  }
+
+  shooter?.update();
+
+  const t1 = performance.now();
+  renderer.render(scene, camera);
+  _renderMs += ((performance.now() - t1) - _renderMs) * EMA;
+
+  updatePerfStats();
+  stats.end();
+}
+
+// ── Resize ────────────────────────────────────────────────────
+
+function onResize() {
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', onResize);
+
+// ── Boot ──────────────────────────────────────────────────────
+
+mountPipelineControls();
+shooter = mountShooter({
+  canvas,
+  camera,
+  controls,
+  scene,
+  getCore: () => coreRef,
+  getBallParams: () => CONFIG.projectile,
+});
+initScene()
+  .then(() => loop())
+  .catch((err) => {
+    console.error('Failed to initialize destructible vehicle demo:', err);
+    setHint(`Error: ${err?.message ?? err}`);
+  });
