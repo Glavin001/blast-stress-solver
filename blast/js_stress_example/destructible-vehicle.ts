@@ -49,14 +49,16 @@ const CONFIG = {
     // 0 = keep parts whole.
     fractureCellSize: 0.6,
     bondMaxSeparation: 0.12, // m — max surface gap auto-bonding treats as contact
-    // Per-role attachment strength (Reset to apply). Cargo/accessories start weak
-    // so they shed readily; the frame is the strong skeleton.
-    bondStrength: { frame: 1, wheel: 1, panel: 1, cargo: 0.5, accessory: 0.4 } as Record<VehiclePartRole, number>,
+    // Per-role attachment strength (LIVE). 1 = the baseline hierarchy (cargo is
+    // already the weakest via its base threshold, the frame the strongest); lower
+    // a role to make it shed more easily, raise it to weld it on. Drives both
+    // impact and motion shedding instantly.
+    bondStrength: { frame: 1, wheel: 1, panel: 1, cargo: 1, accessory: 1 } as Record<VehiclePartRole, number>,
   },
   // Live breaking knobs (no Reset needed).
   breaking: {
-    impactSensitivity: 1.0, // scales how easily a direct hit detaches a part
-    shedOnMotion: 1.0, // how readily cargo/accessories tear off a violently moving body
+    impactSensitivity: 1.0, // global: how easily a direct hit detaches a part
+    shedOnMotion: 1.0, // global: how readily parts tear off a violently moving body (0 = off)
   },
   projectile: {
     radius: 0.25,
@@ -199,10 +201,13 @@ let _impactCuts = 0;
 // ground without shedding parts. A drop from height lands well after this.
 let sceneSettleUntil = 0;
 
-// Effective detach threshold, scaled by the live impact-sensitivity knob
-// (higher sensitivity → lower threshold → easier to break off).
+// Effective detach threshold = base × the role's live attachment strength,
+// divided by the global impact-sensitivity. So the per-role sliders and the
+// global slider both take effect immediately on the next hit (no Reset). This is
+// what actually governs destruction (the stress solver is kept stiff on purpose).
 const thrOf = (role: VehiclePartRole) =>
-  IMPACT_DETACH_THRESHOLD[role] / Math.max(0.05, CONFIG.breaking.impactSensitivity);
+  (IMPACT_DETACH_THRESHOLD[role] * (CONFIG.vehicle.bondStrength[role] ?? 1)) /
+  Math.max(0.02, CONFIG.breaking.impactSensitivity);
 
 function handleImpact(e: { nodeIndex: number; force: number; otherBodyHandle: number }) {
   const roles = nodeRolesRef;
@@ -249,8 +254,13 @@ function handleImpact(e: { nodeIndex: number; force: number; otherBodyHandle: nu
 // in the solver, but physically the loosely-lashed cargo would tear off. So when
 // a body carrying cargo/accessories moves or spins violently, progressively cut
 // those weak parts' bonds (they fly off as debris). "Shed on motion" scales it.
-// Base "violence" (m/s-equivalent) at which each role starts to tear loose.
-const INERTIAL_SHED_BASE: Partial<Record<VehiclePartRole, number>> = { cargo: 9, accessory: 6 };
+// Base "violence" (m/s-equivalent: linear speed + weighted spin) at which each
+// role starts to tear loose from a flung/spinning body. Cargo/accessories are
+// low (shed readily); frame/wheels are high (only a savage tumble shakes them
+// off) — but "Shed on motion" can scale all of it for full control.
+const INERTIAL_SHED_BASE: Record<VehiclePartRole, number> = {
+  accessory: 6, cargo: 9, panel: 28, wheel: 55, frame: 80,
+};
 
 function processInertialShedding() {
   const roles = nodeRolesRef;
@@ -275,11 +285,12 @@ function processInertialShedding() {
     const ch = (core.chunks as any[])[i];
     if (!ch.active || ch.bodyHandle == null) continue;
     const role = roles[i];
-    const base = INERTIAL_SHED_BASE[role];
-    if (base === undefined) continue; // only cargo/accessories tear off from motion
+    if (!role) continue;
     const vv = violence.get(ch.bodyHandle) ?? 0;
-    const thr = base / sens;
-    if (vv > thr && Math.random() < Math.min(0.4, 0.05 * (vv / thr - 1))) {
+    // Threshold scales with the role's live attachment strength, so the same
+    // per-role sliders that govern impact breaking also govern motion shedding.
+    const thr = (INERTIAL_SHED_BASE[role] * (CONFIG.vehicle.bondStrength[role] ?? 1)) / sens;
+    if (vv > thr && Math.random() < Math.min(0.5, 0.05 * (vv / thr - 1))) {
       if (core.cutNodeBonds(i)) _impactCuts++;
     }
   }
