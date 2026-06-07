@@ -47,6 +47,16 @@ export type BatchedChunkMeshOptions = ChunkMeshBuildOptions & {
   enableBVH?: boolean;
   /** Margin forwarded to optional `computeBVH` helper. Default: 0.5. */
   bvhMargin?: number;
+  /**
+   * Per-instance front-to-back sort each frame (THREE.BatchedMesh default `true`). For opaque
+   * chunks this only trims overdraw, but it costs an O(visible·log visible) sort inside
+   * `onBeforeRender` every frame/pass — ~5 ms for 27k instances, the dominant render-thread cost
+   * on a large city. Default: `false`.
+   */
+  sortObjects?: boolean;
+  /** Per-instance frustum culling (THREE.BatchedMesh default `true`). Keep on to skip off-screen
+   *  instances when zoomed in. Default: leave the BatchedMesh default. */
+  perObjectFrustumCulled?: boolean;
 };
 
 type OptionalBvhApi = {
@@ -413,6 +423,12 @@ function buildBatchedChunkMeshInternal(
   batchedMesh.castShadow = shadowsEnabled;
   batchedMesh.receiveShadow = shadowsEnabled;
   batchedMesh.frustumCulled = false;
+  // Opaque chunks: skip the per-frame front-to-back sort (THREE default on). It dominates the
+  // render thread at scale (~5 ms for 27k instances) and only trims overdraw for opaque material.
+  batchedMesh.sortObjects = options?.sortObjects ?? false;
+  if (options?.perObjectFrustumCulled !== undefined) {
+    batchedMesh.perObjectFrustumCulled = options.perObjectFrustumCulled;
+  }
 
   const geometryIds: number[] = [];
   const chunkToInstanceId = new Map<number, number>();

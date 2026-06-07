@@ -165,6 +165,18 @@ describe('buildBatchedChunkMesh', () => {
     expect(result.batchedMesh).toBeInstanceOf(THREE.BatchedMesh);
     result.dispose();
   });
+
+  it('disables the per-frame sort by default (opaque chunks), honoring overrides', () => {
+    const core = makeMockCore([makeChunk(0, { x: 0, y: 0, z: 0 })]);
+    const def = buildBatchedChunkMesh(core);
+    expect(def.batchedMesh.sortObjects).toBe(false); // big render-thread win at scale
+    def.dispose();
+
+    const on = buildBatchedChunkMesh(core, { sortObjects: true, perObjectFrustumCulled: false });
+    expect(on.batchedMesh.sortObjects).toBe(true);
+    expect(on.batchedMesh.perObjectFrustumCulled).toBe(false);
+    on.dispose();
+  });
 });
 
 describe('buildBatchedChunkMeshFromGeometries', () => {
