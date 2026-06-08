@@ -82,7 +82,10 @@ These three cost the most time. Internalize them before writing code.
    artist meshes don't share exact triangle faces). Tune `maxSeparation` (~0.06–0.2 m):
    too small and wheels/loose parts find no contact (orphans).
 
-7. **Apply the hierarchy + guarantee connectivity.** Scale each bond's area by a
+7. **Prune the over-bonding (role-aware), apply the hierarchy, guarantee connectivity.**
+   Average-mode bonding over-connects a dense fractured model — thin only the *prop*
+   attachments (wheel/cargo/accessory) while keeping every chassis bond (gotcha #21).
+   Scale each bond's area by a
    role-pair multiplier (frame↔frame strongest, cargo/accessory weakest), then union-find
    the bond graph and stitch any leftover components together so nothing is an orphan
    (an orphan detaches and drops on frame 1). Per-node colors by role for the view.
@@ -158,8 +161,13 @@ explosions and instability that only show up while the simulation runs.
    Proximity = centroid star; exact = no bonds (separate meshes share no faces).
 8. **A big spanning part auto-bonds to everything from a central centroid** → both the
    blob hull and the green bond-star. Fracturing it (gotcha #5) fixes both at once.
-9. **maxSeparation too small → orphans → stitch fallback → star.** Bump it, or fracture
-   the nearby frame so local chunks come within reach of the wheels/loose parts.
+9. **maxSeparation is a double-edged sword.** Too small → wheels/loose parts find no
+   contact (orphans → stitch fallback → star). Too large → the opposite: the average
+   bonder inflates each chunk by `maxSeparation/minSide`, so in a *dense, fractured*
+   model every part bonds to dozens of neighbours (a wheel to ~40 frame chunks). That
+   over-connection is both the dense web you see in the bond debug view AND real
+   over-strength. Keep it modest (~0.08–0.10) and prune (gotcha #21) rather than cranking
+   it. Wheels that still won't bond are handled by the connectivity stitch.
 10. **`cutNodeBonds` detaches but does NOT set `chunk.detached`**, and the damage
     system's destroy path *disables the collider* (the part vanishes — wrong for a
     vehicle). Use `cutNodeBonds` for "falls off"; track your own shed counter.
@@ -189,6 +197,26 @@ explosions and instability that only show up while the simulation runs.
 20. **Perf:** auto-bonding + split + fracture process a lot of triangles → first
     load/Reset takes a few seconds; high-poly parts make convex-hull colliders chunky.
     Decimating collider/bond geometry (keeping full-res for render) is the obvious win.
+21. **Prune the over-bonding ROLE-AWARELY, or you trade one bug for another.** The dense
+    web (gotcha #9) makes parts over-strong and the debug view unreadable, so thin it —
+    but **only the prop attachments** (wheel/cargo/accessory ↔ anything): per part-pair
+    keep the few largest-area contacts, and cap how many other parts each prop bonds to
+    (so a wheel attaches at its hub, not to half the car). **Keep every intra-part bond
+    AND every structural inter-part bond (frame/panel ↔ frame/panel).** I learned this the
+    hard way: pruning the chassis bonds (intra siblings or frame-to-frame) drops the
+    frame's rigidity → it jitters apart on settle and *explodes* on heavy hits (sparser
+    bonds let detaching chunks cascade into debris-vs-body overlaps). Run the connectivity
+    stitch after pruning to reattach anything orphaned. (See `pruneBonds` in
+    `glb-vehicle.ts`.) Always re-run the soak after touching bonds — bond changes are the
+    most common way to reintroduce the explosion.
+22. **Debris mode interacts with bond density.** `'noDebrisPairs'` (debris bounces off the
+    car, not other debris) is stable when the chassis is densely bonded, but once bonds
+    are sparser a hard hit can still blow up via debris-vs-*body* overlap; `'debrisGroundOnly'`
+    (debris hits only the ground) is the density-independent safe choice if you can accept
+    parts falling through each other instead of bouncing.
+23. **The bond debug lines are node-centroid → node-centroid**, not drawn at the contact
+    point. So a bond to a large or central chunk *looks* long even when the surfaces touch
+    — judge bonds by count/role-pair stats and where they attach, not just line length.
 
 ## Quick-start checklist for a new GLB
 
