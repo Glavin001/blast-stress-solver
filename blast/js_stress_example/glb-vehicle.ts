@@ -393,6 +393,10 @@ export type BuildVehicleScenarioOptions = {
    * cargo is held). Default 1 for each. This is the main "make cargo weaker" knob.
    */
   roleStrength?: Partial<Record<VehiclePartRole, number>>;
+  /** Max bonds kept between any two distinct parts (strongest first). Default 2. */
+  bondMaxPerPair?: number;
+  /** Max distinct other parts each PROP (wheel/cargo/accessory) may bond to. Default 3. */
+  bondMaxNeighbors?: number;
 };
 
 export type VehicleScenarioResult = {
@@ -545,6 +549,18 @@ export async function buildVehicleScenario(
           bondDetectionOptions: proximityOptions,
         });
 
+  // Average-mode auto-bonding inflates each chunk by maxSeparation/minSide, so in a
+  // dense, fractured model a part ends up bonded to DOZENS of neighbours (a wheel to
+  // every nearby frame chunk; a central tank to everything around it) — over-connected
+  // and over-strong, with long centroid-to-centroid debug lines. Prune the INTER-part
+  // bonds down to the few strongest contacts per part-pair, and cap how many other
+  // parts each part attaches to, while keeping EVERY INTRA-part bond so the fractured
+  // shells stay rigid. This makes the wheel attach at its hub, not to half the car.
+  const pruneStats = pruneBonds(scenario, meta, {
+    maxPerPair: options.bondMaxPerPair ?? 2,
+    maxPartNeighbors: options.bondMaxNeighbors ?? 3,
+  });
+
   // A representative base area (median of the normalised areas) used for the
   // stitch bonds we may add for connectivity.
   const baseArea = medianArea(scenario.bonds) || 0.1;
@@ -590,6 +606,13 @@ export async function buildVehicleScenario(
   );
   // Orphan stitches (centroid bonds) — these are the long "star" debug lines.
   console.log(`[glb-vehicle] orphan stitches added: ${stitched}`);
+  console.log(`[glb-vehicle] prop-attachment prune: ${pruneStats.before} → ${pruneStats.after} bonds`);
+  // Fan-out: how many bonds each node carries (over-connection shows up as a high max).
+  const fan = new Int32Array(scenario.nodes.length);
+  for (const bond of scenario.bonds) { fan[bond.node0]++; fan[bond.node1]++; }
+  let maxFan = 0, sumFan = 0;
+  for (const f of fan) { if (f > maxFan) maxFan = f; sumFan += f; }
+  console.log(`[glb-vehicle] bonds per node: max=${maxFan} avg=${(sumFan / Math.max(1, scenario.nodes.length)).toFixed(1)}`);
   // Parts whose collider spans a large fraction of the vehicle (likely a single
   // mesh holding multiple disconnected shapes — e.g. wheel-nuts across wheels).
   const carLen = Math.max(bounds.size.x, bounds.size.z) || 1;
@@ -640,6 +663,81 @@ function medianArea(bonds: Array<{ area: number }>): number {
  * component. Stitch bonds use the role-pair multiplier so the joins respect the
  * same hierarchy.
  */
+/**
+ * Thin out the bonds that the average-mode auto-bonder over-produces — a wheel ends up
+ * bonded to dozens of frame chunks (over-strong, dense, long debug lines). The fix is
+ * ROLE-AWARE so it never weakens the load-bearing chassis:
+ * - Keep ALL intra-part bonds (a fractured shell's internal density holds it rigid).
+ * - Keep ALL structural inter-part bonds (frame/panel ↔ frame/panel) — the chassis.
+ * - Only thin INTER-part bonds that involve a PROP (wheel/cargo/accessory): per pair of
+ *   parts keep the `maxPerPair` largest contacts, and limit each prop to its
+ *   `maxPartNeighbors` strongest other-parts (a pair survives only if it's in the top set
+ *   of every prop endpoint). The connectivity stitch afterwards reattaches any prop that
+ *   gets fully trimmed, so nothing is orphaned.
+ */
+const PROP_ROLES: ReadonlySet<VehiclePartRole> = new Set<VehiclePartRole>(['wheel', 'cargo', 'accessory']);
+
+function pruneBonds(
+  scenario: any,
+  meta: FragMeta[],
+  opts: { maxPerPair: number; maxPartNeighbors: number },
+): { before: number; after: number } {
+  const before = scenario.bonds.length;
+  const partRole = new Map<number, VehiclePartRole>();
+  for (const m of meta) if (m) partRole.set(m.partId, m.role);
+
+  const keep: any[] = []; // intra + structural inter — always kept
+  const interByPair = new Map<string, any[]>(); // prop-involving inter bonds (prunable)
+  for (const bond of scenario.bonds) {
+    const a = meta[bond.node0];
+    const b = meta[bond.node1];
+    if (!a || !b || a.partId === b.partId) { keep.push(bond); continue; }
+    if (!PROP_ROLES.has(a.role) && !PROP_ROLES.has(b.role)) { keep.push(bond); continue; } // chassis
+    const key = a.partId < b.partId ? `${a.partId}_${b.partId}` : `${b.partId}_${a.partId}`;
+    let arr = interByPair.get(key);
+    if (!arr) { arr = []; interByPair.set(key, arr); }
+    arr.push(bond);
+  }
+
+  // Per pair: keep the strongest few; record best area + endpoints.
+  type Pair = { key: string; pa: number; pb: number; bonds: any[]; area: number };
+  const pairs: Pair[] = [];
+  for (const [key, bonds] of interByPair) {
+    bonds.sort((x, y) => y.area - x.area);
+    const kept = bonds.slice(0, Math.max(1, opts.maxPerPair));
+    const [pa, pb] = key.split('_').map(Number);
+    pairs.push({ key, pa, pb, bonds: kept, area: kept[0]?.area ?? 0 });
+  }
+
+  // Per PROP part: keep only its strongest maxPartNeighbors pairs.
+  const topPairsForProp = new Map<number, Set<string>>();
+  const byPart = new Map<number, Pair[]>();
+  for (const p of pairs) {
+    (byPart.get(p.pa) ?? byPart.set(p.pa, []).get(p.pa)!).push(p);
+    (byPart.get(p.pb) ?? byPart.set(p.pb, []).get(p.pb)!).push(p);
+  }
+  for (const [part, plist] of byPart) {
+    if (!PROP_ROLES.has(partRole.get(part)!)) continue; // structural parts: no neighbour cap
+    plist.sort((x, y) => y.area - x.area);
+    const set = new Set<string>();
+    for (let i = 0; i < Math.min(Math.max(1, opts.maxPartNeighbors), plist.length); i++) set.add(plist[i].key);
+    topPairsForProp.set(part, set);
+  }
+
+  // A pair survives only if every PROP endpoint keeps it in its top set.
+  const keptInter: any[] = [];
+  for (const p of pairs) {
+    const aProp = PROP_ROLES.has(partRole.get(p.pa)!);
+    const bProp = PROP_ROLES.has(partRole.get(p.pb)!);
+    const okA = !aProp || topPairsForProp.get(p.pa)?.has(p.key);
+    const okB = !bProp || topPairsForProp.get(p.pb)?.has(p.key);
+    if (okA && okB) keptInter.push(...p.bonds);
+  }
+
+  scenario.bonds = [...keep, ...keptInter];
+  return { before, after: scenario.bonds.length };
+}
+
 function stitchConnectivity(
   scenario: any,
   fragments: FragmentInfo[],

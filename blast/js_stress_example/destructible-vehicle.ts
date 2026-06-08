@@ -48,7 +48,7 @@ const CONFIG = {
     // their colliders are tight (a whole roll cage as one convex hull is a blob).
     // 0 = keep parts whole.
     fractureCellSize: 0.6,
-    bondMaxSeparation: 0.12, // m — max surface gap auto-bonding treats as contact
+    bondMaxSeparation: 0.10, // m — max surface gap auto-bonding treats as contact
     // Per-role attachment strength (LIVE). 1 = the baseline hierarchy (cargo is
     // already the weakest via its base threshold, the frame the strongest); lower
     // a role to make it shed more easily, raise it to weld it on. Drives both
@@ -337,7 +337,7 @@ async function initScene(dropHeight = 0) {
   nodeCentroidsRef = scenario.nodes.map((n: any) => n.centroid);
   _impactCuts = 0;
   // Grace window: settle a resting spawn (~0.1 s) or let a height-drop fall first.
-  sceneSettleUntil = performance.now() + (dropHeight > 0 ? 350 : 600);
+  sceneSettleUntil = performance.now() + (dropHeight > 0 ? 500 : 1100);
 
   console.log(
     `Destructible vehicle: ${summary.parts} parts → ${summary.nodes} nodes, ${summary.bonds} bonds`,
@@ -507,11 +507,12 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Detached debris bounces off the intact body and the ground, but NOT off other
-// debris. Fractured/split chunks have overlapping convex hulls, so allowing
-// debris-vs-debris contact lets a pile of just-detached overlapping chunks resolve
-// their penetration as a violent explosion. 'noDebrisPairs' keeps debris lively
-// (cargo bounces off the car) while removing that failure mode. Verified stable
+// Detached debris collides with the GROUND only. Fractured/split chunks have
+// overlapping convex hulls; once bonds are pruned sparser, a hard hit detaches
+// chunks that still overlap the intact body, and debris-vs-body penetration
+// resolves as a violent explosion (noDebrisPairs only stops debris-vs-debris).
+// Ground-only is density-independent and rock-solid; the trade-off is shed parts
+// fall through the car/each other rather than bouncing off it. Verified stable
 // under heavy destruction by scripts/soak-vehicle.mjs.
 physicsConfig.debrisCollisionMode = 'noDebrisPairs';
 
