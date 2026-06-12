@@ -6,7 +6,7 @@
   "scripts": {
     "test": "npm run build && npm run demo && npm run demo:ext && npm run demo:ext-cube && npm run demo:ext-bridge",
     "build": "node ./scripts/build.js",
-    "build:ts": "npx -y tsc || true",
+    "build:ts": "(npx -y tsc || true) && node ./scripts/restore-wasm-runtime.mjs",
     "build:demo:wall": "esbuild wall-demolition.ts --outfile=dist/wall-demolition.js --format=esm",
     "build:demo:tower": "esbuild tower-collapse.ts --outfile=dist/tower-collapse.js --format=esm",
     "build:demo:fractured-wall": "esbuild fractured-wall.ts --outfile=dist/fractured-wall.js --format=esm",

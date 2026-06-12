@@ -116,12 +116,18 @@ reassociation may differ.
 
 ### Tier 1 — configuration & dependency wins (days, low risk)
 
-1. **Swap to `@dimforge/rapier3d-simd-compat`** (same 0.19.x, drop-in).
-   Measured here on `bench:large`: `rapierStep` mean 8.85 → 7.07 ms (**−20 %**),
-   p95 13.13 → 9.92 ms (−24 %); whole frame −8.4 % mean, −12 % p95. Attacks the
-   #1 phase in every scenario. *Physically identical* (same engine, same
-   iterations; SIMD float reassociation) — re-baseline the determinism
-   fixtures once. Ship as the default, keep the scalar package behind a flag.
+1. **Swap to `@dimforge/rapier3d-simd-compat`** (same 0.19.x, drop-in) —
+   **status: re-measured, not adopted yet.** Interleaved A/B at the locked
+   version (0.19.3, Node x64 container): scalar and SIMD are **indistinguishable**
+   (`rapierStep` ≈ 13.1 ms both, two runs each). At 0.19.1 the SIMD build *is*
+   reliably faster (−12–14 % `rapierStep`, reproduced interleaved), so the win is
+   version/build-specific — an earlier non-interleaved measurement on 0.19.1
+   (−20 %) overstated it. Re-evaluate per Rapier release and **in a real
+   browser** before shipping; the swap itself stays a one-line dependency alias
+   (`"@dimforge/rapier3d-compat": "npm:@dimforge/rapier3d-simd-compat@<ver>"`).
+   Beware when benchmarking: `bench.mjs` outcomes are wall-clock-coupled
+   (projectile TTL is in real seconds), so only interleaved same-session runs
+   are comparable.
 2. **Island-aware solve + skip-settled ON by default** for every core
    (`destructible-core.ts:485` currently `false`; only mini-city flips it).
    Measured: 13.1 → 1.37 ms on the excited city; also wins on single
@@ -250,7 +256,7 @@ reassociation may differ.
 | stage | action-frame estimate | basis |
 |---|---:|---|
 | today (recording) | ~19.5 ms mean, 51 % frames > 16.6 ms | `perf-resim-findings.md` |
-| + Tier 1 (Rapier SIMD, island solve, fixed 60 Hz step) | ~11–13 ms | −1.8 ms rapierStep, −2…−11 ms solver, physics ≤ 60 Hz |
+| + Tier 1 (island solve, fixed 60 Hz step; Rapier SIMD pending re-eval) | ~12–14 ms | −2…−11 ms solver, physics ≤ 60 Hz |
 | + Tier 2 (snapshot, splash→WASM, SoA drain, scoped resim) | ~7–9 ms | −1.5, −2.5, −1, −3 (fracture frames) |
 | + Tier 3 (worker + interpolation, shadow gating) | render thread ≈ GPU-bound only | physics off-thread |
 
