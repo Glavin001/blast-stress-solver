@@ -376,9 +376,12 @@ export type DestructibleCore = {
    *  re-solves the same frame its load changes (paused, never frozen). Off by default. */
   setIslandSolver?: (opts: { enabled?: boolean; skipSettled?: boolean }) => void;
   /** Toggle experimental scoped resim live (skip stationary, decoupled bodies in
-   *  the resim step). Opt-in; not byte-identical for cascading fractures. */
+   *  the resim step). Opt-in; output-faithful (sub-mm on cascades). */
   setScopedResim?: (enabled: boolean) => void;
   getScopedResim?: () => boolean;
+  /** Last fracture frame's scoped-resim ceiling: total dynamic bodies, how many
+   *  were disjoint from the fracture, and how many were frozen (skipped). */
+  getScopedResimStats?: () => { totalDynamic: number; disjoint: number; frozen: number };
   /** Current island-solver settings plus the last update's island count and skipped count. */
   getIslandSolverStats?: () => { enabled: boolean; skipSettled: boolean; islandCount: number; islandsSkipped: number };
   // Damageable chunks API (present when damage is enabled)

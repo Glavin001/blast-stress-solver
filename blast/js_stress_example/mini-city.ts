@@ -73,9 +73,9 @@ const CONFIG = {
     // Island-aware solve: solve each disconnected group independently and skip groups that have
     // settled (no input change + already converged). On by default; toggled live in the sidebar.
     islandSolver: true,
-    // Scoped resim (experimental): on a fracture, skip re-stepping stationary, decoupled debris
-    // in the resim pass. Faster, but NOT byte-identical for cascading fractures — off by default;
-    // toggle live to A/B whether it "looks the same".
+    // Scoped resim (island-exact): on a fracture, skip re-stepping whole settled contact
+    // components disjoint from the break. Output-faithful (sub-mm even on cascades); speedup
+    // scales with how much of the city is settled and spatially apart. Off by default; toggle live.
     scopedResim: false,
   },
   features: { debug: false },
@@ -160,6 +160,10 @@ function updateStatus(core: any) {
   setText('stat-fragments', String(core.chunks.length));
   const isl = core.getIslandSolverStats?.();
   setText('stat-islands', isl?.enabled ? `${isl.islandsSkipped}/${isl.islandCount} skipped` : 'off');
+  const sr = core.getScopedResim?.() ? core.getScopedResimStats?.() : null;
+  setText('stat-scoped-resim', sr && sr.totalDynamic
+    ? `${sr.frozen}/${sr.totalDynamic} frozen (${Math.round((100 * sr.frozen) / sr.totalDynamic)}%)`
+    : 'off');
 }
 function updatePerf() {
   setText('stat-physics-ms', _physicsMs.toFixed(1) + ' ms');

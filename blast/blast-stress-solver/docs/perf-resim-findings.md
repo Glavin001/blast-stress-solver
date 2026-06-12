@@ -74,32 +74,39 @@ change — the groundwork for acting on it.
 
 ## Output-safe levers, ranked by (impact × safety)
 
-### 1. Scope the resim to fracture-affected bodies — *implemented as opt-in `scopedResim`; NOT byte-identical for cascades*
-The second `world.step()` is the most expensive thing on a fracture frame. The
-idea: pin stationary, decoupled bodies at their initial-step result and sleep them
-for the resim step, so Rapier's island solver skips them; the fractured region and
-its contact closure still re-step. Rapier auto-wakes a sleeper the instant an
-active body *contacts* it, so contact-*gain* coupling is preserved.
+### 1. Island-exact scoped resim — *implemented as opt-in `scopedResim`; output-faithful (sub-mm)*
+The second `world.step()` is the most expensive thing on a fracture frame, but only
+the fractured region — and whatever is in contact with it — moves differently the
+second time. Freeze whole **contact components that are disjoint from the fracture's
+contact closure AND settled**: pin them at their initial-step result and sleep them
+for the resim step so Rapier's island solver skips them. Rapier auto-wakes a sleeper
+the instant an active body *contacts* it, so contact-*gain* coupling is preserved.
 
-**Implemented behind `scopedResim` (default off; live toggle `setScopedResim`, and
-a sidebar checkbox in the mini-city demo).** Measured with the equivalence harness
-(`rapier.resim-perf.test.ts` §D):
+The critical detail (and the fix for the first attempt) is **where the closure comes
+from**: the **initial pass's** contact graph, read *before* `flushPendingBodies`
+migrates colliders. That graph still holds the resting contacts of bodies sitting
+*on* the fractured structure, so they land in the closure and are re-stepped —
+covering contact-*loss* (support removal), which Rapier never auto-wakes on.
 
-- **Isolated fracture → byte-identical** (`maxPosDelta === 0`), resim step ~40 %
-  cheaper. Safe and faithful.
-- **Cascading fracture → diverges (~12.8 m).** A body resting *on* a structure
-  that fractures loses its support in the resim, but Rapier only auto-wakes on
-  contact *gain*, never *loss* — and the post-fracture contact graph needed to
-  detect that coupling doesn't exist until the resim itself runs (so the contact
-  closure can't see it). The error then compounds chaotically through the
-  fracture → stress → fracture feedback loop.
+A first attempt (PR #41) classified per-body by velocity and read the contact graph
+*after* migration (a clobbered narrow phase that found nothing) — so debris resting
+on a collapsing structure was wrongly frozen and the error compounded to **~12.8 m**
+on cascades. Island-exact scoping from the pre-migration graph fixes exactly that.
 
-So it cannot be a default (real scenes cascade — the mini-city had 321 cascading
-resim frames). It ships as an **opt-in experiment** so the "looks the same?"
-trade-off can be evaluated live in the browser. The truly output-safe version
-would require predicting the resim's own contact changes, which is not possible
-ahead of the step; the only effective *general* lever is sleep (§4), which changes
-output by design.
+Measured (`rapier.resim-perf.test.ts` §D):
+
+- **Isolated fracture → byte-identical** (`maxPosDelta === 0`).
+- **Cascading fracture → ~0.24 mm** (vs ~12.8 m for the old heuristic — a ~50,000×
+  reduction). The residual no longer flips discrete fracture decisions, so it does
+  not amplify.
+
+Still **opt-in / default off**: near-identical, not provably bit-exact (a re-stepped
+body crossing into a frozen island, or a sleep-timer shift, can perturb low bits),
+and the **speedup is scene-dependent** — it skips only quiescent, decoupled regions,
+so a single collapsing pile (~3 % freezable) gains little, while a scene with many
+settled, spatially-separated structures (the mini-city) gains more. The live toggle
++ the "Scoped resim N% frozen" readout in the mini-city sidebar (`getScopedResimStats`)
+make the real ceiling visible per scene.
 
 ### 2. Drop the dead snapshot re-capture on the final resim pass — *free, easy, safe*
 The `captureWorldSnapshot()` after `restoreWorldSnapshot()` exists only to support
