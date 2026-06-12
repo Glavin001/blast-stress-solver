@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type RAPIER from '@dimforge/rapier3d-compat';
 import type { ChunkData, DestructibleCore } from '../rapier/types';
+import type { InterpolatedPoseView } from '../rapier/fixedStepLoop';
 
 const shadowsEnabled = true;
 
@@ -567,12 +568,21 @@ export function updateBatchedChunkMesh(
     /** Mask (by instanceId) of fragments hidden by an external LOD layer (e.g. an intact-building
      *  proxy box stands in for them). Non-zero → the fragment instance is forced invisible. */
     instanceHidden?: Uint8Array;
+    /** Fixed-timestep render interpolation: blend each chunk's pose between the last two
+     *  physics states (`createPoseInterpolator(core).view(alpha)`). Chunks without a captured
+     *  pose (NaN sentinel) fall back to the live chunk pose. Settled chunks interpolate to an
+     *  identical pose, so the unchanged-pose skip still elides their writes. */
+    interpolation?: InterpolatedPoseView;
   },
 ) {
   const updateBVH = options?.updateBVH ?? false;
   const nodeColors = options?.nodeColors;
   const instanceHidden = options?.instanceHidden;
   const forceFull = options?.forceFullUpdate === true;
+  const interp = options?.interpolation;
+  const interpPrev = interp?.prev;
+  const interpCurr = interp?.curr;
+  const interpAlpha = interp ? Math.min(1, Math.max(0, interp.alpha)) : 0;
   const canColor = typeof batchedMesh.setColorAt === 'function';
   // Health-based coloring only applies when damage is enabled; capture the getter once.
   const healthGetter =
@@ -616,7 +626,31 @@ export function updateBatchedChunkMesh(
     let px: number, py: number, pz: number, qx: number, qy: number, qz: number, qw: number;
     const wp = chunk.worldPosition;
     const wq = chunk.worldQuaternion;
-    if (wp && wq) {
+    const ib = i * 7;
+    if (
+      interpPrev !== undefined &&
+      interpCurr !== undefined &&
+      // NaN sentinel in either buffer → no captured pose for this chunk yet; fall through.
+      interpPrev[ib + 6] === interpPrev[ib + 6] &&
+      interpCurr[ib + 6] === interpCurr[ib + 6]
+    ) {
+      const t = interpAlpha;
+      px = interpPrev[ib] + (interpCurr[ib] - interpPrev[ib]) * t;
+      py = interpPrev[ib + 1] + (interpCurr[ib + 1] - interpPrev[ib + 1]) * t;
+      pz = interpPrev[ib + 2] + (interpCurr[ib + 2] - interpPrev[ib + 2]) * t;
+      // nlerp with hemisphere correction: adjacent physics states are near-identical
+      // rotations, where nlerp ≈ slerp and stays monotonic.
+      const pqx = interpPrev[ib + 3], pqy = interpPrev[ib + 4], pqz = interpPrev[ib + 5], pqw = interpPrev[ib + 6];
+      let cqx = interpCurr[ib + 3], cqy = interpCurr[ib + 4], cqz = interpCurr[ib + 5], cqw = interpCurr[ib + 6];
+      if (pqx * cqx + pqy * cqy + pqz * cqz + pqw * cqw < 0) { cqx = -cqx; cqy = -cqy; cqz = -cqz; cqw = -cqw; }
+      qx = pqx + (cqx - pqx) * t;
+      qy = pqy + (cqy - pqy) * t;
+      qz = pqz + (cqz - pqz) * t;
+      qw = pqw + (cqw - pqw) * t;
+      const ql = Math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+      if (ql > 1e-12) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
+      else { qx = 0; qy = 0; qz = 0; qw = 1; }
+    } else if (wp && wq) {
       px = wp.x; py = wp.y; pz = wp.z;
       qx = wq.x; qy = wq.y; qz = wq.z; qw = wq.w;
     } else {
@@ -705,10 +739,19 @@ export function updateBatchedChunkMesh(
 
 export { SolverDebugLinesHelper } from './solver-debug-lines';
 
+const _projPose = { px: 0, py: 0, pz: 0, qx: 0, qy: 0, qz: 0, qw: 1 };
+
 export function updateProjectileMeshes(
   core: DestructibleCore,
   root: THREE.Group,
+  options?: {
+    /** Fixed-timestep render interpolation for projectile bodies (same view handed to
+     *  `updateBatchedChunkMesh`). Projectiles are the fastest movers on screen, so without
+     *  this they would visibly snap at the physics rate while chunks glide. */
+    interpolation?: InterpolatedPoseView;
+  },
 ) {
+  const interp = options?.interpolation;
   const profilerRecorder = (
     core as unknown as {
       recordProjectileCleanupDuration?: (durationMs: number) => void;
@@ -782,9 +825,14 @@ export function updateProjectileMeshes(
 
     const mesh = projectile.mesh as THREE.Mesh;
     mesh.visible = true;
-    const rotation = body.rotation();
-    mesh.position.set(bodyTranslation.x, bodyTranslation.y, bodyTranslation.z);
-    mesh.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
+    if (interp && interp.getBodyPose(projectile.bodyHandle, _projPose)) {
+      mesh.position.set(_projPose.px, _projPose.py, _projPose.pz);
+      mesh.quaternion.set(_projPose.qx, _projPose.qy, _projPose.qz, _projPose.qw);
+    } else {
+      const rotation = body.rotation();
+      mesh.position.set(bodyTranslation.x, bodyTranslation.y, bodyTranslation.z);
+      mesh.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
+    }
   }
 
   if (profilerRecorder && timerStart != null) {

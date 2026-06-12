@@ -22,7 +22,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import * as pinata from '@dgreenheck/three-pinata';
-import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay, buildSpatialCollisionTree } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay, buildSpatialCollisionTree, createFixedStepLoop, createPoseInterpolator } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
@@ -86,6 +86,10 @@ const CONFIG = {
     intactProxies: true,
     intactProxyFar: 70, // proxy a building beyond this distance (m) from the camera
     intactProxyNear: 45, // reveal its real fragments again within this distance (m) — hysteresis
+    // Fixed-timestep physics + render interpolation: identical simulation on every display
+    // rate; a 120 Hz monitor renders 120 smooth frames while physics steps 60×/s.
+    fixedStep: true,
+    fixedStepHz: 60,
   },
   features: { debug: false, lodTree: false },
 };
@@ -420,6 +424,9 @@ const recorder = createRecordingOverlay({
   getProfilerExport: () => profiler.exportData(),
 });
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
+// Fixed-timestep driver + pose interpolator (rebuilt with the core; see the render loop).
+let stepLoopRef: ReturnType<typeof createFixedStepLoop> | null = null;
+let poseInterpRef: ReturnType<typeof createPoseInterpolator> | null = null;
 let shooter: ReturnType<typeof mountShooter> | null = null;
 let cityGroup: THREE.Group | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
@@ -522,6 +529,16 @@ async function initScene() {
   recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
+  // Fixed-timestep driver + interpolator are bound to THIS core (the step closure and the
+  // chunk buffers); rebuild them with it.
+  poseInterpRef = createPoseInterpolator(core);
+  stepLoopRef = createFixedStepLoop({
+    hz: CONFIG.optimization.fixedStepHz,
+    maxStepsPerTick: 3,
+    step: (fixedDt) => core.step(fixedDt),
+    onBeforeStep: () => poseInterpRef?.beforeStep(),
+    onAfterStep: () => poseInterpRef?.afterStep(),
+  });
   cityGroup = group;
   initialBonds = core.getActiveBondsCount();
 
@@ -761,6 +778,12 @@ bindToggle('cfg-island-solver', CONFIG.optimization, 'islandSolver', (v) =>
 bindToggle('cfg-lazy-colliders', CONFIG.optimization, 'lazyIntactColliders', (v) =>
   coreRef?.setLazyIntactColliders?.(v),
 );
+bindToggle('cfg-fixed-step', CONFIG.optimization, 'fixedStep', (v) => {
+  // Re-arm cleanly on toggle: drop pending accumulator time and re-prime the pose buffers
+  // so switching modes mid-flight can't lerp from a stale state.
+  stepLoopRef?.reset();
+  if (v) poseInterpRef?.reset();
+});
 bindToggle('cfg-intact-proxies', CONFIG.optimization, 'intactProxies', (v) =>
   visualsRef?.intactProxies?.setEnabled(v),
 );
@@ -804,9 +827,16 @@ function loop() {
     }
 
     const t0 = performance.now();
-    coreRef.step(dt);
+    let interpolation: ReturnType<NonNullable<typeof poseInterpRef>['view']> | undefined;
+    if (CONFIG.optimization.fixedStep && stepLoopRef && poseInterpRef) {
+      // Fixed 60 Hz physics; the render blends between the last two physics states.
+      const res = stepLoopRef.tick(dt);
+      interpolation = poseInterpRef.view(res.alpha);
+    } else {
+      coreRef.step(dt); // legacy: one variable-dt step per display frame
+    }
     _physicsMs += (performance.now() - t0 - _physicsMs) * EMA;
-    visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true, camera });
+    visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true, camera, interpolation });
     rapierDebug?.update();
     lodViz?.update(coreRef);
     updateStatus(coreRef);

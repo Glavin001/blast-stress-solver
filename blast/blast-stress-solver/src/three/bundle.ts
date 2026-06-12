@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { DestructibleCore, ScenarioDesc } from '../rapier/types';
+import type { InterpolatedPoseView } from '../rapier/fixedStepLoop';
 import {
   buildBatchedChunkMeshFromScenario,
   buildChunkMeshesFromScenario,
@@ -68,6 +69,10 @@ export type DestructibleThreeBundle = {
     materialColors?: boolean;
     /** Camera for intact-proxy distance gating. Omit → proxies use their last decision. */
     camera?: THREE.Camera;
+    /** Fixed-timestep render interpolation (`createPoseInterpolator(core).view(alpha)`):
+     *  chunk instances and projectile meshes blend between the last two physics states.
+     *  Batched-mesh mode only. */
+    interpolation?: InterpolatedPoseView;
   }) => void;
   /** Flip between material colors (true) and physics-state colors (false) at runtime. */
   setMaterialColors: (on: boolean) => void;
@@ -177,13 +182,14 @@ export function createDestructibleThreeBundle(
           updateBVH: updateOptions?.updateBVH,
           nodeColors: nc,
           instanceHidden: intactProxies?.instanceHidden,
+          interpolation: updateOptions?.interpolation,
         });
       } else if (chunkBuild) {
         updateChunkMeshes(core, chunkBuild.objects, { nodeColors: nc });
       }
 
       if (updateOptions?.updateProjectiles ?? true) {
-        updateProjectileMeshes(core, root);
+        updateProjectileMeshes(core, root, { interpolation: updateOptions?.interpolation });
       }
 
       if (debugHelper) {
