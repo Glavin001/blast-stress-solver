@@ -13,10 +13,13 @@ import type { ScenarioBond, Vec3 } from '../rapier/types';
 /**
  * Fragment structural role, used for bond strength multipliers in multi-component scenarios.
  *
- * Two families exist:
- * - Skeleton: 'column', 'beam', 'slab' (and legacy 'floor') — the load-bearing RC frame.
+ * Families:
+ * - Skeleton: 'column', 'beam', 'slab' (and legacy 'floor') — the load-bearing frame.
  * - Infill / non-structural: 'wall', 'infill' — frangible panels hung on the frame.
  * - 'foundation' — static (mass 0) ground anchors.
+ * - House-specific: 'roof' — pitched roof planes/sheathing (caves differently than walls);
+ *   'furniture' — free-standing pieces barely attached to the floor; 'shelf' — wall-mounted
+ *   units bonded more firmly to the wall they hang on.
  */
 export type FragmentType =
   | 'column'
@@ -25,7 +28,10 @@ export type FragmentType =
   | 'floor'
   | 'wall'
   | 'infill'
-  | 'foundation';
+  | 'foundation'
+  | 'roof'
+  | 'furniture'
+  | 'shelf';
 
 export type FragmentInfo = {
   worldPosition: Vec3;

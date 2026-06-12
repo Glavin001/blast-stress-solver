@@ -4,3 +4,8 @@ node_modules/
 stress_solver.cjs
 stress_solver.wasm
 stress_solver.mjs
+
+# Keep the destructible-vehicle demo model tracked despite the repo-wide *.glb
+# ignore in blast/.gitignore (it is required to build/serve the demo).
+!assets/
+!assets/buggy.glb

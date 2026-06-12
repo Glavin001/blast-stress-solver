@@ -26,6 +26,15 @@ export type ChunkMeshBuildOptions = {
   clearGroups?: boolean;
   /** Dispose external source geometries on `dispose()`. Default: false. */
   disposeSourceGeometries?: boolean;
+  /**
+   * Optional per-node base ("material") colors, indexed by `chunk.nodeIndex`. When
+   * provided (and the per-chunk damage overlay is off), chunks render in their material
+   * color instead of the fixed/kinematic/dynamic physics-state colors — so a demo can
+   * show realistic materials. Pass `undefined` (or omit) to fall back to the standard
+   * state coloring; toggling the two is how demos flip between "material" and
+   * "collision/state" views at runtime without rebuilding.
+   */
+  nodeColors?: THREE.Color[];
 };
 
 export type BatchedChunkMeshOptions = ChunkMeshBuildOptions & {
@@ -38,6 +47,16 @@ export type BatchedChunkMeshOptions = ChunkMeshBuildOptions & {
   enableBVH?: boolean;
   /** Margin forwarded to optional `computeBVH` helper. Default: 0.5. */
   bvhMargin?: number;
+  /**
+   * Per-instance front-to-back sort each frame (THREE.BatchedMesh default `true`). For opaque
+   * chunks this only trims overdraw, but it costs an O(visible·log visible) sort inside
+   * `onBeforeRender` every frame/pass — ~5 ms for 27k instances, the dominant render-thread cost
+   * on a large city. Default: `false`.
+   */
+  sortObjects?: boolean;
+  /** Per-instance frustum culling (THREE.BatchedMesh default `true`). Keep on to skip off-screen
+   *  instances when zoomed in. Default: leave the BatchedMesh default. */
+  perObjectFrustumCulled?: boolean;
 };
 
 type OptionalBvhApi = {
@@ -70,6 +89,52 @@ const _scale = new THREE.Vector3(1, 1, 1);
 const _localOffset = new THREE.Vector3();
 const _colorTmp = new THREE.Color();
 const _batchedDefaultColor = new THREE.Color(0x00ff00);
+
+/**
+ * Per-instance "last applied" state for {@link updateBatchedChunkMesh}, so that a frame can
+ * skip the expensive `setMatrixAt`/`setColorAt`/`setVisibleAt` writes (and the matrix-texture
+ * re-upload they trigger) for instances that did not change. This mirrors the physics core's
+ * unchanged-body transform skip: an intact/dormant city writes nothing per frame.
+ */
+type BatchedSyncCache = {
+  count: number;
+  px: Float32Array;
+  py: Float32Array;
+  pz: Float32Array;
+  qx: Float32Array;
+  qy: Float32Array;
+  qz: Float32Array;
+  qw: Float32Array;
+  health: Float32Array;
+  visible: Uint8Array;
+  lastNodeColors: THREE.Color[] | undefined;
+  primed: boolean;
+};
+
+const _batchedSyncCaches = new WeakMap<THREE.BatchedMesh, BatchedSyncCache>();
+
+function getBatchedSyncCache(batchedMesh: THREE.BatchedMesh, count: number): BatchedSyncCache {
+  let cache = _batchedSyncCaches.get(batchedMesh);
+  if (!cache || cache.count < count) {
+    // NaN pose / 255 visibility are sentinels that force a write on the first frame.
+    cache = {
+      count,
+      px: new Float32Array(count).fill(NaN),
+      py: new Float32Array(count).fill(NaN),
+      pz: new Float32Array(count).fill(NaN),
+      qx: new Float32Array(count).fill(NaN),
+      qy: new Float32Array(count).fill(NaN),
+      qz: new Float32Array(count).fill(NaN),
+      qw: new Float32Array(count).fill(NaN),
+      health: new Float32Array(count).fill(NaN),
+      visible: new Uint8Array(count).fill(255),
+      lastNodeColors: undefined,
+      primed: false,
+    };
+    _batchedSyncCaches.set(batchedMesh, cache);
+  }
+  return cache;
+}
 
 function toMeshStandardMaterial(material: THREE.Material | THREE.Material[] | undefined): THREE.MeshStandardMaterial | null {
   return material instanceof THREE.MeshStandardMaterial ? material : null;
@@ -157,7 +222,11 @@ function makeDefaultMaterials(materials?: { deck?: THREE.Material; support?: THR
 }
 
 /**
- * Apply color based on damage health or rigid body type.
+ * Resolve a chunk's color. Precedence:
+ *   1. Damage overlay (if enabled): green→red health gradient.
+ *   2. Material `baseColor` (if provided): the chunk's material color, kept even after
+ *      it breaks free (debris is darkened a touch so motion still reads).
+ *   3. Physics state: kinematic (blue) / fixed (gray) / dynamic (orange).
  * Mutates and returns the provided color instance.
  */
 export function applyChunkColor(opts: {
@@ -165,8 +234,10 @@ export function applyChunkColor(opts: {
   chunk: ChunkLike;
   body: RigidBodyLike;
   color: THREE.Color;
+  /** Material color for "material" view. Omit/null → standard state coloring. */
+  baseColor?: THREE.Color | null;
 }): THREE.Color {
-  const { core, chunk, body, color } = opts;
+  const { core, chunk, body, color, baseColor } = opts;
 
   const damageEnabled = core.damageEnabled === true;
   const healthGetter = core.getNodeHealth;
@@ -179,11 +250,25 @@ export function applyChunkColor(opts: {
     }
   }
 
+  if (baseColor) {
+    color.copy(baseColor);
+    if (body.isDynamic()) color.multiplyScalar(0.82);
+    return color;
+  }
+
   if (body.isKinematic()) color.setHex(KINEMATIC_COLOR);
   else if (body.isFixed()) color.setHex(FIXED_COLOR);
   else if (body.isDynamic()) color.setHex(DYNAMIC_COLOR);
 
   return color;
+}
+
+/** Per-node base color lookup (by chunk.nodeIndex), or null when colors aren't supplied. */
+function baseColorForNode(
+  nodeColors: THREE.Color[] | undefined,
+  nodeIndex: number,
+): THREE.Color | null {
+  return nodeColors ? nodeColors[nodeIndex] ?? null : null;
 }
 
 export function buildChunkMeshes(
@@ -338,6 +423,12 @@ function buildBatchedChunkMeshInternal(
   batchedMesh.castShadow = shadowsEnabled;
   batchedMesh.receiveShadow = shadowsEnabled;
   batchedMesh.frustumCulled = false;
+  // Opaque chunks: skip the per-frame front-to-back sort (THREE default on). It dominates the
+  // render thread at scale (~5 ms for 27k instances) and only trims overdraw for opaque material.
+  batchedMesh.sortObjects = options?.sortObjects ?? false;
+  if (options?.perObjectFrustumCulled !== undefined) {
+    batchedMesh.perObjectFrustumCulled = options.perObjectFrustumCulled;
+  }
 
   const geometryIds: number[] = [];
   const chunkToInstanceId = new Map<number, number>();
@@ -371,7 +462,13 @@ function buildBatchedChunkMeshInternal(
     batchedMesh.setMatrixAt(instanceId, _matrix);
     batchedMesh.setVisibleAt(instanceId, !chunk.destroyed);
     if (typeof batchedMesh.setColorAt === 'function') {
-      batchedMesh.setColorAt(instanceId, _batchedDefaultColor);
+      const baseColor = baseColorForNode(options?.nodeColors, chunk.nodeIndex);
+      if (body) {
+        applyChunkColor({ core, chunk, body, color: _colorTmp, baseColor });
+        batchedMesh.setColorAt(instanceId, _colorTmp);
+      } else {
+        batchedMesh.setColorAt(instanceId, baseColor ?? _batchedDefaultColor);
+      }
     }
   }
 
@@ -404,7 +501,12 @@ function buildBatchedChunkMeshInternal(
   };
 }
 
-export function updateChunkMeshes(core: DestructibleCore, meshes: THREE.Mesh[]) {
+export function updateChunkMeshes(
+  core: DestructibleCore,
+  meshes: THREE.Mesh[],
+  options?: { nodeColors?: THREE.Color[] },
+) {
+  const nodeColors = options?.nodeColors;
   const tmp = new THREE.Vector3();
   const quat = new THREE.Quaternion();
   const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV !== 'production' : true;
@@ -446,7 +548,8 @@ export function updateChunkMeshes(core: DestructibleCore, meshes: THREE.Mesh[]) 
 
     const material = toMeshStandardMaterial(mesh.material);
     if (material) {
-      applyChunkColor({ core, chunk, body, color: material.color });
+      const baseColor = baseColorForNode(nodeColors, chunk.nodeIndex);
+      applyChunkColor({ core, chunk, body, color: material.color, baseColor });
     }
   }
 }
@@ -457,54 +560,145 @@ export function updateBatchedChunkMesh(
   chunkToInstanceId: Map<number, number>,
   options?: {
     updateBVH?: boolean;
+    /** Per-node material colors (by chunk.nodeIndex). Omit for state coloring. */
+    nodeColors?: THREE.Color[];
+    /** Rewrite every instance this frame, bypassing the unchanged-pose skip. */
+    forceFullUpdate?: boolean;
+    /** Mask (by instanceId) of fragments hidden by an external LOD layer (e.g. an intact-building
+     *  proxy box stands in for them). Non-zero → the fragment instance is forced invisible. */
+    instanceHidden?: Uint8Array;
   },
 ) {
   const updateBVH = options?.updateBVH ?? false;
+  const nodeColors = options?.nodeColors;
+  const instanceHidden = options?.instanceHidden;
+  const forceFull = options?.forceFullUpdate === true;
+  const canColor = typeof batchedMesh.setColorAt === 'function';
+  // Health-based coloring only applies when damage is enabled; capture the getter once.
+  const healthGetter =
+    canColor && core.damageEnabled === true && typeof core.getNodeHealth === 'function'
+      ? core.getNodeHealth
+      : undefined;
 
-  for (let i = 0; i < core.chunks.length; i += 1) {
-    const chunk = core.chunks[i];
+  const chunks = core.chunks;
+  const cache = getBatchedSyncCache(batchedMesh, chunks.length);
+
+  // The active color source changed (material-color toggle flips nodeColors between an array
+  // and undefined, damage toggled, or first frame): recolor every visible instance even if it
+  // didn't move.
+  const colorSourceChanged = forceFull || !cache.primed || cache.lastNodeColors !== nodeColors;
+  cache.lastNodeColors = nodeColors;
+  cache.primed = true;
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
     const instanceId = chunkToInstanceId.get(chunk.nodeIndex);
-    if (instanceId == null) continue;
+    if (instanceId == null || instanceId >= cache.count) continue;
 
-    if (chunk.destroyed) {
-      batchedMesh.setVisibleAt(instanceId, false);
-      continue;
-    }
-
+    // Visibility is derived purely from chunk state — debris cleanup marks removed chunks
+    // `destroyed`/inactive — so the dormant fast path never has to touch the physics body.
     const handle = chunk.bodyHandle;
-    if (handle == null) {
-      batchedMesh.setVisibleAt(instanceId, false);
+    const wantVisible =
+      !chunk.destroyed &&
+      chunk.active !== false &&
+      handle != null &&
+      !(instanceHidden !== undefined && instanceHidden[instanceId] !== 0);
+    if (!wantVisible) {
+      if (cache.visible[instanceId] !== 0) {
+        batchedMesh.setVisibleAt(instanceId, false);
+        cache.visible[instanceId] = 0;
+      }
       continue;
     }
 
-    const body = core.world.getRigidBody(handle);
-    if (!body) {
-      batchedMesh.setVisibleAt(instanceId, false);
-      continue;
+    // Prefer the core's cached world pose (composed end-of-step, and held stable across frames
+    // where the body didn't move) over re-reading the rigid body every frame.
+    let px: number, py: number, pz: number, qx: number, qy: number, qz: number, qw: number;
+    const wp = chunk.worldPosition;
+    const wq = chunk.worldQuaternion;
+    if (wp && wq) {
+      px = wp.x; py = wp.y; pz = wp.z;
+      qx = wq.x; qy = wq.y; qz = wq.z; qw = wq.w;
+    } else {
+      // Pre-first-step fallback: compose from the body directly.
+      const body = core.world.getRigidBody(handle as number);
+      if (!body) {
+        if (cache.visible[instanceId] !== 0) {
+          batchedMesh.setVisibleAt(instanceId, false);
+          cache.visible[instanceId] = 0;
+        }
+        continue;
+      }
+      const t = body.translation();
+      const r = body.rotation();
+      _quaternion.set(r.x, r.y, r.z, r.w);
+      _localOffset
+        .set(chunk.baseLocalOffset.x, chunk.baseLocalOffset.y, chunk.baseLocalOffset.z)
+        .applyQuaternion(_quaternion);
+      px = t.x + _localOffset.x; py = t.y + _localOffset.y; pz = t.z + _localOffset.z;
+      qx = r.x; qy = r.y; qz = r.z; qw = r.w;
     }
 
-    const translation = body.translation();
-    const rotation = body.rotation();
-    _position.set(translation.x, translation.y, translation.z);
-    _quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
-    _localOffset
-      .set(chunk.baseLocalOffset.x, chunk.baseLocalOffset.y, chunk.baseLocalOffset.z)
-      .applyQuaternion(_quaternion);
-    _position.add(_localOffset);
+    const becameVisible = cache.visible[instanceId] !== 1;
+    if (becameVisible) {
+      batchedMesh.setVisibleAt(instanceId, true);
+      cache.visible[instanceId] = 1;
+    }
 
-    _matrix.compose(_position, _quaternion, _scale);
-    batchedMesh.setMatrixAt(instanceId, _matrix);
-    batchedMesh.setVisibleAt(instanceId, true);
+    const poseChanged =
+      forceFull ||
+      becameVisible ||
+      cache.px[instanceId] !== px ||
+      cache.py[instanceId] !== py ||
+      cache.pz[instanceId] !== pz ||
+      cache.qx[instanceId] !== qx ||
+      cache.qy[instanceId] !== qy ||
+      cache.qz[instanceId] !== qz ||
+      cache.qw[instanceId] !== qw;
 
-    if (typeof batchedMesh.setColorAt === 'function') {
-      applyChunkColor({ core, chunk, body, color: _colorTmp });
+    if (poseChanged) {
+      _position.set(px, py, pz);
+      _quaternion.set(qx, qy, qz, qw);
+      _matrix.compose(_position, _quaternion, _scale);
+      batchedMesh.setMatrixAt(instanceId, _matrix);
+      cache.px[instanceId] = px; cache.py[instanceId] = py; cache.pz[instanceId] = pz;
+      cache.qx[instanceId] = qx; cache.qy[instanceId] = qy;
+      cache.qz[instanceId] = qz; cache.qw[instanceId] = qw;
+      if (updateBVH && batchedMesh.bvh) {
+        try {
+          batchedMesh.bvh.move(instanceId);
+        } catch {}
+      }
+    }
+
+    if (!canColor) continue;
+
+    // Recolor on movement / (un)hide / color-source change, plus health changes that occur
+    // without movement (e.g. cracking before collapse).
+    let colorNeeded = poseChanged || colorSourceChanged;
+    let healthRatio = NaN;
+    if (healthGetter) {
+      const info = healthGetter(chunk.nodeIndex);
+      if (info && info.maxHealth > 0) {
+        healthRatio = Math.max(0, Math.min(1, info.health / info.maxHealth));
+        if (healthRatio !== cache.health[instanceId]) colorNeeded = true;
+      }
+    }
+    if (!colorNeeded) continue;
+
+    if (!Number.isNaN(healthRatio)) {
+      // Health-driven tint (matches applyChunkColor's damage branch) — no body read needed.
+      _colorTmp.copy(HEALTHY_COLOR).lerp(CRITICAL_COLOR, 1 - healthRatio);
+      cache.health[instanceId] = healthRatio;
       batchedMesh.setColorAt(instanceId, _colorTmp);
-    }
-
-    if (updateBVH && batchedMesh.bvh) {
-      try {
-        batchedMesh.bvh.move(instanceId);
-      } catch {}
+    } else {
+      // State / material color needs the body; only reached on change, so FFI stays bounded.
+      const body = core.world.getRigidBody(handle as number);
+      if (body) {
+        const baseColor = baseColorForNode(nodeColors, chunk.nodeIndex);
+        applyChunkColor({ core, chunk, body, color: _colorTmp, baseColor });
+        batchedMesh.setColorAt(instanceId, _colorTmp);
+      }
     }
   }
 }

@@ -86,27 +86,9 @@
         </section>
 
         <!-- Physics -->
+        <!-- Contacts (demo-specific). Shared Physics/Optimization/Features injected by physics-controls.ts. -->
         <section class="config-section">
-          <h2 class="section-title">Physics <small style="font-weight:normal;opacity:.5">★ = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-debris-collision">Debris Collision ★</label>
-            <select id="cfg-debris-collision" class="config-select">
-              <option value="all" selected>All (full collisions)</option>
-              <option value="noDebrisPairs">No debris pairs</option>
-              <option value="debrisGroundOnly">Debris ↔ ground only</option>
-              <option value="debrisNone">Debris: none</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-friction">Friction</label>
-            <input type="range" id="cfg-friction" class="config-slider" min="0" max="2" step="0.05" value="0.25" />
-            <span class="config-value"><span id="cfg-friction-value">0.25</span></span>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-restitution">Restitution</label>
-            <input type="range" id="cfg-restitution" class="config-slider" min="0" max="1" step="0.05" value="0.00" />
-            <span class="config-value"><span id="cfg-restitution-value">0.00</span></span>
-          </div>
+          <h2 class="section-title">Contacts (Reset to apply)</h2>
           <div class="config-row">
             <label class="config-label" for="cfg-contact-force">Contact Force Scale</label>
             <input type="range" id="cfg-contact-force" class="config-slider" min="1" max="100" step="1" value="30" />
@@ -118,30 +100,9 @@
           </div>
         </section>
 
-        <!-- Optimization -->
+        <!-- Debris cap (demo-specific) -->
         <section class="config-section">
-          <h2 class="section-title">Optimization <small style="font-weight:normal;opacity:.5">★ = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-damping-mode">Small Body Damping ★</label>
-            <select id="cfg-damping-mode" class="config-select">
-              <option value="off" selected>Off</option>
-              <option value="always">Always</option>
-              <option value="afterGroundCollision">After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-cleanup-mode">Debris Cleanup ★</label>
-            <select id="cfg-cleanup-mode" class="config-select">
-              <option value="off">Off</option>
-              <option value="always">Always</option>
-              <option value="afterGroundCollision" selected>After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-debris-ttl">Debris TTL</label>
-            <input type="range" id="cfg-debris-ttl" class="config-slider" min="1000" max="30000" step="500" value="10000" />
-            <span class="config-value"><span id="cfg-debris-ttl-value">10.0s</span></span>
-          </div>
+          <h2 class="section-title">Debris (Reset to apply)</h2>
           <div class="config-row">
             <label class="config-label" for="cfg-max-debris-colliders">Max Debris Colliders</label>
             <input type="range" id="cfg-max-debris-colliders" class="config-slider" min="1" max="10" step="1" value="2" />
@@ -174,15 +135,6 @@
         </section>
 
         <!-- Actions -->
-        <!-- Centrifugal (live) -->
-        <section class="config-section">
-          <h2 class="section-title">Centrifugal <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-centrifugal">Spin self-fracture &#9733;</label>
-            <input type="checkbox" id="cfg-centrifugal" />
-          </div>
-        </section>
-
         <div class="control-actions">
           <button id="btn-reset" class="button button-primary">↻ Reset Tower</button>
           <button id="btn-debug" class="button">◇ Show Debug</button>

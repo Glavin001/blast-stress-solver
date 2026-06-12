@@ -15,21 +15,49 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
+import * as pinata from '@dgreenheck/three-pinata';
 import { buildDestructibleCore, loadScenePackFromUrl , createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
-import { createDestructibleThreeBundle, RapierDebugRenderer } from 'blast-stress-solver/three';
+import { createDestructibleThreeBundle, RapierDebugRenderer, setPinataModule } from 'blast-stress-solver/three';
+import { buildHighRiseScenario, buildHighRiseScenarioAsync, type HighRiseOptions } from 'blast-stress-solver/scenarios';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
+import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
 import { mountShooter } from './shooter-fps.js';
 
+// The scene defaults (camera, material limits, contact-damage tuning) still come from
+// the shared scene-pack JSON so the web and Rust demos agree; the *geometry* is now
+// rebuilt live from the Building controls instead of using the pack's baked scenario.
 const SCENE_URL = '/vendor/blast-stress-solver/high-rise.json';
+
+// Pre-register three-pinata so the synchronous Voronoi fracturer resolves in the
+// browser ESM environment (bare-specifier dynamic imports don't resolve there).
+setPinataModule(pinata as any);
 
 // ── Mutable demo config (driven by the control panel) ──────────
 const CONFIG = {
+  // Building geometry — rebuilt live (apply via Reset). Defaults mirror
+  // DEFAULT_HIGH_RISE_OPTIONS so the live build matches the baked scene pack.
+  building: {
+    floorCount: 9,
+    floorHeight: 3.2,
+    width: 18,
+    depth: 14,
+    columnsX: 4,
+    columnsZ: 3,
+    // Voronoi-fracture the drywall infill walls (auto-bonded via WASM) instead of
+    // the regular box grid. Heavier to build, but the walls shatter realistically.
+    // On by default so the infill walls are bonded shards you can drive through.
+    fractureWalls: true,
+    // Voronoi shards per concrete support pillar (column) storey-segment. 1 = solid
+    // box (default skeleton); >1 shatters each segment (auto-bonded via WASM).
+    pillarFractures: 2,
+  },
   projectile: { radius: 0.6, mass: 2500, speed: 45 },
   solver: {
     gravity: -9.81,
     // Multiplier on the pack's concrete stress limits: >1 = stronger / harder to break,
     // <1 = more fragile. This is the "material strength" knob (clearer than materialScale).
-    strength: 1.0,
+    // Default 3× so the high-rise stays standing instead of collapsing at the first nudge.
+    strength: 3.0,
     // Couples projectile impacts into the *stress* solver. Kept low by default: the
     // high-rise's stress response is near-bimodal, and a high value lets one hit seed a
     // slow global collapse. Raise it for a more impact-reactive (and collapse-prone) frame.
@@ -163,8 +191,6 @@ const recorder = createRecordingOverlay({
 let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
-// Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
-let centrifugalEnabled = false;
 let rebuilding = false;
 
 async function initScene() {
@@ -172,9 +198,36 @@ async function initScene() {
   if (hint) hint.textContent = 'Loading high-rise...';
 
   const pack = await loadScenePackFromUrl(SCENE_URL);
-  const { scenario, defaults } = pack;
+  const { defaults } = pack;
   baseLimits = (defaults.solverSettings as Record<string, number>) ?? {};
   packDamage = (defaults.damage as Record<string, unknown>) ?? {};
+
+  // Build the high-rise geometry live from the Building controls (the pack's baked
+  // scenario is ignored). Slab divisions scale with the footprint so bigger buildings
+  // keep ~3 m floor tiles instead of a few giant slabs.
+  const b = CONFIG.building;
+  const fractureColumns = b.pillarFractures > 1;
+  const opts: HighRiseOptions = {
+    floorCount: b.floorCount,
+    floorHeight: b.floorHeight,
+    width: b.width,
+    depth: b.depth,
+    columnsX: b.columnsX,
+    columnsZ: b.columnsZ,
+    slabDivX: Math.max(4, Math.round(b.width / 3)),
+    slabDivZ: Math.max(3, Math.round(b.depth / 3)),
+  };
+  // Any fracturing (walls or pillars) needs the async builder + WASM auto-bonder.
+  const scenario = b.fractureWalls || fractureColumns
+    ? await buildHighRiseScenarioAsync({
+        ...opts,
+        fractureInfill: b.fractureWalls,
+        fractureColumns,
+        columnFragments: b.pillarFractures,
+        bondMode: 'auto',
+        pinata: pinata as any,
+      })
+    : buildHighRiseScenario(opts);
 
   controls.target.set(defaults.camera.target.x, defaults.camera.target.y, defaults.camera.target.z);
   controls.update();
@@ -188,22 +241,11 @@ async function initScene() {
       maxSolverIterationsPerFrame: CONFIG.solver.iterations,
       graphReductionLevel: CONFIG.solver.graphReduction,
     },
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.solver.contactForceScale,
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
-    damage: { ...packDamage, enabled: CONFIG.features.damage } as any,
-    debrisCleanup: {
-      mode: CONFIG.optimization.debrisCleanupMode as any,
-      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
-      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
-    },
-    smallBodyDamping: {
-      mode: CONFIG.optimization.smallBodyDampingMode as any,
-      colliderCountThreshold: 3,
-      minLinearDamping: 2,
-      minAngularDamping: 2,
-    },
+    // Shared Physics/Optimization/Features controls (physics-controls.ts).
+    ...physicsCoreOverrides(),
+    // ...but keep the scene-pack's per-chunk damage tuning when the toggle is on.
+    damage: { ...packDamage, enabled: physicsConfig.damage } as any,
     ...pipelineCoreOverrides(),
   });
 
@@ -219,10 +261,10 @@ async function initScene() {
   });
 
   rapierDebug?.dispose();
-  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: CONFIG.features.debug });
+  rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: physicsConfig.debug });
 
   coreRef = core;
-  core.setSolverCentrifugalEnabled(centrifugalEnabled);
+  core.setSolverCentrifugalEnabled(physicsConfig.centrifugal);
   recorder.attach(core, { scenario, meta: { demo: 'high-rise', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -275,6 +317,25 @@ function bindSelect(id: string, obj: Record<string, any>, key: string, onChange?
   select.addEventListener('change', () => { obj[key] = select.value; onChange?.(select.value); });
 }
 
+// Building geometry (deferred — apply on Reset). These rebuild the whole structure.
+bindSlider('cfg-floors', CONFIG.building, 'floorCount', (v) => v.toFixed(0));
+bindSlider('cfg-floor-height', CONFIG.building, 'floorHeight', (v) => v.toFixed(1) + ' m');
+bindSlider('cfg-width', CONFIG.building, 'width', (v) => v.toFixed(0) + ' m');
+bindSlider('cfg-depth', CONFIG.building, 'depth', (v) => v.toFixed(0) + ' m');
+bindSlider('cfg-columns-x', CONFIG.building, 'columnsX', (v) => v.toFixed(0));
+bindSlider('cfg-columns-z', CONFIG.building, 'columnsZ', (v) => v.toFixed(0));
+bindSlider('cfg-pillar-fractures', CONFIG.building, 'pillarFractures', (v) =>
+  v <= 1 ? 'solid' : v.toFixed(0) + ' shards');
+
+// Fracture-walls toggle: switches the drywall infill from boxes to Voronoi shards
+// (auto-bonded via WASM). Rebuilds immediately so the change is visible at once.
+const optFracture = document.getElementById('cfg-fracture-walls') as HTMLInputElement | null;
+if (optFracture) optFracture.checked = CONFIG.building.fractureWalls;
+optFracture?.addEventListener('change', () => {
+  CONFIG.building.fractureWalls = !!optFracture.checked;
+  void rebuild();
+});
+
 // Projectile (read live at shoot time)
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
 bindSlider('cfg-proj-mass', CONFIG.projectile, 'mass', (v) => v.toLocaleString() + ' kg');
@@ -287,32 +348,11 @@ bindSlider('cfg-iterations', CONFIG.solver, 'iterations', (v) => v.toFixed(0));
 bindSlider('cfg-graph-reduction', CONFIG.solver, 'graphReduction', (v) => v.toFixed(0));
 bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1) + ' m/s²', (v) => coreRef?.setGravity(v));
 
-// Physics
-document.getElementById('cfg-centrifugal')?.addEventListener('change', (e) => {
-  centrifugalEnabled = (e.target as HTMLInputElement).checked;
-  coreRef?.setSolverCentrifugalEnabled(centrifugalEnabled);
-});
-bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) => coreRef?.setDebrisCollisionMode(v as any));
-bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
-bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));
-
-// Optimization (live)
-bindSelect('cfg-damping-mode', CONFIG.optimization, 'smallBodyDampingMode', (v) => coreRef?.setSmallBodyDamping?.({ mode: v as any }));
-bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) =>
-  coreRef?.setDebrisCleanup?.({ mode: v as any, debrisTtlMs: CONFIG.optimization.debrisTtlMs }));
-bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 1000).toFixed(1) + 's', (v) =>
-  coreRef?.setDebrisCleanup?.({ mode: CONFIG.optimization.debrisCleanupMode as any, debrisTtlMs: v }));
-
-// Features
-const optDamage = document.getElementById('opt-damage') as HTMLInputElement | null;
-if (optDamage) optDamage.checked = CONFIG.features.damage;
-optDamage?.addEventListener('change', () => { CONFIG.features.damage = !!optDamage.checked; void rebuild(); });
-
-const optDebug = document.getElementById('opt-debug') as HTMLInputElement | null;
-if (optDebug) optDebug.checked = CONFIG.features.debug;
-optDebug?.addEventListener('change', () => {
-  CONFIG.features.debug = !!optDebug.checked;
-  rapierDebug?.setEnabled(CONFIG.features.debug);
+// Physics / Optimization / Features — the shared module wires high-rise's existing inline rows.
+mountPhysicsControls({
+  getCore: () => coreRef,
+  onDebug: (on) => rapierDebug?.setEnabled(on),
+  onRebuild: () => void rebuild(),
 });
 
 document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });
@@ -331,7 +371,7 @@ function loop() {
     const t0 = performance.now();
     coreRef.step(dt);
     _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
-    visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true });
+    visualsRef.update({ debug: physicsConfig.debug, updateBVH: false, updateProjectiles: true });
     rapierDebug?.update();
     updateStatus(coreRef);
   }

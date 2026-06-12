@@ -87,6 +87,7 @@ StressProcessor::prepare(const SolverNodeS* nodes, uint32_t N_nodes, const Solve
     m_solver_cache.resize(s_use_simd ? CGNR_SIMD().required_cache_size(N_nodes, N_bonds) : CGNR_SISD().required_cache_size(N_nodes, N_bonds));
     m_can_resume = false;
     m_skipValid = false;        // topology changed: drop the settled-state baseline so a fresh one is rebuilt
+    m_islandTopoValid = false;  // topology changed: rebuild the island grouping cache on the next island solve
 
     // Calculate bond offsets and length scale
     uint32_t offsets_to_scale = 0;
@@ -292,40 +293,74 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
     const uint32_t N_bonds = getBondCount();
     if (N_bonds == 0) return 0;     // nothing bonded; let the caller use the whole-graph path
 
+#ifdef STRESS_SOLVER_NO_ISLAND_CACHE
+    m_islandTopoValid = false;      // A/B switch: rebuild the island grouping every frame (original behavior)
+#endif
+
     const uint32_t kInvalid = (uint32_t)-1;
     const Coupling* C = m_couplings.data();
     const InertiaS* sqrt_I_inv = m_recip_sqrt_I.data();
 
-    // ── 1. Union-find over bonds. Static (zero-mass) nodes carry no coupling and act as cut
-    //       points, so two structures sharing only a static/world node are separate islands. ──
-    m_uf.resize(N_nodes);
-    for (uint32_t i = 0; i < N_nodes; ++i) m_uf[i] = i;
-    for (uint32_t b = 0; b < N_bonds; ++b)
+    // ── 1-3. Build the island grouping (union-find + per-bond island id + CSR grouping). This is a
+    //         pure function of topology, so it is built only when m_islandTopoValid is false (set by
+    //         prepare()/removeBond()) and reused bit-identically on every other frame. m_islandCount,
+    //         m_islandBondBegin and m_bondsByIsland persist across frames as the cache. ──
+    if (!m_islandTopoValid)
     {
-        const uint32_t n0 = C[b].node0;
-        const uint32_t n1 = C[b].node1;
-        if (!(sqrt_I_inv[n0].m > 0.0f) || !(sqrt_I_inv[n1].m > 0.0f)) continue;   // cut at static nodes
-        uint32_t r0 = n0; while (m_uf[r0] != r0) { m_uf[r0] = m_uf[m_uf[r0]]; r0 = m_uf[r0]; }
-        uint32_t r1 = n1; while (m_uf[r1] != r1) { m_uf[r1] = m_uf[m_uf[r1]]; r1 = m_uf[r1]; }
-        if (r0 != r1) m_uf[r0] = r1;
+        // 1. Union-find over bonds. Static (zero-mass) nodes carry no coupling and act as cut points,
+        //    so two structures sharing only a static/world node are separate islands.
+        m_uf.resize(N_nodes);
+        for (uint32_t i = 0; i < N_nodes; ++i) m_uf[i] = i;
+        for (uint32_t b = 0; b < N_bonds; ++b)
+        {
+            const uint32_t n0 = C[b].node0;
+            const uint32_t n1 = C[b].node1;
+            if (!(sqrt_I_inv[n0].m > 0.0f) || !(sqrt_I_inv[n1].m > 0.0f)) continue;   // cut at static nodes
+            uint32_t r0 = n0; while (m_uf[r0] != r0) { m_uf[r0] = m_uf[m_uf[r0]]; r0 = m_uf[r0]; }
+            uint32_t r1 = n1; while (m_uf[r1] != r1) { m_uf[r1] = m_uf[m_uf[r1]]; r1 = m_uf[r1]; }
+            if (r0 != r1) m_uf[r0] = r1;
+        }
+
+        // 2. Assign each bond a compacted island id (the component of its dynamic endpoint).
+        m_bondIsland.assign(N_bonds, kInvalid);
+        m_rootIsland.assign(N_nodes, kInvalid);
+        uint32_t islandCount = 0;
+        for (uint32_t b = 0; b < N_bonds; ++b)
+        {
+            const uint32_t n0 = C[b].node0;
+            const uint32_t n1 = C[b].node1;
+            const bool s0 = !(sqrt_I_inv[n0].m > 0.0f);
+            const bool s1 = !(sqrt_I_inv[n1].m > 0.0f);
+            if (s0 && s1) continue;                          // degenerate static-static bond: no coupling
+            uint32_t rep = s0 ? n1 : n0;                     // a dynamic endpoint
+            while (m_uf[rep] != rep) { m_uf[rep] = m_uf[m_uf[rep]]; rep = m_uf[rep]; }
+            if (m_rootIsland[rep] == kInvalid) m_rootIsland[rep] = islandCount++;
+            m_bondIsland[b] = m_rootIsland[rep];
+        }
+
+        // 3. Group bonds contiguously by island (CSR offsets via counting sort). Skipped when there is
+        //    at most one island, since the whole-graph fallback below does not read the grouping.
+        if (islandCount > 1)
+        {
+            m_islandBondBegin.assign(islandCount + 1, 0);
+            for (uint32_t b = 0; b < N_bonds; ++b)
+                if (m_bondIsland[b] != kInvalid) ++m_islandBondBegin[m_bondIsland[b] + 1];
+            for (uint32_t k = 0; k < islandCount; ++k)
+                m_islandBondBegin[k + 1] += m_islandBondBegin[k];
+            m_bondsByIsland.resize(m_islandBondBegin[islandCount]);
+            m_cursor.assign(m_islandBondBegin.begin(), m_islandBondBegin.end());
+            for (uint32_t b = 0; b < N_bonds; ++b)
+            {
+                const uint32_t isl = m_bondIsland[b];
+                if (isl != kInvalid) m_bondsByIsland[m_cursor[isl]++] = b;
+            }
+        }
+
+        m_islandCount = islandCount;
+        m_islandTopoValid = true;
     }
 
-    // ── 2. Assign each bond a compacted island id (the component of its dynamic endpoint). ──
-    m_bondIsland.assign(N_bonds, kInvalid);
-    std::vector<uint32_t> rootIsland(N_nodes, kInvalid);
-    uint32_t islandCount = 0;
-    for (uint32_t b = 0; b < N_bonds; ++b)
-    {
-        const uint32_t n0 = C[b].node0;
-        const uint32_t n1 = C[b].node1;
-        const bool s0 = !(sqrt_I_inv[n0].m > 0.0f);
-        const bool s1 = !(sqrt_I_inv[n1].m > 0.0f);
-        if (s0 && s1) continue;                          // degenerate static-static bond: no coupling
-        uint32_t rep = s0 ? n1 : n0;                     // a dynamic endpoint
-        while (m_uf[rep] != rep) { m_uf[rep] = m_uf[m_uf[rep]]; rep = m_uf[rep]; }
-        if (rootIsland[rep] == kInvalid) rootIsland[rep] = islandCount++;
-        m_bondIsland[b] = rootIsland[rep];
-    }
+    const uint32_t islandCount = m_islandCount;
 
     if (islandCount <= 1)
     {
@@ -336,22 +371,6 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
     }
 
     handled = true;
-
-    // ── 3. Group bonds contiguously by island (CSR offsets via counting sort). ──
-    m_islandBondBegin.assign(islandCount + 1, 0);
-    for (uint32_t b = 0; b < N_bonds; ++b)
-        if (m_bondIsland[b] != kInvalid) ++m_islandBondBegin[m_bondIsland[b] + 1];
-    for (uint32_t k = 0; k < islandCount; ++k)
-        m_islandBondBegin[k + 1] += m_islandBondBegin[k];
-    m_bondsByIsland.resize(m_islandBondBegin[islandCount]);
-    {
-        std::vector<uint32_t> cursor(m_islandBondBegin.begin(), m_islandBondBegin.end());
-        for (uint32_t b = 0; b < N_bonds; ++b)
-        {
-            const uint32_t isl = m_bondIsland[b];
-            if (isl != kInvalid) m_bondsByIsland[cursor[isl]++] = b;
-        }
-    }
 
     // ── 4. Scratch + scaling constants (identical to solve()). ──
     m_g2l.resize(N_nodes);
@@ -508,6 +527,7 @@ StressProcessor::removeBond(uint32_t bondIndex)
     --m_B.N;
     m_can_resume = false;
     m_skipValid = false;        // topology changed: drop the settled-state baseline
+    m_islandTopoValid = false;  // topology changed: rebuild the island grouping cache on the next island solve
 
     return true;
 }

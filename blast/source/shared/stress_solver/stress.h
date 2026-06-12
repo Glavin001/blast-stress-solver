@@ -35,6 +35,7 @@ class StressProcessor
 public:
     /** Constructor clears member data. */
     StressProcessor() : m_mass_scale(0.0f), m_length_scale(0.0f), m_can_resume(false),
+        m_islandCount(0), m_islandTopoValid(false),
         m_skipValid(false), m_lastIslandsSkipped(0), m_lastIslandsTotal(0) {}
 
     /** Parameters controlling the data preparation. */
@@ -145,6 +146,16 @@ protected:
     std::vector<uint32_t>   m_bondIsland;       // bond -> island id
     std::vector<uint32_t>   m_islandBondBegin;  // CSR-style start offset per island (size islandCount+1)
     std::vector<uint32_t>   m_bondsByIsland;    // bond indices grouped contiguously by island
+    std::vector<uint32_t>   m_rootIsland;       // scratch: node root -> compact island id (used only on rebuild)
+    std::vector<uint32_t>   m_cursor;           // scratch: per-island write cursor (used only on rebuild)
+
+    // Island grouping cache. The union-find / bond->island assignment / CSR grouping above are a pure
+    // function of topology (bond node indices and which nodes are static), so they are identical every
+    // frame until the topology changes. They are rebuilt only when m_islandTopoValid is false — set by
+    // prepare()/removeBond() — and reused (bit-identically) otherwise, so the per-island solves are
+    // unchanged. m_islandCount caches the island count (including the <=1 whole-graph-fallback case).
+    uint32_t                m_islandCount;
+    bool                    m_islandTopoValid;
     std::vector<uint32_t>   m_g2l;              // global node -> island-local node index
     std::vector<uint32_t>   m_g2lStamp;         // version stamp so m_g2l can be reused without clearing
     std::vector<uint32_t>   m_l2g;              // island-local node index -> global node

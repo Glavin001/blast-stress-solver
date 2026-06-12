@@ -68,6 +68,46 @@ describe('Fractured scenarios (requires three-pinata)', () => {
       expect(scenario.parameters!.width).toBe(6);
     });
 
+    it.skipIf(!pinataAvailable)('emits a semantic collisionTree (building → floor → element → fragments) that partitions every node exactly once', async () => {
+      const { buildFracturedTowerScenario } = await import('../scenarios/fracturedTowerScenario');
+      const floorCount = 3;
+      const scenario = await buildFracturedTowerScenario({
+        width: 6, depth: 6, floorCount, floorHeight: 3,
+        thickness: 0.3, floorThickness: 0.2, columnSize: 0.6, columnsX: 2, columnsZ: 2,
+        fragmentCountPerWall: 4, fragmentCountPerFloor: 4, fragmentCountPerColumn: 2, deckMass: 5000,
+      });
+
+      const tree = (scenario as any).collisionTree as Array<any>;
+      expect(Array.isArray(tree)).toBe(true);
+      expect(tree.length).toBe(1); // one building (one connected component)
+      const root = tree[0];
+      // Level 2 = floors (≥ floorCount: per-floor wall sections + plates + roof + foundation group).
+      expect(root.children.length).toBeGreaterThanOrEqual(floorCount);
+      // Level 3 = element leaves (walls/columns/slabs), each carrying fragment indices.
+      let leafCount = 0;
+      const leafSizes: number[] = [];
+      const seen = new Set<number>();
+      const walkLeaves = (g: any, depth: number) => {
+        if (g.fragments) {
+          leafCount++; leafSizes.push(g.fragments.length);
+          for (const i of g.fragments) { expect(seen.has(i)).toBe(false); seen.add(i); } // no overlap
+          expect(depth).toBeGreaterThanOrEqual(2); // building(0) → floor(1) → element-leaf(≥2)
+          return;
+        }
+        for (const c of g.children) walkLeaves(c, depth + 1);
+      };
+      walkLeaves(root, 0);
+      // Every node is covered exactly once (a true partition) — required for correct LOD enable.
+      expect(seen.size).toBe(scenario.nodes.length);
+      for (let i = 0; i < scenario.nodes.length; i++) expect(seen.has(i)).toBe(true);
+      // Leaves are element-sized, not building-sized: many of them, the median ≈ a wall/column, and
+      // none is the whole building (the foundation grid is the largest single element).
+      expect(leafCount).toBeGreaterThan(floorCount * 4);
+      leafSizes.sort((a, b) => a - b);
+      expect(leafSizes[leafSizes.length >> 1]).toBeLessThanOrEqual(12); // median element ≈ a wall
+      expect(Math.max(...leafSizes)).toBeLessThan(scenario.nodes.length); // no leaf == whole building
+    });
+
     it.skipIf(!pinataAvailable)('fragment geometries are stored in parameters', async () => {
       const { buildFracturedTowerScenario } = await import('../scenarios/fracturedTowerScenario');
 
