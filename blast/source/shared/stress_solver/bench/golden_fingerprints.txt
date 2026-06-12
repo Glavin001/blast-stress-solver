@@ -1,0 +1,4 @@
+  building-6x6x12                islandAware=0  iters=12    hash=b9ad784d97cd4d28  err=(5.900044e-04,1.246608e-03)
+  city-28x(6x6x4..12)            islandAware=0  iters=-25   hash=e4b071352974e269  err=(5.028650e-02,1.166508e-01)
+  city-28x(6x6x4..12)            islandAware=1  iters=-213  hash=99b1b02517a6b08f  err=(2.449324e-02,5.711690e-02)
+  city+removeBond                islandAware=1  bonds=20872  hash=f937242099bcbc61  err=(1.380213e-02,3.098695e-02)

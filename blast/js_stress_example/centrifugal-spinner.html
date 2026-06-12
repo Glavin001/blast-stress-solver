@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Centrifugal Spinner — blast-stress-solver Demo</title>
+    <link rel="stylesheet" href="./styles/demo-common.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three/build/three.module.js",
+          "three/addons/": "/vendor/three/examples/jsm/",
+          "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs",
+          "blast-stress-solver": "/vendor/blast-stress-solver/index.js",
+          "blast-stress-solver/rapier": "/vendor/blast-stress-solver/rapier.js",
+          "blast-stress-solver/three": "/vendor/blast-stress-solver/three.js",
+          "blast-stress-solver/scenarios": "/vendor/blast-stress-solver/scenarios.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="viewport">
+        <canvas id="demo-canvas"></canvas>
+        <div class="viewport-hint">Toggle Centrifugal — a few bonds near the middle snap. Raise Bond strength for fewer breaks (live).</div>
+      </section>
+
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
+        <span class="icon-open">&#9776;</span>
+        <span class="icon-close">&#10005;</span>
+      </button>
+      <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+      <aside class="sidebar" id="sidebar">
+        <header>
+          <a href="./demo-index.html" class="back-link">&larr; All Demos</a>
+          <h1>&#127744; Centrifugal Spinner</h1>
+          <p>
+            A free-floating beam spun in zero gravity. With <strong>Centrifugal</strong> off it spins
+            forever, intact. Turn it on and the inward (centripetal) load loads the bonds in
+            compression — strongest at the centre — so at the default settings a few bonds near the
+            middle give way while the ends hang on. Raise <strong>Bond strength</strong> for fewer
+            breaks (it goes fully intact past the threshold), lower it for more, or change the
+            <strong>Spin rate</strong> (stress grows with spin²). Strength and shape apply live.
+          </p>
+        </header>
+
+        <!-- The star of the show (live) -->
+        <section class="config-section">
+          <h2 class="section-title">Centrifugal <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-centrifugal">Centrifugal acceleration &#9733;</label>
+            <input type="checkbox" id="cfg-centrifugal" />
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-spin">Spin rate &#9733;</label>
+            <input type="range" id="cfg-spin" class="config-slider" min="0" max="120" step="1" value="20" />
+            <span class="config-value"><span id="cfg-spin-value">20</span> rad/s</span>
+          </div>
+        </section>
+
+        <!-- Scene shape + strength (rebuild the beam on release) -->
+        <section class="config-section">
+          <h2 class="section-title">Beams &amp; strength <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-beams">Beams</label>
+            <input type="range" id="cfg-beams" class="config-slider" min="1" max="8" step="1" value="1" />
+            <span class="config-value"><span id="cfg-beams-value">1</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-segments">Segments / beam</label>
+            <input type="range" id="cfg-segments" class="config-slider" min="3" max="13" step="1" value="9" />
+            <span class="config-value"><span id="cfg-segments-value">9</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-bond-strength">Bond strength (log)</label>
+            <input type="range" id="cfg-bond-strength" class="config-slider" min="1" max="6" step="0.05" value="3.48" />
+            <span class="config-value"><span id="cfg-bond-strength-value">3000</span></span>
+          </div>
+        </section>
+
+        <!-- Actions -->
+        <div class="control-actions">
+          <button id="btn-reset" class="button button-primary">&orarr; Reset Scene</button>
+          <button id="btn-debug" class="button">&#9671; Show Debug</button>
+        </div>
+
+        <!-- Status -->
+        <section class="status-panel">
+          <h2>Simulation</h2>
+          <div class="status-grid">
+            <div class="status-item"><span class="status-label">Bodies</span><span class="status-value" id="stat-bodies">0</span></div>
+            <div class="status-item"><span class="status-label">Bonds</span><span class="status-value" id="stat-bonds">0</span></div>
+            <div class="status-item"><span class="status-label">Fragments</span><span class="status-value" id="stat-fragments">0</span></div>
+            <div class="status-item"><span class="status-label">Chunks</span><span class="status-value" id="stat-chunks">0</span></div>
+          </div>
+        </section>
+
+        <!-- Performance -->
+        <section class="status-panel">
+          <h2>Performance</h2>
+          <div class="status-grid">
+            <div class="status-item"><span class="status-label">Physics</span><span class="status-value" id="stat-physics-ms">&mdash; ms</span></div>
+            <div class="status-item"><span class="status-label">Render</span><span class="status-value" id="stat-render-ms">&mdash; ms</span></div>
+            <div class="status-item"><span class="status-label">Draw Calls</span><span class="status-value" id="stat-draw-calls">0</span></div>
+            <div class="status-item"><span class="status-label">Triangles</span><span class="status-value" id="stat-triangles">0</span></div>
+          </div>
+        </section>
+
+        <!-- Session recorder docks here (mounted by the demo via recordingOverlay). -->
+        <section class="config-section recorder-section" id="recorder-slot"></section>
+      </aside>
+    </main>
+
+    <script type="module" src="./dist/demo-shell.js"></script>
+    <script type="module" src="./dist/centrifugal-spinner.js"></script>
+  </body>
+</html>

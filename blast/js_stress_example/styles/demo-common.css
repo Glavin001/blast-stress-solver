@@ -353,21 +353,22 @@ body {
 
 .sidebar-toggle {
   position: fixed;
-  top: 0.75rem;
-  right: 0.75rem;
+  top: calc(0.75rem + env(safe-area-inset-top, 0px));
+  right: calc(0.75rem + env(safe-area-inset-right, 0px));
   z-index: 100;
-  width: 32px;
-  height: 32px;
+  width: 38px;
+  height: 38px;
   border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.6);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.62);
   color: #dde5ff;
-  font-size: 1rem;
+  font-size: 1.05rem;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   backdrop-filter: blur(6px);
+  -webkit-tap-highlight-color: transparent;
 }
 
 .sidebar-toggle .icon-close { display: none; }
@@ -390,14 +391,23 @@ body {
     top: 0;
     right: 0;
     bottom: 0;
-    width: 300px;
+    /* Roomy on a phone but never edge-to-edge, so the scene stays peekable. */
+    width: min(92vw, 360px);
     z-index: 90;
     transform: translateX(100%);
     transition: transform 0.25s ease;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    overscroll-behavior: contain;
   }
 
   .sidebar.open {
     transform: translateX(0);
+    box-shadow: -16px 0 40px rgba(0, 0, 0, 0.5);
+  }
+
+  /* Leave room for the floating ☰/✕ button at the top-right of the header. */
+  .sidebar header {
+    padding-right: 3.25rem;
   }
 
   .sidebar-backdrop {
@@ -415,4 +425,26 @@ body {
     opacity: 1;
     pointer-events: auto;
   }
+
+  /* Bigger touch targets for the controls on phones. */
+  .config-section { padding: 0.85rem 1rem; }
+  .config-label { flex-basis: 84px; font-size: 0.78rem; }
+  .config-slider { height: 6px; }
+  .config-slider::-webkit-slider-thumb { width: 18px; height: 18px; }
+  .config-slider::-moz-range-thumb { width: 18px; height: 18px; }
+  .config-select { padding: 7px 8px; font-size: 0.8rem; }
+  .button { padding: 0.6rem 0.5rem; font-size: 0.78rem; }
+  .toggle-row input[type="checkbox"] { width: 18px; height: 18px; }
+
+  /* Keep the FPS meter from colliding with the sidebar toggle. */
+  .viewport-hint { bottom: calc(1rem + env(safe-area-inset-bottom, 0px)); }
+}
+
+/* ── Recorder docked in the sidebar ───────────────────── */
+/* The demos mount the session recorder into a sidebar section (instead of
+   floating it over the viewport). Style the host section so it reads as a
+   normal control group; the recorder's own chrome is neutralised by the
+   library's `.sidebar .bss-rec` rule. */
+.config-section.recorder-section {
+  display: block;
 }

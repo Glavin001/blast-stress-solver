@@ -95,8 +95,8 @@
           </div>
           <div class="config-row">
             <label class="config-label" for="cfg-proj-speed">Speed</label>
-            <input type="range" id="cfg-proj-speed" class="config-slider" min="5" max="60" step="1" value="20" />
-            <span class="config-value"><span id="cfg-proj-speed-value">20</span> m/s</span>
+            <input type="range" id="cfg-proj-speed" class="config-slider" min="5" max="120" step="1" value="36" />
+            <span class="config-value"><span id="cfg-proj-speed-value">36</span> m/s</span>
           </div>
         </section>
 
@@ -115,58 +115,13 @@
           </div>
         </section>
 
-        <!-- Physics -->
+        <!-- Contacts (demo-specific). Shared Physics/Optimization/Features (incl. centrifugal) injected by physics-controls.ts. -->
         <section class="config-section">
-          <h2 class="section-title">Physics <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-debris-collision">Debris Collision &#9733;</label>
-            <select id="cfg-debris-collision" class="config-select">
-              <option value="all" selected>All (full collisions)</option>
-              <option value="noDebrisPairs">No debris pairs</option>
-              <option value="debrisGroundOnly">Debris &harr; ground only</option>
-              <option value="debrisNone">Debris: none</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-friction">Friction</label>
-            <input type="range" id="cfg-friction" class="config-slider" min="0" max="2" step="0.05" value="0.25" />
-            <span class="config-value"><span id="cfg-friction-value">0.25</span></span>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-restitution">Restitution</label>
-            <input type="range" id="cfg-restitution" class="config-slider" min="0" max="1" step="0.05" value="0.00" />
-            <span class="config-value"><span id="cfg-restitution-value">0.00</span></span>
-          </div>
+          <h2 class="section-title">Contacts (Reset to apply)</h2>
           <div class="config-row">
             <label class="config-label" for="cfg-contact-force">Contact Force Scale</label>
             <input type="range" id="cfg-contact-force" class="config-slider" min="1" max="100" step="1" value="30" />
             <span class="config-value"><span id="cfg-contact-force-value">30</span></span>
-          </div>
-        </section>
-
-        <!-- Optimization -->
-        <section class="config-section">
-          <h2 class="section-title">Optimization <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-damping-mode">Small Body Damping &#9733;</label>
-            <select id="cfg-damping-mode" class="config-select">
-              <option value="off">Off</option>
-              <option value="always" selected>Always</option>
-              <option value="afterGroundCollision">After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-cleanup-mode">Debris Cleanup &#9733;</label>
-            <select id="cfg-cleanup-mode" class="config-select">
-              <option value="off">Off</option>
-              <option value="always" selected>Always</option>
-              <option value="afterGroundCollision">After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-debris-ttl">Debris TTL</label>
-            <input type="range" id="cfg-debris-ttl" class="config-slider" min="1000" max="30000" step="500" value="10000" />
-            <span class="config-value"><span id="cfg-debris-ttl-value">10.0s</span></span>
           </div>
         </section>
 
@@ -198,25 +153,12 @@
             <div class="status-item"><span class="status-label">Triangles</span><span class="status-value" id="stat-triangles">0</span></div>
           </div>
         </section>
+        <!-- Session recorder docks here (mounted by the demo via recordingOverlay). -->
+        <section class="config-section recorder-section" id="recorder-slot"></section>
       </aside>
     </main>
 
-    <script>
-      (function () {
-        var toggle = document.getElementById('sidebar-toggle');
-        var sidebar = document.getElementById('sidebar');
-        var backdrop = document.getElementById('sidebar-backdrop');
-        var layout = document.querySelector('.layout');
-        var mql = window.matchMedia('(max-width: 768px)');
-        function isMobile() { return mql.matches; }
-        function close() { toggle.classList.remove('active'); if (isMobile()) { sidebar.classList.remove('open'); backdrop.classList.remove('visible'); } else { layout.classList.add('sidebar-hidden'); } }
-        function open() { toggle.classList.add('active'); if (isMobile()) { sidebar.classList.add('open'); backdrop.classList.add('visible'); } else { layout.classList.remove('sidebar-hidden'); } }
-        function isOpen() { return isMobile() ? sidebar.classList.contains('open') : !layout.classList.contains('sidebar-hidden'); }
-        toggle.addEventListener('click', function () { if (isOpen()) close(); else open(); });
-        backdrop.addEventListener('click', close);
-        if (!isMobile()) toggle.classList.add('active');
-      })();
-    </script>
+    <script type="module" src="./dist/demo-shell.js"></script>
     <script type="module" src="./dist/fractured-bridge.js"></script>
   </body>
 </html>

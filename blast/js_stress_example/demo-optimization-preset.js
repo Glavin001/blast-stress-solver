@@ -22,7 +22,8 @@
 /** @typedef {'off' | 'always' | 'afterGroundCollision'} OptimizationMode */
 
 /**
- * Sleep settings — spread at the top level of buildDestructibleCore options.
+ * Sleep settings — each demo spreads this at the top level of its
+ * buildDestructibleCore options.
  * @type {{ sleepMode: OptimizationMode; sleepLinearThreshold: number; sleepAngularThreshold: number }}
  */
 export const RECOMMENDED_SLEEP = {
@@ -32,9 +33,10 @@ export const RECOMMENDED_SLEEP = {
 };
 
 /**
- * Post-landing damping thresholds — spread into the `smallBodyDamping` object. `mode`
- * is left to each demo (usually wired to its UI dropdown via
- * CONFIG.optimization.smallBodyDampingMode), so only the numeric tuning lives here.
+ * Damping thresholds — spread into the `smallBodyDamping` object by
+ * physicsCoreOverrides() in physics-controls.ts. The damping *mode* stays a UI
+ * dropdown there (shared physicsConfig state, default 'off'), so only the numeric
+ * tuning lives here; it takes effect when the dropdown enables damping.
  * @type {{ colliderCountThreshold: number; minLinearDamping: number; minAngularDamping: number }}
  */
 export const RECOMMENDED_DAMPING = {

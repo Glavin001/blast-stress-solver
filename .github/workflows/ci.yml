@@ -3,12 +3,12 @@ name: CI
 on:
   push:
     branches:
-      - feat/rapier-destruction
+      - main
   pull_request:
 
 # ── Change this to your default/production branch ──────────
 env:
-  PRODUCTION_BRANCH: feat/rapier-destruction
+  PRODUCTION_BRANCH: main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -221,7 +221,7 @@ jobs:
     needs: build
     if: >-
       github.event_name == 'pull_request' ||
-      (github.event_name == 'push' && github.ref != format('refs/heads/{0}', vars.PRODUCTION_BRANCH || 'feat/rapier-destruction'))
+      (github.event_name == 'push' && github.ref != format('refs/heads/{0}', vars.PRODUCTION_BRANCH || 'main'))
     runs-on: ubuntu-latest
     # The "Comment preview URL on PR" step posts via the GITHUB_TOKEN.
     # The repo default is read-only, so grant just enough to comment.
@@ -295,7 +295,7 @@ jobs:
   deploy-production:
     name: Deploy Production
     needs: [build, test, rust-tests]
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', vars.PRODUCTION_BRANCH || 'feat/rapier-destruction')
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', vars.PRODUCTION_BRANCH || 'main')
     runs-on: ubuntu-latest
     environment:
       name: production

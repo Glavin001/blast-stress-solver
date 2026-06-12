@@ -103,6 +103,11 @@ const STYLE_CSS = `
 .bss-rec-stat b{color:#fff;font-weight:600}
 .bss-rec.collapsed .bss-rec-body{display:none}
 @keyframes bss-rec-pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,60,80,.5)}50%{box-shadow:0 0 0 5px rgba(255,60,80,0)}}
+/* Docked inside the settings sidebar (the demos mount it there instead of
+   floating it over the viewport, where it covered the scene on phones). It then
+   flows inline as a normal panel section rather than an absolute overlay. */
+.sidebar .bss-rec{position:static;inset:auto;min-width:0;width:100%;
+  background:transparent;border:none;border-radius:0;padding:0;backdrop-filter:none}
 `;
 
 function ensureStyles(doc: Document) {

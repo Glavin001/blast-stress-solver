@@ -21,7 +21,8 @@ import {
 import { buildFracturedTowerScenario } from 'blast-stress-solver/scenarios';
 import { FRACTURED_TOWER_DEMO_CONFIG as CONFIG } from './fractured-demo-config.js';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
-import { RECOMMENDED_SLEEP, RECOMMENDED_DAMPING } from './demo-optimization-preset.js';
+import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
+import { RECOMMENDED_SLEEP } from './demo-optimization-preset.js';
 import { mountShooter } from './shooter-fps.js';
 
 // ── Config ────────────────────────────────────────────────────
@@ -124,6 +125,7 @@ const profiler = createFrameProfilerOverlay();
 // forces, gravity) and every fracture/topology change into a single gzipped
 // bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
 const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
   exportName: 'fractured-tower-recording',
   getProfilerExport: () => profiler.exportData(),
 });
@@ -131,6 +133,8 @@ let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
+// Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
+let centrifugalEnabled = false;
 
 async function initScene() {
   const { width, floorCount, floorHeight, fragmentCountPerWall, fragmentCountPerFloor, fragmentCountPerColumn, deckMass } = CONFIG.tower;
@@ -163,21 +167,9 @@ async function initScene() {
     scenario,
     gravity: CONFIG.solver.gravity,
     materialScale: CONFIG.solver.materialScale,
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.physics.contactForceScale,
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
-    damage: { enabled: false },
-    debrisCleanup: {
-      mode: CONFIG.optimization.debrisCleanupMode as any,
-      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
-      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
-    },
     ...RECOMMENDED_SLEEP,
-    smallBodyDamping: {
-      mode: CONFIG.optimization.smallBodyDampingMode as any,
-      ...RECOMMENDED_DAMPING,
-    },
+    ...physicsCoreOverrides(),
     ...pipelineCoreOverrides(),
   });
 
@@ -197,6 +189,7 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
 
   coreRef = core;
+  core.setSolverCentrifugalEnabled(physicsConfig.centrifugal);
   recorder.attach(core, { scenario, meta: { demo: 'fractured-tower' } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -217,6 +210,7 @@ document.getElementById('btn-reset')?.addEventListener('click', async () => {
   visualsRef = null;
   await initScene();
 });
+
 
 document.getElementById('btn-debug')?.addEventListener('click', () => {
   showDebug = !showDebug;
@@ -275,16 +269,11 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Physics (live)
-bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) => { coreRef?.setDebrisCollisionMode(v as any); });
-bindSlider('cfg-friction', CONFIG.physics, 'friction', (v) => v.toFixed(2));
-bindSlider('cfg-restitution', CONFIG.physics, 'restitution', (v) => v.toFixed(2));
+// Shared Physics / Optimization / Features controls (debris collision, friction, restitution,
+// damping, cleanup, TTL, centrifugal). Demo keeps its own Show Debug button, so debug is excluded.
+// Demo-specific contact-force stays wired here.
+mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
-
-// Optimization (live)
-bindSelect('cfg-damping-mode', CONFIG.optimization, 'smallBodyDampingMode', (v) => { coreRef?.setSmallBodyDamping?.({ mode: v as any }); });
-bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) => { coreRef?.setDebrisCleanup?.({ mode: v as any, debrisTtlMs: CONFIG.optimization.debrisTtlMs }); });
-bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', (v) => (v / 1000).toFixed(1) + 's');
 
 // ── Render loop ──────────────────────────────────────────────
 

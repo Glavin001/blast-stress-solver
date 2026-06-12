@@ -16,7 +16,8 @@ import {
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
-import { RECOMMENDED_SLEEP, RECOMMENDED_DAMPING } from './demo-optimization-preset.js';
+import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
+import { RECOMMENDED_SLEEP } from './demo-optimization-preset.js';
 import { mountShooter } from './shooter-fps.js';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 
@@ -36,7 +37,7 @@ const CONFIG = {
   projectile: {
     radius: 0.35,
     mass: 1_000,
-    speed: 30,
+    speed: 50,
   },
   solver: {
     gravity: -9.81,
@@ -50,10 +51,10 @@ const CONFIG = {
     skipSingleBodies: false,
   },
   optimization: {
-    // Damp small debris only after it lands ('always' floats falling debris — see
+    // Damping defaults to off; 'afterGroundCollision' would damp small debris only after it lands ('always' floats falling debris — see
     // rapier.smallBodyDamping.fall.test.ts).
-    smallBodyDampingMode: 'afterGroundCollision' as string,
-    debrisCleanupMode: 'always' as string,
+    smallBodyDampingMode: 'off' as string,
+    debrisCleanupMode: 'afterGroundCollision' as string,
     debrisTtlMs: 10000,
     maxCollidersForDebris: 2,
   },
@@ -159,6 +160,7 @@ const profiler = createFrameProfilerOverlay();
 // forces, gravity) and every fracture/topology change into a single gzipped
 // bug-report bundle (⬇ Save). Zero allocation on the hot path while recording.
 const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
   exportName: 'fracture-policy-recording',
   getProfilerExport: () => profiler.exportData(),
 });
@@ -166,6 +168,8 @@ let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
+// Opt-in: feed spinning dynamic actors their centrifugal acceleration (NVIDIA Blast default).
+let centrifugalEnabled = false;
 
 async function initScene() {
   const scenario = buildTowerScenario(CONFIG.tower);
@@ -190,22 +194,10 @@ async function initScene() {
     scenario: modScenario,
     gravity: CONFIG.solver.gravity,
     materialScale: CONFIG.solver.materialScale,
-    friction: CONFIG.physics.friction,
-    restitution: CONFIG.physics.restitution,
     contactForceScale: CONFIG.physics.contactForceScale,
-    debrisCollisionMode: CONFIG.physics.debrisCollisionMode as any,
     skipSingleBodies: CONFIG.physics.skipSingleBodies,
-    damage: { enabled: false },
-    debrisCleanup: {
-      mode: CONFIG.optimization.debrisCleanupMode as any,
-      debrisTtlMs: CONFIG.optimization.debrisTtlMs,
-      maxCollidersForDebris: CONFIG.optimization.maxCollidersForDebris,
-    },
     ...RECOMMENDED_SLEEP,
-    smallBodyDamping: {
-      mode: CONFIG.optimization.smallBodyDampingMode as any,
-      ...RECOMMENDED_DAMPING,
-    },
+    ...physicsCoreOverrides(),
     fracturePolicy: { ...CONFIG.fracturePolicy },
     ...pipelineCoreOverrides(),
   });
@@ -226,6 +218,7 @@ async function initScene() {
   rapierDebug = new RapierDebugRenderer(scene, core.world as any, { enabled: showDebug });
 
   coreRef = core;
+  core.setSolverCentrifugalEnabled(physicsConfig.centrifugal);
   recorder.attach(core, { scenario, meta: { demo: 'fracture-policy', config: CONFIG } });
   profiler.attach(core);
   visualsRef = visuals;
@@ -245,6 +238,7 @@ document.getElementById('btn-reset')?.addEventListener('click', async () => {
   visualsRef = null;
   await initScene();
 });
+
 
 document.getElementById('btn-debug')?.addEventListener('click', () => {
   showDebug = !showDebug;
@@ -361,24 +355,13 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', { fmt: (v) => v.toFixed(1) }
   }
 }
 
-// Physics controls
-bindSelect('cfg-debris-collision', CONFIG.physics, 'debrisCollisionMode', (v) => {
-  coreRef?.setDebrisCollisionMode(v as any);
-});
-bindSlider('cfg-friction', CONFIG.physics, 'friction', { fmt: (v) => v.toFixed(2) });
-bindSlider('cfg-restitution', CONFIG.physics, 'restitution', { fmt: (v) => v.toFixed(2) });
+// Shared Physics / Optimization / Features controls (debris collision, friction, restitution,
+// damping, cleanup, TTL, centrifugal). Demo keeps its own Show Debug button, so debug is excluded.
+// Demo-specific contact-force / skip-single / max-debris-colliders stay here.
+mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', { fmt: (v) => v.toFixed(0) });
 bindCheckbox('cfg-skip-single', CONFIG.physics, 'skipSingleBodies');
-
-// Optimization controls
-bindSelect('cfg-damping-mode', CONFIG.optimization, 'smallBodyDampingMode', (v) => {
-  coreRef?.setSmallBodyDamping?.({ mode: v as any });
-});
-bindSelect('cfg-cleanup-mode', CONFIG.optimization, 'debrisCleanupMode', (v) => {
-  coreRef?.setDebrisCleanup?.({ mode: v as any, debrisTtlMs: CONFIG.optimization.debrisTtlMs });
-});
-bindSlider('cfg-debris-ttl', CONFIG.optimization, 'debrisTtlMs', { fmt: (v) => (v / 1000).toFixed(1) + 's' });
-bindSlider('cfg-max-debris-colliders', CONFIG.optimization, 'maxCollidersForDebris', { fmt: (v) => v.toFixed(0) });
+bindSlider('cfg-max-debris-colliders', physicsConfig, 'maxCollidersForDebris', { fmt: (v) => v.toFixed(0) });
 
 // ── Render loop ───────────────────────────────────────────────
 

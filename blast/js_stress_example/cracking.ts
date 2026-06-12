@@ -14,7 +14,8 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { buildDestructibleCore } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
+import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
 import { createDestructibleThreeBundle } from 'blast-stress-solver/three';
 import { mountShooter } from './shooter-fps.js';
 
@@ -114,6 +115,14 @@ let shooter: ReturnType<typeof mountShooter> | null = null;
 let rebuilding = false;
 let initialBonds = 0;
 
+// Standard session recorder (● Record / ⬇ Save) + live frame profiler.
+const profiler = createFrameProfilerOverlay();
+const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
+  exportName: 'cracking-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
+
 function scaledLimits() {
   const s = CONFIG.strength, o: any = {};
   for (const k of Object.keys(BASE_LIMITS)) o[k] = (BASE_LIMITS as any)[k] * s;
@@ -129,9 +138,8 @@ async function initScene() {
     gravity: -G * CONFIG.loadFactor,
     materialScale: 1,
     solverSettings: { ...scaledLimits(), maxSolverIterationsPerFrame: 100, graphReductionLevel: 0 },
-    friction: 0.4, restitution: 0, contactForceScale: 12,
-    damage: { enabled: false },
-    debrisCleanup: { mode: 'always' as any, debrisTtlMs: 12000, maxCollidersForDebris: 3 },
+    contactForceScale: 12,
+    ...physicsCoreOverrides(),
   });
   // Solve every frame (no idle-skip) so the live Load slider and the stress colors stay current.
   core.setFracturePolicy({ idleSkip: false });
@@ -142,6 +150,8 @@ async function initScene() {
   });
   coreRef = core;
   visualsRef = visuals;
+  recorder.attach(core, { scenario, meta: { demo: 'cracking', config: CONFIG } });
+  profiler.attach(core);
   initialBonds = core.getActiveBondsCount();
 }
 
@@ -172,6 +182,13 @@ bindSlider('cfg-strength', () => CONFIG.strength, (v) => CONFIG.strength = v, (v
 
 const modeSel = document.getElementById('cfg-mode') as HTMLSelectElement | null;
 modeSel?.addEventListener('change', () => { CONFIG.mode = parseInt(modeSel.value, 10) || 0; });
+
+// Shared Physics / Optimization controls (this stress-viz has no debug renderer / spin).
+mountPhysicsControls({
+  getCore: () => coreRef,
+  onRebuild: () => void rebuild(),
+  include: { centrifugal: false, debug: false },
+});
 const cracksOnly = document.getElementById('opt-cracks-only') as HTMLInputElement | null;
 cracksOnly?.addEventListener('change', () => { CONFIG.cracksOnly = !!cracksOnly.checked; });
 document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });
@@ -201,6 +218,8 @@ function updateCracks() {
 const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
+  profiler.render();
+  recorder.render();
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();
   if (coreRef && visualsRef) {
@@ -225,7 +244,7 @@ shooter = mountShooter({
   controls,
   scene,
   getCore: () => coreRef,
-  getBallParams: () => ({ radius: 0.35, mass: 400, speed: 22 }),
+  getBallParams: () => ({ radius: 0.35, mass: 400, speed: 40 }),
 });
 initScene().then(() => loop()).catch((err) => {
   console.error('Failed to initialize cracking demo:', err);
