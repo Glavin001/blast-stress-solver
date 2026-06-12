@@ -115,6 +115,16 @@ export type BuildDestructibleCoreOptions = {
    *  (with `skipSettled: true`); pass `false` or `{ enabled: false }` for the legacy
    *  whole-graph solve. */
   islandSolver?: boolean | { enabled?: boolean; skipSettled?: boolean };
+  /** Deduplicate contact hits per node before splash expansion: a pile fragment struck by
+   *  a dozen contacts in one frame currently re-expands its whole splash neighbourhood a
+   *  dozen times; with this on, the resolved body-local forces are accumulated per hit
+   *  node (in f64, rounded to f32 once) and each node expands exactly once. The per-node
+   *  force TOTALS the solver sees are mathematically identical, but float summation order
+   *  changes, so results are equivalent only to rounding (fracture outcomes on knife-edge
+   *  bonds can differ) — hence opt-in, default false. Where nothing fractures the output
+   *  is bit-identical (the solver feeds back to the physics world only via fracture);
+   *  rapier.contact-dedup.test.ts pins both properties. */
+  dedupeContactHits?: boolean;
   /** Collision-dormant intact buildings. When on, every fragment collider of a still-intact
    *  bond-graph component ("building") starts DISABLED — out of the broadphase entirely — and a
    *  predictive pass enables the leaves of the building's collision-LOD tree just-in-time,
@@ -128,8 +138,7 @@ export type BuildDestructibleCoreOptions = {
    *  shape casts, point projections) until something materializes them — keep this off (or
    *  materialize first) if you hitscan against intact structures. Only meaningful for anchored
    *  scenarios (the LOD AABBs assume fragments sit on the fixed root); ignored when the
-   *  scenario has no supports. Default false. */
-  lazyIntactColliders?: boolean;
+   *  scenario has no supports. Default false. */  lazyIntactColliders?: boolean;
 };
 
 const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV !== 'production' : true;
@@ -236,6 +245,7 @@ export async function buildDestructibleCore({
   debrisCleanup,
   fracturePolicy,
   islandSolver,
+  dedupeContactHits = false,
   lazyIntactColliders = false,
 }: BuildDestructibleCoreOptions): Promise<DestructibleCore> {
   await RAPIER.init();
@@ -991,6 +1001,29 @@ export async function buildDestructibleCore({
   let stashPos = new Float32Array(256 * 3);
   let stashForce = new Float32Array(256 * 3);
   let stashCount = 0;
+
+  // Per-node dedup accumulators (dedupeContactHits). Slots are claimed in first-hit order
+  // (deterministic) and re-validated per pass via an epoch stamp, so nothing is cleared
+  // between frames. Forces accumulate in f64 and round to f32 once at stash time.
+  let dedupEpochByNode = new Int32Array(0);
+  let dedupSlotByNode = new Int32Array(0);
+  let dedupNodeList = new Uint32Array(256);
+  let dedupBodyList = new Float64Array(256);
+  let dedupFx = new Float64Array(256);
+  let dedupFy = new Float64Array(256);
+  let dedupFz = new Float64Array(256);
+  let dedupCount = 0;
+  let contactDedupEpoch = 0;
+
+  function ensureDedupCapacity(slot: number) {
+    if (slot < dedupNodeList.length) return;
+    const n = dedupNodeList.length * 2;
+    const nl = new Uint32Array(n); nl.set(dedupNodeList); dedupNodeList = nl;
+    const bl = new Float64Array(n); bl.set(dedupBodyList); dedupBodyList = bl;
+    const fx = new Float64Array(n); fx.set(dedupFx); dedupFx = fx;
+    const fy = new Float64Array(n); fy.set(dedupFy); dedupFy = fy;
+    const fz = new Float64Array(n); fz.set(dedupFz); dedupFz = fz;
+  }
 
   function pushContactStash(nodeIndex: number, bodyHandle: number, px: number, py: number, pz: number, fx: number, fy: number, fz: number): void {
     const i = stashCount;
@@ -1751,6 +1784,14 @@ export async function buildDestructibleCore({
     // through per-call addForce when the batched WASM export is absent.
     solverForceCount = 0;
     stashCount = 0;
+    // Dedup epoch: one per inject pass, so resim passes dedup within themselves only
+    // (matching the plain path, which also re-resolves per pass).
+    contactDedupEpoch++;
+    dedupCount = 0;
+    if (dedupeContactHits && dedupEpochByNode.length < chunks.length) {
+      dedupEpochByNode = new Int32Array(chunks.length).fill(-1);
+      dedupSlotByNode = new Int32Array(chunks.length);
+    }
 
     // Pass 1 — resolve: per-contact body + rotation round-trip, world→local force
     // rotation, buffer the full-strength hit force, and stash the hit for splash.
@@ -1788,7 +1829,40 @@ export async function buildDestructibleCore({
       // original interleaved loop — float addition isn't associative, so this
       // change is purely about *where the time is attributed*, not the result.
       const hitPos = hitChunk.baseLocalOffset;
-      pushContactStash(contact.nodeIndex, hitChunk.bodyHandle, hitPos.x, hitPos.y, hitPos.z, sfx, sfy, sfz);
+      if (dedupeContactHits) {
+        // Accumulate per hit node (f64): N contacts on one node become ONE stash entry
+        // carrying their summed force, so the splash pass expands the node once. Slot
+        // order = first-hit order (deterministic). Position and body are per-node
+        // constants within the pass (the centroid, and the body it sits on).
+        const ni = contact.nodeIndex;
+        if (dedupEpochByNode[ni] !== contactDedupEpoch) {
+          dedupEpochByNode[ni] = contactDedupEpoch;
+          ensureDedupCapacity(dedupCount);
+          dedupSlotByNode[ni] = dedupCount;
+          dedupNodeList[dedupCount] = ni;
+          dedupBodyList[dedupCount] = hitChunk.bodyHandle;
+          dedupFx[dedupCount] = sfx;
+          dedupFy[dedupCount] = sfy;
+          dedupFz[dedupCount] = sfz;
+          dedupCount++;
+        } else {
+          const slot = dedupSlotByNode[ni];
+          dedupFx[slot] += sfx;
+          dedupFy[slot] += sfy;
+          dedupFz[slot] += sfz;
+        }
+      } else {
+        pushContactStash(contact.nodeIndex, hitChunk.bodyHandle, hitPos.x, hitPos.y, hitPos.z, sfx, sfy, sfz);
+      }
+    }
+    if (dedupeContactHits) {
+      // Emit the deduped hits (f64 sums round to f32 once here, in pushContactStash's
+      // Float32Array write — same single rounding the plain path applies per contact).
+      for (let slot = 0; slot < dedupCount; slot++) {
+        const ni = dedupNodeList[slot];
+        const off = chunks[ni].baseLocalOffset;
+        pushContactStash(ni, dedupBodyList[slot], off.x, off.y, off.z, dedupFx[slot], dedupFy[slot], dedupFz[slot]);
+      }
     }
     stopTiming(resolveT0, 'contactInjectResolveMs');
 
@@ -3431,6 +3505,12 @@ export async function buildDestructibleCore({
   }).__clearDebugSplitContinuityLog = () => {
     splitContinuityLog.length = 0;
   };
+
+  // Test/debug accessor: stash entries produced by the most recent contact-inject pass
+  // (post-dedup when dedupeContactHits is on) — the unit splash expansion scales with.
+  (core as DestructibleCore & {
+    __contactStashCount?: () => number;
+  }).__contactStashCount = () => stashCount;
 
   // Test/debug accessor: surfaces the precomputed static splash adjacency (per node,
   // the same-radius neighbours and their quadratic falloff weights) so the precompute
