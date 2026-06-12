@@ -41,6 +41,19 @@ import {
 } from './contactHelpers';
 import { isBuildingRenderIntact } from './collisionTree';
 
+export type DebrisSettleOptions = {
+  mode?: 'off' | 'freeze';
+  /** Continuous-sleep time before a candidate freezes (wall-clock ms). Default 2000. */
+  settleDelayMs?: number;
+  /** Bodies with at most this many chunks are freeze candidates. Default 3. */
+  maxCollidersForSettle?: number;
+  /** Contact force magnitude that thaws a frozen body back to dynamic. Default 150. */
+  unfreezeImpulse?: number;
+  /** Thaw frozen bodies within this distance of a removed body (their support may have
+   *  vanished — Rapier never wakes fixed bodies on contact LOSS). Default 3. */
+  unfreezeNeighborRadius?: number;
+};
+
 export type BuildDestructibleCoreOptions = {
   scenario: ScenarioDesc;
   nodeSize?: (nodeIndex: number, scenario: ScenarioDesc) => Vec3;
@@ -115,6 +128,18 @@ export type BuildDestructibleCoreOptions = {
    *  (with `skipSettled: true`); pass `false` or `{ enabled: false }` for the legacy
    *  whole-graph solve. */
   islandSolver?: boolean | { enabled?: boolean; skipSettled?: boolean };
+  /** Settled-debris lifecycle. With mode 'freeze', a small debris body (≤
+   *  maxCollidersForSettle chunks) that has been Rapier-asleep continuously for
+   *  settleDelayMs is converted to a FIXED body: it leaves the dynamic solve, the
+   *  per-frame rollback snapshot, and the island/contact graphs entirely — the only
+   *  lever that bends the super-linear rapierStep curve at high debris counts without
+   *  deleting debris. It thaws back to dynamic (and wakes) when a contact force ≥
+   *  unfreezeImpulse lands on it, or when another body is removed within
+   *  unfreezeNeighborRadius of it (its support may have vanished). This is an explicit
+   *  BEHAVIOUR CHANGE (a frozen body ignores sub-threshold nudges and never re-settles
+   *  under slow load shifts), so it is opt-in: default mode 'off' is exactly the
+   *  legacy behaviour, pinned by rapier.debris-settle.test.ts. */
+  debrisSettle?: DebrisSettleOptions;
   /** Collision-dormant intact buildings. When on, every fragment collider of a still-intact
    *  bond-graph component ("building") starts DISABLED — out of the broadphase entirely — and a
    *  predictive pass enables the leaves of the building's collision-LOD tree just-in-time,
@@ -128,8 +153,7 @@ export type BuildDestructibleCoreOptions = {
    *  shape casts, point projections) until something materializes them — keep this off (or
    *  materialize first) if you hitscan against intact structures. Only meaningful for anchored
    *  scenarios (the LOD AABBs assume fragments sit on the fixed root); ignored when the
-   *  scenario has no supports. Default false. */
-  lazyIntactColliders?: boolean;
+   *  scenario has no supports. Default false. */  lazyIntactColliders?: boolean;
 };
 
 const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV !== 'production' : true;
@@ -236,6 +260,7 @@ export async function buildDestructibleCore({
   debrisCleanup,
   fracturePolicy,
   islandSolver,
+  debrisSettle,
   lazyIntactColliders = false,
 }: BuildDestructibleCoreOptions): Promise<DestructibleCore> {
   await RAPIER.init();
@@ -1168,6 +1193,12 @@ export async function buildDestructibleCore({
       // momentum boost) instead of re-resolving the colliders.
       const b1 = getBodyForColliderHandle(world, h1);
       const b2 = getBodyForColliderHandle(world, h2);
+
+      // Thaw frozen debris a strong-enough contact lands on (settled-debris lifecycle).
+      if (frozenDebris.size > 0 && (totalForce ?? 0) >= debrisSettleSettings.unfreezeImpulse) {
+        if (b1 && frozenDebris.has(b1.handle)) pendingUnfreeze.add(b1.handle);
+        if (b2 && frozenDebris.has(b2.handle)) pendingUnfreeze.add(b2.handle);
+      }
 
       // Track ground collisions for optimization modes (damage-independent).
       try {
@@ -2129,17 +2160,119 @@ export async function buildDestructibleCore({
     for (const bh of bodiesToRemove) {
       const body = world.getRigidBody(bh);
       if (body) {
+        // A removed body may have been propping up frozen debris (Rapier never wakes
+        // fixed bodies on contact loss) — thaw anything frozen around it first.
+        const t = body.translation();
+        thawFrozenDebrisNear(t.x, t.y, t.z);
         world.removeRigidBody(body);
       }
       nodesByBodyHandle.delete(bh);
       debrisCreationTimes.delete(bh);
       bodyRestoreProvenance.delete(bh);
+      debrisSleepSince.delete(bh);
+      frozenDebris.delete(bh);
+      pendingUnfreeze.delete(bh);
       // Drop the cached pose so a future body that reuses this handle can't match a stale
       // pose and be wrongly skipped by the chunk-transform readout cache.
       lastBodyXformPose.delete(bh);
     }
     bodiesToRemove.clear();
     stopTiming(t0, 'cleanupDisabledMs');
+  }
+
+  // ── Settled-debris freeze lifecycle (opt-in) ──
+  const debrisSettleSettings = {
+    mode: (debrisSettle?.mode ?? 'off') as 'off' | 'freeze',
+    settleDelayMs: debrisSettle?.settleDelayMs ?? 2000,
+    maxCollidersForSettle: debrisSettle?.maxCollidersForSettle ?? 3,
+    unfreezeImpulse: debrisSettle?.unfreezeImpulse ?? 150,
+    unfreezeNeighborRadius: debrisSettle?.unfreezeNeighborRadius ?? 3,
+  };
+  // First-seen continuous-sleep timestamp per candidate body.
+  const debrisSleepSince = new Map<number, number>();
+  // Frozen bodies + their (immovable) position, for the removed-neighbor thaw check.
+  const frozenDebris = new Map<number, { x: number; y: number; z: number }>();
+  const pendingUnfreeze = new Set<number>();
+
+  function updateDebrisSettle(opts: DebrisSettleOptions) {
+    if (opts.mode != null) debrisSettleSettings.mode = opts.mode;
+    if (typeof opts.settleDelayMs === 'number' && Number.isFinite(opts.settleDelayMs)) {
+      debrisSettleSettings.settleDelayMs = Math.max(0, opts.settleDelayMs);
+    }
+    if (typeof opts.maxCollidersForSettle === 'number' && Number.isFinite(opts.maxCollidersForSettle)) {
+      debrisSettleSettings.maxCollidersForSettle = Math.max(1, Math.floor(opts.maxCollidersForSettle));
+    }
+    if (typeof opts.unfreezeImpulse === 'number' && Number.isFinite(opts.unfreezeImpulse)) {
+      debrisSettleSettings.unfreezeImpulse = Math.max(0, opts.unfreezeImpulse);
+    }
+    if (typeof opts.unfreezeNeighborRadius === 'number' && Number.isFinite(opts.unfreezeNeighborRadius)) {
+      debrisSettleSettings.unfreezeNeighborRadius = Math.max(0, opts.unfreezeNeighborRadius);
+    }
+    if (debrisSettleSettings.mode === 'off') {
+      // Live-disable: thaw everything so the world returns to the legacy state.
+      for (const bh of frozenDebris.keys()) pendingUnfreeze.add(bh);
+      debrisSleepSince.clear();
+    }
+  }
+
+  function thawDebrisBody(bodyHandle: number) {
+    frozenDebris.delete(bodyHandle);
+    const body = world.getRigidBody(bodyHandle);
+    if (!body) return;
+    try {
+      body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+      body.wakeUp();
+    } catch {}
+  }
+
+  // Runs in the pre-step sweep, BEFORE the resim snapshot capture: thaws apply first so a
+  // struck body re-enters this frame's step (and its snapshot) as dynamic, then sleeping
+  // candidates that crossed the delay freeze. Frozen bodies are FIXED: skipped by the
+  // dynamic-body snapshot, the broadphase island solve, and the predictive mover pass.
+  function processDebrisSettle() {
+    if (pendingUnfreeze.size > 0) {
+      for (const bh of pendingUnfreeze) thawDebrisBody(bh);
+      pendingUnfreeze.clear();
+    }
+    if (debrisSettleSettings.mode !== 'freeze') return;
+    const now = Date.now();
+    for (const [bh, nodes] of nodesByBodyHandle) {
+      if (bh === rootBody.handle || frozenDebris.has(bh)) continue;
+      if (nodes.size === 0 || nodes.size > debrisSettleSettings.maxCollidersForSettle) continue;
+      const body = world.getRigidBody(bh);
+      if (!body || body.isFixed()) continue;
+      const asleep = typeof (body as { isSleeping?: () => boolean }).isSleeping === 'function'
+        && (body as { isSleeping: () => boolean }).isSleeping();
+      if (!asleep) {
+        debrisSleepSince.delete(bh);
+        continue;
+      }
+      const since = debrisSleepSince.get(bh);
+      if (since === undefined) {
+        debrisSleepSince.set(bh, now);
+        continue;
+      }
+      if (now - since < debrisSettleSettings.settleDelayMs) continue;
+      try {
+        body.setBodyType(RAPIER.RigidBodyType.Fixed, false);
+        const t = body.translation();
+        frozenDebris.set(bh, { x: t.x, y: t.y, z: t.z });
+      } catch {}
+      debrisSleepSince.delete(bh);
+    }
+  }
+
+  // A removed body may have been supporting frozen debris; Rapier never wakes fixed
+  // bodies on contact LOSS, so thaw anything frozen nearby and let it re-settle.
+  function thawFrozenDebrisNear(x: number, y: number, z: number) {
+    if (frozenDebris.size === 0) return;
+    const r = debrisSettleSettings.unfreezeNeighborRadius;
+    if (r <= 0) return;
+    const r2 = r * r;
+    for (const [bh, p] of frozenDebris) {
+      const dx = p.x - x, dy = p.y - y, dz = p.z - z;
+      if (dx * dx + dy * dy + dz * dz <= r2) pendingUnfreeze.add(bh);
+    }
   }
 
   function processDebrisCleanup() {
@@ -2857,6 +2990,7 @@ export async function buildDestructibleCore({
 
     const preStepT0 = startTiming();
     processDebrisCleanup();
+    processDebrisSettle();
     processSmallBodyDamping();
     processSleepThresholds();
     cleanupDisabledColliders();
@@ -3399,6 +3533,12 @@ export async function buildDestructibleCore({
     getSmallBodyDampingSettings: () => ({ ...smallBodyDampingSettings }),
     hasBodyCollidedWithGround: (bodyHandle: number) => bodiesCollidedWithGround.has(bodyHandle),
     setDebrisCleanup: updateDebrisCleanup,
+    setDebrisSettle: updateDebrisSettle,
+    getDebrisSettleStats: () => ({
+      mode: debrisSettleSettings.mode,
+      frozenCount: frozenDebris.size,
+      sleepTracked: debrisSleepSince.size,
+    }),
     getDebrisCleanupSettings: () => ({ ...debrisCleanupSettings }),
     setMaxCollidersForDebris: (n: number) => {
       debrisCleanupSettings.maxCollidersForDebris = Math.max(1, Math.floor(n));
