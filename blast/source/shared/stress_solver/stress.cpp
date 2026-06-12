@@ -403,6 +403,11 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
     uint32_t skipped = 0;
     const bool trySkip = params.skipSettled && m_skipValid;
 
+    // Per-bond "settled-skipped" flags for this solve (consumed by the caller to skip recomputing
+    // unchanged bond stresses). Cleared here so it reflects only this solve; bonds in re-solved
+    // islands and any bond with no island stay 0.
+    m_bondSkipped.assign(N_bonds, 0);
+
     // ── 5. Per-island: gather a contiguous, island-local sub-system → run the same CGNR/scaling as
     //       solve() → scatter the bond impulses back. An island whose dynamic nodes' velocities are
     //       bit-identical to its last solve and that already converged is skipped (its solve would be
@@ -447,6 +452,8 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
         {
             // Inputs unchanged and already converged → re-solving is a no-op. Keep this island's bond
             // impulses (and hence its stresses) exactly as they are; the baseline already matches.
+            // Flag its bonds so the caller can skip recomputing their (unchanged) stresses too.
+            for (uint32_t t = bBegin; t < bEnd; ++t) m_bondSkipped[m_bondsByIsland[t]] = 1;
             ++skipped;
             continue;
         }

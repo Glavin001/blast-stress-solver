@@ -114,6 +114,15 @@ public:
     uint32_t    getLastIslandsTotal() const { return m_lastIslandsTotal; }
 
     /**
+     * \return true iff the given bond's island was skipped as *settled* in the most recent island-aware
+     * solve — i.e. its node velocities were bit-identical to the previous solve and that solve had
+     * converged, so its impulses (and therefore its bond stresses) were left unchanged. Returns false for
+     * bonds of re-solved islands, bonds with no island, and all bonds after a whole-graph solve. Lets the
+     * caller skip recomputing stresses for unchanged bonds; the index space matches the solve's bond order.
+     */
+    bool        wasBondSettledSkipped(uint32_t bondIndex) const { return bondIndex < m_bondSkipped.size() && m_bondSkipped[bondIndex] != 0; }
+
+    /**
      * \return whether or not the solver uses SIMD.  If the device and OS support SSE, AVX, and FMA instruction sets, SIMD is used. 
      */
     static bool usingSIMD() { return s_use_simd; }
@@ -146,6 +155,7 @@ protected:
     std::vector<uint32_t>   m_bondIsland;       // bond -> island id
     std::vector<uint32_t>   m_islandBondBegin;  // CSR-style start offset per island (size islandCount+1)
     std::vector<uint32_t>   m_bondsByIsland;    // bond indices grouped contiguously by island
+    std::vector<uint8_t>    m_bondSkipped;      // per-bond: 1 if its island was skipped (settled) in the last island-aware solve
     std::vector<uint32_t>   m_rootIsland;       // scratch: node root -> compact island id (used only on rebuild)
     std::vector<uint32_t>   m_cursor;           // scratch: per-island write cursor (used only on rebuild)
 
