@@ -11,6 +11,7 @@
           "three": "/vendor/three/build/three.module.js",
           "three/addons/": "/vendor/three/examples/jsm/",
           "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs",
+          "@dgreenheck/three-pinata": "/vendor/three-pinata/three-pinata.es.js",
           "blast-stress-solver": "/vendor/blast-stress-solver/index.js",
           "blast-stress-solver/rapier": "/vendor/blast-stress-solver/rapier.js",
           "blast-stress-solver/three": "/vendor/blast-stress-solver/three.js",
@@ -37,16 +38,65 @@
           <a href="./demo-index.html" class="back-link">&larr; All Demos</a>
           <h1>&#127970; High-Rise Demolition</h1>
           <p>
-            Mid-rise reinforced-concrete apartment, loaded from the same shared scene-pack
-            JSON the Rust demo uses. Click the building to throw the wrecking ball, then tune
-            the projectile, material strength, gravity and physics below. Destruction is
-            stress-solver driven; the per-chunk <em>Custom damage system</em> is off by default.
+            Reinforced-concrete apartment built live from the <em>Building</em> controls — size
+            it up (floors, footprint, columns) and optionally <em>fracture the walls</em> into
+            Voronoi shards (WASM auto-bonded) instead of boxes. Click the building to throw the
+            wrecking ball, then tune the projectile, material strength, gravity and physics below.
+            Destruction is stress-solver driven; the per-chunk <em>Custom damage system</em> is off
+            by default. (Scene material limits still come from the shared Rust/web scene pack.)
           </p>
         </header>
 
         <div class="control-actions">
           <button id="btn-reset" class="button button-primary">&orarr; Reset / Retry</button>
         </div>
+
+        <!-- Building geometry (Reset to apply) -->
+        <section class="config-section">
+          <h2 class="section-title">Building (Reset to apply)</h2>
+          <div class="config-row">
+            <span class="config-label">Floors</span>
+            <input type="range" class="config-slider" id="cfg-floors" min="2" max="30" step="1" value="9" />
+            <span class="config-value" id="cfg-floors-value">9</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Floor height</span>
+            <input type="range" class="config-slider" id="cfg-floor-height" min="2.4" max="5" step="0.1" value="3.2" />
+            <span class="config-value" id="cfg-floor-height-value">3.2 m</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Width</span>
+            <input type="range" class="config-slider" id="cfg-width" min="8" max="60" step="1" value="18" />
+            <span class="config-value" id="cfg-width-value">18 m</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Depth</span>
+            <input type="range" class="config-slider" id="cfg-depth" min="8" max="60" step="1" value="14" />
+            <span class="config-value" id="cfg-depth-value">14 m</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Columns (X)</span>
+            <input type="range" class="config-slider" id="cfg-columns-x" min="2" max="10" step="1" value="4" />
+            <span class="config-value" id="cfg-columns-x-value">4</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Columns (Z)</span>
+            <input type="range" class="config-slider" id="cfg-columns-z" min="2" max="10" step="1" value="3" />
+            <span class="config-value" id="cfg-columns-z-value">3</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Pillar fractures</span>
+            <input type="range" class="config-slider" id="cfg-pillar-fractures" min="1" max="8" step="1" value="2" />
+            <span class="config-value" id="cfg-pillar-fractures-value">2 shards</span>
+          </div>
+          <label class="toggle-row">
+            <input type="checkbox" id="cfg-fracture-walls" />
+            <span class="toggle-text">
+              Fracture walls (auto-bond)
+              <small>Voronoi-shatter the drywall infill instead of boxes, bonded via the WASM auto-bonder. Heavier to build; rebuilds on toggle.</small>
+            </span>
+          </label>
+        </section>
 
         <!-- Projectile (live at next throw) -->
         <section class="config-section">
@@ -73,8 +123,8 @@
           <h2 class="section-title">Structure (Reset to apply)</h2>
           <div class="config-row">
             <span class="config-label">Strength</span>
-            <input type="range" class="config-slider" id="cfg-strength" min="0.25" max="4" step="0.05" value="1" />
-            <span class="config-value" id="cfg-strength-value">1.00&times;</span>
+            <input type="range" class="config-slider" id="cfg-strength" min="0.25" max="10" step="0.05" value="3" />
+            <span class="config-value" id="cfg-strength-value">3.00&times;</span>
           </div>
           <div class="config-row">
             <span class="config-label">Impact&rarr;stress</span>
@@ -103,78 +153,7 @@
           </div>
         </section>
 
-        <!-- Physics -->
-        <section class="config-section">
-          <h2 class="section-title">Physics <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-centrifugal">Centrifugal (spin self-fracture) &#9733;</label>
-            <input type="checkbox" id="cfg-centrifugal" />
-          </div>
-          <div class="config-row">
-            <span class="config-label">Debris Collision &#9733;</span>
-            <select id="cfg-debris-collision" class="config-select">
-              <option value="all" selected>All (full collisions)</option>
-              <option value="noDebrisPairs">No debris pairs</option>
-              <option value="debrisGroundOnly">Debris &harr; ground only</option>
-              <option value="debrisNone">Debris: none</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Friction</span>
-            <input type="range" class="config-slider" id="cfg-friction" min="0" max="2" step="0.05" value="0.25" />
-            <span class="config-value" id="cfg-friction-value">0.25</span>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Restitution</span>
-            <input type="range" class="config-slider" id="cfg-restitution" min="0" max="1" step="0.05" value="0" />
-            <span class="config-value" id="cfg-restitution-value">0.00</span>
-          </div>
-        </section>
-
-        <!-- Optimization (live) -->
-        <section class="config-section">
-          <h2 class="section-title">Optimization <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <span class="config-label">Small Body Damping &#9733;</span>
-            <select id="cfg-damping-mode" class="config-select">
-              <option value="off" selected>Off</option>
-              <option value="always">Always</option>
-              <option value="afterGroundCollision">After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Debris Cleanup &#9733;</span>
-            <select id="cfg-cleanup-mode" class="config-select">
-              <option value="off">Off</option>
-              <option value="always">Always</option>
-              <option value="afterGroundCollision" selected>After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <span class="config-label">Debris TTL &#9733;</span>
-            <input type="range" class="config-slider" id="cfg-debris-ttl" min="1000" max="30000" step="500" value="10000" />
-            <span class="config-value" id="cfg-debris-ttl-value">10.0s</span>
-          </div>
-        </section>
-
-        <!-- Features -->
-        <section class="config-section">
-          <h2 class="section-title">Features</h2>
-          <label class="toggle-row">
-            <input type="checkbox" id="opt-damage" />
-            <span class="toggle-text">
-              Custom damage system
-              <small>Per-chunk health/splash. Off by default (it can over-soften the frame). Toggling rebuilds the scene.</small>
-            </span>
-          </label>
-          <label class="toggle-row">
-            <input type="checkbox" id="opt-debug" />
-            <span class="toggle-text">
-              Debug wireframe
-              <small>Show Rapier colliders &amp; bond lines</small>
-            </span>
-          </label>
-        </section>
+        <!-- Physics / Optimization / Features sections are injected by physics-controls.ts -->
 
         <!-- Status -->
         <section class="status-panel">

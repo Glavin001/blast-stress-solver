@@ -117,6 +117,16 @@
             <input type="range" id="cfg-seed" class="config-slider" min="1" max="999" step="1" value="7" />
             <span class="config-value"><span id="cfg-seed-value">7</span></span>
           </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-mass-density-min">Mass Density (min)</label>
+            <input type="range" id="cfg-mass-density-min" class="config-slider" min="100" max="3000" step="50" value="600" />
+            <span class="config-value"><span id="cfg-mass-density-min-value">600 kg/m²/fl</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-mass-density-max">Mass Density (max)</label>
+            <input type="range" id="cfg-mass-density-max" class="config-slider" min="100" max="3000" step="50" value="1200" />
+            <span class="config-value"><span id="cfg-mass-density-max-value">1,200 kg/m²/fl</span></span>
+          </div>
         </section>
 
         <!-- Projectile (immediate) -->
@@ -154,66 +164,28 @@
           </div>
         </section>
 
-        <!-- Physics -->
+        <!-- Islands (demo-specific). Shared Physics/Optimization/Features injected by physics-controls.ts. -->
         <section class="config-section">
-          <h2 class="section-title">Physics <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-debris-collision">Debris Collision &#9733;</label>
-            <select id="cfg-debris-collision" class="config-select">
-              <option value="all" selected>All (full collisions)</option>
-              <option value="noDebrisPairs">No debris pairs</option>
-              <option value="debrisGroundOnly">Debris &harr; ground only</option>
-              <option value="debrisNone">Debris: none</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-friction">Friction</label>
-            <input type="range" id="cfg-friction" class="config-slider" min="0" max="2" step="0.05" value="0.25" />
-            <span class="config-value"><span id="cfg-friction-value">0.25</span></span>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-restitution">Restitution</label>
-            <input type="range" id="cfg-restitution" class="config-slider" min="0" max="1" step="0.05" value="0.00" />
-            <span class="config-value"><span id="cfg-restitution-value">0.00</span></span>
-          </div>
-        </section>
-
-        <!-- Optimization -->
-        <section class="config-section">
-          <h2 class="section-title">Optimization <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-damping-mode">Small Body Damping &#9733;</label>
-            <select id="cfg-damping-mode" class="config-select">
-              <option value="off" selected>Off</option>
-              <option value="always">Always</option>
-              <option value="afterGroundCollision">After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-cleanup-mode">Debris Cleanup &#9733;</label>
-            <select id="cfg-cleanup-mode" class="config-select">
-              <option value="off">Off</option>
-              <option value="always">Always</option>
-              <option value="afterGroundCollision" selected>After ground hit</option>
-            </select>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-debris-ttl">Debris TTL &#9733;</label>
-            <input type="range" id="cfg-debris-ttl" class="config-slider" min="1000" max="30000" step="500" value="8000" />
-            <span class="config-value"><span id="cfg-debris-ttl-value">8.0s</span></span>
-          </div>
+          <h2 class="section-title">Islands <small style="font-weight:normal;opacity:.5">&#9733; = live</small></h2>
           <label class="toggle-row"><input type="checkbox" id="cfg-island-solver" checked />
             <span class="toggle-text">Island solver &#9733;
               <small>Solve each disconnected group on its own and skip ones that have settled &mdash; same result, less work.</small></span></label>
           <label class="toggle-row"><input type="checkbox" id="cfg-scoped-resim" />
             <span class="toggle-text">Scoped resim (island-exact)
               <small>On a fracture, skip re-stepping whole settled regions that are disconnected from the break. Output-faithful (sub-mm even on cascades); speedup scales with how much of the city is settled and apart.</small></span></label>
+          <label class="toggle-row"><input type="checkbox" id="cfg-lazy-colliders" checked />
+            <span class="toggle-text">Lazy intact colliders &#9733;
+              <small>Intact buildings keep their per-fragment colliders disabled until a projectile/debris is about to hit them &mdash; huge idle physics win on big cities. Identical while intact &amp; on approach.</small></span></label>
+          <label class="toggle-row"><input type="checkbox" id="cfg-intact-proxies" checked />
+            <span class="toggle-text">Intact building LOD &#9733;
+              <small>Draw a still-intact building as one box once it is far from the camera instead of all its fragments &mdash; cuts the per-frame render cost on a settled city. Reverts to full detail when hit or approached.</small></span></label>
         </section>
 
         <!-- Actions -->
         <div class="control-actions">
           <button id="btn-reset" class="button button-primary">&orarr; Rebuild City</button>
           <button id="btn-debug" class="button">&#9671; Show Debug</button>
+          <button id="btn-lod" class="button">&#9707; Show LOD Tree</button>
         </div>
 
         <!-- Status -->
@@ -227,6 +199,7 @@
             <div class="status-item"><span class="status-label">Chunks</span><span class="status-value" id="stat-chunks">0</span></div>
             <div class="status-item"><span class="status-label">Islands</span><span class="status-value" id="stat-islands">off</span></div>
             <div class="status-item"><span class="status-label">Scoped resim</span><span class="status-value" id="stat-scoped-resim">off</span></div>
+            <div class="status-item"><span class="status-label">Buildings</span><span class="status-value" id="stat-lazy">off</span></div>
           </div>
         </section>
 
@@ -238,6 +211,7 @@
             <div class="status-item"><span class="status-label">Render</span><span class="status-value" id="stat-render-ms">&mdash; ms</span></div>
             <div class="status-item"><span class="status-label">Draw Calls</span><span class="status-value" id="stat-draw-calls">0</span></div>
             <div class="status-item"><span class="status-label">Triangles</span><span class="status-value" id="stat-triangles">0</span></div>
+            <div class="status-item"><span class="status-label">Render LOD</span><span class="status-value" id="stat-proxies">off</span></div>
           </div>
         </section>
         <!-- Session recorder docks here (mounted by the demo via recordingOverlay). -->

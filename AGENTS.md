@@ -144,6 +144,7 @@ release. It requires the repository secret `CARGO_REGISTRY_TOKEN`.
 After running `npm start` at the root:
 
 **Primary demos (high-level API):**
+- **`/blast/js_stress_example/destructible-vehicle.html`** — Loads a GLB model (`assets/buggy.glb`), auto-decomposes it into parts, classifies each into a structural role (frame/wheel/panel/cargo/accessory) and bonds them in a **strength hierarchy** so the payload sheds first while the cage holds; a hard hit/drop shatters it all. Decomposition lives in `glb-vehicle.ts`; the companion CLI `scripts/analyze-glb.mjs` reports/classifies any GLB and emits a hand-editable manifest. See `DESTRUCTIBLE_VEHICLE.md`.
 - **`/blast/js_stress_example/wall-demolition.html`** — Destructible brick wall. Click to shoot projectiles. Config panel for wall geometry, projectile params, material scale (log slider), and **Auto Bonds (experimental)** toggle.
 - **`/blast/js_stress_example/tower-collapse.html`** — Destructible tower. Same config panel pattern. Includes diagonal bonds and small-body damping.
 - **`/blast/js_stress_example/fractured-wall.html`** — Voronoi-fractured wall using `three-pinata`. Irregular fragments with proximity-based bond detection. Config panel for fragment count, projectile params, and material scale.

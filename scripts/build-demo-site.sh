@@ -50,6 +50,13 @@ if [ -d "$DEMO_SRC/styles" ]; then
   cp -r "$DEMO_SRC/styles/." "$OUT/styles/"
 fi
 
+# Static demo assets (e.g. the destructible-vehicle GLB model). Referenced as
+# ./assets/... from the demo pages, which sit at the output root in production.
+if [ -d "$DEMO_SRC/assets" ]; then
+  mkdir -p "$OUT/assets"
+  cp -r "$DEMO_SRC/assets/." "$OUT/assets/"
+fi
+
 # ── Vendor libraries (mirror the aliases from serve-demo.mjs) ─
 NODE_MODULES="$ROOT/node_modules"
 

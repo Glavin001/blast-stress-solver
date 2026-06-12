@@ -16,12 +16,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import { buildDestructibleCore } from 'blast-stress-solver/rapier';
+import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import {
   createDestructibleThreeBundle,
   RapierDebugRenderer,
 } from 'blast-stress-solver/three';
 import { buildSpinningBeamsScenario } from 'blast-stress-solver/scenarios';
+import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
 
 // ── Config ────────────────────────────────────────────────────
 
@@ -113,6 +114,14 @@ let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
 
+// Standard session recorder (● Record / ⬇ Save) + live frame profiler.
+const profiler = createFrameProfilerOverlay();
+const recorder = createRecordingOverlay({
+  mount: document.getElementById('recorder-slot') ?? undefined,
+  exportName: 'centrifugal-spinner-recording',
+  getProfilerExport: () => profiler.exportData(),
+});
+
 async function initScene() {
   const scenario = buildSpinningBeamsScenario({
     beams: CONFIG.beams,
@@ -137,9 +146,9 @@ async function initScene() {
     // bodies awake/undamped so they keep spinning.
     fracturePolicy: { idleSkip: false },
     sleepMode: 'off',
-    smallBodyDamping: { mode: 'off' },
-    debrisCleanup: { mode: 'off' },
-    damage: { enabled: false },
+    // Shared Physics/Optimization controls (debris cleanup is forced 'off' via defaults below —
+    // spinning debris in zero-g should persist).
+    ...physicsCoreOverrides(),
   });
 
   core.setSolverCentrifugalEnabled(CONFIG.centrifugal);
@@ -161,6 +170,8 @@ async function initScene() {
 
   coreRef = core;
   visualsRef = visuals;
+  recorder.attach(core, { scenario, meta: { demo: 'centrifugal-spinner', config: CONFIG } });
+  profiler.attach(core);
 }
 
 /** Drive every live dynamic body at the configured spin about +Y, so beams keep tumbling. */
@@ -224,6 +235,14 @@ function bindCheckbox(id: string, obj: Record<string, any>, key: string, onChang
 
 // Live: toggling centrifugal applies immediately to the running core.
 bindCheckbox('cfg-centrifugal', CONFIG, 'centrifugal', (v) => coreRef?.setSolverCentrifugalEnabled(v));
+
+// Shared Physics / Optimization controls (this demo keeps its own spin + debug toggles).
+mountPhysicsControls({
+  getCore: () => coreRef,
+  onRebuild: () => void rebuild(),
+  include: { centrifugal: false, debug: false, damage: false },
+  defaults: { debrisCleanupMode: 'off' }, // keep spinning debris in zero-g
+});
 // Live: spin rate is read every frame in applySpin().
 bindSlider('cfg-spin', CONFIG, 'spin', (v) => v.toFixed(0));
 // Scene shape + bond strength rebuild the scene on release ('change') so they apply live.
@@ -252,6 +271,8 @@ const clock = new THREE.Clock();
 
 function loop() {
   requestAnimationFrame(loop);
+  profiler.render();
+  recorder.render();
   stats.begin();
   const dt = Math.min(clock.getDelta(), 1 / 30);
   controls.update();
