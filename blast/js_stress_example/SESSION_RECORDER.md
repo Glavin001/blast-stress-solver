@@ -51,6 +51,36 @@ Plain JSON (gzipped). Heavy arrays are little-endian base64:
 In code, `decodeSimRecording(data)` (from `blast-stress-solver/rapier`) rehydrates
 everything into typed arrays with `frame(i)` / `bodyInFrame(i, handle)` helpers.
 
+## Viewing a recording in the browser
+
+A standalone **⏯️ Session Viewer** page imports a `*.sim.json[.gz]` bundle and
+plays it back visually — no physics, no WASM, no re-simulation. It is served with
+the other demos:
+
+```bash
+npm start            # from the repo root, then open the served page
+# → http://localhost:8000/session-viewer.html   (or open it from demo-index)
+```
+
+Drop a recording onto the page (or pick one) and you get:
+
+- a **3D replay** that reconstructs each chunk's world transform every frame from
+  the recorded body trace + the baseline node→body map + the topology event stream.
+  Fragments are coloured **per rigid body**, so a piece that splits off picks up a
+  new colour the moment it `migrate`s to a fresh body — you can *see* the structure
+  come apart. Projectiles / unowned bodies render as red spheres; static supports
+  (mass 0) are slate grey.
+- a **transport bar**: play/pause (`Space`), a scrubber, step (`←`/`→`,
+  `Shift` = ×10), playback speed, and loop. Below the scrubber an **event strip**
+  marks projectile spawns, forces, gravity changes, detaches, destroys and splits
+  along the timeline.
+- a **live readout** of the current frame's scalars (sim time, bodies, active
+  bonds, rigid bodies, projectiles, islands) and — when the recording embedded the
+  full-session timing — that frame's total cost in ms.
+
+Recordings made without scenario geometry still play back via a per-body fallback
+(every recorded body is drawn as a box at its transform).
+
 ## Inspecting a recording
 
 A zero-dependency CLI prints a summary and answers example questions (it flags
