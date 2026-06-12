@@ -69,6 +69,10 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, {
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Cache-Control': 'no-cache',
+      // Cross-origin isolation: enables SharedArrayBuffer for the worker-physics mode
+      // (matches the production headers in vercel.json).
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
     });
     res.end(data);
   } catch {

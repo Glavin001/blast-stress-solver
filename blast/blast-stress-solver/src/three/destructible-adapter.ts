@@ -574,7 +574,7 @@ export function updateBatchedChunkMesh(
      *  identical pose, so the unchanged-pose skip still elides their writes. */
     interpolation?: InterpolatedPoseView;
   },
-) {
+): { writes: number } {
   const updateBVH = options?.updateBVH ?? false;
   const nodeColors = options?.nodeColors;
   const instanceHidden = options?.instanceHidden;
@@ -592,6 +592,7 @@ export function updateBatchedChunkMesh(
 
   const chunks = core.chunks;
   const cache = getBatchedSyncCache(batchedMesh, chunks.length);
+  let writes = 0;
 
   // The active color source changed (material-color toggle flips nodeColors between an array
   // and undefined, damage toggled, or first frame): recolor every visible instance even if it
@@ -617,6 +618,7 @@ export function updateBatchedChunkMesh(
       if (cache.visible[instanceId] !== 0) {
         batchedMesh.setVisibleAt(instanceId, false);
         cache.visible[instanceId] = 0;
+        writes++;
       }
       continue;
     }
@@ -691,6 +693,7 @@ export function updateBatchedChunkMesh(
       cache.qw[instanceId] !== qw;
 
     if (poseChanged) {
+      writes++;
       _position.set(px, py, pz);
       _quaternion.set(qx, qy, qz, qw);
       _matrix.compose(_position, _quaternion, _scale);
@@ -720,6 +723,7 @@ export function updateBatchedChunkMesh(
     }
     if (!colorNeeded) continue;
 
+    writes++;
     if (!Number.isNaN(healthRatio)) {
       // Health-driven tint (matches applyChunkColor's damage branch) — no body read needed.
       _colorTmp.copy(HEALTHY_COLOR).lerp(CRITICAL_COLOR, 1 - healthRatio);
@@ -735,6 +739,7 @@ export function updateBatchedChunkMesh(
       }
     }
   }
+  return { writes };
 }
 
 export { SolverDebugLinesHelper } from './solver-debug-lines';
