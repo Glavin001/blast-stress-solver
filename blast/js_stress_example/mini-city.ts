@@ -80,6 +80,12 @@ const CONFIG = {
     // the broadphase) until a mover is about to hit them, then enable just-in-time. Huge idle win
     // on big cities; identical while intact and on approach. On by default; toggled live.
     lazyIntactColliders: true,
+    // Render LOD: draw a still-intact (un-hit) building as a single proxy box instead of all its
+    // fragment instances once it is far enough from the camera. Collapses the per-frame batched
+    // instance/triangle load on a settled city; reverts to full fragments when hit or approached.
+    intactProxies: true,
+    intactProxyFar: 70, // proxy a building beyond this distance (m) from the camera
+    intactProxyNear: 45, // reveal its real fragments again within this distance (m) — hysteresis
   },
   features: { debug: false, lodTree: false },
 };
@@ -165,6 +171,11 @@ function updateStatus(core: any) {
   setText('stat-islands', isl?.enabled ? `${isl.islandsSkipped}/${isl.islandCount} skipped` : 'off');
   const lz = core.getLazyColliderStats?.();
   setText('stat-lazy', lz?.enabled ? `${lz.dormantCount} dormant / ${lz.explodedCount} hit · ${lz.activeLeafFragments} active` : 'off');
+  const proxies = visualsRef?.intactProxies;
+  setText(
+    'stat-proxies',
+    CONFIG.optimization.intactProxies && proxies ? `${proxies.proxiedCount()} as box` : 'off',
+  );
 }
 function updatePerf() {
   setText('stat-physics-ms', _physicsMs.toFixed(1) + ' ms');
@@ -488,6 +499,11 @@ async function initScene() {
     useBatchedMesh: true,
     batchedMeshOptions: { enableBVH: false, bvhMargin: 5 },
     includeDebugLines: true,
+    intactProxies: {
+      enabled: CONFIG.optimization.intactProxies,
+      farDistance: CONFIG.optimization.intactProxyFar,
+      nearDistance: CONFIG.optimization.intactProxyNear,
+    },
   });
 
   rapierDebug?.dispose();
@@ -745,6 +761,9 @@ bindToggle('cfg-island-solver', CONFIG.optimization, 'islandSolver', (v) =>
 bindToggle('cfg-lazy-colliders', CONFIG.optimization, 'lazyIntactColliders', (v) =>
   coreRef?.setLazyIntactColliders?.(v),
 );
+bindToggle('cfg-intact-proxies', CONFIG.optimization, 'intactProxies', (v) =>
+  visualsRef?.intactProxies?.setEnabled(v),
+);
 
 // Actions
 document.getElementById('btn-meteor')?.addEventListener('click', () => meteorStorm());
@@ -787,7 +806,7 @@ function loop() {
     const t0 = performance.now();
     coreRef.step(dt);
     _physicsMs += (performance.now() - t0 - _physicsMs) * EMA;
-    visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true });
+    visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true, camera });
     rapierDebug?.update();
     lodViz?.update(coreRef);
     updateStatus(coreRef);
