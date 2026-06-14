@@ -35,6 +35,12 @@ export {
 export type { SpinningBeamsOptions } from './spinningBeamsScenario';
 
 export {
+  buildFlywheelScenario,
+  DEFAULT_FLYWHEEL_OPTIONS,
+} from './flywheelScenario';
+export type { FlywheelOptions, FlywheelScenario } from './flywheelScenario';
+
+export {
   buildHouseScenario,
   buildHouseScenarioAsync,
   DEFAULT_HOUSE_OPTIONS,
