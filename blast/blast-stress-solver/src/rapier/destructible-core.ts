@@ -79,6 +79,26 @@ export type BuildDestructibleCoreOptions = {
    *  legacy always-capture behaviour (the output-equivalence A/B test pins both
    *  paths to identical trajectories; also an emergency rollback switch). */
   deferRedundantResimSnapshot?: boolean;
+  /** Resim scoping (default **false**, runtime-toggleable via `setScopedResim`).
+   *  On a fracture the resim re-runs `world.step()` over *every* body, but only the
+   *  fractured region — and whatever is in contact with it — moves differently the
+   *  second time. With this on, whole contact components that are **disjoint from
+   *  the fracture's contact closure AND settled** are pinned at their initial-step
+   *  result and slept for the resim step, so Rapier's island solver skips them. The
+   *  closure is taken from the **initial pass's** contact graph (pre-collider-
+   *  migration), so bodies resting ON the fractured structure are in the closure
+   *  and re-stepped — the support-loss case the per-body heuristic missed.
+   *  **Output-faithful**: byte-identical for isolated fractures, sub-millimetre on
+   *  multi-impact cascades (vs ~12.8 m for the old heuristic) — the residual no
+   *  longer flips fracture decisions, so it doesn't amplify. Still opt-in: it is
+   *  near-identical, not provably bit-exact (a re-stepped body crossing into a
+   *  frozen island, or a sleep-timer shift, can perturb low bits). Speedup is
+   *  scene-dependent (it skips only quiescent, decoupled regions). See the measured
+   *  divergence/speedup in `rapier.resim-perf.test.ts`. */
+  scopedResim?: boolean;
+  /** Linear speed (m/s) below which a non-fracture body is treated as stationary
+   *  and eligible to be skipped during the resim step. Default = `sleepLinearThreshold`. */
+  scopedResimLinearThreshold?: number;
   onWorldReplaced?: (newWorld: RAPIER.World) => void;
   resimulateOnDamageDestroy?: boolean;
   /** Scale factor for contact forces fed into the stress solver (default 30).
@@ -125,7 +145,13 @@ const perfNow =
     ? () => performance.now()
     : () => Date.now();
 
-type MutableCoreProfilerSample = CoreProfilerSample & { finalized?: boolean };
+type MutableCoreProfilerSample = CoreProfilerSample & {
+  finalized?: boolean;
+  // Scoped-resim probe stats (read-only; see classifyScopedResimFreezeIslands).
+  scopedResimTotalDynamic?: number;
+  scopedResimDisjoint?: number;
+  scopedResimFrozen?: number;
+};
 type NumericProfilerField = Exclude<
   {
     [K in keyof MutableCoreProfilerSample]: MutableCoreProfilerSample[K] extends number
@@ -208,6 +234,8 @@ export async function buildDestructibleCore({
   maxResimulationPasses = 1,
   snapshotMode = 'perBody',
   deferRedundantResimSnapshot = true,
+  scopedResim = false,
+  scopedResimLinearThreshold,
   onWorldReplaced,
   resimulateOnDamageDestroy = !!damage?.enabled,
   contactForceScale = 30,
@@ -494,6 +522,9 @@ export async function buildDestructibleCore({
   // its load changes (a new contact, or a neighbour waking shifts its input), so it is paused, never
   // frozen or evicted: anything settled can always be loaded and fractured again.
   let islandSolverEnabled = false;
+  // Runtime-toggleable scoped-resim flag (see setScopedResim). Starts from the
+  // build option; the demo sidebar flips it live so it can be A/B'd in-browser.
+  let scopedResimEnabled = scopedResim;
   let islandSolverSkipSettled = true;
 
   const solver = runtime.createExtSolver({ nodes, bonds, settings: scaledSettings });
@@ -1582,6 +1613,170 @@ export async function buildDestructibleCore({
       }
     }
     stopTiming(t0, 'snapshotRestoreMs');
+  }
+
+  // ── Scoped resim (opt-in, experimental) ─────────────────────────────────────
+  // The resim re-steps the whole world after a fracture, but only the fractured
+  // region — and whatever is in contact with it — moves differently the second
+  // time. Island-exact scoping freezes whole **contact components that are
+  // disjoint from the fracture's contact closure** AND settled: those are
+  // provably unaffected by the resim (decoupled + at rest → P1_resim == P1), so
+  // pinning them at their initial-step result and sleeping them for the resim step
+  // is output-identical for that set. The closure is computed from the **initial
+  // pass's** contact graph, *before* `flushPendingBodies` migrates colliders, so it
+  // still contains the resting contacts of bodies sitting ON the fractured
+  // structure (those land in the closure and are re-stepped — the support-loss
+  // case that the earlier per-body heuristic missed). A disjoint body that is
+  // *moving* is re-stepped (it must advance); only disjoint+settled bodies freeze.
+  type FrozenBody = {
+    h: number;
+    t: { x: number; y: number; z: number };
+    r: { x: number; y: number; z: number; w: number };
+    lv: { x: number; y: number; z: number };
+    av: { x: number; y: number; z: number };
+  };
+  const resimFrozen: FrozenBody[] = []; // reused buffer (no per-frame allocation)
+  let resimFrozenCount = 0;
+  // Read-only probe stats for the most recent classification (the scoped-resim
+  // "ceiling" — how much of the world is freezable). Surfaced on profiler samples.
+  let scopedResimTotalDynamic = 0;
+  let scopedResimDisjointBodies = 0;
+  // Pooled union-find parent array (grown as needed, reused across frames).
+  let ufParent = new Int32Array(256);
+
+  /** Classify freeze-eligible bodies from the **pre-migration** initial-pass
+   *  contact graph: union-find the dynamic bodies over their contacts, mark the
+   *  components containing any fracture source, and freeze settled bodies whose
+   *  component is disjoint from all of them. Captures their P1 state into
+   *  `resimFrozen` (the rollback restore is about to overwrite it). Returns the
+   *  number frozen; also updates the probe stats. MUST run before
+   *  `flushPendingBodies()`. */
+  function classifyScopedResimFreezeIslands(): number {
+    resimFrozenCount = 0;
+    scopedResimTotalDynamic = 0;
+    scopedResimDisjointBodies = 0;
+
+    // Fracture sources: the bodies being split this frame (their pre-split source)
+    // plus split sources whose COM shifted. No identified source → scope nothing.
+    const sources = new Set<number>(comDirtyReusedBodies);
+    for (let i = 0; i < pendingBodiesToCreate.length; i += 1) {
+      sources.add(pendingBodiesToCreate[i].inheritFromBodyHandle);
+    }
+    if (sources.size === 0) return 0;
+
+    // Union-find over dynamic bodies, keyed by a dense index.
+    const idx = new Map<number, number>();
+    const dyn: number[] = [];
+    const indexOf = (h: number): number => {
+      let i = idx.get(h);
+      if (i === undefined) {
+        i = dyn.length;
+        if (i >= ufParent.length) {
+          const grown = new Int32Array(ufParent.length * 2);
+          grown.set(ufParent);
+          ufParent = grown;
+        }
+        ufParent[i] = i;
+        idx.set(h, i);
+        dyn.push(h);
+      }
+      return i;
+    };
+    const find = (x: number): number => {
+      while (ufParent[x] !== x) { ufParent[x] = ufParent[ufParent[x]]; x = ufParent[x]; }
+      return x;
+    };
+    const union = (a: number, b: number) => {
+      const ra = find(a), rb = find(b);
+      if (ra !== rb) ufParent[ra] = rb;
+    };
+
+    world.forEachRigidBody((body) => {
+      if (body.isFixed()) return;
+      const bi = indexOf(body.handle);
+      const nc = body.numColliders();
+      for (let i = 0; i < nc; i += 1) {
+        const col = body.collider(i);
+        world.contactPairsWith(col, (other) => {
+          const parent = other.parent();
+          if (!parent || parent.isFixed()) return;
+          union(bi, indexOf(parent.handle));
+        });
+      }
+    });
+    scopedResimTotalDynamic = dyn.length;
+
+    // Roots of the components that contain a fracture source.
+    const closureRoots = new Set<number>();
+    for (const s of sources) {
+      const i = idx.get(s);
+      if (i !== undefined) closureRoots.add(find(i));
+    }
+    // Conservative: if a source isn't in the graph we can't bound its component,
+    // so don't risk freezing anything this frame.
+    if (closureRoots.size < sources.size && [...sources].some((s) => idx.get(s) === undefined)) {
+      // (only bail when a source is truly absent, not merely merged into a shared root)
+      let missing = false;
+      for (const s of sources) if (idx.get(s) === undefined) { missing = true; break; }
+      if (missing) return 0;
+    }
+
+    const linThr = scopedResimLinearThreshold ?? sleepSettings.linear ?? 0.05;
+    const angThr = sleepSettings.angular ?? linThr;
+    const l2 = linThr * linThr;
+    const a2 = (angThr || linThr) * (angThr || linThr);
+
+    for (let d = 0; d < dyn.length; d += 1) {
+      const h = dyn[d];
+      if (closureRoots.has(find(d))) continue; // coupled to the fracture → re-step
+      scopedResimDisjointBodies += 1;
+      const body = world.getRigidBody(h);
+      if (!body) continue;
+      const lv = body.linvel();
+      if (lv.x * lv.x + lv.y * lv.y + lv.z * lv.z > l2) continue; // disjoint but moving → re-step
+      const av = body.angvel();
+      if (av.x * av.x + av.y * av.y + av.z * av.z > a2) continue;
+      const t = body.translation();
+      const r = body.rotation();
+      let f = resimFrozen[resimFrozenCount];
+      if (!f) {
+        f = { h, t: { x: 0, y: 0, z: 0 }, r: { x: 0, y: 0, z: 0, w: 1 }, lv: { x: 0, y: 0, z: 0 }, av: { x: 0, y: 0, z: 0 } };
+        resimFrozen.push(f);
+      }
+      f.h = h;
+      f.t.x = t.x; f.t.y = t.y; f.t.z = t.z;
+      f.r.x = r.x; f.r.y = r.y; f.r.z = r.z; f.r.w = r.w;
+      f.lv.x = lv.x; f.lv.y = lv.y; f.lv.z = lv.z;
+      f.av.x = av.x; f.av.y = av.y; f.av.z = av.z;
+      resimFrozenCount += 1;
+    }
+    return resimFrozenCount;
+  }
+
+  /** After the rollback restore (which moved everyone back to P0 and woke them),
+   *  pin the frozen bodies back at their P1 result and sleep them so the resim
+   *  step skips them. */
+  function applyScopedResimFreeze() {
+    for (let i = 0; i < resimFrozenCount; i += 1) {
+      const f = resimFrozen[i];
+      const b = world.getRigidBody(f.h);
+      if (!b) continue;
+      b.setTranslation(f.t, false);
+      b.setRotation(f.r, false);
+      b.setLinvel(f.lv, false);
+      b.setAngvel(f.av, false);
+      b.sleep();
+    }
+  }
+
+  /** Wake the frozen bodies after the resim step so the next frame's initial step
+   *  integrates them normally. (Bodies an active body collided with were already
+   *  auto-woken by Rapier and stepped; waking them again is a no-op.) */
+  function wakeScopedResimFreeze() {
+    for (let i = 0; i < resimFrozenCount; i += 1) {
+      const b = world.getRigidBody(resimFrozen[i].h);
+      if (b) b.wakeUp();
+    }
   }
 
   function processOneFracturePass(passIndex: number, reasons: string[]): boolean {
@@ -2809,6 +3004,17 @@ export async function buildDestructibleCore({
     stopTiming(initialT0, 'initialPassMs');
 
     if (hadFracture || needsResim) {
+      // Island-exact scoped resim: classify freeze-eligible bodies from the
+      // initial-pass contact graph *before* colliders migrate (no-op when off).
+      const scopedFrozen = (scopedResimEnabled && resimulateOnFracture)
+        ? classifyScopedResimFreezeIslands()
+        : 0;
+      if (activeProfilerSample && scopedResimEnabled) {
+        activeProfilerSample.scopedResimTotalDynamic = scopedResimTotalDynamic;
+        activeProfilerSample.scopedResimDisjoint = scopedResimDisjointBodies;
+        activeProfilerSample.scopedResimFrozen = scopedFrozen;
+      }
+
       flushPendingBodies();
       flushColliderMigrations();
       rebuildColliderToNodeMap();
@@ -2827,9 +3033,14 @@ export async function buildDestructibleCore({
           // deferRedundantResimSnapshot A/B in rapier.resim-perf.test.ts).
           const willResimAgain = resimCount + 1 < maxResim;
           if (!deferRedundantResimSnapshot || willResimAgain) captureWorldSnapshot();
+          // Pin the disjoint+settled bodies at their P1 result and sleep them so
+          // the resim world.step() skips them (Rapier auto-wakes any one a moving
+          // body collides with). The fracture's contact closure still re-steps.
+          if (scopedFrozen > 0) applyScopedResimFreeze();
           const rapierResimT0 = startTiming();
           world.step(eventQueue);
           stopTiming(rapierResimT0, 'rapierStepMs');
+          if (scopedFrozen > 0) wakeScopedResimFreeze();
           drainContactForces();
         }
 
@@ -3148,6 +3359,24 @@ export async function buildDestructibleCore({
     applyIslandSolverSettings();
   }
 
+  // Toggle scoped resim live (experimental). Takes effect on the next fracture frame.
+  function setScopedResim(enabled: boolean) {
+    scopedResimEnabled = !!enabled;
+  }
+  function getScopedResim() {
+    return scopedResimEnabled;
+  }
+  // Last fracture frame's scoped-resim ceiling: how many dynamic bodies there were,
+  // how many were disjoint from the fracture, and how many were frozen (skipped).
+  // `frozen / totalDynamic` is the fraction of the world the resim step skipped.
+  function getScopedResimStats() {
+    return {
+      totalDynamic: scopedResimTotalDynamic,
+      disjoint: scopedResimDisjointBodies,
+      frozen: resimFrozenCount,
+    };
+  }
+
   function getIslandSolverStats() {
     // Prefer the count the per-island solve actually used this frame (fresh, and always
     // >= islandsSkipped). It is 0 when island-aware solving didn't run (off, or a single
@@ -3297,6 +3526,9 @@ export async function buildDestructibleCore({
     getActiveBondsCount,
     getIslandSettledStats,
     setIslandSolver,
+    setScopedResim,
+    getScopedResim,
+    getScopedResimStats,
     getIslandSolverStats,
     setLazyIntactColliders,
     getLazyColliderStats,

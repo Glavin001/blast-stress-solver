@@ -76,6 +76,10 @@ const CONFIG = {
     // Island-aware solve: solve each disconnected group independently and skip groups that have
     // settled (no input change + already converged). On by default; toggled live in the sidebar.
     islandSolver: true,
+    // Scoped resim (island-exact): on a fracture, skip re-stepping whole settled contact
+    // components disjoint from the break. Output-faithful (sub-mm even on cascades); speedup
+    // scales with how much of the city is settled and spatially apart. Off by default; toggle live.
+    scopedResim: false,
     // Lazy intact colliders: intact buildings keep their per-fragment colliders disabled (out of
     // the broadphase) until a mover is about to hit them, then enable just-in-time. Huge idle win
     // on big cities; identical while intact and on approach. On by default; toggled live.
@@ -169,6 +173,10 @@ function updateStatus(core: any) {
   setText('stat-fragments', String(core.chunks.length));
   const isl = core.getIslandSolverStats?.();
   setText('stat-islands', isl?.enabled ? `${isl.islandsSkipped}/${isl.islandCount} skipped` : 'off');
+  const sr = core.getScopedResim?.() ? core.getScopedResimStats?.() : null;
+  setText('stat-scoped-resim', sr && sr.totalDynamic
+    ? `${sr.frozen}/${sr.totalDynamic} frozen (${Math.round((100 * sr.frozen) / sr.totalDynamic)}%)`
+    : 'off');
   const lz = core.getLazyColliderStats?.();
   setText('stat-lazy', lz?.enabled ? `${lz.dormantCount} dormant / ${lz.explodedCount} hit · ${lz.activeLeafFragments} active` : 'off');
   const proxies = visualsRef?.intactProxies;
@@ -518,6 +526,7 @@ async function initScene() {
 
   coreRef = core;
   core.setIslandSolver?.({ enabled: CONFIG.optimization.islandSolver }); // persist the toggle across rebuilds
+  core.setScopedResim?.(CONFIG.optimization.scopedResim); // persist the experimental toggle across rebuilds
   core.setLazyIntactColliders?.(CONFIG.optimization.lazyIntactColliders);
   recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
   profiler.attach(core);
@@ -757,6 +766,9 @@ mountPhysicsControls({
 });
 bindToggle('cfg-island-solver', CONFIG.optimization, 'islandSolver', (v) =>
   coreRef?.setIslandSolver?.({ enabled: v }),
+);
+bindToggle('cfg-scoped-resim', CONFIG.optimization, 'scopedResim', (v) =>
+  coreRef?.setScopedResim?.(v),
 );
 bindToggle('cfg-lazy-colliders', CONFIG.optimization, 'lazyIntactColliders', (v) =>
   coreRef?.setLazyIntactColliders?.(v),

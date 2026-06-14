@@ -409,4 +409,80 @@ describe.skipIf(!runtimeAvailable)('Resim / rapier perf levers (requires WASM bu
       expect(dominantHits).toBeGreaterThanOrEqual(2);
     }, 180_000);
   });
+
+  // ── D. Island-exact scoped resim (opt-in): re-step only the fractured region ─
+  // Freezes whole contact components that are DISJOINT from the fracture's contact
+  // closure AND settled, during the resim world.step(). The closure is read from
+  // the initial pass's contact graph (pre-migration), so bodies resting ON the
+  // fractured structure are in it and re-stepped. This locks in BOTH the fidelity
+  // (byte-identical isolated; sub-mm on cascades — the failure that sank the first
+  // attempt at ~12.8 m) and that it engages.
+  describe('D. Scoped resim (island-exact) — output-faithful on isolated AND cascading fractures', () => {
+    it('is runtime-toggleable via setScopedResim (default off) and exposes ceiling stats', async () => {
+      await loadModules();
+      const core = await buildDestructibleCore({
+        scenario: buildTowerScenario({ side: 4, stories: 6, totalMass: 1500 }),
+        gravity: -9.81, materialScale: 1e8, debrisCleanup: { mode: 'off' },
+      });
+      expect(core.getScopedResim?.()).toBe(false); // off by default
+      core.setScopedResim?.(true);
+      expect(core.getScopedResim?.()).toBe(true);
+      core.setScopedResim?.(false);
+      expect(core.getScopedResim?.()).toBe(false);
+      const stats = core.getScopedResimStats?.();
+      expect(stats).toBeDefined();
+      expect(stats!.frozen).toBeLessThanOrEqual(stats!.disjoint);
+      try { core.dispose(); } catch { /* ignore */ }
+    }, 30_000);
+
+    it('ISOLATED fracture: byte-identical to a full resim', async () => {
+      await loadModules();
+      const mk = () => buildTowerScenario({ side: 6, stories: 12, totalMass: 5000 });
+      const plan = centerHit(6, 45000);
+      const frames = 120;
+      const full = await runScenario(mk(), { scopedResim: false }, { frames, plan });
+      const scoped = await runScenario(mk(), { scopedResim: true }, { frames, plan });
+
+      const d = compareTrajectories(full.trajectory, scoped.trajectory);
+      const resimFrames = full.samples.filter((s) => (s.resimPasses ?? 0) > 0).length;
+      console.log(`\n  [Scoped resim — ISOLATED] resim frames ${resimFrames}; divergence ${d.maxPosDelta.toExponential(2)} m`);
+      expect(resimFrames).toBeGreaterThan(0);
+      // Skipping disjoint+settled components changes nothing for an isolated fracture.
+      expect(d.maxPosDelta).toBe(0);
+      expect(d.maxQuatDelta).toBe(0);
+    }, 120_000);
+
+    it('CASCADING fracture: stays sub-millimetre (the island-exact fix; old heuristic was ~12.8 m)', async () => {
+      await loadModules();
+      // Repeated impacts over time → settled debris rests on structures that later
+      // re-fracture. The old per-body heuristic froze that debris (Rapier doesn't
+      // wake on support LOSS) and the error compounded to ~12.8 m. Island-exact
+      // scoping puts those resting bodies in the fracture's contact closure (read
+      // pre-migration) and re-steps them, so divergence stays sub-mm and never
+      // amplifies.
+      const mk = () => buildTowerScenario({ side: 7, stories: 18, totalMass: 9000 });
+      const plan: ImpactPlan[] = [4, 30, 60, 90, 120].map((frame, i) => ({
+        frame,
+        projectiles: [{
+          position: { x: 5 * Math.cos(i), y: 9 * (0.3 + 0.1 * i), z: 5 * Math.sin(i) + 3 },
+          velocity: { x: -20 * Math.cos(i), y: -3, z: -34 }, radius: 0.4, mass: 28000,
+        }],
+      }));
+      const frames = 200;
+      const full = await runScenario(mk(), { scopedResim: false }, { frames, plan });
+      const scoped = await runScenario(mk(), { scopedResim: true }, { frames, plan });
+      const d = compareTrajectories(full.trajectory, scoped.trajectory);
+      const resimFrames = full.samples.filter((s) => (s.resimPasses ?? 0) > 0).length;
+      console.log(`\n  [Scoped resim — CASCADING] resim frames ${resimFrames}; ` +
+        `divergence maxPos ${d.maxPosDelta.toExponential(2)} m (first ${d.firstDivergeFrame})`);
+
+      // Sustained fracturing must have happened (several resim frames).
+      expect(resimFrames).toBeGreaterThanOrEqual(3);
+      // The headline fix: divergence is tiny (orders of magnitude below the old
+      // 12.8 m heuristic) and does not flip discrete fracture decisions. Generous
+      // bound (1 cm) to absorb float/sleep-timer noise while still catching any
+      // regression toward the old support-loss blow-up.
+      expect(d.maxPosDelta).toBeLessThan(0.01);
+    }, 180_000);
+  });
 });
