@@ -24,6 +24,7 @@ import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverl
 import { createDestructibleThreeBundle, RapierDebugRenderer, setPinataModule } from 'blast-stress-solver/three';
 import { buildBrickCastleScenario, type BrickCastleOptions, type CastleStructureKind } from 'blast-stress-solver/scenarios';
 import { mountShooter } from './shooter-fps.js';
+import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
 
 // Pre-register three-pinata so the synchronous Voronoi fracturer resolves under
 // browser ESM (bare-specifier dynamic imports don't resolve there).
@@ -202,12 +203,13 @@ async function initScene() {
     scenario,
     gravity: CONFIG.gravity,
     materialScale: Math.pow(10, CONFIG.materialExp),
-    // Avoid the overlapping-chunk explosion when many fragments detach at once
-    // (debris bounces off the castle + ground, not off other debris).
-    debrisCollisionMode: 'noDebrisPairs',
-    friction: 0.7,
-    restitution: 0.0,
     contactForceScale: 20,
+    // Shared Physics/Optimization controls (debris collision, friction, restitution,
+    // damping, cleanup). Defaults to full 'all' collision like the other demos — the
+    // geometry fixes + per-frame fracture budget keep it stable here (verified by the
+    // soak). The live "Debris Collision" selector lets you switch to the lighter modes
+    // if you ever see overlapping debris pop apart.
+    ...physicsCoreOverrides(),
     // Scalability: only materialize colliders for the struck region.
     lazyIntactColliders: CONFIG.lazy,
     // Let settled bodies sleep so the idle castle costs almost nothing.
@@ -418,6 +420,17 @@ bindCheckbox('cfg-lazy', () => CONFIG.lazy, (v) => { CONFIG.lazy = v; coreRef?.s
 bindCheckbox('cfg-island', () => CONFIG.island, (v) => { CONFIG.island = v; coreRef?.setIslandSolver({ enabled: v, skipSettled: true }); });
 bindCheckbox('cfg-sleep', () => CONFIG.sleep, (v) => { CONFIG.sleep = v; coreRef?.setSleepMode(v ? 'always' : 'off'); });
 bindSlider('cfg-gravity', CONFIG, 'gravity', (v) => v.toFixed(1) + ' m/s²', (v) => coreRef?.setGravity(v));
+
+// Shared Physics / Optimization controls (self-injected): live Debris Collision
+// selector (All / No-debris-pairs / Ground-only / None), friction, restitution,
+// small-body damping, debris cleanup. Castle-specific safe defaults below; the
+// castle owns its own Debug + scalability toggles, so those are excluded here.
+mountPhysicsControls({
+  getCore: () => coreRef,
+  onRebuild: () => void rebuild(),
+  include: { centrifugal: false, damage: false, debug: false },
+  defaults: { friction: 0.7, restitution: 0 }, // debris collision stays 'all' (full), like the other demos
+});
 
 // Actions.
 document.getElementById('btn-reset')?.addEventListener('click', () => { void rebuild(); });
