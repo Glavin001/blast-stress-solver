@@ -41,6 +41,7 @@
     "high-rise.ts",
     "house.ts",
     "centrifugal-spinner.ts",
+    "keystone-arch.ts",
     "cracking.ts",
     "mini-city.ts",
     "rapier-debug-renderer.js",

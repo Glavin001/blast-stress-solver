@@ -34,6 +34,9 @@ export {
 } from './spinningBeamsScenario';
 export type { SpinningBeamsOptions } from './spinningBeamsScenario';
 
+export { buildArchScenario, DEFAULT_ARCH_OPTIONS } from './archScenario';
+export type { ArchScenarioOptions, ArchScenarioResult } from './archScenario';
+
 export {
   buildHouseScenario,
   buildHouseScenarioAsync,
