@@ -21,6 +21,16 @@ export type BuildingRenderState = {
   aabbMin: { x: number; y: number; z: number };
   aabbMax: { x: number; y: number; z: number };
   fragments: number[];
+  /**
+   * Optional per-element AABBs (the building's LOD leaves: wall / column / slab / roof). When
+   * present the proxy draws one cheap box per part — a faithful blocky silhouette (pillars, slabs,
+   * roof read correctly) — instead of one building-sized box. Omit (or empty) to fall back to a
+   * single box around the whole building.
+   */
+  parts?: Array<{
+    aabbMin: { x: number; y: number; z: number };
+    aabbMax: { x: number; y: number; z: number };
+  }>;
 };
 
 export type IntactBuildingProxyOptions = {
@@ -94,19 +104,16 @@ export function createIntactBuildingProxies(
     options.material ??
     new THREE.MeshStandardMaterial({ color: 0xbababa, roughness: 0.5, metalness: 0.1 });
   const geometry = new THREE.BoxGeometry(1, 1, 1);
-  const mesh = new THREE.InstancedMesh(geometry, material, Math.max(1, count));
-  mesh.castShadow = options.castShadow ?? true;
-  mesh.receiveShadow = options.receiveShadow ?? true;
-  // Instances are scattered across the whole city; cull per-building via proxy state, not the
-  // mesh's (huge, would-be-stale) bounding sphere.
-  mesh.frustumCulled = false;
-  mesh.count = count;
 
-  // Per-building, precomputed once: the box transform (AABB is stable while intact), the world
-  // center (for distance tests), and the fragment instance ids the proxy replaces.
-  const boxMatrix: THREE.Matrix4[] = new Array(count);
+  // Each building is drawn as one box per LOD leaf ("part": wall / column / slab / roof) so the
+  // intact silhouette reads faithfully — pillars, slabs and roofs survive — instead of a single
+  // building-sized block. A building with no parts falls back to one box around its whole AABB, so
+  // the slot layout stays 1:1 with buildings in that case (instance i ⇔ building i).
+  const boxMatrices: THREE.Matrix4[][] = new Array(count); // per building → one matrix per slot
+  const slotBase: number[] = new Array(count); // first global instance index for this building
   const center: THREE.Vector3[] = new Array(count);
   const fragInstances: number[][] = new Array(count);
+  let totalSlots = 0;
   for (let i = 0; i < count; i++) {
     const s = states0[i];
     _center.set(
@@ -114,23 +121,49 @@ export function createIntactBuildingProxies(
       (s.aabbMin.y + s.aabbMax.y) / 2,
       (s.aabbMin.z + s.aabbMax.z) / 2,
     );
-    _size.set(
-      Math.max(1e-3, s.aabbMax.x - s.aabbMin.x),
-      Math.max(1e-3, s.aabbMax.y - s.aabbMin.y),
-      Math.max(1e-3, s.aabbMax.z - s.aabbMin.z),
-    );
-    boxMatrix[i] = new THREE.Matrix4().compose(_center, _IDENT_Q, _size);
-    center[i] = _center.clone();
+    center[i] = _center.clone(); // distance test uses the whole-building center
+    const boxes = s.parts && s.parts.length > 0 ? s.parts : [{ aabbMin: s.aabbMin, aabbMax: s.aabbMax }];
+    const mats: THREE.Matrix4[] = new Array(boxes.length);
+    for (let b = 0; b < boxes.length; b++) {
+      const box = boxes[b];
+      _center.set(
+        (box.aabbMin.x + box.aabbMax.x) / 2,
+        (box.aabbMin.y + box.aabbMax.y) / 2,
+        (box.aabbMin.z + box.aabbMax.z) / 2,
+      );
+      _size.set(
+        Math.max(1e-3, box.aabbMax.x - box.aabbMin.x),
+        Math.max(1e-3, box.aabbMax.y - box.aabbMin.y),
+        Math.max(1e-3, box.aabbMax.z - box.aabbMin.z),
+      );
+      mats[b] = new THREE.Matrix4().compose(_center, _IDENT_Q, _size);
+    }
+    boxMatrices[i] = mats;
+    slotBase[i] = totalSlots;
+    totalSlots += mats.length;
     const insts: number[] = [];
     for (const ni of s.fragments) {
       const id = chunkToInstanceId.get(ni);
       if (id != null) insts.push(id);
     }
     fragInstances[i] = insts;
-    // Start hidden (boxes off, real fragments shown) until the first update() decides.
-    mesh.setMatrixAt(i, _ZERO_MATRIX);
+  }
+
+  const mesh = new THREE.InstancedMesh(geometry, material, Math.max(1, totalSlots));
+  mesh.castShadow = options.castShadow ?? true;
+  mesh.receiveShadow = options.receiveShadow ?? true;
+  // Instances are scattered across the whole city; cull per-building via proxy state, not the
+  // mesh's (huge, would-be-stale) bounding sphere.
+  mesh.frustumCulled = false;
+  mesh.count = totalSlots;
+  for (let i = 0; i < count; i++) {
+    const mats = boxMatrices[i];
     const c = options.buildingColors?.[i];
-    if (c) mesh.setColorAt(i, c);
+    for (let b = 0; b < mats.length; b++) {
+      // Start hidden (boxes off, real fragments shown) until the first update() decides.
+      mesh.setMatrixAt(slotBase[i] + b, _ZERO_MATRIX);
+      if (c) mesh.setColorAt(slotBase[i] + b, c);
+    }
   }
   mesh.instanceMatrix.needsUpdate = true;
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
@@ -143,7 +176,8 @@ export function createIntactBuildingProxies(
   function setBuildingProxied(i: number, on: boolean) {
     if (on === (proxied[i] !== 0)) return;
     proxied[i] = on ? 1 : 0;
-    mesh.setMatrixAt(i, on ? boxMatrix[i] : _ZERO_MATRIX);
+    const mats = boxMatrices[i];
+    for (let b = 0; b < mats.length; b++) mesh.setMatrixAt(slotBase[i] + b, on ? mats[b] : _ZERO_MATRIX);
     const insts = fragInstances[i];
     const v = on ? 1 : 0;
     for (let k = 0; k < insts.length; k++) instanceHidden[insts[k]] = v;

@@ -252,6 +252,9 @@ type CollectedFragments = {
   fragmentTypes: (FragmentType | undefined)[];
   foundationTopY: number;
   slabTopY: (k: number) => number;
+  /** One {start,count} fragment range per structural element (foundation / column-storey / slab /
+   *  infill panel), valid even after inline Voronoi fracturing. Authored into `collisionTree`. */
+  elementRanges: Array<{ start: number; count: number }>;
 };
 
 /**
@@ -292,17 +295,29 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
   const storeyClearH = floorHeight - slabThickness;
 
   const fragments: FragmentInfo[] = [];
+  // One {start,count} fragment range per structural element (foundation, each column-storey, each
+  // floor slab, each infill panel) — including any Voronoi shards, which are pushed inline here.
+  // Used to author a semantic collision-LOD tree (building → element) so the intact render-LOD
+  // draws a faithful box per column / slab / panel instead of one box around the whole tower.
+  const elementRanges: Array<{ start: number; count: number }> = [];
+  const markElement = (start: number) => {
+    if (fragments.length > start) elementRanges.push({ start, count: fragments.length - start });
+  };
 
   // ── Foundation: static (mass 0) tiles covering the footprint ──────────────
-  fragments.push(
-    ...subdivideBoxFragments({
-      center: { x: 0, y: groundClearance + foundationThickness * 0.5, z: 0 },
-      size: { x: width, y: foundationThickness, z: depth },
-      divisions: { x: Math.max(2, columnsX), y: 1, z: Math.max(2, columnsZ) },
-      fragmentType: 'foundation',
-      isSupport: true,
-    }),
-  );
+  {
+    const start = fragments.length;
+    fragments.push(
+      ...subdivideBoxFragments({
+        center: { x: 0, y: groundClearance + foundationThickness * 0.5, z: 0 },
+        size: { x: width, y: foundationThickness, z: depth },
+        divisions: { x: Math.max(2, columnsX), y: 1, z: Math.max(2, columnsZ) },
+        fragmentType: 'foundation',
+        isSupport: true,
+      }),
+    );
+    markElement(start);
+  }
 
   // ── Columns: one chunk per storey at each grid position ───────────────────
   // When `fractureColumns` is set, each storey-segment is Voronoi-shattered into
@@ -316,6 +331,7 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
     const h = yTop - yBottom;
     for (const cx of colXs) {
       for (const cz of colZs) {
+        const start = fragments.length;
         if (o.fractureColumns && columnFragments > 1) {
           const geometry = new THREE.BoxGeometry(columnSize, h, columnSize, 1, 1, 1);
           const shards = fractureGeometry(geometry, {
@@ -339,6 +355,7 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
             }),
           );
         }
+        markElement(start); // this column-storey segment = one element
       }
     }
   }
@@ -346,6 +363,7 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
   // ── Floor slabs (incl. roof): full-footprint concrete plates ──────────────
   for (let k = 1; k <= floorCount; k++) {
     const topY = slabTopY(k);
+    const start = fragments.length;
     fragments.push(
       ...subdivideBoxFragments({
         center: { x: 0, y: topY - slabThickness * 0.5, z: 0 },
@@ -355,6 +373,7 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
         density: concreteDensity,
       }),
     );
+    markElement(start); // each floor slab = one element
   }
 
   // ── Infill walls: frangible panels in the perimeter bays between columns ──
@@ -368,6 +387,7 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
   ) => {
     const h = yTop - yBottom;
     const spanH = Math.max(spanX, spanZ); // the wide (in-plane horizontal) span
+    const elementStart = fragments.length;
 
     if (o.fractureInfill) {
       // Voronoi-fracture the panel into irregular drywall shards. Each shard inherits
@@ -387,6 +407,7 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
       for (const shard of shards) {
         fragments.push({ ...shard, fragmentType: 'infill', density: infillDensity });
       }
+      markElement(elementStart); // this infill panel = one element
       return;
     }
 
@@ -403,6 +424,7 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
         density: infillDensity,
       }),
     );
+    markElement(elementStart); // this infill panel = one element
   };
 
   for (let k = 0; k < floorCount; k++) {
@@ -435,6 +457,7 @@ function collectHighRiseFragments(o: MergedHighRiseOptions): CollectedFragments 
   return {
     fragments,
     fragmentTypes: fragments.map((f) => f.fragmentType),
+    elementRanges,
     foundationTopY,
     slabTopY,
   };
@@ -501,6 +524,18 @@ function finalizeHighRiseScenario(
       fragmentTypes,
     },
   };
+
+  // Author a semantic collision-LOD tree (building → element) from the per-element ranges. The
+  // ranges include inline Voronoi shards, so they stay valid regardless of fractureColumns/Infill.
+  // Consumed by `lazyIntactColliders` and the intact render-LOD (one faithful box per element).
+  const range = (start: number, count: number) => {
+    const out = new Array<number>(count);
+    for (let i = 0; i < count; i++) out[i] = start + i;
+    return out;
+  };
+  scenario.collisionTree = [
+    { children: collected.elementRanges.map((r) => ({ fragments: range(r.start, r.count) })) },
+  ];
   return scenario;
 }
 

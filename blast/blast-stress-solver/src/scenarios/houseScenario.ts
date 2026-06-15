@@ -265,6 +265,12 @@ type CollectedHouse = {
   fragments: FragmentInfo[];
   nodeColors: (number | undefined)[];
   dims: Record<string, number>;
+  /** One {start,count} fragment range per structural element (each `push`): foundation, floor,
+   *  each post / beam / wall run / roof slope / furniture piece. Used to author a semantic
+   *  collision-LOD tree (building → element) so the intact render-LOD draws a faithful box per
+   *  element instead of one box around the whole house. Indices are valid only on the unfractured
+   *  fragment list (the async `fracture` path expands fragments and skips the authored tree). */
+  elementRanges: Array<{ start: number; count: number }>;
 };
 
 function overlaps1D(aMin: number, aMax: number, bMin: number, bMax: number): boolean {
@@ -352,11 +358,16 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
 
   const fragments: FragmentInfo[] = [];
   const nodeColors: (number | undefined)[] = [];
+  const elementRanges: Array<{ start: number; count: number }> = [];
   const hw = width * 0.5;
   const hd = depth * 0.5;
 
+  // Each push is one structural element (a post, a wall run, a beam, the roof, a furniture piece).
+  // Record its contiguous fragment range so the builders can author a semantic collision-LOD tree.
   const push = (fs: FragmentInfo[], color?: number) => {
+    const start = fragments.length;
     for (const f of fs) { fragments.push(f); nodeColors.push(color); }
+    if (fragments.length > start) elementRanges.push({ start, count: fragments.length - start });
   };
 
   // Datum: floor top = 0 (lifted onto the runtime ground at the end).
@@ -526,6 +537,7 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
   return {
     fragments,
     nodeColors,
+    elementRanges,
     dims: {
       width, depth, wallHeight,
       floorTopY: floorTopY + liftY,
@@ -622,6 +634,18 @@ function fractureSelected(
 
 // ── Public builders ─────────────────────────────────────────────────────────
 
+/** Author a semantic collision-LOD tree (building → element) from per-element fragment ranges. */
+function elementTreeFromRanges(
+  ranges: Array<{ start: number; count: number }>,
+): Array<{ children: Array<{ fragments: number[] }> }> {
+  const range = (start: number, count: number) => {
+    const out = new Array<number>(count);
+    for (let i = 0; i < count; i++) out[i] = start + i;
+    return out;
+  };
+  return [{ children: ranges.map((r) => ({ fragments: range(r.start, r.count) })) }];
+}
+
 function finalize(
   scenario: ScenarioDesc, options: HouseOptions,
   fragments: FragmentInfo[], nodeColors: (number | undefined)[], dims: Record<string, number>,
@@ -640,9 +664,13 @@ function finalize(
  */
 export function buildHouseScenario(options: HouseOptions = {}): ScenarioDesc {
   const o = { ...DEFAULT_HOUSE_OPTIONS, ...options };
-  const { fragments, nodeColors, dims } = collectHouseFragments(o);
+  const collected = collectHouseFragments(o);
+  const { fragments, nodeColors, dims } = collected;
   const scenario = buildScenarioFromFragments(fragments, { areaNormalization: 'none' });
-  return finalize(scenario, options, fragments, nodeColors, dims);
+  finalize(scenario, options, fragments, nodeColors, dims);
+  // Unfractured boxes ⇒ the per-element ranges are valid: author the semantic render/collision LOD.
+  scenario.collisionTree = elementTreeFromRanges(collected.elementRanges);
+  return scenario;
 }
 
 /**
@@ -677,5 +705,9 @@ export async function buildHouseScenarioAsync(options: HouseOptions = {}): Promi
   // Fractured shards bond best with the WASM auto-bonder; plain boxes are fine with proximity.
   const bondMode = options.bondMode ?? (types.size > 0 ? 'auto' : 'proximity');
   const scenario = await buildScenarioFromFragmentsAsync(fragments, { bondMode, areaNormalization: 'none' });
-  return finalize(scenario, options, fragments, nodeColors, collected.dims);
+  finalize(scenario, options, fragments, nodeColors, collected.dims);
+  // Author the semantic LOD tree only when the fragment list is still the unfractured one (the
+  // `fracture` path expands fragments, invalidating the ranges — the core's spatial split covers it).
+  if (types.size === 0) scenario.collisionTree = elementTreeFromRanges(collected.elementRanges);
+  return scenario;
 }

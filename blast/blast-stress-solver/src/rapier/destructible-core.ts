@@ -2668,27 +2668,45 @@ export async function buildDestructibleCore({
   // looks like its original solid shell, so the box proxy is faithful. Independent of the lazy
   // collider toggle: the tree is materialized on demand.
   let buildingRenderStatesCache:
-    | Array<{ buildingId: number; intact: boolean; aabbMin: Vec3; aabbMax: Vec3; fragments: number[] }>
+    | Array<{
+        buildingId: number;
+        intact: boolean;
+        aabbMin: Vec3;
+        aabbMax: Vec3;
+        fragments: number[];
+        parts: Array<{ aabbMin: Vec3; aabbMax: Vec3 }>;
+      }>
     | null = null;
   function getBuildingRenderStates() {
     ensureLodRoots();
     if (!buildingRenderStatesCache || buildingRenderStatesCache.length !== lodRoots.length) {
-      const collect = (node: LodNode, out: number[]) => {
+      // Gather the building's fragment list AND its leaf-node AABBs. The leaves are the authored
+      // structural elements (wall / column / slab / roof) when the scenario ships a semantic
+      // `collisionTree`, else the spatial-split chunks — either way a renderer can draw one cheap
+      // box per leaf for a faithful intact-LOD silhouette instead of a single building-sized box.
+      const collect = (
+        node: LodNode,
+        outFrags: number[],
+        outParts: Array<{ aabbMin: Vec3; aabbMax: Vec3 }>,
+      ) => {
         if (node.children.length === 0) {
-          for (const f of node.fragments) out.push(f);
+          for (const f of node.fragments) outFrags.push(f);
+          outParts.push({ aabbMin: { ...node.aabbMin }, aabbMax: { ...node.aabbMax } });
           return;
         }
-        for (const ch of node.children) collect(ch, out);
+        for (const ch of node.children) collect(ch, outFrags, outParts);
       };
       buildingRenderStatesCache = lodRoots.map((root) => {
         const fragments: number[] = [];
-        collect(root, fragments);
+        const parts: Array<{ aabbMin: Vec3; aabbMax: Vec3 }> = [];
+        collect(root, fragments, parts);
         return {
           buildingId: root.buildingId,
           intact: true,
           aabbMin: { ...root.aabbMin },
           aabbMax: { ...root.aabbMax },
           fragments,
+          parts,
         };
       });
     }
