@@ -74,14 +74,37 @@ State** to instead see intact-vs-detached state).
 
 ## Breaking model
 
-Breaking is **not** stress-driven (a free body barely stresses its bonds on a
-hit). Two controlled paths drive it instead:
+Breaking is **entirely stress-driven** — the NVIDIA Blast stress solver computes
+each bond's stress every frame and fractures the ones past their fatal limit.
+There are no scripted force/velocity thresholds; destruction is whatever the
+physics produces. The three stress sources:
 
-- **Direct impact** (`onImpact`): a hit past a role-based force threshold cuts the
-  struck part's bonds (it detaches and falls), with a small bounded splash.
-- **Inertial shedding:** when a body carrying cargo/accessories is flung or spun
-  hard, those weakly-lashed parts progressively tear off and bounce away — so a
-  car that's hit and goes tumbling sheds its payload, not just the part you hit.
+- **Localized contact (impacts).** A projectile or ground hit is a force on one
+  region of the body. Even though the car is a *free* (unanchored) body, that hit
+  develops real internal bond stress: the struck region has to drag the rest of
+  the body along, and the inertial reaction of "the rest of the body" (d'Alembert)
+  loads the bonds in between. Hit harder → more stress → more breaks. Contact
+  forces are injected into the solver scaled by **Contact Force Scale**.
+- **Gravity.** A uniform field on a free body produces *zero* internal stress
+  (rigid free-fall), so a parked or airborne car never self-destructs from gravity
+  alone — its weight is carried by the localized ground reaction at the wheels,
+  which stresses the strong wheel/frame load path (kept under its limit).
+- **Centrifugal.** A spinning/tumbling body feeds each node `ω×(ω×r)`, so a car
+  that's flung and goes tumbling self-stresses and sheds its loosely-bonded cargo —
+  real physics, not a motion heuristic. (On by default here.)
+
+The **hierarchy is the bond geometry**: stress = impulse / area, so each role pair
+is given a bond-area multiplier (`frame|frame ×8` … `frame|accessory ×0.12`). The
+weak (small-area) cargo/accessory joints reach their limit first and shed; the
+strong (large-area) frame welds hold until a catastrophic hit. **Material Scale**
+(live) rescales every limit at once — the master toughness knob.
+
+**Warm-up:** fracture is suppressed for the first ~0.5 s after a (re)build
+(`fractureWarmupFrames`). A freshly built body starts the iterative solve from a
+zero guess, so the first few frames can transiently overshoot the true static
+stress; warming up lets the solver converge to equilibrium before any bond is
+allowed to break, so a car settling onto the ground doesn't shed parts from the
+spawn transient.
 
 Detached debris uses `debrisCollisionMode: 'noDebrisPairs'` — it bounces off the
 car and ground but not off other debris (overlapping just-detached chunks colliding
@@ -89,16 +112,21 @@ with each other is what caused the early "explosion").
 
 ## Controls
 
-Tuning GUI in the sidebar:
-- **Bond Strength by Role** — per-role attachment strength (frame / wheel / panel /
-  cargo / accessory), the main hierarchy knobs (needs *Reset*). Cargo/accessories
-  start weak so they shed readily.
-- **Breaking Sensitivity (live)** — *Impact break ease* (how easily a direct hit
-  detaches a part) and *Shed on motion* (how readily cargo tears off a flung/
-  spinning car). Both apply immediately, no Reset.
+Tuning GUI in the sidebar. All breaking is stress-solver-computed, so the knobs
+are the real stress parameters:
+- **Attachment Strength by Role** — per-role bond-**area** multiplier (frame /
+  wheel / panel / cargo / accessory), the hierarchy (needs *Reset* — area is baked
+  into the bonds at build). Cargo/accessories start weak so they reach their stress
+  limit first and shed.
+- **Material Scale (live)** — master toughness; live-rescales every stress limit
+  (`core.setMaterialScale`). Lower = the whole car breaks more easily.
+- **Contact Force Scale (live)** — how much bond stress an impact injects
+  (`core.setContactForceScale`). Higher = a hit breaks parts more easily.
+- **Centrifugal (live)** — spin self-fracture; on by default so a flung car sheds
+  cargo through computed centrifugal stress.
 - **Total Mass**, **Fracture Cell Size**, **Bond Reach** — vehicle build (*Reset*).
 - **Projectile** radius / mass / speed — live.
-- **Material Scale** (kept high so the car is solid at rest) / **Gravity** (*Reset*).
+- **Gravity** (*Reset*).
 - Shared **Physics / Optimization** controls plus the live frame profiler and
   session recorder.
 
@@ -147,18 +175,20 @@ exports (`buildScenarioFromFragmentsAsync`, `fractureGeometryAsync`,
 - Voronoi fracture (three-pinata) runs on meshes that may be non-manifold; it's
   guarded with a per-part fallback to "keep whole", so a model that doesn't
   fracture cleanly still works.
-- **Impact breaking is contact-driven.** A free-floating car barely stresses its
-  bonds on impact, so breaking is driven by the core's `onImpact` callback: a hit
-  past a role-based force threshold cuts the struck part's bonds (it detaches and
-  falls), with a small bounded splash. `materialScale` is kept high so the stress
-  solver holds the car rock-solid under gravity; all breaking goes through the
-  impact path.
-- **Debris collides with the ground only** (`debrisCollisionMode:
-  'debrisGroundOnly'`). Fractured/split chunks have overlapping convex hulls;
-  fine while welded into one body, but when many detach at once, debris-vs-body
-  penetration would otherwise resolve as a violent explosion. Ground-only keeps it
-  stable (the trade-off is that shed parts fall through each other rather than
-  piling).
+- **Impact breaking is stress-driven** (no scripted cuts). A free-floating car
+  *does* stress its bonds on a localized hit — the inertial reaction of the rest of
+  the body loads the bonds at the impact (d'Alembert), which is what the solver
+  computes. Tuning is three knobs: `materialScale` (master toughness, live),
+  `contactForceScale` (how much stress a hit injects, live), and the per-role bond
+  **area** multipliers (the hierarchy). The earlier build used an `onImpact`
+  force-threshold callback to script detachment; that was a workaround for a
+  mis-tuned material (limits ~1e9 that no stress could reach) and has been removed.
+- **Debris doesn't collide with other debris** (`debrisCollisionMode:
+  'noDebrisPairs'`). Fractured/split chunks have overlapping convex hulls; fine
+  while welded into one body, but a pile of just-detached overlapping chunks
+  resolving their mutual penetration is a violent explosion. `noDebrisPairs` keeps
+  debris lively (cargo still bounces off the car and ground) while removing that
+  failure mode.
 
 ## Headless QA
 

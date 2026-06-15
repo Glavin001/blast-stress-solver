@@ -58,7 +58,8 @@ function assertStable(label, worst, final) {
   const status = exploded ? 'EXPLODED' : 'ok';
   console.log(
     `  [${status}] ${label}: peakSpeed=${worst.maxSpeed.toFixed(1)} ` +
-    `peakFastBodies=${worst.fastBodies} bodies=${final?.bodies ?? '?'} shed=${final?.shed ?? '?'}`,
+    `peakFastBodies=${worst.fastBodies} bodies=${final?.bodies ?? '?'} ` +
+    `bondsBroken=${final?.brokenBonds ?? '?'}/${final?.bonds0 ?? '?'}`,
   );
   if (exploded) failures.push(label);
 }
@@ -67,8 +68,15 @@ await page.goto(URL, { waitUntil: 'load', timeout: 30000 });
 if (!(await waitReady())) { console.error('demo did not initialize'); process.exit(2); }
 console.log(`Soaking ${URL}\n`);
 
-// 1) Settle untouched — must stay calm.
-{ const w = await watch(5); assertStable('settle (no input)', w, await metrics()); }
+// 1) Settle untouched — must stay calm AND keep its bonds (a parked car must not
+// shed parts under gravity; this guards the solver warm-up against regression).
+{
+  const w = await watch(5);
+  const final = await metrics();
+  assertStable('settle (no input)', w, final);
+  const frac = final?.brokenFrac ?? 0;
+  if (frac > 0.03) { console.log(`  [SHED] settle broke ${(frac * 100).toFixed(1)}% of bonds at rest (warm-up regression?)`); failures.push('settle integrity'); }
+}
 
 const canvas = page.locator('#demo-canvas');
 const box = await canvas.boundingBox();
