@@ -115,6 +115,13 @@ export type BrickCastleOptions = {
   bondMode?: 'auto' | 'proximity';
   /** Auto-bond contact tolerance (the mortar gap). Default = mortarGap * 1.5. */
   maxSeparation?: number;
+  /**
+   * Keep the weak inter-structure bonds that stitch adjacent structures together.
+   * Default false: structures are left as independent stress islands so a hit
+   * stays local instead of cascading around the whole castle. true restores the
+   * full four-tier hierarchy (and the single-island behaviour).
+   */
+  bondAcrossStructures?: boolean;
 
   // ── Strength hierarchy ──
   multipliers?: Partial<CastleBondMultipliers>;
@@ -145,6 +152,7 @@ const DEFAULTS: Required<Omit<BrickCastleOptions, 'multipliers' | 'pinata' | 'ra
   battlements: true,
   chunksPerBrick: 2,
   bondMode: 'auto',
+  bondAcrossStructures: false,
   density: CASTLE_STONE_DENSITY,
 };
 
@@ -476,7 +484,14 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
     ? await buildScenarioFromFragmentsAsync(allFragments, scenarioOptions)
     : buildScenarioFromFragments(allFragments, scenarioOptions);
 
-  // ── Apply the three-tier strength hierarchy ──
+  // ── Apply the strength hierarchy, and (by default) DECOUPLE structures ──
+  // Auto-bonding across a wall↔tower seam stitches every wall, tower and the
+  // gatehouse into ONE giant stress island, so a single hit propagates around
+  // the whole ring ("crumbles from the first hit"). By default we DROP the
+  // inter-structure bonds: each wall / tower / keep becomes its own stress
+  // island (still anchored to the shared foundation and resting against its
+  // neighbours), so a hit stays local. Set bondAcrossStructures:true to keep the
+  // weak inter-structure tier instead.
   const isFoundation = (i: number) => kindByNode[i] === 'foundation';
   const tierOf = (b: ScenarioBond): CastleBondTier => {
     const a = b.node0, c = b.node1;
@@ -486,12 +501,16 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
     return CastleBondTier.InterStructure;
   };
   const tierMult = [mult.anchor, mult.intraBrick, mult.mortar, mult.interStructure];
-  const bondTiers = new Uint8Array(scenario.bonds.length);
-  scenario.bonds = scenario.bonds.map((b, i) => {
+  const keptBonds: ScenarioBond[] = [];
+  const keptTiers: number[] = [];
+  for (const b of scenario.bonds) {
     const tier = tierOf(b);
-    bondTiers[i] = tier;
-    return { ...b, area: Math.max(b.area * tierMult[tier], 1e-8) };
-  });
+    if (tier === CastleBondTier.InterStructure && !opt.bondAcrossStructures) continue;
+    keptBonds.push({ ...b, area: Math.max(b.area * tierMult[tier], 1e-8) });
+    keptTiers.push(tier);
+  }
+  scenario.bonds = keptBonds;
+  const bondTiers = Uint8Array.from(keptTiers);
 
   // ── Collision-LOD tree: castle → structure → brick(leaf) ──
   const byStructure = new Map<number, number[][]>();

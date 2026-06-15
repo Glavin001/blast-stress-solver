@@ -46,10 +46,13 @@ const CONFIG = {
   chunksPerBrick: 2,
   battlements: true,
   // Strength hierarchy (deferred — applied on Rebuild).
-  materialExp: 9.1, // materialScale = 10^materialExp ("stone strength")
+  materialExp: 9.3, // materialScale = 10^materialExp ("stone strength")
   intra: 9.0,
   mortar: 1.6,
   inter: 0.5,
+  // Keep the weak wall↔tower seam bonds. Off by default so each wall/tower/keep is
+  // its own stress island and a hit stays LOCAL instead of cascading the whole ring.
+  bondAcrossStructures: false,
   // Scalability (live).
   lazy: true,
   island: true,
@@ -185,6 +188,7 @@ async function initScene() {
     chunksPerBrick: CONFIG.chunksPerBrick,
     battlements: CONFIG.battlements,
     bondMode: 'auto',
+    bondAcrossStructures: CONFIG.bondAcrossStructures,
     multipliers: { intraBrick: CONFIG.intra, mortar: CONFIG.mortar, interStructure: CONFIG.inter },
     pinata: pinata as any,
   });
@@ -203,7 +207,7 @@ async function initScene() {
     scenario,
     gravity: CONFIG.gravity,
     materialScale: Math.pow(10, CONFIG.materialExp),
-    contactForceScale: 20,
+    contactForceScale: 16,
     // Shared Physics/Optimization controls (debris collision, friction, restitution,
     // damping, cleanup). Defaults to full 'all' collision like the other demos — the
     // geometry fixes + per-frame fracture budget keep it stable here (verified by the
@@ -398,6 +402,7 @@ bindSlider('cfg-proj-speed', CONFIG.projectile, 'speed', (v) => v.toFixed(0) + '
 bindSlider('cfg-intra', CONFIG, 'intra', (v) => v.toFixed(1));
 bindSlider('cfg-mortar', CONFIG, 'mortar', (v) => v.toFixed(1));
 bindSlider('cfg-inter', CONFIG, 'inter', (v) => v.toFixed(1));
+bindCheckbox('cfg-bond-structures', () => CONFIG.bondAcrossStructures, (v) => { CONFIG.bondAcrossStructures = v; });
 
 // Castle (deferred).
 {

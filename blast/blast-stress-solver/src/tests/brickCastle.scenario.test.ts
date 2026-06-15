@@ -41,9 +41,10 @@ describe('brick-castle scenario (requires three-pinata)', () => {
     }
   });
 
-  it.skipIf(!pinataAvailable)('builds an anchored, auto-bonded castle with a three-tier hierarchy', async () => {
+  it.skipIf(!pinataAvailable)('builds an anchored, auto-bonded castle with a four-tier hierarchy', async () => {
     const { buildBrickCastleScenario } = await import('../scenarios/brickCastleScenario');
-    const scenario = await buildBrickCastleScenario({ ...SMALL, bondMode: 'auto' });
+    // Keep the inter-structure bonds so all four tiers are exercised here.
+    const scenario = await buildBrickCastleScenario({ ...SMALL, bondMode: 'auto', bondAcrossStructures: true });
     const p = scenario.parameters as any;
 
     // Valid graph.
@@ -107,5 +108,31 @@ describe('brick-castle scenario (requires three-pinata)', () => {
     scenario.bonds.forEach((b, i) => { sum[tiers[i]] += b.area; cnt[tiers[i]]++; });
     const mean = (t: number) => sum[t] / Math.max(1, cnt[t]);
     expect(mean(CastleBondTier.Mortar)).toBeGreaterThan(mean(CastleBondTier.IntraBrick));
+  }, 60_000);
+
+  it.skipIf(!pinataAvailable)('decouples structures into separate stress islands by default', async () => {
+    const { buildBrickCastleScenario } = await import('../scenarios/brickCastleScenario');
+    // Default (bondAcrossStructures:false) drops the inter-structure bonds so a hit
+    // stays local. Confirm the tier is empty and the largest dynamic island is well
+    // below the whole castle (no single ring island).
+    const scenario = await buildBrickCastleScenario({ ...SMALL, bondMode: 'auto' });
+    const p = scenario.parameters as any;
+    expect(Array.from(p.tierCounts)[CastleBondTier.InterStructure]).toBe(0);
+
+    const n = scenario.nodes.length;
+    const dyn = (i: number) => scenario.nodes[i].mass > 0;
+    const dynCount = scenario.nodes.filter((nd) => nd.mass > 0).length;
+    const par = Array.from({ length: n }, (_, i) => i);
+    const find = (x: number): number => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+    for (const b of scenario.bonds) {
+      if (!dyn(b.node0) || !dyn(b.node1)) continue;
+      const a = find(b.node0), c = find(b.node1);
+      if (a !== c) par[a] = c;
+    }
+    const size = new Map<number, number>();
+    for (let i = 0; i < n; i++) { if (!dyn(i)) continue; const r = find(i); size.set(r, (size.get(r) ?? 0) + 1); }
+    const largest = Math.max(...size.values());
+    // No single island should span more than ~60% of the dynamic bricks.
+    expect(largest).toBeLessThan(dynCount * 0.6);
   }, 60_000);
 });
