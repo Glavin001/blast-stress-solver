@@ -106,14 +106,16 @@ These three cost the most time. Internalize them before writing code.
    already injects into the stress solver) + gravity + projectile contact forces create
    a real load path, and the solver's existing overstressed-bond fracture path breaks
    bonds where stress exceeds the (area-encoded) per-role limit. So you do **not** need
-   an `onImpact` callback — just calibrate `materialScale`. Two stability aids:
-   - **Progressive fracture:** `core.setFracturePolicy({ maxFracturesPerFrame: ~4-6 })`
-     peels a cluster off over a few frames instead of releasing a whole overlapping-hull
-     region in one step (which explodes).
+   an `onImpact` callback — just calibrate `materialScale`. (Don't reach for
+   `maxFracturesPerFrame` to "spread out" breaks — if a hit shatters a huge region at
+   once, `materialScale` is too low; at the right value breaks are already local.) Two
+   genuine aids:
    - **Resting cargo:** cap each cargo/accessory part to a single weak bond
      (`capRestingBonds`) so it sheds like a resting contact, not a welded seam.
-   - **Debris collision:** `debrisCollisionMode: 'debrisGroundOnly'` (safest) or
-     `'noDebrisPairs'`. NOT `'all'` — that's the explosion. Verify with the soak.
+   - **Debris collision:** `debrisCollisionMode: 'noDebrisPairs'` — debris bounces off
+     the car + ground but not other debris. `'all'` survives light play but explodes
+     under sustained heavy fire (overlapping single-hull-per-node colliders); the real
+     fix is convex decomposition. Verify with the soak.
 
 10. **GUI for live tuning:** the real knobs are **`materialScale`** (global toughness)
     and the **per-role bond-strength** multipliers (the area hierarchy). Expose those;
@@ -238,7 +240,7 @@ explosions and instability that only show up while the simulation runs.
 - [ ] Decide split/fracture role gates (don't split/fracture wheels-equivalent).
 - [ ] Set `maxSeparation` so wheels/loose parts bond (check the `bonds by role pair` log).
 - [ ] Cap resting cargo/accessory to a single weak bond (`capRestingBonds`).
-- [ ] Calibrate `materialScale` (+ `setFracturePolicy({ maxFracturesPerFrame })`): solid
-      at rest (settle → ~2 bodies, 0 shed), but cargo sheds / frame holds on a hit.
+- [ ] Calibrate `materialScale`: solid at rest (settle → ~2 bodies, 0 shed), but cargo
+      sheds / frame holds on a hit. Pick a sensible default projectile (probe-vehicle.mjs).
 - [ ] `node scripts/soak-vehicle.mjs` → settle/light/drop must be stable before human QA.
 - [ ] Register the demo (tsconfig / package.json / demo-index / build-demo-site).

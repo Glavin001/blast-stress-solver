@@ -56,9 +56,12 @@ const CONFIG = {
     bondStrength: { frame: 1, wheel: 1, panel: 1, cargo: 1, accessory: 1 } as Record<VehiclePartRole, number>,
   },
   projectile: {
+    // A heavy ball (~wrecking-ball): at the calibrated materialScale this sheds a
+    // satisfying few parts per hit (cargo first, the cage holding) without
+    // shattering the car or exploding. Swept in scripts/probe-vehicle.mjs.
     radius: 0.25,
     mass: 150,
-    speed: 38,
+    speed: 45,
     ttlMs: 8000,
   },
   solver: {
@@ -376,13 +379,15 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Detached debris bounces off the intact body and the ground, but NOT off other
-// debris. Fractured/split chunks have overlapping convex hulls, so allowing
-// debris-vs-debris contact lets a pile of just-detached overlapping chunks resolve
-// their penetration as a violent explosion. 'noDebrisPairs' keeps debris lively
-// (cargo bounces off the car) while removing that failure mode. Verified stable
-// under heavy destruction by scripts/soak-vehicle.mjs.
-physicsConfig.debrisCollisionMode = 'debrisGroundOnly';
+// Detached debris bounces off the intact car and the ground, but NOT off other
+// debris. This is the one genuine collider-fidelity mitigation: the runtime builds
+// a single convex hull per node, and fractured/concave pieces have *overlapping*
+// hulls, so under sustained heavy destruction debris-vs-debris contacts resolve
+// their mutual penetration as an explosion (full 'all' mode survives settle/light
+// shots/drops but blows up on rapid heavy fire — see scripts/soak-vehicle.mjs).
+// 'noDebrisPairs' keeps debris lively (it still bounces off the car) while removing
+// that failure mode. The real fix would be convex decomposition (out of scope).
+physicsConfig.debrisCollisionMode = 'noDebrisPairs';
 
 // Shared Physics / Optimization / Features controls.
 mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });

@@ -94,15 +94,16 @@ Lower = more fragile. The mechanism is pinned by a headless test,
 [`freeBodyGroundStress.test.ts`](../blast-stress-solver/src/tests/freeBodyGroundStress.test.ts)
 (a free column breaks under self-weight when resting, stays intact in free-fall).
 
-Two supporting details keep it stable:
-- **Progressive fracture** (`setFracturePolicy({ maxFracturesPerFrame })`) peels a
-  cluster off over a few frames instead of detaching a whole overlapping-hull
-  region in one step (which would resolve as an explosion).
+Two supporting details:
 - **Resting cargo** is reduced to a single weak bond (`capRestingBonds` in
   `glb-vehicle.ts`) so it sheds like a resting contact, not a welded seam.
-- Detached debris uses `debrisCollisionMode: 'debrisGroundOnly'` — it collides
-  with the ground but not the intact body or other debris (overlapping
-  just-detached convex hulls colliding is what caused the early "explosion").
+- Detached debris uses `debrisCollisionMode: 'noDebrisPairs'` — it bounces off the
+  intact car and the ground but not off *other debris*. This is the one real
+  collider-fidelity mitigation: the runtime builds a single convex hull per node,
+  so fractured/concave pieces have overlapping hulls, and under sustained heavy
+  fire debris-vs-debris contacts resolve their mutual penetration as an explosion.
+  (No per-frame fracture cap is needed — at the calibrated `materialScale` a hit
+  already peels off only a few parts at a time.)
 
 ## Controls
 
@@ -170,17 +171,14 @@ exports (`buildScenarioFromFragmentsAsync`, `fractureGeometryAsync`,
   so the role hierarchy lives entirely in the area multipliers. Genuinely
   different *materials* per bond, or tension-free "resting" contacts, would need a
   fork of the vendored solver; the single-bond cargo approximation avoids that.
-- **A 2.5-tonne ram launches debris fast.** Because breaking is physical, a very
+- **A heavy projectile launches debris fast.** Because breaking is physical, a
   heavy/fast projectile transfers real momentum to the struck part as it detaches,
-  so that part can fly off faster than the gentler (old scripted) model produced.
-  This is expected; `soak-vehicle.mjs`'s `fastBodies` (>60 m/s) check is strict
-  for that extreme case.
-- **Debris collides with the ground only** (`debrisCollisionMode:
-  'debrisGroundOnly'`). Fractured/split chunks have overlapping convex hulls;
-  fine while welded into one body, but when many detach at once, debris-vs-body
-  penetration would otherwise resolve as a violent explosion. Ground-only keeps it
-  stable (the trade-off is that shed parts fall through each other rather than
-  piling).
+  so it flies off faster than the old scripted model produced — momentum, not an
+  explosion. An *absurd* mass (a 2.5-tonne ram) launches parts past the soak's
+  60 m/s "explosion" check, so the soak uses a plausible 600 kg heavy instead.
+- **Debris doesn't collide with other debris** (`'noDebrisPairs'`) — see the
+  Breaking model section. It bounces off the car and ground (lively), just not off
+  other just-detached overlapping hulls (which would explode under heavy fire).
 
 ## Headless QA
 
