@@ -208,13 +208,13 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
   const maxSeparation = options.maxSeparation ?? gap * 7;
 
   // Archetype library (cached Voronoi). "stretcher" = standard brick;
-  // "header"/half = end filler for running bond; "ashlar" = big keep block;
-  // "merlon" = short battlement tooth; "voussoir" = gate-arch wedge.
+  // "ashlar" = big keep block; "merlon" = short battlement tooth. (The gate is a
+  // carved opening in the wall — no separate pier/voussoir bricks to overlap it.)
   const stretcher = makeArchetype({ x: L, y: H, z: D }, opt.chunksPerBrick, options.pinata);
-  const half = makeArchetype({ x: (L - gap) * 0.5, y: H, z: D }, Math.max(1, opt.chunksPerBrick - 1), options.pinata);
   const ashlar = makeArchetype({ x: L * 1.1, y: H, z: D * 1.2 }, opt.chunksPerBrick, options.pinata);
-  const merlon = makeArchetype({ x: L, y: H * 1.1, z: D }, Math.max(1, opt.chunksPerBrick - 1), options.pinata);
-  const voussoir = makeArchetype({ x: L * 0.7, y: H, z: D }, Math.max(1, opt.chunksPerBrick - 1), options.pinata);
+  // Merlon height == one course (not taller) so it rests cleanly on the top
+  // course with a mortar gap instead of sinking into it.
+  const merlon = makeArchetype({ x: L, y: H, z: D }, Math.max(1, opt.chunksPerBrick - 1), options.pinata);
 
   // ── Accumulators ──
   const allFragments: FragmentInfo[] = [];
@@ -301,10 +301,32 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
   // there puts two separate bodies inside each other → a settle "pop").
   const sideCenter = halfFoot; // |coordinate| of each wall's mid-line == tower centre
 
+  // Tower footprint (towers are built from the stretcher archetype). A tower's
+  // perpendicular quoin runs sit at ±extent and extend ±depth/2, so the tower
+  // occupies ±towerOuterHalf about its centre. Curtain-wall bricks must stop short
+  // of that (plus a mortar gap), or a wall-end brick lands inside the tower's quoin
+  // run — two separate bodies interpenetrating, which the physics ejects violently
+  // the moment they materialise. This was the main inter-structure overlap bug.
+  const towerPitch = stretcher.size.x + gap;
+  const towerHalfSide = ((opt.towerSideBricks - 1) * towerPitch) * 0.5;
+  const towerExtent = towerHalfSide + towerPitch * 0.5;
+  const towerOuterHalf = towerExtent + stretcher.size.z * 0.5;
+  const wallEndLimit = sideCenter - towerOuterHalf - gap; // max |along| a wall brick edge may reach
+
   placeWallRun('south', -sideCenter, true);
   placeWallRun('north', +sideCenter, false);
   placeWallRun('west', -sideCenter, false);
   placeWallRun('east', +sideCenter, false);
+
+  /** Is (course, along) inside the carved gate opening? Rectangular below the
+   *  spring line, then corbelled inward one brick per course to a point — so the
+   *  arch is formed by *omitting* wall bricks, never by overlaying extra ones. */
+  function gateOpening(c: number, along: number, gateHalf: number): boolean {
+    if (Math.abs(along) >= gateHalf) return false;
+    if (c < opt.gateHeightCourses) return true;
+    const narrow = (c - opt.gateHeightCourses + 1) * pitchX;
+    return Math.abs(along) < gateHalf - narrow;
+  }
 
   function placeWallRun(side: 'north' | 'south' | 'east' | 'west', lineConst: number, withGate: boolean): void {
     const sid = structureId++;
@@ -317,19 +339,23 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
       const y = baseY + H * 0.5 + c * pitchY;
       const isSupport = c === 0; // first course is anchored footing
       const odd = c % 2 === 1;
-      // Running bond: odd courses shift half a pitch and carry one fewer brick
-      // (the half-pitch end gaps are tucked behind the corner towers).
+      // Running bond: odd courses shift half a pitch and carry one fewer brick.
       const count = odd ? n - 1 : n;
       const shift = odd ? pitchX * 0.5 : 0;
       for (let i = 0; i < count; i++) {
         const along = startAlong + i * pitchX + shift;
-        // Gate opening: skip bricks in the central gap for the lower courses.
-        if (withGate && c < opt.gateHeightCourses && Math.abs(along) < gateHalf) continue;
+        // Trim the run so its end bricks clear the corner towers (no overlap).
+        if (Math.abs(along) + L * 0.5 > wallEndLimit) continue;
+        if (withGate && gateOpening(c, along, gateHalf)) continue; // carved gate
+        // Tag the bricks bordering the opening as the "gatehouse" (for colour).
+        const jamb = withGate && (
+          gateOpening(c, along - pitchX, gateHalf) || gateOpening(c, along + pitchX, gateHalf) ||
+          gateOpening(c - 1, along, gateHalf) || gateOpening(c + 1, along, gateHalf)
+        );
         const center = wallPoint(side, lineConst, along, y);
-        placeBrick(stretcher, center, rotY, sid, 'wall', colWall, isSupport);
+        placeBrick(stretcher, center, rotY, sid, jamb ? 'gatehouse' : 'wall', jamb ? colGate : colWall, isSupport);
       }
     }
-    if (withGate) buildGateArch(sid, side, lineConst, rotY, gateHalf);
     if (opt.battlements) buildBattlement(sid, side, lineConst, rotY, n, startAlong);
   }
 
@@ -343,38 +369,13 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
     }
   }
 
-  /** Semicircular-ish arch of voussoir wedges over the gate opening. */
-  function buildGateArch(sid: number, side: 'north' | 'south' | 'east' | 'west', lineConst: number, rotY: number, gateHalf: number): void {
-    const springY = baseY + opt.gateHeightCourses * pitchY; // arch springs here
-    const radius = gateHalf + L * 0.2;
-    const count = Math.max(5, Math.round(opt.gateWidthBricks * 1.6) | 1); // odd → keystone in middle
-    for (let k = 0; k < count; k++) {
-      const t = count > 1 ? k / (count - 1) : 0.5;
-      const ang = Math.PI * (1 - t); // PI → 0 (left springer to right springer)
-      const along = Math.cos(ang) * radius;
-      const y = springY + Math.sin(ang) * radius * 0.6 + H * 0.5;
-      // Wedge faces radially; rotate the brick so its long axis follows the arch.
-      const tilt = rotY + (ang - Math.PI * 0.5);
-      const center = wallPoint(side, lineConst, along, y);
-      placeBrick(voussoir, center, tilt, sid, 'gatehouse', colGate, false);
-    }
-    // Two gate piers (thicken the jambs) for a proper gatehouse read.
-    for (const s of [-1, 1]) {
-      for (let c = 0; c < opt.gateHeightCourses; c++) {
-        const y = baseY + H * 0.5 + c * pitchY;
-        const along = s * (gateHalf + (L - gap) * 0.25);
-        const center = wallPoint(side, lineConst, along, y);
-        placeBrick(half, center, rotY, sid, 'gatehouse', colGate, c === 0);
-      }
-    }
-  }
-
-  /** Alternating merlons / crenels along a wall top. */
+  /** Alternating merlons / crenels along a wall top (trimmed to clear the towers). */
   function buildBattlement(sid: number, side: 'north' | 'south' | 'east' | 'west', lineConst: number, rotY: number, n: number, startAlong: number): void {
     const y = baseY + H * 0.5 + opt.wallCourses * pitchY;
     for (let i = 0; i < n; i++) {
       if (i % 2 === 1) continue; // crenel (gap)
       const along = startAlong + i * pitchX;
+      if (Math.abs(along) + L * 0.5 > wallEndLimit) continue; // clear the towers
       const center = wallPoint(side, lineConst, along, y);
       placeBrick(merlon, center, rotY, sid, 'battlement', colMerlon, false);
     }
@@ -428,7 +429,9 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
         }
       }
     }
-    // Battlements on the tower top.
+    // Battlements on the tower top. Front/back runs own the corners; the left/right
+    // runs skip the corner cells (j = 0 and j = sideBricks-1) so corner merlons are
+    // never double-placed into each other.
     if (opt.battlements) {
       const y = baseY + aSize.y * 0.5 + courses * (aSize.y + gap);
       for (let i = 0; i < sideBricks; i++) {
@@ -437,7 +440,7 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
         placeBrick(merlon, { x, y, z: cz - extent }, 0, sid, 'battlement', colMerlon, false);
         placeBrick(merlon, { x, y, z: cz + extent }, 0, sid, 'battlement', colMerlon, false);
       }
-      for (let j = 0; j < sideBricks; j++) {
+      for (let j = 1; j < sideBricks - 1; j++) {
         if (j % 2 === 1) continue;
         const z = cz - halfSide + j * sidePitch;
         placeBrick(merlon, { x: cx - extent, y, z }, Math.PI * 0.5, sid, 'battlement', colMerlon, false);

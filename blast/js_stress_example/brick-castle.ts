@@ -355,6 +355,8 @@ function maxBodyMetrics(core: any): { maxSpeed: number; fastBodies: number; bodi
   wreckingBall,
   boulderStorm,
   fireVolley,
+  /** Fire an exact projectile spawn (used by headless repro of recorded shots). */
+  shoot: (spawn: any) => coreRef?.enqueueProjectile(spawn),
   isReady: () => !!coreRef && !rebuilding,
 };
 
