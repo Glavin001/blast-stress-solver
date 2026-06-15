@@ -1,6 +1,6 @@
 ---
 name: make-glb-destructible
-description: Use when turning a GLB/glTF model (a car, building, prop, etc.) into a destructible Three.js + Rapier physics demo with the blast-stress-solver in this repo — decompose the model into physical pieces, bond them in a strength hierarchy, fracture the concave parts, and make them break/shed realistically. Covers the full pipeline, the threshold-based free-body breaking model, and the gotchas that waste hours (collider explosions, welded concave meshes, dead-feeling tuning sliders, verifying headless before asking a human to QA).
+description: Use when turning a GLB/glTF model (a car, building, prop, etc.) into a destructible Three.js + Rapier physics demo with the blast-stress-solver in this repo — decompose the model into physical pieces, bond them in a strength hierarchy, fracture the concave parts, and make them break/shed realistically. Covers the full pipeline, the stress-driven free-body breaking model (calibrated materialScale, no scripted onImpact), and the gotchas that waste hours (collider explosions, welded concave meshes, verifying headless before asking a human to QA).
 ---
 
 # Making a GLB model destructible
@@ -16,13 +16,17 @@ them the slow way.
 
 These three cost the most time. Internalize them before writing code.
 
-1. **A free-floating body does NOT break via the stress solver.** An impact on a
-   free object becomes momentum, not internal stress (verified: 0 parts shed even at
-   `materialScale` 1e5 with hard hits and 4 m drops). The stress solver only sheds
-   parts on *anchored* structures (walls/towers, where supports create stress). So
-   for a vehicle/free prop: keep `materialScale` **high** (solid at rest) and drive
-   breaking yourself via **force/violence thresholds**, not bond stress. Corollary:
-   **bond "strength"/area values barely affect destruction** — tune *thresholds*.
+1. **A free body breaks via the stress solver — once it rests on the ground.** A body
+   is stress-free only in *free-fall* (gravity = uniform acceleration, no internal load;
+   this is why an airborne object sheds nothing). The moment it rests on the ground, the
+   ground-contact reaction — which the core already injects into the stress solver
+   alongside gravity — concentrates at the contacts while weight pulls everywhere, so a
+   real internal load path forms and the solver's overstressed-bond path breaks it.
+   Projectile contact forces are injected the same way. So for a vehicle/free prop you
+   **calibrate `materialScale`** (hold at rest, break on hit) and let the stress solver
+   drive everything — no scripted `onImpact`/threshold path. Bond strength (the area
+   hierarchy) and materialScale *are* what govern destruction. (Pinned headless by
+   `blast/blast-stress-solver/src/tests/freeBodyGroundStress.test.ts`.)
 
 2. **Overlapping fractured/split colliders explode when many detach at once.** The
    runtime auto-builds one convex hull per node from its geometry; Voronoi chunks and
@@ -90,28 +94,31 @@ These three cost the most time. Internalize them before writing code.
    the bond graph and stitch any leftover components together so nothing is an orphan
    (an orphan detaches and drops on frame 1). Per-node colors by role for the view.
 
-8. **Build the core** (`buildDestructibleCore`) with **high `materialScale`** (1e12 —
-   solid under gravity; at 1e10 it silently fragments into ~28 pieces just settling
-   because auto-bond contact areas are small). Render with `createDestructibleThreeBundle`
-   using `nodeColors` (role colors) — it renders the *real* per-part geometry, so the car
+8. **Build the core** (`buildDestructibleCore`) with `materialScale` **calibrated** so
+   the intact car holds under its own weight at rest yet a hit/drop overstresses the
+   weak joints (for the buggy: ~1e11; too low → it fragments while just settling, too
+   high → nothing ever breaks). Render with `createDestructibleThreeBundle` using
+   `nodeColors` (role colors) — it renders the *real* per-part geometry, so the car
    keeps its silhouette.
 
-9. **Breaking (threshold-based — the part that actually works on a free body):**
-   - **Direct hits:** pass an `onImpact({nodeIndex, force})` callback to
-     `buildDestructibleCore` (added in `destructible-core.ts`; fires for projectile/ground
-     contacts). When `force` exceeds a per-role threshold, `core.cutNodeBonds(node)` —
-     the part detaches and falls *keeping its mesh*, with a small bounded splash.
-   - **Inertial shedding:** each frame, for bodies moving/spinning violently, cut the
-     bonds of cargo/accessory (and optionally all) nodes on them — so a car that's flung
-     and tumbling sheds its payload (which a pure contact path never would).
-   - **Debris collision:** `debrisCollisionMode: 'noDebrisPairs'` (debris bounces off the
-     car + ground but not other debris) or `'debrisGroundOnly'` (safest). NOT `'all'` —
-     that's the explosion. Verify with the soak.
+9. **Breaking (stress-driven — no scripted path):** a free body is stress-free only in
+   *free-fall*; resting on the ground, the ground-contact reaction (which the core
+   already injects into the stress solver) + gravity + projectile contact forces create
+   a real load path, and the solver's existing overstressed-bond fracture path breaks
+   bonds where stress exceeds the (area-encoded) per-role limit. So you do **not** need
+   an `onImpact` callback — just calibrate `materialScale`. Two stability aids:
+   - **Progressive fracture:** `core.setFracturePolicy({ maxFracturesPerFrame: ~4-6 })`
+     peels a cluster off over a few frames instead of releasing a whole overlapping-hull
+     region in one step (which explodes).
+   - **Resting cargo:** cap each cargo/accessory part to a single weak bond
+     (`capRestingBonds`) so it sheds like a resting contact, not a welded seam.
+   - **Debris collision:** `debrisCollisionMode: 'debrisGroundOnly'` (safest) or
+     `'noDebrisPairs'`. NOT `'all'` — that's the explosion. Verify with the soak.
 
-10. **GUI for live tuning:** expose **per-role detach thresholds** and global
-    impact/shed sensitivity as **live** sliders. (Wiring sliders to bond *areas* feels
-    dead — see truth #1.) Per-role + global multipliers on the thresholds, applied every
-    frame, give instant, satisfying tuning.
+10. **GUI for live tuning:** the real knobs are **`materialScale`** (global toughness)
+    and the **per-role bond-strength** multipliers (the area hierarchy). Expose those;
+    bond strength needs a Reset (it's baked at build), materialScale ideally too. There
+    is no separate "detach threshold" to tune — strength *is* the threshold.
 
 ## Build, run, verify (don't skip the last one)
 
@@ -146,8 +153,11 @@ explosions and instability that only show up while the simulation runs.
 1. **Verify the simulation headless before asking the human to QA.** Build a Playwright
    soak + a `window.__demo.metrics()` probe (max body speed, count > 60 m/s, spread).
    Single screenshots miss time-dependent blow-ups. This was the #1 wasted-trust moment.
-2. **Free bodies don't stress-break** (truth #1). Don't chase materialScale to make hits
-   work — drive breaking from `onImpact` + inertial shedding. Anchored demos differ.
+2. **Free bodies DO stress-break — once they rest on the ground.** A free body is
+   stress-free only in free-fall; resting on the ground, the injected ground-contact
+   reaction + gravity (and projectile hits) stress the bonds, and the solver's
+   overstressed-bond path breaks them. So calibrate `materialScale` (hold at rest, break
+   on hit) — no `onImpact` scripting needed. (Pinned by `freeBodyGroundStress.test.ts`.)
 3. **`'all'` debris mode → explosion** when overlapping chunks detach together. Use
    `'noDebrisPairs'` / `'debrisGroundOnly'`.
 4. **The runtime builds a convex hull per node from `fragmentGeometries`** even if you
@@ -192,8 +202,9 @@ explosions and instability that only show up while the simulation runs.
     card, and add an asset-copy line to `build-demo-site.sh` if you ship a model.
 18. **Repo-wide `*.glb` gitignore** (`blast/.gitignore`): un-ignore your demo asset with a
     `!assets/your.glb` negation in the local `.gitignore`, else `git add` silently skips it.
-19. **Tuning sliders that feel dead** = they're wired to bond areas (truth #1). Wire them
-    to the per-role *thresholds* (live) instead.
+19. **Bond strength / materialScale need a Reset to take effect** — they're baked into
+    the solver at build time, so a live slider won't change an already-built car until
+    you rebuild. Make that explicit in the UI (or rebuild on change).
 20. **Perf:** auto-bonding + split + fracture process a lot of triangles → first
     load/Reset takes a few seconds; high-poly parts make convex-hull colliders chunky.
     Decimating collider/bond geometry (keeping full-res for render) is the obvious win.
@@ -226,7 +237,8 @@ explosions and instability that only show up while the simulation runs.
 - [ ] Tune `classifyVehiclePart` keywords/heuristics for the model's part names.
 - [ ] Decide split/fracture role gates (don't split/fracture wheels-equivalent).
 - [ ] Set `maxSeparation` so wheels/loose parts bond (check the `bonds by role pair` log).
-- [ ] Keep `materialScale` high; confirm it's solid at rest (settle → ~2 bodies).
-- [ ] Set per-role detach thresholds; confirm the hierarchy (cargo sheds, frame holds).
-- [ ] `node scripts/soak-vehicle.mjs` → must PASS (no explosions) before human QA.
+- [ ] Cap resting cargo/accessory to a single weak bond (`capRestingBonds`).
+- [ ] Calibrate `materialScale` (+ `setFracturePolicy({ maxFracturesPerFrame })`): solid
+      at rest (settle → ~2 bodies, 0 shed), but cargo sheds / frame holds on a hit.
+- [ ] `node scripts/soak-vehicle.mjs` → settle/light/drop must be stable before human QA.
 - [ ] Register the demo (tsconfig / package.json / demo-index / build-demo-site).
