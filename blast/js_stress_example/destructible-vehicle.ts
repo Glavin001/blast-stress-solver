@@ -251,10 +251,6 @@ async function initScene(dropHeight = 0) {
 
   coreRef = core;
   core.setSolverCentrifugalEnabled(physicsConfig.centrifugal);
-  // Progressive fracture: cap bonds broken per frame so a hard hit peels parts off
-  // over a few frames instead of detaching a whole overlapping-hull cluster in one
-  // step (which resolves as an explosion). Models realistic crack propagation too.
-  core.setFracturePolicy?.({ maxFracturesPerFrame: 4 });
   recorder.attach(core, { scenario, meta: { demo: 'destructible-vehicle' } });
   profiler.attach(core);
   visualsRef = visuals;
