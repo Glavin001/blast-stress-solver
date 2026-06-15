@@ -29,7 +29,7 @@
  * solver's stress limits are global — see {@link makeHouseBondMultiplier}.
  */
 import * as THREE from 'three';
-import type { ScenarioDesc, ScenarioBond } from '../rapier/types';
+import type { ScenarioDesc, ScenarioBond, CollisionGroup } from '../rapier/types';
 import type { FragmentInfo, FragmentType } from '../three/fracture';
 import {
   applyBondStrengthMultipliers,
@@ -271,6 +271,10 @@ type CollectedHouse = {
    *  element instead of one box around the whole house. Indices are valid only on the unfractured
    *  fragment list (the async `fracture` path expands fragments and skips the authored tree). */
   elementRanges: Array<{ start: number; count: number }>;
+  /** Half-open index range `[start, end)` into `elementRanges` covering the two gable roof slopes,
+   *  so a builder can group them under one `shape: 'prism'` collision node (the intact render-LOD
+   *  draws the gable as a single ridge prism instead of two flat-topped slope boxes). */
+  roofRanges: { start: number; end: number };
 };
 
 function overlaps1D(aMin: number, aMax: number, bMin: number, bMax: number): boolean {
@@ -497,6 +501,7 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
   const roofCols = Math.max(2, Math.round(roofLenX / panelCell));
   const roofRows = Math.max(2, Math.round(slopeLen / panelCell));
   const ridgePivot: Vec3 = { x: 0, y: ridgeUndersideY, z: 0 };
+  const roofRangeStart = elementRanges.length;
   for (const sign of [-1, 1] as const) {
     push(buildRotatedBoxGridFragments({
       center: { x: 0, y: ridgeUndersideY + roofThickness * 0.5, z: sign * slopeLen * 0.5 },
@@ -506,6 +511,7 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
       rotation: { axis: 'x', angle: sign * slope, pivot: ridgePivot },
     }), HOUSE_PALETTE.roof);
   }
+  const roofRangeEnd = elementRanges.length;
 
   // ── Gable-end drywall triangles: ABOVE the top plate, each course sized so its top stays
   // UNDER the sloped roof (touching, never poking through). ──
@@ -538,6 +544,7 @@ function collectHouseFragments(o: MergedOptions): CollectedHouse {
     fragments,
     nodeColors,
     elementRanges,
+    roofRanges: { start: roofRangeStart, end: roofRangeEnd },
     dims: {
       width, depth, wallHeight,
       floorTopY: floorTopY + liftY,
@@ -634,16 +641,31 @@ function fractureSelected(
 
 // ── Public builders ─────────────────────────────────────────────────────────
 
-/** Author a semantic collision-LOD tree (building → element) from per-element fragment ranges. */
+/** Author a semantic collision-LOD tree (building → element) from per-element fragment ranges.
+ *  The element ranges in `roofRanges` (the two gable slopes) are grouped under one
+ *  `shape: 'prism'` node so the intact render-LOD draws the gable as a single ridge prism, while
+ *  the slopes remain separate collision leaves underneath it. */
 function elementTreeFromRanges(
   ranges: Array<{ start: number; count: number }>,
-): Array<{ children: Array<{ fragments: number[] }> }> {
+  roofRanges?: { start: number; end: number },
+): Array<CollisionGroup> {
   const range = (start: number, count: number) => {
     const out = new Array<number>(count);
     for (let i = 0; i < count; i++) out[i] = start + i;
     return out;
   };
-  return [{ children: ranges.map((r) => ({ fragments: range(r.start, r.count) })) }];
+  const leaf = (i: number): CollisionGroup => ({ fragments: range(ranges[i].start, ranges[i].count) });
+  const children: CollisionGroup[] = [];
+  for (let i = 0; i < ranges.length; i++) {
+    if (roofRanges && i >= roofRanges.start && i < roofRanges.end) continue; // grouped into the prism below
+    children.push(leaf(i));
+  }
+  if (roofRanges && roofRanges.end > roofRanges.start) {
+    const roofChildren: CollisionGroup[] = [];
+    for (let i = roofRanges.start; i < roofRanges.end; i++) roofChildren.push(leaf(i));
+    children.push({ shape: 'prism', children: roofChildren });
+  }
+  return [{ children }];
 }
 
 function finalize(
@@ -669,7 +691,7 @@ export function buildHouseScenario(options: HouseOptions = {}): ScenarioDesc {
   const scenario = buildScenarioFromFragments(fragments, { areaNormalization: 'none' });
   finalize(scenario, options, fragments, nodeColors, dims);
   // Unfractured boxes ⇒ the per-element ranges are valid: author the semantic render/collision LOD.
-  scenario.collisionTree = elementTreeFromRanges(collected.elementRanges);
+  scenario.collisionTree = elementTreeFromRanges(collected.elementRanges, collected.roofRanges);
   return scenario;
 }
 
@@ -708,6 +730,6 @@ export async function buildHouseScenarioAsync(options: HouseOptions = {}): Promi
   finalize(scenario, options, fragments, nodeColors, collected.dims);
   // Author the semantic LOD tree only when the fragment list is still the unfractured one (the
   // `fracture` path expands fragments, invalidating the ranges — the core's spatial split covers it).
-  if (types.size === 0) scenario.collisionTree = elementTreeFromRanges(collected.elementRanges);
+  if (types.size === 0) scenario.collisionTree = elementTreeFromRanges(collected.elementRanges, collected.roofRanges);
   return scenario;
 }

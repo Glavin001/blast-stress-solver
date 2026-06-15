@@ -69,6 +69,23 @@ describe('house composer', () => {
     expect(roofToFrame.length, 'roof should bond to the ridge/plate or gable wall').toBeGreaterThan(0);
   });
 
+  it('authors a single gable-prism collision node grouping every roof slope', () => {
+    const roots = scenario.collisionTree!;
+    expect(roots.length).toBe(1); // one building
+    const children = roots[0].children!;
+    const prismNodes = children.filter((c) => c.shape === 'prism');
+    expect(prismNodes.length).toBe(1); // the gable roof → one ridge-prism render proxy
+    // No bare roof leaves left at the top level: every roof fragment lives under the prism node.
+    const roofIdx = new Set(types.flatMap((t, i) => (t === 'roof' ? [i] : [])));
+    expect(roofIdx.size).toBeGreaterThan(0);
+    const underPrism = new Set<number>();
+    for (const slope of prismNodes[0].children ?? []) for (const f of slope.fragments ?? []) underPrism.add(f);
+    expect(prismNodes[0].children!.length).toBe(2); // two gable slopes kept as separate collision leaves
+    for (const i of roofIdx) expect(underPrism.has(i), `roof fragment ${i} under the prism node`).toBe(true);
+    // And the prism node holds ONLY roof fragments.
+    for (const i of underPrism) expect(roofIdx.has(i), `prism fragment ${i} is roof`).toBe(true);
+  });
+
   it('has interior king posts that rise to support the ridge', () => {
     const ridgeY = (scenario.parameters as any).house.ridgeY as number;
     // King posts (columns) reach up near the ridge — the dispersed roof support.

@@ -665,6 +665,10 @@ export async function buildDestructibleCore({
     aabbMin: Vec3; aabbMax: Vec3;
     enabled: boolean;
     buildingId: number;
+    // Optional render-LOD proxy shape (authored on the CollisionGroup). Cosmetic only — collision
+    // descends children regardless. When set, the intact render-LOD draws one shaped proxy for this
+    // whole node instead of one box per descendant leaf (e.g. a gable roof → a single ridge prism).
+    shape?: 'box' | 'prism';
   };
   const lodRoots: LodNode[] = [];
   const buildingOfNode = new Int32Array(scenario.nodes.length).fill(-1);
@@ -2508,8 +2512,8 @@ export async function buildDestructibleCore({
 
   // Build a runtime LodNode (recursively) from an authored CollisionGroup, assigning every
   // descendant fragment to `buildingId`. AABBs are unioned bottom-up.
-  function buildLodNodeFromGroup(group: { children?: unknown[]; fragments?: number[] }, buildingId: number): LodNode {
-    const childGroups = (group.children ?? []) as Array<{ children?: unknown[]; fragments?: number[] }>;
+  function buildLodNodeFromGroup(group: { children?: unknown[]; fragments?: number[]; shape?: 'box' | 'prism' }, buildingId: number): LodNode {
+    const childGroups = (group.children ?? []) as Array<{ children?: unknown[]; fragments?: number[]; shape?: 'box' | 'prism' }>;
     if (childGroups.length > 0) {
       const children = childGroups.map((g) => buildLodNodeFromGroup(g, buildingId));
       let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -2517,19 +2521,19 @@ export async function buildDestructibleCore({
         if (ch.aabbMin.x < minX) minX = ch.aabbMin.x; if (ch.aabbMin.y < minY) minY = ch.aabbMin.y; if (ch.aabbMin.z < minZ) minZ = ch.aabbMin.z;
         if (ch.aabbMax.x > maxX) maxX = ch.aabbMax.x; if (ch.aabbMax.y > maxY) maxY = ch.aabbMax.y; if (ch.aabbMax.z > maxZ) maxZ = ch.aabbMax.z;
       }
-      return { children, fragments: [], aabbMin: { x: minX, y: minY, z: minZ }, aabbMax: { x: maxX, y: maxY, z: maxZ }, enabled: false, buildingId };
+      return { children, fragments: [], aabbMin: { x: minX, y: minY, z: minZ }, aabbMax: { x: maxX, y: maxY, z: maxZ }, enabled: false, buildingId, shape: group.shape };
     }
     const fragments = (group.fragments ?? []) as number[];
     for (const ni of fragments) if (ni >= 0 && ni < buildingOfNode.length) buildingOfNode[ni] = buildingId;
     const { aabbMin, aabbMax } = aabbOfFragments(fragments);
-    return { children: [], fragments: fragments.slice(), aabbMin, aabbMax, enabled: false, buildingId };
+    return { children: [], fragments: fragments.slice(), aabbMin, aabbMax, enabled: false, buildingId, shape: group.shape };
   }
 
   // Build the LOD roots. Source: an explicit `scenario.collisionTree` if present; otherwise one flat
   // leaf per bond-connected component (supports included) — i.e. the non-hierarchical behavior.
   function ensureLodRoots() {
     if (lodRoots.length > 0) return;
-    const explicit = (scenario as { collisionTree?: Array<{ children?: unknown[]; fragments?: number[] }> }).collisionTree;
+    const explicit = (scenario as { collisionTree?: Array<{ children?: unknown[]; fragments?: number[]; shape?: 'box' | 'prism' }> }).collisionTree;
     if (explicit && explicit.length > 0) {
       explicit.forEach((g) => { lodRoots.push(buildLodNodeFromGroup(g, lodRoots.length)); });
       // Any node not referenced by the tree becomes its own single-fragment building (robustness).
@@ -2674,7 +2678,7 @@ export async function buildDestructibleCore({
         aabbMin: Vec3;
         aabbMax: Vec3;
         fragments: number[];
-        parts: Array<{ aabbMin: Vec3; aabbMax: Vec3 }>;
+        parts: Array<{ aabbMin: Vec3; aabbMax: Vec3; shape?: 'box' | 'prism' }>;
       }>
     | null = null;
   function getBuildingRenderStates() {
@@ -2684,11 +2688,25 @@ export async function buildDestructibleCore({
       // structural elements (wall / column / slab / roof) when the scenario ships a semantic
       // `collisionTree`, else the spatial-split chunks — either way a renderer can draw one cheap
       // box per leaf for a faithful intact-LOD silhouette instead of a single building-sized box.
+      // A node carrying a `shape` collapses to ONE shaped proxy for its whole subtree (e.g. a gable
+      // roof authored as two slabs → a single ridge prism) while still contributing every fragment.
+      const gatherFrags = (node: LodNode, outFrags: number[]) => {
+        if (node.children.length === 0) {
+          for (const f of node.fragments) outFrags.push(f);
+          return;
+        }
+        for (const ch of node.children) gatherFrags(ch, outFrags);
+      };
       const collect = (
         node: LodNode,
         outFrags: number[],
-        outParts: Array<{ aabbMin: Vec3; aabbMax: Vec3 }>,
+        outParts: Array<{ aabbMin: Vec3; aabbMax: Vec3; shape?: 'box' | 'prism' }>,
       ) => {
+        if (node.shape) {
+          gatherFrags(node, outFrags);
+          outParts.push({ aabbMin: { ...node.aabbMin }, aabbMax: { ...node.aabbMax }, shape: node.shape });
+          return;
+        }
         if (node.children.length === 0) {
           for (const f of node.fragments) outFrags.push(f);
           outParts.push({ aabbMin: { ...node.aabbMin }, aabbMax: { ...node.aabbMax } });
@@ -2698,7 +2716,7 @@ export async function buildDestructibleCore({
       };
       buildingRenderStatesCache = lodRoots.map((root) => {
         const fragments: number[] = [];
-        const parts: Array<{ aabbMin: Vec3; aabbMax: Vec3 }> = [];
+        const parts: Array<{ aabbMin: Vec3; aabbMax: Vec3; shape?: 'box' | 'prism' }> = [];
         collect(root, fragments, parts);
         return {
           buildingId: root.buildingId,
