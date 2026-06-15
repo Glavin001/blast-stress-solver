@@ -487,14 +487,22 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
     ? await buildScenarioFromFragmentsAsync(allFragments, scenarioOptions)
     : buildScenarioFromFragments(allFragments, scenarioOptions);
 
-  // ── Apply the strength hierarchy, and (by default) DECOUPLE structures ──
-  // Auto-bonding across a wall↔tower seam stitches every wall, tower and the
-  // gatehouse into ONE giant stress island, so a single hit propagates around
-  // the whole ring ("crumbles from the first hit"). By default we DROP the
-  // inter-structure bonds: each wall / tower / keep becomes its own stress
-  // island (still anchored to the shared foundation and resting against its
-  // neighbours), so a hit stays local. Set bondAcrossStructures:true to keep the
-  // weak inter-structure tier instead.
+  // ── Apply the strength hierarchy, and KEEP STRUCTURES INDEPENDENT ──
+  // Two back-doors otherwise stitch the whole castle into one stress island, so a
+  // hit on one structure wakes/shatters every other (e.g. hitting a corner tower
+  // collapses the centre keep):
+  //   1. Direct wall↔tower seam bonds (inter-structure tier).
+  //   2. The shared foundation slab: every structure's footing bonds to a single
+  //      connected grid of foundation tiles, so a hit routes THROUGH the foundation
+  //      into all structures. (This one is the real culprit — verified from a
+  //      recorded session where a corner-tower hit woke 262 keep chunks the same
+  //      frame, the keep and tower sharing one foundation-linked component.)
+  // Each structure's bottom course is already a static (mass-0) footing that anchors
+  // it on its own, so we DROP every foundation-touching bond and leave the
+  // foundation as an unbonded static floor. We also drop inter-structure bonds by
+  // default. Result: each wall / tower / keep is its own island and a hit stays
+  // local. Set bondAcrossStructures:true to restore the weak wall↔tower seam tier
+  // (the foundation stays decoupled regardless).
   const isFoundation = (i: number) => kindByNode[i] === 'foundation';
   const tierOf = (b: ScenarioBond): CastleBondTier => {
     const a = b.node0, c = b.node1;
@@ -508,6 +516,7 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
   const keptTiers: number[] = [];
   for (const b of scenario.bonds) {
     const tier = tierOf(b);
+    if (tier === CastleBondTier.Anchor) continue; // foundation = unbonded static floor
     if (tier === CastleBondTier.InterStructure && !opt.bondAcrossStructures) continue;
     keptBonds.push({ ...b, area: Math.max(b.area * tierMult[tier], 1e-8) });
     keptTiers.push(tier);

@@ -66,12 +66,12 @@ describe('brick-castle scenario (requires three-pinata)', () => {
     // Dynamic bricks carry physical (volume*density) mass.
     expect(scenario.nodes.some((n) => n.mass > 0)).toBe(true);
 
-    // The always-present tiers (anchor, intra-brick, mortar) must be populated.
-    // The inter-structure tier may legitimately be empty: structures are spaced so
-    // their colliders never overlap, which can also leave them just out of bond
-    // contact — separation we accept to keep the scene overlap-free.
+    // The structural tiers (intra-brick, mortar) must be populated. The anchor
+    // tier is intentionally empty — foundation bonds are dropped so the slab can't
+    // couple structures (anchoring is via each structure's own mass-0 footing). The
+    // inter-structure tier may also be empty (structures are spaced overlap-free).
     const tc: number[] = Array.from(p.tierCounts);
-    expect(tc[CastleBondTier.Anchor]).toBeGreaterThan(0);
+    expect(tc[CastleBondTier.Anchor]).toBe(0);
     expect(tc[CastleBondTier.IntraBrick]).toBeGreaterThan(0);
     expect(tc[CastleBondTier.Mortar]).toBeGreaterThan(0);
 
@@ -177,5 +177,33 @@ describe('brick-castle scenario (requires three-pinata)', () => {
       }
     }
     expect(deep).toBe(0);
+  }, 60_000);
+
+  it.skipIf(!pinataAvailable)('keeps every structure an independent island (no foundation coupling)', async () => {
+    // Regression guard for "hit a corner tower, the centre keep also breaks": the
+    // shared foundation slab used to bond all structures into one connected graph,
+    // so a hit propagated through it into every structure. No bonded component may
+    // span more than one structure (foundation bonds are dropped entirely).
+    const { buildBrickCastleScenario } = await import('../scenarios/brickCastleScenario');
+    const scenario = await buildBrickCastleScenario({ ...SMALL, bondMode: 'auto' });
+    const p = scenario.parameters as any;
+    const kind = p.kindByNode as string[];
+    const sid = p.structureIdByNode as number[];
+    const N = scenario.nodes.length;
+    const par = Array.from({ length: N }, (_, i) => i);
+    const find = (x: number): number => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+    for (const b of scenario.bonds) { const a = find(b.node0), c = find(b.node1); if (a !== c) par[a] = c; }
+    // No foundation bonds should survive at all.
+    expect(scenario.bonds.some((b) => kind[b.node0] === 'foundation' || kind[b.node1] === 'foundation')).toBe(false);
+    // Every connected component must contain at most one (non-foundation) structure.
+    const compStructs = new Map<number, Set<number>>();
+    for (let i = 0; i < N; i++) {
+      if (kind[i] === 'foundation') continue;
+      const r = find(i);
+      const set = compStructs.get(r) ?? new Set<number>();
+      set.add(sid[i]); compStructs.set(r, set);
+    }
+    const maxStructsPerComponent = Math.max(...[...compStructs.values()].map((s) => s.size));
+    expect(maxStructsPerComponent).toBe(1);
   }, 60_000);
 });
