@@ -247,6 +247,13 @@ async function initScene(dropHeight = 0) {
     contactForceScale: CONFIG.physics.contactForceScale,
     skipSingleBodies: CONFIG.physics.skipSingleBodies,
     fractureWarmupFrames: CONFIG.solver.warmupFrames,
+    // Progressive fracture: a hard hit can overstress hundreds of bonds at once.
+    // Releasing all those overlapping convex-hull chunks in a single frame makes
+    // Rapier resolve their mutual penetration explosively (debris flung faster than
+    // the projectile). Capping fractures/new-bodies per frame spreads a big shatter
+    // over a few frames — visually still near-instant, but stable. (Anchored demos
+    // don't need this; a free body releasing its own mass does.)
+    fracturePolicy: { maxFracturesPerFrame: 40, maxNewBodiesPerFrame: 24 },
     ...physicsCoreOverrides(),
     ...pipelineCoreOverrides(),
   });
@@ -410,13 +417,16 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Detached debris bounces off the intact body and the ground, but NOT off other
-// debris. Fractured/split chunks have overlapping convex hulls, so allowing
-// debris-vs-debris contact lets a pile of just-detached overlapping chunks resolve
-// their penetration as a violent explosion. 'noDebrisPairs' keeps debris lively
-// (cargo bounces off the car) while removing that failure mode. Verified stable
-// under heavy destruction by scripts/soak-vehicle.mjs.
-physicsConfig.debrisCollisionMode = 'noDebrisPairs';
+// Detached debris collides with the GROUND ONLY — not with the still-intact car
+// nor with other debris. Stress-driven shattering can free a large cluster of
+// chunks at once; because fractured chunks have overlapping convex hulls, letting
+// those freshly-freed chunks collide with the body they just left (or each other)
+// makes Rapier resolve the mutual penetration explosively (debris flung faster
+// than the projectile). 'debrisGroundOnly' removes that whole failure mode so a
+// hard hit can shatter a lot without exploding — the trade-off is that shed parts
+// fall past the car rather than bouncing off it. Verified stable under heavy
+// destruction by scripts/soak-vehicle.mjs.
+physicsConfig.debrisCollisionMode = 'debrisGroundOnly';
 
 // Shared Physics / Optimization / Features controls. Centrifugal (spin
 // self-fracture) defaults ON here so a flung/spinning body sheds its cargo.
