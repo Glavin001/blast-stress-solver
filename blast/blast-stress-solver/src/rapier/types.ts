@@ -353,11 +353,25 @@ export type DestructibleCore = {
    * Off by default; opt in when large fragments should secondary-fracture as they rotate.
    */
   setSolverCentrifugalEnabled: (v: boolean) => void;
+  /**
+   * Live-rescale the stress solver's six elastic/fatal limits by `scale`
+   * (the same factor the `materialScale` build option applies once). Lower =
+   * bonds break more easily. Returns the applied scale.
+   */
+  setMaterialScale: (scale: number) => number;
+  /**
+   * Live-adjust how strongly external contact forces are injected into the stress
+   * solver (higher = the same impact produces more bond stress). No-op when the
+   * damage system owns impacts. Returns the applied value.
+   */
+  setContactForceScale: (scale: number) => number;
   /** @deprecated Use setDebrisCollisionMode instead */
   setSingleCollisionMode: (mode: SingleCollisionMode) => void;
   setDebrisCollisionMode: (mode: DebrisCollisionMode) => void;
   getRigidBodyCount: () => number;
   getActiveBondsCount: () => number;
+  /** Bonds currently past the solver's elastic limit (about to fracture). */
+  getSolverOverstressedBondCount: () => number;
   getSolverDebugLines: (mode?: number) => Array<{ p0: Vec3; p1: Vec3; color0: number; color1: number }>;
   // Bond interaction helpers
   getNodeBonds: (nodeIndex: number) => BondRef[];

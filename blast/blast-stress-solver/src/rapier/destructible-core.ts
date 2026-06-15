@@ -54,14 +54,15 @@ export type BuildDestructibleCoreOptions = {
   damage?: DamageOptions & { autoDetachOnDestroy?: boolean; autoCleanupPhysics?: boolean };
   onNodeDestroyed?: (e: { nodeIndex: number; actorIndex: number; reason: 'impact'|'manual' }) => void;
   /**
-   * Called for each external contact impact on a node (projectile or ground hit),
-   * with the contact force magnitude. Lets a consumer drive custom impact response
-   * (e.g. detaching weak parts via cutNodeBonds) without the damage system's
-   * destroy-and-vanish behaviour. Only fired when `force >= onImpactMinForce`.
-   */
-  onImpact?: (e: { nodeIndex: number; force: number; otherBodyHandle: number }) => void;
-  /** Minimum contact force to fire `onImpact` (filters resting contacts). Default 0. */
-  onImpactMinForce?: number;
+   * Suppress stress-driven fracture for the first N `step()`s after build, giving
+   * the iterative stress solver time to converge to the static (gravity + resting
+   * contact) equilibrium before any bond is allowed to break. A freshly built body
+   * starts from a zero impulse guess, so the first few solves can transiently
+   * overshoot the true static stress and spuriously fracture a settling structure
+   * (most visible on a free body spawned onto the ground). 0 = no warm-up (default;
+   * unchanged for existing demos). Does not affect contact/impact stress once past
+   * the window. */
+  fractureWarmupFrames?: number;
   resimulateOnFracture?: boolean;
   maxResimulationPasses?: number;
   /** Rollback strategy for resimulation.
@@ -201,8 +202,7 @@ export async function buildDestructibleCore({
   debrisCollisionMode,
   damage,
   onNodeDestroyed,
-  onImpact,
-  onImpactMinForce = 0,
+  fractureWarmupFrames = 0,
   resimulateOnFracture = true,
   maxResimulationPasses = 1,
   snapshotMode = 'perBody',
@@ -1037,7 +1037,8 @@ export async function buildDestructibleCore({
   // solver keeps carrying gravity/structural load (which redistributes robustly around
   // missing nodes). Without this, a large contact force collapses the whole structure
   // globally regardless of how it is partitioned. See contact-injection loop below.
-  const effectiveContactStressScale = damageOptions.enabled
+  // Mutable so a consumer can tune impact strength live (setContactForceScale).
+  let effectiveContactStressScale = damageOptions.enabled
     ? damageContactStressScale
     : contactForceScale;
 
@@ -1281,9 +1282,6 @@ export async function buildDestructibleCore({
             });
           }
           if (chunk.bodyHandle != null) bodiesCollidedWithGround.add(chunk.bodyHandle);
-          if (onImpact && totalForce >= onImpactMinForce) {
-            try { onImpact({ nodeIndex: node1, force: totalForce, otherBodyHandle: b2?.handle ?? -1 }); } catch {}
-          }
         }
       } else if (node2 != null) {
         const chunk = chunks[node2];
@@ -1302,9 +1300,6 @@ export async function buildDestructibleCore({
             });
           }
           if (chunk.bodyHandle != null) bodiesCollidedWithGround.add(chunk.bodyHandle);
-          if (onImpact && totalForce >= onImpactMinForce) {
-            try { onImpact({ nodeIndex: node2, force: totalForce, otherBodyHandle: b1?.handle ?? -1 }); } catch {}
-          }
         }
       }
     });
@@ -1815,7 +1810,11 @@ export async function buildDestructibleCore({
 
     const fractureT0 = startTiming();
     let hadFracture = false;
-    if (!shouldSkipSolver && solver.overstressedBondCount() > 0) {
+    // Warm-up: let the solver converge to the static equilibrium before allowing
+    // any break, so a settling spawn's transient overshoot can't spuriously
+    // fracture the structure. (safeFrames starts at 0 at build.)
+    const pastWarmup = safeFrames >= fractureWarmupFrames;
+    if (!shouldSkipSolver && pastWarmup && solver.overstressedBondCount() > 0) {
       let perActor = profiledGenerateFractureCommands();
 
       // ── Fracture policy: progressive fracture budget ──
@@ -2906,6 +2905,16 @@ export async function buildDestructibleCore({
     return bondTable.length - removedBondIndices.size;
   }
 
+  /**
+   * Number of bonds currently past the stress solver's elastic limit (about to
+   * fracture). A direct read of how hard the structure is being stressed right
+   * now — useful for tuning material toughness / contact scale. 0 when the solver
+   * is absent.
+   */
+  function getSolverOverstressedBondCount(): number {
+    try { return solver.overstressedBondCount(); } catch { return 0; }
+  }
+
   // ── Stage 1: island settled-state measurement (read-only instrumentation) ──
   // Connected components of the ACTIVE bond graph, treating static (mass<=0)
   // nodes as non-merging CUT POINTS — a shared ground node carries sqrt_I_inv=0
@@ -3099,6 +3108,38 @@ export async function buildDestructibleCore({
     solverCentrifugalEnabled = v;
   }
 
+  /**
+   * Live-adjust the stress-solver material toughness. Recomputes the six
+   * elastic/fatal limits from the base material constants × `scale` and pushes
+   * them to the WASM solver, so a consumer can tune how easily bonds break
+   * without rebuilding the core. (The same scaling applied once at build time
+   * via the `materialScale` option.) Returns the applied scale.
+   */
+  function setMaterialScale(scale: number): number {
+    const s = Math.max(1e-6, scale);
+    scaledSettings.compressionElasticLimit = baseCompressionElastic * s;
+    scaledSettings.compressionFatalLimit = baseCompressionFatal * s;
+    scaledSettings.tensionElasticLimit = baseTensionElastic * s;
+    scaledSettings.tensionFatalLimit = baseTensionFatal * s;
+    scaledSettings.shearElasticLimit = baseShearElastic * s;
+    scaledSettings.shearFatalLimit = baseShearFatal * s;
+    // Re-apply any explicit build-time solver-settings overrides on top.
+    Object.assign(scaledSettings, solverSettings ?? {});
+    try { (solver as any).setSettings?.(scaledSettings); } catch {}
+    return s;
+  }
+
+  /**
+   * Live-adjust how strongly external contact forces (projectile/ground impacts)
+   * are injected into the stress solver. Higher = the same hit produces more bond
+   * stress (breaks more easily). No-op semantically when the damage system owns
+   * impacts (that path uses its own scale). Returns the applied value.
+   */
+  function setContactForceScale(scale: number): number {
+    if (!damageOptions.enabled) effectiveContactStressScale = Math.max(0, scale);
+    return effectiveContactStressScale;
+  }
+
   // Enable/disable island-aware solving and settled-island skipping at runtime (Stage 4).
   function setIslandSolver(opts: { enabled?: boolean; skipSettled?: boolean }) {
     if (opts.enabled != null) islandSolverEnabled = !!opts.enabled;
@@ -3249,10 +3290,13 @@ export async function buildDestructibleCore({
     setGravity: setGravityFn,
     setSolverGravityEnabled,
     setSolverCentrifugalEnabled,
+    setMaterialScale,
+    setContactForceScale,
     setSingleCollisionMode,
     setDebrisCollisionMode: setDebrisCollisionModeFn,
     getRigidBodyCount,
     getActiveBondsCount,
+    getSolverOverstressedBondCount,
     getIslandSettledStats,
     setIslandSolver,
     getIslandSolverStats,
