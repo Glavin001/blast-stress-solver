@@ -564,6 +564,10 @@ export async function buildVehicleScenario(
     bond.area = Math.max(bond.area * mult * rsOf(a.role) * rsOf(b.role), 1e-6);
   }
 
+  // Resting cargo/accessories: collapse their many footprint bonds down to a
+  // single weakest-link contact so they shed cleanly instead of being welded on.
+  const cappedBonds = capRestingBonds(scenario, meta, { roles: ['cargo', 'accessory'], maxBondsPerNode: 1 });
+
   // Guarantee the bond graph is a single connected component, otherwise an
   // isolated part would split off and drop on the first solver step.
   const stitched = stitchConnectivity(scenario, fragments, meta, baseArea);
@@ -589,7 +593,7 @@ export async function buildVehicleScenario(
     `| total=${scenario.bonds.length} nodes=${scenario.nodes.length} meta=${meta.length} maxNodeIdx=${maxNode} undefMeta=${undefMeta}`,
   );
   // Orphan stitches (centroid bonds) — these are the long "star" debug lines.
-  console.log(`[glb-vehicle] orphan stitches added: ${stitched}`);
+  console.log(`[glb-vehicle] resting bonds capped: ${cappedBonds} | orphan stitches added: ${stitched}`);
   // Parts whose collider spans a large fraction of the vehicle (likely a single
   // mesh holding multiple disconnected shapes — e.g. wheel-nuts across wheels).
   const carLen = Math.max(bounds.size.x, bounds.size.z) || 1;
@@ -632,6 +636,60 @@ function medianArea(bonds: Array<{ area: number }>): number {
   if (!bonds.length) return 0;
   const a = bonds.map((b) => b.area).sort((x, y) => x - y);
   return a[Math.floor(a.length / 2)];
+}
+
+/**
+ * Cargo / accessories are NOT structurally attached — they just rest in the
+ * vehicle. Their bonds exist only so they ride along as one reduced rigid body
+ * until disturbed (a perf convenience), not because they are welded on. The
+ * triangle-surface auto-bonder, however, glues a resting box along its whole
+ * contact footprint (many bonds), which over-constrains it into "welded".
+ *
+ * Reduce each such part to a single strongest bond so it behaves like a resting
+ * contact: one weak link that lets go cleanly under the slightest stress. A bond
+ * is kept if it is a top-`maxBondsPerNode` bond (by area) of EITHER endpoint, so
+ * every capped node keeps at least its best link; full disconnection (if any) is
+ * repaired afterwards by stitchConnectivity. Bonds between two un-capped
+ * (structural) parts are never touched.
+ *
+ * Exported for unit testing the pure graph logic without a GLB.
+ */
+export function capRestingBonds(
+  scenario: { bonds: Array<{ node0: number; node1: number; area: number }> },
+  meta: Array<{ role: VehiclePartRole } | undefined>,
+  options: { roles?: VehiclePartRole[]; maxBondsPerNode?: number } = {},
+): number {
+  const roles = new Set<VehiclePartRole>(options.roles ?? ['cargo', 'accessory']);
+  const maxPer = Math.max(1, Math.floor(options.maxBondsPerNode ?? 1));
+  const bonds = scenario.bonds;
+  const isCapped = (n: number) => roles.has(meta[n]?.role as VehiclePartRole);
+
+  // Collect bond indices touching each capped node.
+  const perNode = new Map<number, number[]>();
+  for (let bi = 0; bi < bonds.length; bi++) {
+    const { node0, node1 } = bonds[bi];
+    if (isCapped(node0)) (perNode.get(node0) ?? perNode.set(node0, []).get(node0)!).push(bi);
+    if (isCapped(node1)) (perNode.get(node1) ?? perNode.set(node1, []).get(node1)!).push(bi);
+  }
+  if (perNode.size === 0) return 0;
+
+  // Keep each capped node's strongest `maxPer` bonds (by area).
+  const keep = new Set<number>();
+  for (const biList of perNode.values()) {
+    biList.sort((a, b) => bonds[b].area - bonds[a].area);
+    for (let k = 0; k < Math.min(maxPer, biList.length); k++) keep.add(biList[k]);
+  }
+
+  // Drop bonds that touch a capped node but aren't kept by either endpoint.
+  const next: typeof bonds = [];
+  let removed = 0;
+  for (let bi = 0; bi < bonds.length; bi++) {
+    const { node0, node1 } = bonds[bi];
+    if ((isCapped(node0) || isCapped(node1)) && !keep.has(bi)) { removed++; continue; }
+    next.push(bonds[bi]);
+  }
+  scenario.bonds = next;
+  return removed;
 }
 
 /**
