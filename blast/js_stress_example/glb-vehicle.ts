@@ -60,14 +60,14 @@ export const ROLE_LABELS: Record<VehiclePartRole, string> = {
 const INTER_ROLE_MULTIPLIER: Record<string, number> = {
   'frame|frame': 8.0, // skeleton welds — strongest; keeps the shell together
   'frame|wheel': 5.0, // hub/axle to chassis — very strong
-  'frame|panel': 3.0, // panels bolted to the frame
+  'frame|panel': 1.0, // panels bolted to the frame — weak enough to blow off on a hit
   'frame|cargo': 0.25, // payload lashed to the frame — weak, sheds first
   'frame|accessory': 0.12,
   'wheel|wheel': 1.5,
-  'wheel|panel': 2.0,
+  'wheel|panel': 0.9,
   'wheel|cargo': 0.2,
   'wheel|accessory': 0.1,
-  'panel|panel': 2.0,
+  'panel|panel': 0.9, // bodywork comes apart panel-by-panel
   'panel|cargo': 0.3,
   'panel|accessory': 0.15,
   'cargo|cargo': 0.35, // payload items tied to each other
@@ -79,7 +79,7 @@ const INTER_ROLE_MULTIPLIER: Record<string, number> = {
 const INTERNAL_ROLE_MULTIPLIER: Record<VehiclePartRole, number> = {
   frame: 6.0,
   wheel: 4.0,
-  panel: 2.5,
+  panel: 1.0, // a panel itself cracks up readily once hit
   cargo: 1.5,
   accessory: 1.2,
 };
