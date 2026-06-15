@@ -30,10 +30,18 @@ import {
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
 import { mountShooter } from './shooter-fps.js';
-import { buildFracturedTowerScenario } from 'blast-stress-solver/scenarios';
+import {
+  buildFracturedTowerScenario,
+  buildHighRiseScenarioAsync,
+  buildHouseScenario,
+} from 'blast-stress-solver/scenarios';
 
 type Vec3 = { x: number; y: number; z: number };
 type ScenarioDesc = Awaited<ReturnType<typeof buildFracturedTowerScenario>>;
+
+// What kind of building sits on a lot, and (for the tall ones) how it is built.
+type BuildingKind = 'house' | 'midrise' | 'highrise';
+type Construction = 'fractured' | 'skeleton';
 
 // ── Config (driven by the control panel) ──────────────────────
 const CONFIG = {
@@ -42,12 +50,27 @@ const CONFIG = {
     street: 9, // gap between building footprints (m)
     widthMin: 6,
     widthMax: 9,
-    minFloors: 2,
-    maxFloors: 6,
+    maxFloors: 8, // tallest downtown high-rise (floors)
     fragments: 5, // Voronoi fragments per wall (floors/columns scale from this)
     seed: 7,
     massDensityMin: 600, // kg per m² per floor (min, randomised per building)
     massDensityMax: 1200, // kg per m² per floor (max)
+
+    // ── Composition / zoning ──────────────────────────────────
+    // The city is zoned by distance from its centre: a downtown core of tall buildings,
+    // surrounded by a residential ring of low houses. Proportion sliders bias the mix
+    // within each zone. All picks are seeded (mulberry32), so a seed reproduces the layout.
+    downtownFrac: 0.45, // radius of the downtown core, as a fraction of the city half-extent
+    highRiseShare: 0.4, // P(high-rise vs mid-rise) for a downtown lot
+    suburbShopShare: 0.15, // P(a small mid-rise "shop" appearing among the suburban houses)
+    emptyLotShare: 0.08, // P(a cell is left empty — a park/plaza — for street variety)
+    houseMaxFloors: 1, // a lot with ≤ this many floors becomes a house
+    midRiseMaxFloors: 4, // above houseMaxFloors and ≤ this → mid-rise; taller → high-rise
+    // How tall buildings are constructed (per band). 'fractured' = the simpler Voronoi-
+    // fractured concrete tower; 'skeleton' = the realistic high-rise (concrete frame +
+    // frangible drywall infill).
+    midRiseConstruction: 'fractured' as Construction,
+    highRiseConstruction: 'skeleton' as Construction,
   },
   projectile: { radius: 0.6, mass: 1500, speed: 60 },
   destroy: {
@@ -250,10 +273,14 @@ function mergeScenarios(parts: Part[]): ScenarioDesc {
       });
     }
 
-    // Carry each tower's authored collision-LOD tree, offsetting its fragment indices into the
-    // merged node array (one root per building).
-    const tree = (scenario as any).collisionTree as any[] | undefined;
-    if (tree) for (const root of tree) collisionTree.push(offsetCollisionGroup(root, base));
+    // Carry each building's collision-LOD tree, offsetting its fragment indices into the
+    // merged node array (one root per building). Fractured towers ship an AUTHORED semantic
+    // tree (building → floor → element); house / high-rise parts don't, so we synthesize a
+    // spatial one for them here. Either way every part contributes a tree, so localized hits
+    // only materialize the struck region's colliders regardless of building type.
+    let tree = (scenario as any).collisionTree as any[] | undefined;
+    if (!tree) tree = buildSpatialCollisionTree(scenario, { leafMaxFragments: 24 });
+    for (const root of tree) collisionTree.push(offsetCollisionGroup(root, base));
 
     base += scenario.nodes.length;
   }
@@ -291,13 +318,18 @@ const VARIANTS_PER_SHAPE = 3;
 
 async function buildCity(): Promise<ScenarioDesc> {
   buildings.length = 0;
-  const { grid, street, widthMin, widthMax, minFloors, maxFloors, fragments, seed, massDensityMin, massDensityMax } =
-    CONFIG.city;
+  const {
+    grid, street, widthMin, widthMax, maxFloors, fragments, seed,
+    massDensityMin, massDensityMax, downtownFrac, highRiseShare, suburbShopShare,
+    emptyLotShare, houseMaxFloors, midRiseMaxFloors, midRiseConstruction, highRiseConstruction,
+  } = CONFIG.city;
   const rng = mulberry32(seed * 2654435761);
 
   const cell = widthMax + street; // grid pitch
   const span = (grid - 1) * cell;
   const half = span / 2;
+  const maxDist = Math.max(1e-3, Math.hypot(half, half)); // corner distance, for zoning
+  const FLOOR_HEIGHT = 3;
 
   const parts: Part[] = [];
   let nodeBase = 0;
@@ -305,11 +337,14 @@ async function buildCity(): Promise<ScenarioDesc> {
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
   const total = grid * grid;
 
+  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+  const randInt = (lo: number, hi: number) => lo + Math.floor(rng() * (Math.max(lo, hi) - lo + 1));
+
   // Fracture is the dominant startup cost (Voronoi tessellation + O(n²) bond
   // detection per building), and it runs serially on the main thread. But
-  // buildings only vary by (width, floorCount) — a handful of distinct shapes.
-  // So we fracture at most VARIANTS_PER_SHAPE towers per shape and reuse them:
-  // a grid² city does ≤ shapes × VARIANTS fractures regardless of grid size.
+  // buildings only vary by (kind, construction, width, floorCount) — a handful of
+  // distinct shapes. So we build at most a few variants per shape and reuse them:
+  // a grid² city does ≤ shapes × variants fractures regardless of grid size.
   //
   // Sharing a cached scenario across instances is safe: mergeScenarios reads it
   // and emits fresh, offset node/bond objects without mutating the source, and
@@ -319,6 +354,8 @@ async function buildCity(): Promise<ScenarioDesc> {
   const templateCache = new Map<string, ScenarioDesc[]>();
   let fractureCount = 0;
 
+  // ── Building builders ─────────────────────────────────────────
+  // Simpler Voronoi-fractured concrete tower (the original mini-city building).
   const fractureTower = (width: number, floorCount: number, floorHeight: number) =>
     buildFracturedTowerScenario({
       width,
@@ -337,56 +374,130 @@ async function buildCity(): Promise<ScenarioDesc> {
       pinata: pinata as any,
     });
 
+  // Realistic high-rise: stiff concrete frame + frangible drywall infill. Kept
+  // deliberately coarse (few column lines / slab divisions, infill left as boxes) so a
+  // whole city of these stays within a sane collider budget; per-fragment masses come
+  // from real densities, so it needs no mass multiplier.
+  const skeletonTower = (width: number, floorCount: number, floorHeight: number) =>
+    buildHighRiseScenarioAsync({
+      width,
+      depth: width,
+      floorCount,
+      floorHeight,
+      columnsX: clamp(Math.round(width / 5), 2, 4),
+      columnsZ: clamp(Math.round(width / 5), 2, 4),
+      slabDivX: clamp(Math.round(width / 4), 2, 5),
+      slabDivZ: clamp(Math.round(width / 4), 2, 5),
+      fractureInfill: false,
+      fractureColumns: false,
+      bondMode: 'proximity',
+      pinata: pinata as any,
+    });
+
+  // One-storey wood-framed house (boxes; furniture off to keep the city light).
+  const houseLot = (width: number) =>
+    Promise.resolve(
+      buildHouseScenario({
+        width,
+        depth: width,
+        wallHeight: FLOOR_HEIGHT,
+        roofRise: width * 0.18,
+        furniture: false,
+      }),
+    );
+
+  type Spec = { kind: BuildingKind; construction: Construction; width: number; floorCount: number };
+
+  // Decide what occupies a lot from its zone (distance from centre) + the proportion
+  // sliders. Returns null for an empty lot (a park / plaza). All draws are seeded.
+  const pickSpec = (d: number): Spec | null => {
+    if (rng() < emptyLotShare) return null;
+    if (d <= downtownFrac) {
+      // Downtown core — tall buildings.
+      const highRise = rng() < highRiseShare;
+      const kind: BuildingKind = highRise ? 'highrise' : 'midrise';
+      const construction = highRise ? highRiseConstruction : midRiseConstruction;
+      const floorCount = highRise
+        ? randInt(midRiseMaxFloors + 1, maxFloors)
+        : randInt(Math.max(2, houseMaxFloors + 1), midRiseMaxFloors);
+      const width = Math.round(widthMin + rng() * (widthMax - widthMin));
+      return { kind, construction, width, floorCount };
+    }
+    // Residential ring — mostly houses, with the occasional small "shop".
+    if (rng() < suburbShopShare) {
+      const floorCount = randInt(Math.max(2, houseMaxFloors + 1), Math.min(3, midRiseMaxFloors));
+      const width = Math.round(widthMin + rng() * (widthMax - widthMin) * 0.5);
+      return { kind: 'midrise', construction: midRiseConstruction, width, floorCount };
+    }
+    const width = Math.round(widthMin + rng() * 2); // houses sit on smaller footprints
+    return { kind: 'house', construction: 'fractured', width, floorCount: houseMaxFloors };
+  };
+
+  const buildPart = (spec: Spec): Promise<ScenarioDesc> => {
+    if (spec.kind === 'house') return houseLot(spec.width);
+    return spec.construction === 'skeleton'
+      ? skeletonTower(spec.width, spec.floorCount, FLOOR_HEIGHT)
+      : fractureTower(spec.width, spec.floorCount, FLOOR_HEIGHT);
+  };
+
   for (let r = 0; r < grid; r++) {
     for (let c = 0; c < grid; c++) {
       const idx = r * grid + c;
-      const width = Math.round(widthMin + rng() * (widthMax - widthMin));
-      const floorCount = minFloors + Math.floor(rng() * (maxFloors - minFloors + 1));
-      const floorHeight = 3;
-      const height = floorCount * floorHeight;
+      const cx = -half + c * cell;
+      const cz = -half + r * cell;
+      const d = Math.hypot(cx, cz) / maxDist; // 0 at centre → 1 at the corners
+
+      const spec = pickSpec(d);
+      if (!spec) {
+        // Empty lot (park / plaza) — leave the gap for street variety.
+        if (hint && idx % 16 === 0) hint.textContent = `Assembling city… (${idx + 1}/${total})`;
+        continue;
+      }
+      const { kind, construction, width, floorCount } = spec;
+      const height = floorCount * FLOOR_HEIGHT;
       cityMaxHeight = Math.max(cityMaxHeight, height);
 
-      const key = `${width}|${floorCount}`;
-      let variants = templateCache.get(key);
+      // Deterministic builders (houses, box high-rises) produce identical instances, so
+      // one cached variant suffices; only the random Voronoi tower benefits from several.
+      const variantCap = kind !== 'house' && construction === 'fractured' ? VARIANTS_PER_SHAPE : 1;
+      const buildKey = `${kind}|${construction}|${width}|${floorCount}`;
+      let variants = templateCache.get(buildKey);
       if (!variants) {
         variants = [];
-        templateCache.set(key, variants);
+        templateCache.set(buildKey, variants);
       }
 
       let scenario: ScenarioDesc;
-      if (variants.length < VARIANTS_PER_SHAPE) {
-        // Cache miss — pay the fracture cost once, then yield so the browser
-        // paints the progress hint (only the expensive path yields).
+      if (variants.length < variantCap) {
+        // Cache miss — pay the build cost once, then yield so the browser paints the
+        // progress hint (only the expensive path yields).
         fractureCount += 1;
-        if (hint) {
-          hint.textContent = `Building city… fracturing towers (${idx + 1}/${total})`;
-        }
+        if (hint) hint.textContent = `Building city… (${idx + 1}/${total})`;
         await new Promise((res) => setTimeout(res, 0));
-        scenario = await fractureTower(width, floorCount, floorHeight);
+        scenario = await buildPart(spec);
         variants.push(scenario);
       } else {
-        // Cache hit — reuse a fractured tower. Refresh the hint only every so
-        // often; yielding on every cell would cost grid² timer ticks.
+        // Cache hit — reuse a built variant. Refresh the hint only occasionally; yielding
+        // on every cell would cost grid² timer ticks.
         scenario = variants[(rng() * variants.length) | 0];
-        if (hint && idx % 16 === 0) {
-          hint.textContent = `Assembling city… (${idx + 1}/${total})`;
-        }
+        if (hint && idx % 16 === 0) hint.textContent = `Assembling city… (${idx + 1}/${total})`;
       }
 
-      const cx = -half + c * cell;
-      const cz = -half + r * cell;
-      const density = massDensityMin + rng() * (massDensityMax - massDensityMin);
-      const massMultiplier = density / 320; // 320 is the base density baked into fractureTower
-      parts.push({ scenario, offset: { x: cx, y: 0, z: cz }, massMultiplier });
+      // Jitter each building a little within its cell so rows don't look perfectly rigid.
+      const jit = Math.min(street * 0.5, 3);
+      const ox = cx + (rng() - 0.5) * jit;
+      const oz = cz + (rng() - 0.5) * jit;
 
-      buildings.push({
-        cx,
-        cz,
-        width,
-        height,
-        nodeStart: nodeBase,
-        nodeCount: scenario.nodes.length,
-      });
+      // Houses / box high-rises carry real per-fragment densities already (default ×1);
+      // only the fractured tower (which bakes a 320 kg/m² base density) is rescaled to the
+      // requested mass-density range.
+      const massMultiplier =
+        kind !== 'house' && construction === 'fractured'
+          ? (massDensityMin + rng() * (massDensityMax - massDensityMin)) / 320
+          : 1;
+      parts.push({ scenario, offset: { x: ox, y: 0, z: oz }, massMultiplier });
+
+      buildings.push({ cx: ox, cz: oz, width, height, nodeStart: nodeBase, nodeCount: scenario.nodes.length });
       nodeBase += scenario.nodes.length;
     }
   }
@@ -394,8 +505,8 @@ async function buildCity(): Promise<ScenarioDesc> {
   cityRadius = Math.max(40, half + widthMax);
 
   console.log(
-    `Mini-city: ${total} buildings from ${fractureCount} unique fractures ` +
-      `(${templateCache.size} shapes × ≤${VARIANTS_PER_SHAPE} variants)`,
+    `Mini-city: ${buildings.length}/${total} lots built from ${fractureCount} unique builds ` +
+      `(${templateCache.size} distinct shapes)`,
   );
 
   const merged = mergeScenarios(parts);
@@ -709,12 +820,21 @@ function bindToggle(
 // City (deferred — needs Reset/Rebuild)
 bindSlider('cfg-grid', CONFIG.city, 'grid', (v) => `${v}×${v}`);
 bindSlider('cfg-street', CONFIG.city, 'street', (v) => v.toFixed(0) + ' m');
-bindSlider('cfg-min-floors', CONFIG.city, 'minFloors');
 bindSlider('cfg-max-floors', CONFIG.city, 'maxFloors');
 bindSlider('cfg-frags', CONFIG.city, 'fragments');
 bindSlider('cfg-seed', CONFIG.city, 'seed');
 bindSlider('cfg-mass-density-min', CONFIG.city, 'massDensityMin', (v) => v.toLocaleString() + ' kg/m²/fl');
 bindSlider('cfg-mass-density-max', CONFIG.city, 'massDensityMax', (v) => v.toLocaleString() + ' kg/m²/fl');
+
+// Composition / zoning (deferred — needs Rebuild). Sliders store a 0–1 fraction; show %.
+const pct = (v: number) => Math.round(v * 100) + '%';
+bindSlider('cfg-downtown', CONFIG.city, 'downtownFrac', pct);
+bindSlider('cfg-highrise-share', CONFIG.city, 'highRiseShare', pct);
+bindSlider('cfg-suburb-shops', CONFIG.city, 'suburbShopShare', pct);
+bindSlider('cfg-empty-lots', CONFIG.city, 'emptyLotShare', pct);
+bindSlider('cfg-midrise-floors', CONFIG.city, 'midRiseMaxFloors');
+bindSelect('cfg-midrise-construction', CONFIG.city, 'midRiseConstruction');
+bindSelect('cfg-highrise-construction', CONFIG.city, 'highRiseConstruction');
 
 // Projectile (live at shoot time)
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
