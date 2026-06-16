@@ -522,9 +522,15 @@ export async function buildDestructibleCore({
       .setTranslation(0, 0, 0)
       .setUserData({ ground: true })
   );
+  // Ground: a THICK slab (top surface at y=0). A thin floor lets a deep pile of many
+  // small/heavy debris bodies tunnel through it under accumulated contact pressure and
+  // get ejected at absurd speeds (an "explosion" that only shows up with hundreds of
+  // free bodies, e.g. a full shatter). A thick half-extent removes the tunnelling path
+  // without changing the contact surface. (Verified: thin 5cm floor → 130 m/s ejection;
+  // thick floor → gentle collapse for the same 500+ hull pile.)
   world.createCollider(
-    RAPIER.ColliderDesc.cuboid(100, 0.025, 100)
-      .setTranslation(0, -0.025, 0)
+    RAPIER.ColliderDesc.cuboid(100, 5, 100)
+      .setTranslation(0, -5, 0)
       .setFriction(0.9)
       .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
       .setContactForceEventThreshold(0.0)
@@ -620,11 +626,17 @@ export async function buildDestructibleCore({
     const builder = (scenario.colliderDescForNode && Array.isArray(scenario.colliderDescForNode)) ? (scenario.colliderDescForNode[nodeIndex] ?? null) : null;
     let desc = typeof builder === 'function' ? builder() : null;
     if (!desc) {
-      // If fragmentGeometries are available, use convex hull for non-support fragments
-      const fragmentGeometries = (scenario.parameters?.fragmentGeometries ?? []) as Array<{ getAttribute?: (name: string) => { array?: unknown; count?: number } | null } | null>;
-      const fragGeom = fragmentGeometries[nodeIndex];
-      if (!isSupport && fragGeom) {
-        const posAttr = fragGeom.getAttribute?.('position');
+      // Prefer a DEDICATED collider-geometry channel when present, so render and
+      // collision geometry can differ per node (e.g. detailed render mesh +
+      // tight convex-hull collider). Falls back to fragmentGeometries (the render
+      // geometry) when no separate collider geometry is supplied — unchanged
+      // behavior for every existing scenario.
+      const geoms = scenario.parameters ?? {};
+      const colliderGeometries = (geoms.colliderGeometries ?? []) as Array<{ getAttribute?: (name: string) => { array?: unknown; count?: number } | null } | null>;
+      const fragmentGeometries = (geoms.fragmentGeometries ?? []) as Array<{ getAttribute?: (name: string) => { array?: unknown; count?: number } | null } | null>;
+      const colliderGeom = colliderGeometries[nodeIndex] ?? fragmentGeometries[nodeIndex];
+      if (!isSupport && colliderGeom) {
+        const posAttr = colliderGeom.getAttribute?.('position');
         const arr = posAttr?.array;
         if (arr instanceof Float32Array && arr.length >= 9) {
           desc = RAPIER.ColliderDesc.convexHull(arr);

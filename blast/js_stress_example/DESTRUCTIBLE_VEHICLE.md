@@ -55,7 +55,7 @@ The decomposition pipeline (in `glb-vehicle.ts`) is:
 
   | joint | ×area | meaning |
   |---|---:|---|
-  | frame ↔ frame | 8.0 | roll cage / chassis welds — strongest, holds the shell |
+  | frame ↔ frame | 6.0 | roll cage / chassis welds — strongest, holds the shell |
   | frame ↔ wheel | 5.0 | hub / axle to the chassis |
   | frame ↔ panel | 3.0 | panels bolted to the frame |
   | panel ↔ panel / wheel | 2.0 | |
@@ -63,7 +63,23 @@ The decomposition pipeline (in `glb-vehicle.ts`) is:
   | anything ↔ **accessory** | 0.1–0.18 | loose bits (chain, bucket) — first to go |
 
   Chunks of the *same* fractured part get strong **internal** bonds so the shell
-  holds together until hit hard.
+  holds together until hit hard. The global **`materialScale`** then sets overall
+  fragility on top of this hierarchy (lower = more destructible).
+
+## Visuals: render mesh ≠ collision mesh
+
+The car is decomposed (offline, via the GLB pipeline) into tight **CoACD convex
+hull** pieces — great *collision* shapes (non-overlapping, so debris doesn't
+explode) but ugly faceted blobs if you *render* them. So the demo separates the
+two: each node keeps its CoACD hull for **collision**, but is **rendered** with a
+slice of the original detailed `buggy.glb` model. At load, every original triangle
+is assigned to the node whose collider owns it (`attachDetailedRenderGeometry` in
+`glb-vehicle.ts`), so the union of the slices is the real car and each slice rides
+with its piece when it detaches. The plumbing is a per-node
+`scenario.parameters.colliderGeometries` channel the core prefers for the hull
+collider (`destructible-core.ts`), leaving `fragmentGeometries` for the render
+mesh. Toggle **Show Debug** to see the tight hull colliders behind the detailed
+render.
 
 - **Destroy.** Click to shoot, or **Drop from Height**. A light hit knocks the
   barrels/crates off while the cage holds; raise the projectile mass/speed (or
@@ -97,13 +113,19 @@ Lower = more fragile. The mechanism is pinned by a headless test,
 Two supporting details:
 - **Resting cargo** is reduced to a single weak bond (`capRestingBonds` in
   `glb-vehicle.ts`) so it sheds like a resting contact, not a welded seam.
-- Detached debris uses `debrisCollisionMode: 'noDebrisPairs'` — it bounces off the
-  intact car and the ground but not off *other debris*. This is the one real
-  collider-fidelity mitigation: the runtime builds a single convex hull per node,
-  so fractured/concave pieces have overlapping hulls, and under sustained heavy
-  fire debris-vs-debris contacts resolve their mutual penetration as an explosion.
-  (No per-frame fracture cap is needed — at the calibrated `materialScale` a hit
-  already peels off only a few parts at a time.)
+- Detached debris uses **`debrisCollisionMode: 'all'`** — full collision (debris ↔
+  car, ↔ ground, and ↔ other debris). This is safe because the offline pipeline now
+  emits genuinely **non-overlapping** collider hulls (a `drop-overlaps` pass removes
+  the few residual sliver overlaps — harmless since render ≠ collision) **and** the
+  core uses a thick ground slab so a deep pile of hundreds of pieces can't tunnel
+  through and eject. Pinned by `scripts/shatter-test.mjs`: **cut every bond at once
+  → the whole car collapses and settles, no explosion.** Press **Detonate all (F)**
+  to see it.
+
+The car is heavy on purpose (`totalMass` ~4000 kg) so a projectile transfers into
+local bond stress (pieces break off) instead of shoving the whole car away; the
+`materialScale` is set to hold that self-weight at rest yet break progressively
+under fire.
 
 ## Controls
 
@@ -176,9 +198,11 @@ exports (`buildScenarioFromFragmentsAsync`, `fractureGeometryAsync`,
   so it flies off faster than the old scripted model produced — momentum, not an
   explosion. An *absurd* mass (a 2.5-tonne ram) launches parts past the soak's
   60 m/s "explosion" check, so the soak uses a plausible 600 kg heavy instead.
-- **Debris doesn't collide with other debris** (`'noDebrisPairs'`) — see the
-  Breaking model section. It bounces off the car and ground (lively), just not off
-  other just-detached overlapping hulls (which would explode under heavy fire).
+- **Full debris collision (`'all'`) is on** — every piece collides with the car,
+  the ground and other debris. This works because the colliders are genuinely
+  non-overlapping (pipeline `drop-overlaps` pass) and the core's ground is a thick
+  slab (a thin floor let a deep pile tunnel through and explode — the historical
+  reason this was `'noDebrisPairs'`). Verified by `scripts/shatter-test.mjs`.
 
 ## Headless QA
 

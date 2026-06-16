@@ -284,6 +284,98 @@ def coacd_pieces(mesh, threshold):
     return hulls
 
 
+def drop_overlapping_pieces(flat, min_depth=0.0008, max_iters=400):
+    """Guarantee NON-OVERLAPPING colliders by greedily removing pieces until no two
+    hulls interpenetrate by more than `min_depth`.
+
+    This is safe ONLY because render != collision: each removed convex hull is a
+    COLLISION piece; the visual model is rendered from the original mesh (assigned
+    to the remaining nodes at runtime), so dropping a collider leaves no visible
+    hole. We remove the piece involved in the most overlapping pairs first
+    (greedy hitting-set), tie-broken toward the SMALLER piece, so we delete as few
+    (and as small) colliders as possible to reach zero overlap. This is what lets
+    full debris collision ('all') collapse-and-settle instead of exploding."""
+    removed = 0
+    for _ in range(max_iters):
+        hulls = [f[2] for f in flat]
+        mgr = collision.CollisionManager()
+        for i, h in enumerate(hulls):
+            mgr.add_object(str(i), h)
+        _, data = mgr.in_collision_internal(return_names=False, return_data=True)
+        pairs = {}
+        for c in data:
+            a, b = (int(x) for x in c.names)
+            if a == b:
+                continue
+            d = abs(float(getattr(c, "depth", 0.0)))
+            if d < min_depth:
+                continue  # ignore sub-mm touching
+            key = (min(a, b), max(a, b))
+            pairs[key] = max(pairs.get(key, 0.0), d)
+        if not pairs:
+            break
+        deg = {}
+        for (a, b) in pairs:
+            deg[a] = deg.get(a, 0) + 1
+            deg[b] = deg.get(b, 0) + 1
+        # Highest overlap-degree first; among ties remove the smaller-volume piece.
+        worst = max(deg.keys(), key=lambda i: (deg[i], -float(flat[i][2].volume)))
+        flat.pop(worst)
+        removed += 1
+    print(f"[build] drop-overlaps: removed {removed} colliders to reach non-overlap "
+          f"(threshold {min_depth*1000:.1f}mm)")
+    return flat, removed
+
+
+def segment_long_hulls(flat, seg_len=0.16, ratio=2.2):
+    """Slice elongated hulls into segments along their long axis.
+
+    CoACD splits a part by CONCAVITY, so a long straight frame tube becomes ONE long
+    convex hull (it's already convex). That single hull then owns the tube's entire
+    render slice → a long render on a small-looking collider → "spike"/asterisk
+    fragments. Slicing long hulls into ~seg_len chunks gives the frame proper
+    per-segment colliders so the render partitions into clean tube segments. Slicing a
+    convex hull by parallel planes yields convex, non-overlapping (touching) pieces."""
+    out = []
+    n_sliced = 0
+    for pidx, pri, h in flat:
+        ext = np.asarray(h.extents, float)
+        axis = int(np.argmax(ext))
+        L = float(ext[axis])
+        others = float(max(e for i, e in enumerate(ext) if i != axis))
+        nseg = int(np.ceil(L / seg_len))
+        if L < seg_len * 1.5 or nseg < 2 or L < ratio * others:
+            out.append([pidx, pri, h])
+            continue
+        lo = float(h.bounds[0][axis]); hi = float(h.bounds[1][axis])
+        step = (hi - lo) / nseg
+        made = 0
+        for k in range(nseg):
+            a = lo + k * step
+            b = lo + (k + 1) * step
+            try:
+                no = np.zeros(3); no[axis] = 1.0
+                oa = np.zeros(3); oa[axis] = a
+                piece = h.slice_plane(plane_origin=oa, plane_normal=no, cap=True)
+                if piece is None or piece.is_empty:
+                    continue
+                ob = np.zeros(3); ob[axis] = b
+                piece = piece.slice_plane(plane_origin=ob, plane_normal=-no, cap=True)
+                if piece is None or piece.is_empty:
+                    continue
+                ch = piece.convex_hull
+                if len(ch.vertices) >= 4 and float(ch.volume) > 1e-8:
+                    out.append([pidx, pri, ch]); made += 1
+            except Exception as e:
+                print(f"[build] WARNING segment slice failed ({type(e).__name__}: {e})")
+        if made >= 2:
+            n_sliced += 1
+        else:
+            out.append([pidx, pri, h])  # slicing failed → keep whole
+    print(f"[build] segment-long-hulls: split {n_sliced} elongated hulls -> {len(out)} total pieces")
+    return out
+
+
 def cross_part_overlap(part_hulls):
     mgr = collision.CollisionManager()
     owner = {}
@@ -353,6 +445,12 @@ def main():
         flat_raw = [[pi, pr, np.asarray(h.vertices), np.asarray(h.faces)] for pi, pr, h in flat]
         pickle.dump((flat_raw, part_meta), open(cache, "wb"))
 
+    # Slice long straight hulls (frame tubes) into segments so each gets its own
+    # collider and the render partitions into clean segments (no long "spike" slices).
+    if "--no-segment" not in args:
+        seg_len = float(args[args.index("--seg-len") + 1]) if "--seg-len" in args else 0.16
+        flat = segment_long_hulls(flat, seg_len=seg_len)
+
     nb, mxb, mnb = cross_part_overlap([(p[0], p[2]) for p in flat])
     print(f"[build] CoACD: {len(parts)} parts -> {len(flat)} hulls in {time.time()-t0:.0f}s")
     print(f"[build] overlap BEFORE {method}: pairs={nb}  maxDepth={mxb:.3f}m  meanDepth={mnb:.3f}m")
@@ -366,6 +464,15 @@ def main():
         raise SystemExit(f"unknown --method {method!r} (expected boolean|clip)")
     na, mxa, mna = cross_part_overlap([(p[0], p[2]) for p in flat])
     print(f"[build] overlap AFTER  {method}: pairs={na}  maxDepth={mxa:.3f}m  meanDepth={mna:.3f}m  ({time.time()-t1:.0f}s, {len(flat)} hulls)")
+
+    # Final guarantee: drop the few residual overlapping colliders (slivers clip
+    # can't fix). Render != collision, so removed hulls leave no visible hole.
+    do_drop = "--no-drop-overlaps" not in args
+    drop_depth = float(args[args.index("--drop-depth") + 1]) if "--drop-depth" in args else 0.0008
+    if do_drop:
+        flat, _ = drop_overlapping_pieces(flat, min_depth=drop_depth)
+        nd, mxd, mnd = cross_part_overlap([(p[0], p[2]) for p in flat])
+        print(f"[build] overlap AFTER  drop: pairs={nd}  maxDepth={mxd:.3f}m  meanDepth={mnd:.3f}m  ({len(flat)} hulls)")
 
     # Regroup hulls by part into the asset.
     by_part = {}

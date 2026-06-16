@@ -31,8 +31,10 @@ import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './phy
 import { mountShooter } from './shooter-fps.js';
 import {
   buildVehicleScenarioFromAsset,
+  extractVehicleParts,
   ROLE_COLORS,
   ROLE_LABELS,
+  type VehiclePart,
   type VehiclePartRole,
   type VehiclePiecesAsset,
 } from './glb-vehicle.js';
@@ -42,10 +44,17 @@ import {
 // Pre-decomposed pieces asset (CoACD pipeline output): tight, non-overlapping
 // convex collider pieces, so full debris collision doesn't explode.
 const ASSET_URL = './assets/buggy.pieces.json';
+// Original full-detail model — used ONLY for rendering (render != collision). Each
+// collider piece keeps its tight CoACD hull for physics but draws a slice of this
+// model, so the car looks like the real vehicle, not faceted hulls.
+const MODEL_URL = './assets/buggy.glb';
 
 const CONFIG = {
   vehicle: {
-    totalMass: 1800,
+    // Heavy on purpose: a hit transfers into local bond stress (pieces break)
+    // rather than shoving the whole car away. Paired with materialScale below so it
+    // still holds at rest under the higher self-weight.
+    totalMass: 4000,
     // Fracture large concave structural parts into ~this many metres per chunk so
     // their colliders are tight (a whole roll cage as one convex hull is a blob).
     // 0 = keep parts whole.
@@ -61,25 +70,26 @@ const CONFIG = {
     // A heavy ball (~wrecking-ball): at the calibrated materialScale this sheds a
     // satisfying few parts per hit (cargo first, the cage holding) without
     // shattering the car or exploding. Swept in scripts/probe-vehicle.mjs.
-    radius: 0.25,
-    mass: 150,
-    speed: 45,
+    radius: 0.28,
+    mass: 220,
+    speed: 52,
     ttlMs: 8000,
   },
   solver: {
     gravity: -9.81,
-    // Holds the intact car rock-solid at rest. The CoACD pieces have small contact
-    // areas, so the per-area bonds need a high materialScale not to sag under
-    // gravity; impact breaking is then driven by contactForceScale (below) so a hit
-    // still spikes local bond stress past the limit. Soak-verified: holds at rest,
-    // sheds on light/heavy shots, stable drops.
-    materialScale: 1e13,
+    // Global material limit (Pa-ish) — the single fragility knob. Calibrated so the
+    // intact car holds under its own weight at rest, yet projectile hits overstress
+    // and progressively destroy it (not just the payload — the cage breaks under
+    // sustained fire). Lower = more fragile. Soak- and shatter-verified.
+    materialScale: 1e12,
   },
   physics: {
-    // High on purpose: with the strong (high-materialScale) bonds, this amplifies
-    // projectile/ground contact forces into the stress solver so a hit overstresses
-    // and sheds local parts (light shot ~3, heavy ~9 in the soak).
-    contactForceScale: 200,
+    // Modest amplification of real Rapier contact forces into the stress solver so a
+    // hit overstresses local bonds. Kept low (not the old 200×) so resting ground
+    // contacts don't churn near-limit bonds — the destruction comes from a sensibly
+    // fragile materialScale, not from cranking this. (Higher = breaks more on impact
+    // but also jitters the car at rest.)
+    contactForceScale: 140,
     skipSingleBodies: false,
   },
 };
@@ -176,9 +186,18 @@ let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
 let colorByRole = true;
+// Exploded-chunks inspection: when > 0, physics is frozen and every chunk's render
+// mesh is pushed radially outward from the vehicle centre by this factor, so each
+// fracture piece can be inspected on its own (what the vehicle breaks into).
+let explodeFactor = 0;
+// When set, the frozen view shows ONLY these chunk indices (at rest positions) so a
+// single fracture piece can be inspected in isolation.
+let isolateSet: Set<number> | null = null;
 
 // Cached pieces asset so Reset / Drop rebuild without re-fetching.
 let piecesAsset: VehiclePiecesAsset | null = null;
+// Cached full-detail render parts (from buggy.glb) for the render!=collision path.
+let renderParts: VehiclePart[] | null = null;
 
 // Breaking is fully stress-driven: the solver sees gravity + the ground-contact
 // reaction + projectile contact forces, and breaks bonds wherever the stress
@@ -207,15 +226,33 @@ async function ensureAssetLoaded(): Promise<VehiclePiecesAsset> {
   return piecesAsset;
 }
 
+/** Load the original full-detail model and extract its world-space parts (render only). */
+async function ensureRenderPartsLoaded(): Promise<VehiclePart[] | null> {
+  if (renderParts) return renderParts;
+  try {
+    const loader = new GLTFLoader();
+    const gltf = await loader.loadAsync(MODEL_URL);
+    const { parts } = extractVehicleParts(gltf.scene, { splitComponents: false });
+    renderParts = parts;
+    console.log(`Loaded render model: ${parts.length} detail parts from ${MODEL_URL}`);
+  } catch (err) {
+    console.warn('Failed to load detailed render model; rendering collider hulls:', err);
+    renderParts = null;
+  }
+  return renderParts;
+}
+
 /** Build (or rebuild) the destructible vehicle. `dropHeight` lifts it for a drop test. */
 async function initScene(dropHeight = 0) {
   const asset = await ensureAssetLoaded();
+  const detailParts = await ensureRenderPartsLoaded();
 
   const { scenario, nodeColors, summary } = await buildVehicleScenarioFromAsset(asset, {
     totalMass: CONFIG.vehicle.totalMass,
     bondMaxSeparation: CONFIG.vehicle.bondMaxSeparation,
     roleStrength: CONFIG.vehicle.bondStrength,
     groundGap: 0.03 + Math.max(0, dropHeight),
+    renderParts: detailParts ?? undefined,
   });
 
   console.log(
@@ -246,6 +283,13 @@ async function initScene(dropHeight = 0) {
     includeDebugLines: true,
     nodeColors,
     materialColors: colorByRole,
+    // The original model parts are thin single-sided shells; once a piece breaks off
+    // you see the inside of the shell, which is unlit/black with a front-side material.
+    // Render double-sided so detached fragments are lit on both faces.
+    materials: {
+      deck: new THREE.MeshStandardMaterial({ color: 0xbababa, roughness: 0.62, metalness: 0.05, side: THREE.DoubleSide }),
+      support: new THREE.MeshStandardMaterial({ color: 0x7a889a, roughness: 0.7, metalness: 0.15, side: THREE.DoubleSide }),
+    },
   });
 
   rapierDebug?.dispose();
@@ -378,23 +422,40 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Detached debris bounces off the intact car and the ground, but NOT off other
-// debris. This is the one genuine collider-fidelity mitigation: the runtime builds
-// a single convex hull per node, and fractured/concave pieces have *overlapping*
-// Debris collision: the CoACD pipeline (split → weld+simplify → CoACD → clip)
-// makes tight, near-non-overlapping collider pieces. A few thin sliver pieces from
-// the messy source can't be fully de-interpenetrated, so under full 'all' debris
-// collision a mass shatter can still cascade off those residual overlaps. The
-// runtime-robust choice is 'noDebrisPairs' (debris still bounces off the car +
-// ground, just not off each other), which passes settle/light/heavy/drop in
-// scripts/soak-vehicle.mjs. Eliminating the slivers entirely (more aggressive
-// simplify) would let this be 'all'.
-physicsConfig.debrisCollisionMode = 'noDebrisPairs';
+// FULL debris collision: every detached piece collides with the car, the ground,
+// AND other debris. This is correct now because (a) the CoACD pipeline + the new
+// drop-overlaps pass produce genuinely non-overlapping collider hulls, and (b) the
+// core uses a thick ground slab so a deep pile of hundreds of pieces can't tunnel
+// through and explode. Verified by scripts/shatter-test.mjs (cut every bond → the
+// whole car collapses and settles, no explosion) and scripts/soak-vehicle.mjs.
+physicsConfig.debrisCollisionMode = 'all';
 
 // Shared Physics / Optimization / Features controls.
 mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
 bindCheckbox('cfg-skip-single', CONFIG.physics, 'skipSingleBodies');
+
+// ── Exploded-chunks inspection ────────────────────────────────
+
+// Push every chunk's render mesh radially out from the vehicle centre so each
+// fracture piece is separated and inspectable (what the car breaks into).
+function applyExplodedLayout() {
+  const meshes = visualsRef?.chunkMeshes;
+  const core = coreRef;
+  if (!meshes || !core) return;
+  const cyC = 0.7; // vehicle mid-height; explode from (0, cyC, 0)
+  const f = 1 + explodeFactor;
+  for (let i = 0; i < meshes.length; i++) {
+    const mesh = meshes[i];
+    const chunk = core.chunks[i];
+    if (!mesh || !chunk) continue;
+    if (isolateSet && !isolateSet.has(i)) { mesh.visible = false; continue; }
+    const o = chunk.baseLocalOffset;
+    mesh.position.set(o.x * f, cyC + (o.y - cyC) * f, o.z * f);
+    mesh.quaternion.identity();
+    mesh.visible = true;
+  }
+}
 
 // ── Render loop ───────────────────────────────────────────────
 
@@ -410,13 +471,17 @@ function loop() {
   controls.update();
 
   if (coreRef && visualsRef) {
-    const t0 = performance.now();
-    coreRef.step(dt);
-    _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
+    if (explodeFactor > 0 || isolateSet) {
+      applyExplodedLayout();
+    } else {
+      const t0 = performance.now();
+      coreRef.step(dt);
+      _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
 
-    visualsRef.update({ debug: showDebug, updateBVH: false, updateProjectiles: true });
-    rapierDebug?.update();
-    updateStatus(coreRef);
+      visualsRef.update({ debug: showDebug, updateBVH: false, updateProjectiles: true });
+      rapierDebug?.update();
+      updateStatus(coreRef);
+    }
   }
 
   shooter?.update();
@@ -454,6 +519,50 @@ window.addEventListener('resize', onResize);
   setDebug(colliders: boolean, bonds: boolean) {
     showDebug = !!bonds;
     rapierDebug?.setEnabled(!!colliders);
+  },
+  // Freeze physics and spread every chunk's RENDER mesh radially so each fracture
+  // piece can be inspected on its own. `explode(0)` resumes the simulation.
+  explode(factor = 1.8) {
+    explodeFactor = Math.max(0, factor);
+    if (explodeFactor > 0) applyExplodedLayout();
+    return explodeFactor;
+  },
+  // Show ONLY these chunk indices (frozen, at rest positions) for close inspection.
+  // Pass null/[] to clear and resume normal rendering.
+  isolate(indices: number[] | null) {
+    isolateSet = indices && indices.length ? new Set(indices) : null;
+    if (isolateSet) applyExplodedLayout();
+    return isolateSet ? isolateSet.size : 0;
+  },
+  // Per-chunk render-geometry diagnostics: triangle count and the ratio of the render
+  // slice's bbox to the collider hull's bbox. A large ratio = a stray/spanning triangle
+  // (the "spike" artifact); tiny tri counts = near-empty slivers. Sorted worst-first.
+  inspectChunks() {
+    const meshes = visualsRef?.chunkMeshes;
+    const core = coreRef;
+    if (!meshes || !core) return null;
+    const rows: any[] = [];
+    for (let i = 0; i < meshes.length; i++) {
+      const g = meshes[i].geometry as THREE.BufferGeometry;
+      g.computeBoundingBox();
+      const bb = g.boundingBox!;
+      const rs = [bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z];
+      const pos = g.getAttribute('position');
+      const tri = Math.floor((g.index ? g.index.count : (pos?.count ?? 0)) / 3);
+      const hull = core.chunks[i].size;
+      const hmax = Math.max(hull.x, hull.y, hull.z, 1e-3);
+      const rmax = Math.max(rs[0], rs[1], rs[2]);
+      rows.push({
+        i, tri,
+        rsize: rs.map((v) => +v.toFixed(3)),
+        hsize: [+hull.x.toFixed(3), +hull.y.toFixed(3), +hull.z.toFixed(3)],
+        ratio: +(rmax / hmax).toFixed(2),
+      });
+    }
+    rows.sort((a, b) => b.ratio - a.ratio);
+    const spikes = rows.filter((r) => r.ratio > 1.6).length;
+    const tiny = rows.filter((r) => r.tri < 2).length;
+    return { count: rows.length, spikes, tiny, worst: rows.slice(0, 25) };
   },
   // Stability probe for headless soak tests: max linear speed and max distance
   // from origin across dynamic bodies (an explosion spikes both), plus counts.
