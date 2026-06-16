@@ -22,6 +22,8 @@ import os
 import json
 import time
 import pickle
+import tempfile
+import subprocess
 import numpy as np
 import trimesh
 from trimesh import collision
@@ -203,7 +205,7 @@ def boolean_deinterpenetrate(flat, threshold, dilate=0.004):
             continue
         if cut_changed:
             n_cut += 1
-            sub = coacd_pieces(cut, threshold)
+            sub = coacd_pieces_isolated(cut, threshold)  # isolated: notched meshes can crash CoACD
             n_recoacd += len(sub)
             for p in sub:
                 placed.append((pidx, p))
@@ -216,6 +218,42 @@ def boolean_deinterpenetrate(flat, threshold, dilate=0.004):
     if bool_err:
         print(f"[build] WARNING boolean de-interp: errors {bool_err}")
     return out
+
+
+_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_coacd_worker.py")
+
+
+def coacd_pieces_isolated(mesh, threshold, timeout=120):
+    """CoACD in a subprocess so a C++ hard-abort on degenerate input becomes a
+    recoverable, REPORTED error instead of killing the build. Falls back to the
+    part's convex hull (loudly) if CoACD crashes/times out."""
+    with tempfile.TemporaryDirectory() as td:
+        inp, outp = os.path.join(td, "in.npz"), os.path.join(td, "out.npz")
+        np.savez(inp, v=np.asarray(mesh.vertices, np.float64), f=np.asarray(mesh.faces, np.int32))
+        try:
+            r = subprocess.run([sys.executable, _WORKER, inp, outp, str(threshold)],
+                               capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f"[build] WARNING CoACD timed out (>{timeout}s); using convex hull")
+            return [convex(mesh)]
+        if r.returncode != 0 or not os.path.exists(outp):
+            err = (r.stderr.decode(errors="replace").strip() or "no stderr")[-200:]
+            print(f"[build] WARNING CoACD subprocess crashed (rc={r.returncode}): {err}; using convex hull")
+            return [convex(mesh)]
+        d = np.load(outp)
+        hulls = []
+        for i in range(int(d["n"])):
+            h = trimesh.Trimesh(vertices=d[f"v{i}"], faces=d[f"f{i}"], process=False)
+            try:
+                h = h.convex_hull
+            except Exception as e:
+                print(f"[build] WARNING coacd piece convex_hull failed ({type(e).__name__}: {e})")
+            if len(h.vertices) >= 4:
+                hulls.append(h)
+        if not hulls:
+            print("[build] WARNING CoACD produced no usable hulls; using the part convex hull")
+            return [convex(mesh)]
+        return hulls
 
 
 def coacd_pieces(mesh, threshold):
