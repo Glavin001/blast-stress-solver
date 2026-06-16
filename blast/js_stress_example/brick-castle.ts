@@ -43,7 +43,9 @@ const SIZE_ORDER: SizeKey[] = ['Small', 'Medium', 'Hero', 'Max'];
 // ── Mutable demo config (driven by the control panel) ──────────
 const CONFIG = {
   size: 'Hero' as SizeKey,
-  chunksPerBrick: 2,
+  // Solid bricks by default (1 chunk each). Bump via the "Chunks / brick" slider +
+  // Rebuild to fracture each brick into Voronoi pieces (intra-brick bonds hold them).
+  chunksPerBrick: 1,
   battlements: true,
   // Strength hierarchy (deferred — applied on Rebuild).
   materialExp: 9.3, // materialScale = 10^materialExp ("stone strength")
@@ -358,6 +360,9 @@ function maxBodyMetrics(core: any): { maxSpeed: number; fastBodies: number; bodi
   /** Fire an exact projectile spawn (used by headless repro of recorded shots). */
   shoot: (spawn: any) => coreRef?.enqueueProjectile(spawn),
   isReady: () => !!coreRef && !rebuilding,
+  // Exposed for headless QA: reposition the view (e.g. brickwork closeups).
+  camera,
+  controls,
 };
 
 // ── Control panel wiring ──────────────────────────────────────

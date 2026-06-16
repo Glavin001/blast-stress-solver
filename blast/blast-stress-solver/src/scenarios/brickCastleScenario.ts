@@ -140,7 +140,12 @@ const DEFAULTS: Required<Omit<BrickCastleOptions, 'multipliers' | 'pinata' | 'ra
   brickLength: 0.9,
   brickHeight: 0.42,
   brickDepth: 0.5,
-  mortarGap: 0.025,
+  // Bricks TOUCH exactly (gap 0): adjacent faces are coincident so the EXACT
+  // triangle bonder welds every contact — side-by-side, course-to-course AND the
+  // merlons seated on top. (The 'average' bonder silently drops every *vertical*
+  // (Y-normal) contact — see autoBondingOptions below — so any gap there would
+  // leave the courses unbonded and the castle collapses as loose stacked rings.)
+  mortarGap: 0,
   wallLengthBricks: 18,
   wallCourses: 11,
   towerSideBricks: 5,
@@ -150,7 +155,9 @@ const DEFAULTS: Required<Omit<BrickCastleOptions, 'multipliers' | 'pinata' | 'ra
   gateWidthBricks: 4,
   gateHeightCourses: 5,
   battlements: true,
-  chunksPerBrick: 2,
+  // Solid bricks by default (1 chunk each). Fracturing each brick into pieces is a
+  // separate concern; keep the structure simple and obviously-correct first.
+  chunksPerBrick: 1,
   bondMode: 'auto',
   bondAcrossStructures: false,
   density: CASTLE_STONE_DENSITY,
@@ -200,12 +207,8 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
   const pitchX = L + gap; // horizontal pitch along a course
   const pitchY = H + gap; // vertical pitch between courses
   const density = opt.density;
-  // Bond contact tolerance. Irregular Voronoi faces across the mortar gap only
-  // bond reliably when the 'average' bonder inflates each chunk enough to
-  // overlap its neighbour — so this is several × the mortar gap. Too small and
-  // the walls fragment into many loosely-stacked clusters that jitter on settle;
-  // this value keeps each structure essentially monolithic.
-  const maxSeparation = options.maxSeparation ?? gap * 7;
+  // maxSeparation only matters for the 'average' bonder (unused here — see below).
+  const maxSeparation = options.maxSeparation ?? Math.max(gap * 7, 0.05);
 
   // Archetype library (cached Voronoi). "stretcher" = standard brick;
   // "ashlar" = big keep block; "merlon" = short battlement tooth. (The gate is a
@@ -396,9 +399,15 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
   buildSquareTower(0, 0, opt.keepSideBricks, opt.keepCourses, 'keep', colKeep, ashlar);
 
   /**
-   * Hollow square tower as a stack of running-bond rings. Corners interlock by
-   * alternating which pair of walls runs "full" each course (a quoin pattern),
-   * which also avoids double-placing corner bricks.
+   * Hollow square tower in proper running bond with interlocked quoin corners.
+   *
+   * Each course is a ring of four faces. Corners alternate ownership (quoin): on
+   * even courses the front/back faces run "full" (corner to corner) and the
+   * left/right faces sit inset between them; on odd courses it flips. AND the
+   * *inset* face of each course is shifted half a brick along its run, so a face's
+   * consecutive courses are offset by half a brick — true running bond, every
+   * brick bridging two below. (Stack bond — aligned vertical columns — is ~5× more
+   * collapse-prone and looks wrong.)
    */
   function buildSquareTower(cx: number, cz: number, sideBricks: number, courses: number, kind: CastleStructureKind, color: number, arch: Archetype): void {
     const sid = structureId++;
@@ -410,12 +419,15 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
       const y = baseY + aSize.y * 0.5 + c * (aSize.y + gap);
       const isSupport = c === 0;
       const fbFull = c % 2 === 0; // even course: front/back full; odd: left/right full
+      // The inset faces are shifted half a brick so the bond runs (offset every course).
+      const fbShift = fbFull ? 0 : sidePitch * 0.5; // front/back inset on odd courses
+      const lrShift = fbFull ? sidePitch * 0.5 : 0; // left/right inset on even courses
       // Front (−Z) and back (+Z) runs (vary along X).
       for (const zc of [-extent, +extent]) {
         const lo = fbFull ? 0 : 1;
         const hi = fbFull ? sideBricks : sideBricks - 1;
         for (let i = lo; i < hi; i++) {
-          const x = cx - halfSide + i * sidePitch;
+          const x = cx - halfSide + i * sidePitch + fbShift;
           placeBrick(arch, { x, y, z: cz + zc }, 0, sid, kind, color, isSupport);
         }
       }
@@ -424,7 +436,7 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
         const lo = fbFull ? 1 : 0;
         const hi = fbFull ? sideBricks - 1 : sideBricks;
         for (let j = lo; j < hi; j++) {
-          const z = cz - halfSide + j * sidePitch;
+          const z = cz - halfSide + j * sidePitch + lrShift;
           placeBrick(arch, { x: cx + xc, y, z }, Math.PI * 0.5, sid, kind, color, isSupport);
         }
       }
@@ -479,7 +491,11 @@ export async function buildBrickCastleScenario(options: BrickCastleOptions = {})
     bondMode: opt.bondMode,
     areaNormalization: 'none' as const, // physical contact areas; tiers scale them
     dimensions: dims,
-    autoBondingOptions: { mode: 'average' as const, maxSeparation, label: 'BrickCastle' },
+    // EXACT (not 'average'): bricks touch with coincident faces, so the exact
+    // coplanar-overlap bonder welds every contact and — crucially — it is the only
+    // mode that bonds VERTICAL (Y-normal) course-to-course contacts. 'average'
+    // silently drops all vertical bonds, which collapses the structure.
+    autoBondingOptions: { mode: 'exact' as const, maxSeparation, label: 'BrickCastle' },
     rapier: options.rapier,
   };
 
