@@ -92,6 +92,49 @@ def inset_hull(hull, delta):
         return hull
 
 
+def clip_deinterpenetrate(pieces, iters=4):
+    """pieces: list of [part_index, priority, hull]. Where two pieces from DIFFERENT
+    parts overlap, clip the lower-priority one along the contact plane (a convex hull
+    sliced by a plane stays convex), removing its penetrating lobe. Unlike inset this
+    works on thin shell pieces. Iterates until clean or `iters` reached."""
+    hulls = [p[2] for p in pieces]
+    for _ in range(iters):
+        mgr = collision.CollisionManager()
+        for i, h in enumerate(hulls):
+            mgr.add_object(str(i), h)
+        _, data = mgr.in_collision_internal(return_names=False, return_data=True)
+        # deepest contact per overlapping cross-part pair
+        worst = {}
+        for c in data:
+            a, b = int(c.names[0]), int(c.names[1])
+            if pieces[a][0] == pieces[b][0]:
+                continue
+            key = (a, b)
+            d = abs(float(getattr(c, "depth", 0.0)))
+            if d > worst.get(key, (0.0,))[0]:
+                worst[key] = (d, np.asarray(c.point, float), np.asarray(c.normal, float))
+        if not worst:
+            break
+        changed = False
+        for (a, b), (d, point, normal) in worst.items():
+            lo = a if pieces[a][1] <= pieces[b][1] else b
+            other = b if lo == a else a
+            to_other = np.asarray(hulls[other].centroid) - np.asarray(hulls[lo].centroid)
+            n = normal if np.dot(normal, to_other) > 0 else -normal
+            try:
+                s = hulls[lo].slice_plane(plane_origin=point, plane_normal=-n, cap=True)
+                if s is not None and not s.is_empty and len(s.vertices) >= 4 and s.volume > 1e-7:
+                    hulls[lo] = s.convex_hull
+                    changed = True
+            except Exception:
+                pass
+        if not changed:
+            break
+    for i, h in enumerate(hulls):
+        pieces[i][2] = h
+    return pieces
+
+
 def coacd_pieces(mesh, threshold):
     cm = coacd.Mesh(mesh.vertices, mesh.faces)
     pieces = coacd.run_coacd(cm, threshold=threshold)
@@ -146,29 +189,44 @@ def main():
 
     coacd.set_log_level("error")
     t0 = time.time()
-    asset_parts = []
-    part_hulls = []  # (part_index, hull) for overlap measurement
+    # CoACD every part into tight hulls, collecting a flat piece list tagged with
+    # its part index and priority (bigger part = higher priority = keeps its volume).
+    flat = []  # [part_index, priority, hull]
+    part_meta = []
     for i, (name, m) in enumerate(parts):
         hulls = coacd_pieces(m, threshold)
         if inset > 0:
             hulls = [inset_hull(h, inset) for h in hulls]
-        pieces = [{"vertices": np.asarray(h.vertices, np.float32).round(5).tolist(),
-                   "faces": np.asarray(h.faces, np.int32).tolist()} for h in hulls]
-        c = m.bounds.mean(axis=0)
-        asset_parts.append({"name": name, "centroid": [float(x) for x in c],
-                            "extents": [float(x) for x in m.extents], "pieces": pieces})
+        pri = float(np.prod(m.extents))
         for h in hulls:
-            part_hulls.append((i, h))
+            flat.append([i, pri, h])
+        part_meta.append({"name": name, "centroid": [float(x) for x in m.bounds.mean(axis=0)],
+                          "extents": [float(x) for x in m.extents]})
         if (i + 1) % 25 == 0:
-            print(f"  ...{i+1}/{len(parts)} parts, {len(part_hulls)} hulls, {time.time()-t0:.0f}s")
+            print(f"  ...{i+1}/{len(parts)} parts, {len(flat)} hulls, {time.time()-t0:.0f}s")
 
-    n, mx, mn = cross_part_overlap(part_hulls)
-    print(f"\n[build] {len(asset_parts)} parts -> {len(part_hulls)} hulls in {time.time()-t0:.0f}s")
-    print(f"[build] residual cross-part overlap: pairs={n}  maxDepth={mx:.3f}m  meanDepth={mn:.3f}m")
+    nb, mxb, mnb = cross_part_overlap([(p[0], p[2]) for p in flat])
+    print(f"[build] CoACD: {len(parts)} parts -> {len(flat)} hulls in {time.time()-t0:.0f}s")
+    print(f"[build] overlap BEFORE clip: pairs={nb}  maxDepth={mxb:.3f}m  meanDepth={mnb:.3f}m")
+
+    flat = clip_deinterpenetrate(flat)
+    na, mxa, mna = cross_part_overlap([(p[0], p[2]) for p in flat])
+    print(f"[build] overlap AFTER  clip: pairs={na}  maxDepth={mxa:.3f}m  meanDepth={mna:.3f}m")
+
+    # Regroup hulls by part into the asset.
+    by_part = {}
+    for pidx, _pri, h in flat:
+        by_part.setdefault(pidx, []).append(h)
+    asset_parts = []
+    for i, meta in enumerate(part_meta):
+        hulls = by_part.get(i, [])
+        meta["pieces"] = [{"vertices": np.asarray(h.vertices, np.float32).round(5).tolist(),
+                           "faces": np.asarray(h.faces, np.int32).tolist()} for h in hulls]
+        asset_parts.append(meta)
 
     if out:
         with open(out, "w") as f:
-            json.dump({"source": glb, "threshold": threshold, "deinterpenetrated": do_deint,
+            json.dump({"source": glb, "threshold": threshold, "inset": inset,
                        "parts": asset_parts}, f)
         print(f"[build] wrote {out}")
 
