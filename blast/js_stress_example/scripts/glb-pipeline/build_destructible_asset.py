@@ -45,6 +45,7 @@ def deinterpenetrate(parts):
     rank = {idx: r for r, idx in enumerate(order)}
     out = []
     trims = 0
+    bool_errors = {}
     for i, (name, m) in enumerate(parts):
         trimmed = m
         v0 = vols[i]
@@ -55,8 +56,9 @@ def deinterpenetrate(parts):
                 continue
             try:
                 diff = trimmed.difference(mj)
-            except Exception:
-                diff = None
+            except Exception as e:
+                bool_errors[type(e).__name__] = bool_errors.get(type(e).__name__, 0) + 1
+                continue
             if diff is None or diff.is_empty:
                 continue
             vd = float(diff.volume)
@@ -67,6 +69,9 @@ def deinterpenetrate(parts):
                 trims += 1
         out.append((name, trimmed))
     print(f"[build] de-interpenetration: {trims} trims applied")
+    if bool_errors:
+        print(f"[build] WARNING de-interpenetration: boolean errors {bool_errors} "
+              "(open/non-watertight parts cannot be subtracted)")
     return out
 
 
@@ -77,36 +82,45 @@ def inset_hull(hull, delta):
     the piece is too thin to inset."""
     try:
         ch = ConvexHull(hull.vertices)
-    except Exception:
+    except Exception as e:
+        print(f"[build] WARNING inset_hull: ConvexHull failed ({type(e).__name__}: {e}); kept whole")
         return hull
     hs = ch.equations.copy()        # A x + b <= 0 (A outward-normal, |A|=1)
     hs[:, -1] += delta              # push each plane inward by delta
     interior = hull.vertices.mean(axis=0)
     # The centroid must stay strictly inside the inset region, else the piece is
-    # thinner than 2*delta in some direction — keep it whole rather than vanish.
+    # thinner than 2*delta in some direction — an expected case: keep it whole.
     if np.any(hs[:, :3] @ interior + hs[:, -1] >= -1e-6):
         return hull
     try:
         pts = HalfspaceIntersection(hs, interior).intersections
         out = trimesh.Trimesh(vertices=pts).convex_hull
-        return out if len(out.vertices) >= 4 else hull
-    except Exception:
+    except Exception as e:
+        print(f"[build] WARNING inset_hull: halfspace inset failed ({type(e).__name__}: {e}); kept whole")
         return hull
+    return out if len(out.vertices) >= 4 else hull
 
 
-def clip_deinterpenetrate(pieces, iters=4):
+def clip_deinterpenetrate(pieces, iters=15, margin=0.01):
     """pieces: list of [part_index, priority, hull]. Where two pieces from DIFFERENT
     parts overlap, clip the lower-priority one along the contact plane (a convex hull
-    sliced by a plane stays convex), removing its penetrating lobe. Unlike inset this
-    works on thin shell pieces. Iterates until clean or `iters` reached."""
+    sliced by a plane stays convex), removing its penetrating lobe + a `margin` so it
+    ends with a gap rather than merely touching. Unlike inset this works on thin shell
+    pieces. Iterates until clean or `iters` reached.
+
+    Failures are surfaced, never swallowed: slice errors are counted by exception
+    type and reported, and any error that wipes out *every* attempt (e.g. a missing
+    backend) raises instead of silently doing nothing."""
     hulls = [p[2] for p in pieces]
+    slice_attempts = 0
+    slice_errors = {}      # exception type name -> count
+    slice_too_small = 0    # clip would erase the piece (kept whole)
     for _ in range(iters):
         mgr = collision.CollisionManager()
         for i, h in enumerate(hulls):
             mgr.add_object(str(i), h)
         _, data = mgr.in_collision_internal(return_names=False, return_data=True)
-        # deepest contact per overlapping cross-part pair
-        worst = {}
+        worst = {}  # deepest contact per overlapping cross-part pair
         for c in data:
             a, b = (int(x) for x in c.names)  # c.names is a set
             if pieces[a][0] == pieces[b][0]:
@@ -123,15 +137,29 @@ def clip_deinterpenetrate(pieces, iters=4):
             other = b if lo == a else a
             to_other = np.asarray(hulls[other].centroid) - np.asarray(hulls[lo].centroid)
             n = normal if np.dot(normal, to_other) > 0 else -normal
+            origin = point - margin * n  # clip slightly past contact -> gap, not touch
+            slice_attempts += 1
             try:
-                s = hulls[lo].slice_plane(plane_origin=point, plane_normal=-n, cap=True)
-                if s is not None and not s.is_empty and len(s.vertices) >= 4 and s.volume > 1e-7:
-                    hulls[lo] = s.convex_hull
-                    changed = True
-            except Exception:
-                pass
+                s = hulls[lo].slice_plane(plane_origin=origin, plane_normal=-n, cap=True)
+            except Exception as e:
+                slice_errors[type(e).__name__] = slice_errors.get(type(e).__name__, 0) + 1
+                continue
+            if s is None or s.is_empty or len(s.vertices) < 4 or s.volume <= 1e-7:
+                slice_too_small += 1
+                continue
+            hulls[lo] = s.convex_hull
+            changed = True
         if not changed:
             break
+    if slice_errors:
+        msg = ", ".join(f"{k}x{v}" for k, v in slice_errors.items())
+        # If EVERY slice errored, the step is silently a no-op — fail loudly.
+        if sum(slice_errors.values()) >= slice_attempts and slice_attempts > 0:
+            raise RuntimeError(f"clip_deinterpenetrate: all {slice_attempts} slices failed ({msg}). "
+                               "A backend is likely missing (e.g. shapely for slice_plane).")
+        print(f"[build] WARNING clip: {sum(slice_errors.values())}/{slice_attempts} slices errored ({msg})")
+    if slice_too_small:
+        print(f"[build] clip: {slice_too_small} clips skipped (would erase a too-thin piece)")
     for i, h in enumerate(hulls):
         pieces[i][2] = h
     return pieces
@@ -145,11 +173,14 @@ def coacd_pieces(mesh, threshold):
         h = trimesh.Trimesh(vertices=np.asarray(verts), faces=np.asarray(faces), process=False)
         try:
             h = h.convex_hull
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[build] WARNING coacd_pieces: convex_hull failed ({type(e).__name__}: {e}); using raw piece")
         if len(h.vertices) >= 4:
             hulls.append(h)
-    return hulls or [convex(mesh)]
+    if not hulls:
+        print(f"[build] WARNING coacd_pieces: CoACD produced no usable hulls; using the part convex hull")
+        return [convex(mesh)]
+    return hulls
 
 
 def cross_part_overlap(part_hulls):

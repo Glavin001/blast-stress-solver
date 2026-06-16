@@ -59,7 +59,8 @@ def drop_ground(parts):
 def convex(p):
     try:
         return p.convex_hull
-    except Exception:
+    except Exception as e:
+        print(f"[diagnose] WARNING convex_hull failed ({type(e).__name__}: {e}); using raw mesh")
         return p
 
 

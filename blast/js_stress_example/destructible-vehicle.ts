@@ -482,10 +482,11 @@ window.addEventListener('resize', onResize);
   // Overlapping convex hulls instead resolve their penetration as a blast.
   shatterAll() {
     const core = coreRef as any;
-    if (!core) return 0;
+    if (!core) { console.warn('[vehicle] shatterAll: no core'); return 0; }
     // Lift any body cap so every chunk can become its own rigid body.
-    try { core.setFracturePolicy?.({ maxDynamicBodies: 0, maxFracturesPerFrame: 0, maxNewBodiesPerFrame: 0 }); } catch {}
-    try { return core.shatterAll?.() ?? 0; } catch { return 0; }
+    core.setFracturePolicy?.({ maxDynamicBodies: 0, maxFracturesPerFrame: 0, maxNewBodiesPerFrame: 0 });
+    if (typeof core.shatterAll !== 'function') { console.warn('[vehicle] shatterAll: core has no shatterAll'); return 0; }
+    return core.shatterAll();
   },
 };
 
