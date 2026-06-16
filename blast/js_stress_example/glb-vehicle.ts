@@ -841,36 +841,43 @@ function attachDetailedRenderGeometry(
     }
   }
 
-  const inside = (i: number, x: number, y: number, z: number, eps: number): boolean => {
-    const pl = planes[i]; if (!pl.length) return false;
-    for (let p = 0; p < pl.length; p += 4) {
-      if (pl[p] * x + pl[p + 1] * y + pl[p + 2] * z - pl[p + 3] > eps) return false;
-    }
-    return true;
-  };
-  const aabbDist2 = (i: number, x: number, y: number, z: number): number => {
+  const aabbDist = (i: number, x: number, y: number, z: number): number => {
     const o = i * 6;
     const dx = x < aabb[o] ? aabb[o] - x : x > aabb[o + 3] ? x - aabb[o + 3] : 0;
     const dy = y < aabb[o + 1] ? aabb[o + 1] - y : y > aabb[o + 4] ? y - aabb[o + 4] : 0;
     const dz = z < aabb[o + 2] ? aabb[o + 2] - z : z > aabb[o + 5] ? z - aabb[o + 5] : 0;
-    return dx * dx + dy * dy + dz * dz;
+    return Math.hypot(dx, dy, dz);
+  };
+  // Signed distance from a point to a node's convex hull, via its outward face planes:
+  // max over faces of (n·p − d). <= 0 means inside (more negative = deeper); > 0 ≈ the
+  // distance outside. This is TIGHT for thin/elongated hulls (unlike an AABB), so a small
+  // sliver hull no longer "reaches" across the model and over-grabs a long strip of
+  // triangles — which was the spiky-fragment cause.
+  const hullDist = (i: number, x: number, y: number, z: number): number => {
+    const pl = planes[i];
+    if (!pl.length) return aabbDist(i, x, y, z);
+    let m = -Infinity;
+    for (let p = 0; p < pl.length; p += 4) {
+      const dd = pl[p] * x + pl[p + 1] * y + pl[p + 2] * z - pl[p + 3];
+      if (dd > m) m = dd;
+    }
+    return m;
   };
 
-  // Pieces that physically contain a triangle but belong to a DIFFERENT original part
-  // (e.g. a frame rail's hull passing over a barrel) would steal its surface triangles
-  // → wrong colour. So score candidates by geometric distance PLUS a role-mismatch
-  // penalty: a same-role piece up to ~sqrt(ROLE_PEN) m away beats a containing wrong-role
-  // piece, but a far same-role piece never wins (that produced spikes). Containment = 0.
-  const ROLE_PEN = 0.012; // ~11 cm² — how far a same-role piece may be and still win
+  // A piece that contains a triangle but belongs to a DIFFERENT original part (e.g. a
+  // frame rail's hull over a barrel) would steal its surface → wrong colour. So score by
+  // hull-surface distance PLUS a role-mismatch penalty (metres): a same-role piece up to
+  // ROLE_PEN closer-equivalent wins, but a far same-role piece never wins (no spikes).
+  const ROLE_PEN = 0.08; // m — how much farther a same-role piece may be and still win
   /**
    * Assign a point to the node whose hull best OWNS it: lowest cost =
-   * (hull-contained ? 0 : aabb-distance²) + (role mismatch ? ROLE_PEN : 0), tiebroken
-   * by smallest hull volume (tightest nested piece). Falls back to pure nearest-AABB if
-   * a point sits in a gap that no candidate contains.
+   * max(0, hullDist) + (role mismatch ? ROLE_PEN : 0); ties broken toward the piece the
+   * point is deepest inside, then the smallest hull. Produces a tight per-hull partition
+   * so each render slice matches its collider (no oversized/spiky fragments).
    */
   function ownerNode(x: number, y: number, z: number, role: VehiclePartRole): number {
     const ix = clampI(Math.floor((x - minX) * inv), gx), iy = clampI(Math.floor((y - minY) * inv), gy), iz = clampI(Math.floor((z - minZ) * inv), gz);
-    let best = -1, bestCost = Infinity, bestVol = Infinity;
+    let best = -1, bestCost = Infinity, bestHd = Infinity, bestVol = Infinity;
     const maxR = Math.max(gx, gy, gz);
     let foundRing = -1;
     for (let r = 0; r <= maxR; r++) {
@@ -882,10 +889,13 @@ function attachDetailedRenderGeometry(
         if (r > 0 && a > x0 && a < x1 && b > y0 && b < y1 && c > z0 && c < z1) continue;
         const list = grid.get((a * gy + b) * gz + c); if (!list) continue;
         for (const n of list) {
-          const geo = inside(n, x, y, z, 1e-3) ? 0 : aabbDist2(n, x, y, z);
-          const cost = geo + (roleOf[n] === role ? 0 : ROLE_PEN);
-          if (cost < bestCost - 1e-9 || (cost < bestCost + 1e-9 && vol[n] < bestVol)) {
-            bestCost = cost; best = n; bestVol = vol[n];
+          const hd = hullDist(n, x, y, z);
+          const cost = (hd > 0 ? hd : 0) + (roleOf[n] === role ? 0 : ROLE_PEN);
+          if (
+            cost < bestCost - 1e-6 ||
+            (cost <= bestCost + 1e-6 && (hd < bestHd - 1e-6 || (hd <= bestHd + 1e-6 && vol[n] < bestVol)))
+          ) {
+            bestCost = cost; bestHd = hd; best = n; bestVol = vol[n];
           }
         }
       }

@@ -47,7 +47,7 @@ const ASSET_URL = './assets/buggy.pieces.json';
 // Original full-detail model — used ONLY for rendering (render != collision). Each
 // collider piece keeps its tight CoACD hull for physics but draws a slice of this
 // model, so the car looks like the real vehicle, not faceted hulls.
-const MODEL_URL = './assets/buggy.glb';
+const MODEL_URL = './assets/buggy-clean.glb';
 
 const CONFIG = {
   vehicle: {
@@ -186,6 +186,13 @@ let shooter: ReturnType<typeof mountShooter> | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
 let colorByRole = true;
+// Exploded-chunks inspection: when > 0, physics is frozen and every chunk's render
+// mesh is pushed radially outward from the vehicle centre by this factor, so each
+// fracture piece can be inspected on its own (what the vehicle breaks into).
+let explodeFactor = 0;
+// When set, the frozen view shows ONLY these chunk indices (at rest positions) so a
+// single fracture piece can be inspected in isolation.
+let isolateSet: Set<number> | null = null;
 
 // Cached pieces asset so Reset / Drop rebuild without re-fetching.
 let piecesAsset: VehiclePiecesAsset | null = null;
@@ -276,6 +283,13 @@ async function initScene(dropHeight = 0) {
     includeDebugLines: true,
     nodeColors,
     materialColors: colorByRole,
+    // The original model parts are thin single-sided shells; once a piece breaks off
+    // you see the inside of the shell, which is unlit/black with a front-side material.
+    // Render double-sided so detached fragments are lit on both faces.
+    materials: {
+      deck: new THREE.MeshStandardMaterial({ color: 0xbababa, roughness: 0.62, metalness: 0.05, side: THREE.DoubleSide }),
+      support: new THREE.MeshStandardMaterial({ color: 0x7a889a, roughness: 0.7, metalness: 0.15, side: THREE.DoubleSide }),
+    },
   });
 
   rapierDebug?.dispose();
@@ -421,6 +435,28 @@ mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
 bindSlider('cfg-contact-force', CONFIG.physics, 'contactForceScale', (v) => v.toFixed(0));
 bindCheckbox('cfg-skip-single', CONFIG.physics, 'skipSingleBodies');
 
+// ── Exploded-chunks inspection ────────────────────────────────
+
+// Push every chunk's render mesh radially out from the vehicle centre so each
+// fracture piece is separated and inspectable (what the car breaks into).
+function applyExplodedLayout() {
+  const meshes = visualsRef?.chunkMeshes;
+  const core = coreRef;
+  if (!meshes || !core) return;
+  const cyC = 0.7; // vehicle mid-height; explode from (0, cyC, 0)
+  const f = 1 + explodeFactor;
+  for (let i = 0; i < meshes.length; i++) {
+    const mesh = meshes[i];
+    const chunk = core.chunks[i];
+    if (!mesh || !chunk) continue;
+    if (isolateSet && !isolateSet.has(i)) { mesh.visible = false; continue; }
+    const o = chunk.baseLocalOffset;
+    mesh.position.set(o.x * f, cyC + (o.y - cyC) * f, o.z * f);
+    mesh.quaternion.identity();
+    mesh.visible = true;
+  }
+}
+
 // ── Render loop ───────────────────────────────────────────────
 
 const clock = new THREE.Clock();
@@ -435,13 +471,17 @@ function loop() {
   controls.update();
 
   if (coreRef && visualsRef) {
-    const t0 = performance.now();
-    coreRef.step(dt);
-    _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
+    if (explodeFactor > 0 || isolateSet) {
+      applyExplodedLayout();
+    } else {
+      const t0 = performance.now();
+      coreRef.step(dt);
+      _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
 
-    visualsRef.update({ debug: showDebug, updateBVH: false, updateProjectiles: true });
-    rapierDebug?.update();
-    updateStatus(coreRef);
+      visualsRef.update({ debug: showDebug, updateBVH: false, updateProjectiles: true });
+      rapierDebug?.update();
+      updateStatus(coreRef);
+    }
   }
 
   shooter?.update();
@@ -479,6 +519,50 @@ window.addEventListener('resize', onResize);
   setDebug(colliders: boolean, bonds: boolean) {
     showDebug = !!bonds;
     rapierDebug?.setEnabled(!!colliders);
+  },
+  // Freeze physics and spread every chunk's RENDER mesh radially so each fracture
+  // piece can be inspected on its own. `explode(0)` resumes the simulation.
+  explode(factor = 1.8) {
+    explodeFactor = Math.max(0, factor);
+    if (explodeFactor > 0) applyExplodedLayout();
+    return explodeFactor;
+  },
+  // Show ONLY these chunk indices (frozen, at rest positions) for close inspection.
+  // Pass null/[] to clear and resume normal rendering.
+  isolate(indices: number[] | null) {
+    isolateSet = indices && indices.length ? new Set(indices) : null;
+    if (isolateSet) applyExplodedLayout();
+    return isolateSet ? isolateSet.size : 0;
+  },
+  // Per-chunk render-geometry diagnostics: triangle count and the ratio of the render
+  // slice's bbox to the collider hull's bbox. A large ratio = a stray/spanning triangle
+  // (the "spike" artifact); tiny tri counts = near-empty slivers. Sorted worst-first.
+  inspectChunks() {
+    const meshes = visualsRef?.chunkMeshes;
+    const core = coreRef;
+    if (!meshes || !core) return null;
+    const rows: any[] = [];
+    for (let i = 0; i < meshes.length; i++) {
+      const g = meshes[i].geometry as THREE.BufferGeometry;
+      g.computeBoundingBox();
+      const bb = g.boundingBox!;
+      const rs = [bb.max.x - bb.min.x, bb.max.y - bb.min.y, bb.max.z - bb.min.z];
+      const pos = g.getAttribute('position');
+      const tri = Math.floor((g.index ? g.index.count : (pos?.count ?? 0)) / 3);
+      const hull = core.chunks[i].size;
+      const hmax = Math.max(hull.x, hull.y, hull.z, 1e-3);
+      const rmax = Math.max(rs[0], rs[1], rs[2]);
+      rows.push({
+        i, tri,
+        rsize: rs.map((v) => +v.toFixed(3)),
+        hsize: [+hull.x.toFixed(3), +hull.y.toFixed(3), +hull.z.toFixed(3)],
+        ratio: +(rmax / hmax).toFixed(2),
+      });
+    }
+    rows.sort((a, b) => b.ratio - a.ratio);
+    const spikes = rows.filter((r) => r.ratio > 1.6).length;
+    const tiny = rows.filter((r) => r.tri < 2).length;
+    return { count: rows.length, spikes, tiny, worst: rows.slice(0, 25) };
   },
   // Stability probe for headless soak tests: max linear speed and max distance
   // from origin across dynamic bodies (an explosion spikes both), plus counts.

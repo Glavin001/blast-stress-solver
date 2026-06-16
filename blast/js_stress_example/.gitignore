@@ -9,3 +9,4 @@ stress_solver.mjs
 # ignore in blast/.gitignore (it is required to build/serve the demo).
 !assets/
 !assets/buggy.glb
+!assets/buggy-clean.glb
