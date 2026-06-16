@@ -59,24 +59,42 @@ sheds parts on light/heavy shots, stable drops, no explosions.
 
 ## 2. Prerequisites & install
 
+> **What needs what:** regenerating the **asset** (clean → CoACD → de-interpenetrate)
+> needs only Node (glTF-Transform) + Python. **Running/testing the demo** also needs
+> the **Emscripten-built core** (the `*.wasm` is gitignored — *not* committed).
+
 ### Node (the demo + clean-up pre-pass)
 
 ```bash
 # repo root: vendor libs the served demo needs (three, rapier, pinata)
 npm install
 
-# the destructible-vehicle demo package
+# the destructible-vehicle demo package (glTF-Transform + meshoptimizer for
+# clean-glb.mjs are now in its package.json devDependencies)
 cd blast/js_stress_example
 npm install
-
-# glTF-Transform weld+simplify pre-pass (clean-glb.mjs)
-npm install @gltf-transform/core @gltf-transform/functions meshoptimizer
 ```
 
 ### Python 3 (the offline geometry pipeline)
 
 ```bash
-pip3 install coacd trimesh numpy python-fcl networkx scipy shapely manifold3d
+pip3 install -r blast/js_stress_example/scripts/glb-pipeline/requirements.txt
+# (coacd, trimesh, python-fcl, networkx, scipy, shapely, manifold3d, numpy)
+```
+
+### Emscripten — REQUIRED to build the core (to serve/test the demo)
+
+`blast/blast-stress-solver/dist/` (the WASM stress solver + JS) is **not
+committed** — CI rebuilds it. A fresh clone must build it before the demo can run
+or the vitest tests pass (the asset pipeline above does **not** need it):
+
+```bash
+git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+~/emsdk/emsdk install latest && ~/emsdk/emsdk activate latest
+source ~/emsdk/emsdk_env.sh
+npm --prefix blast/blast-stress-solver install
+npm --prefix blast/blast-stress-solver run build      # builds WASM + TS into dist/
+node blast/blast-stress-solver/scripts/copy-dist.js   # if build:ts cleaned the wasm
 ```
 
 | package | used for |

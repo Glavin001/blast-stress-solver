@@ -41,8 +41,11 @@
     "test:split:watch": "vitest"
   },
   "devDependencies": {
+    "@gltf-transform/core": "^4.4.0",
+    "@gltf-transform/functions": "^4.4.0",
     "@playwright/test": "^1.56.0",
     "esbuild": "^0.25.10",
+    "meshoptimizer": "^1.1.1",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
   }
