@@ -24,8 +24,12 @@ from trimesh import collision
 
 # Mirror the runtime splitConnectedComponents (glb-vehicle.ts): weld at 1e-4, drop
 # components below MIN_TRIS triangles, keep at most MAX_COMPONENTS (largest) per mesh.
+# A mesh that splits into more than SPLIT_CAP components is cohesive detail (a wheel's
+# tread/bolts, a greebled panel) — not separate physical parts — so keep it whole,
+# matching the runtime keeping wheels whole. This keeps the part/piece count sane.
 MIN_TRIS = 6
-MAX_COMPONENTS = 24
+MAX_COMPONENTS = 16
+SPLIT_CAP = 30
 
 
 def load_parts(glb_path):
@@ -37,10 +41,11 @@ def load_parts(glb_path):
         mesh.apply_transform(transform)
         mesh.merge_vertices(digits_vertex=4)
         comps = [c for c in mesh.split(only_watertight=False) if len(c.faces) >= MIN_TRIS]
-        if len(comps) == 0:
-            comps = [mesh]
-        comps.sort(key=lambda c: -len(c.faces))
-        comps = comps[:MAX_COMPONENTS]
+        if len(comps) == 0 or len(comps) > SPLIT_CAP:
+            comps = [mesh]  # whole: nothing splittable, or cohesive detail (keep together)
+        else:
+            comps.sort(key=lambda c: -len(c.faces))
+            comps = comps[:MAX_COMPONENTS]
         for i, comp in enumerate(comps):
             parts.append((f"{geom_name}#{i}" if len(comps) > 1 else geom_name, comp))
     return parts
