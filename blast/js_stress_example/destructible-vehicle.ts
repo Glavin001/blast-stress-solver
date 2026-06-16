@@ -69,15 +69,17 @@ const CONFIG = {
   solver: {
     gravity: -9.81,
     // Holds the intact car rock-solid at rest. The CoACD pieces have small contact
-    // areas (the de-interpenetration leaves ~1cm gaps), so the per-area bonds need
-    // a high materialScale to not sag under gravity — which currently also makes
-    // impacts under-break. The proper fix is rebuilding the asset with ~0 clip
-    // margin so pieces touch (bigger contact area → strong bonds at a lower scale
-    // that still breaks). Tracked for the weld+simplify rebuild pass.
+    // areas, so the per-area bonds need a high materialScale not to sag under
+    // gravity; impact breaking is then driven by contactForceScale (below) so a hit
+    // still spikes local bond stress past the limit. Soak-verified: holds at rest,
+    // sheds on light/heavy shots, stable drops.
     materialScale: 1e13,
   },
   physics: {
-    contactForceScale: 30,
+    // High on purpose: with the strong (high-materialScale) bonds, this amplifies
+    // projectile/ground contact forces into the stress solver so a hit overstresses
+    // and sheds local parts (light shot ~3, heavy ~9 in the soak).
+    contactForceScale: 200,
     skipSingleBodies: false,
   },
 };
@@ -379,15 +381,15 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
 // Detached debris bounces off the intact car and the ground, but NOT off other
 // debris. This is the one genuine collider-fidelity mitigation: the runtime builds
 // a single convex hull per node, and fractured/concave pieces have *overlapping*
-// hulls, so under sustained heavy destruction debris-vs-debris contacts resolve
-// their mutual penetration as an explosion (full 'all' mode survives settle/light
-// shots/drops but blows up on rapid heavy fire — see scripts/soak-vehicle.mjs).
-// 'noDebrisPairs' keeps debris lively (it still bounces off the car) while removing
-// that failure mode. The real fix would be convex decomposition (out of scope).
-// Full debris collision: the CoACD pipeline produces tight, NON-OVERLAPPING
-// collider pieces, so detached chunks resolve cleanly (no overlapping-hull blast)
-// and pile realistically. (build_destructible_asset.py guarantees ~0 cross-part overlap.)
-physicsConfig.debrisCollisionMode = 'all';
+// Debris collision: the CoACD pipeline (split → weld+simplify → CoACD → clip)
+// makes tight, near-non-overlapping collider pieces. A few thin sliver pieces from
+// the messy source can't be fully de-interpenetrated, so under full 'all' debris
+// collision a mass shatter can still cascade off those residual overlaps. The
+// runtime-robust choice is 'noDebrisPairs' (debris still bounces off the car +
+// ground, just not off each other), which passes settle/light/heavy/drop in
+// scripts/soak-vehicle.mjs. Eliminating the slivers entirely (more aggressive
+// simplify) would let this be 'all'.
+physicsConfig.debrisCollisionMode = 'noDebrisPairs';
 
 // Shared Physics / Optimization / Features controls.
 mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
