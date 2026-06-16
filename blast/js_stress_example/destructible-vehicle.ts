@@ -30,16 +30,18 @@ import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-control
 import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
 import { mountShooter } from './shooter-fps.js';
 import {
-  extractVehicleParts,
-  buildVehicleScenario,
+  buildVehicleScenarioFromAsset,
   ROLE_COLORS,
   ROLE_LABELS,
   type VehiclePartRole,
+  type VehiclePiecesAsset,
 } from './glb-vehicle.js';
 
 // ── Config ────────────────────────────────────────────────────
 
-const MODEL_URL = './assets/buggy.glb';
+// Pre-decomposed pieces asset (CoACD pipeline output): tight, non-overlapping
+// convex collider pieces, so full debris collision doesn't explode.
+const ASSET_URL = './assets/buggy.pieces.json';
 
 const CONFIG = {
   vehicle: {
@@ -172,8 +174,8 @@ let rapierDebug: RapierDebugRenderer | null = null;
 let showDebug = false;
 let colorByRole = true;
 
-// Cached parsed model so Reset / Drop rebuild without re-fetching 8 MB.
-let gltfScene: THREE.Object3D | null = null;
+// Cached pieces asset so Reset / Drop rebuild without re-fetching.
+let piecesAsset: VehiclePiecesAsset | null = null;
 
 // Breaking is fully stress-driven: the solver sees gravity + the ground-contact
 // reaction + projectile contact forces, and breaks bonds wherever the stress
@@ -193,29 +195,23 @@ function setHint(text: string) {
   if (hint) hint.textContent = text;
 }
 
-async function ensureModelLoaded(): Promise<THREE.Object3D> {
-  if (gltfScene) return gltfScene;
+async function ensureAssetLoaded(): Promise<VehiclePiecesAsset> {
+  if (piecesAsset) return piecesAsset;
   setHint('Loading model…');
-  const loader = new GLTFLoader();
-  const gltf = await loader.loadAsync(MODEL_URL);
-  gltfScene = gltf.scene;
-  return gltfScene;
+  const res = await fetch(ASSET_URL);
+  if (!res.ok) throw new Error(`failed to load ${ASSET_URL}: ${res.status} ${res.statusText}`);
+  piecesAsset = (await res.json()) as VehiclePiecesAsset;
+  return piecesAsset;
 }
 
 /** Build (or rebuild) the destructible vehicle. `dropHeight` lifts it for a drop test. */
 async function initScene(dropHeight = 0) {
-  const root = await ensureModelLoaded();
+  const asset = await ensureAssetLoaded();
 
-  // Fresh parts every build — extract clones + bakes geometry, so repeated
-  // rebuilds never accumulate transforms.
-  const { parts, bounds } = extractVehicleParts(root);
-
-  const { scenario, nodeColors, summary } = await buildVehicleScenario(parts, bounds, {
+  const { scenario, nodeColors, summary } = await buildVehicleScenarioFromAsset(asset, {
     totalMass: CONFIG.vehicle.totalMass,
-    fractureCellSize: CONFIG.vehicle.fractureCellSize,
     bondMaxSeparation: CONFIG.vehicle.bondMaxSeparation,
     roleStrength: CONFIG.vehicle.bondStrength,
-    pinata,
     groundGap: 0.03 + Math.max(0, dropHeight),
   });
 
@@ -387,7 +383,10 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
 // shots/drops but blows up on rapid heavy fire — see scripts/soak-vehicle.mjs).
 // 'noDebrisPairs' keeps debris lively (it still bounces off the car) while removing
 // that failure mode. The real fix would be convex decomposition (out of scope).
-physicsConfig.debrisCollisionMode = 'noDebrisPairs';
+// Full debris collision: the CoACD pipeline produces tight, NON-OVERLAPPING
+// collider pieces, so detached chunks resolve cleanly (no overlapping-hull blast)
+// and pile realistically. (build_destructible_asset.py guarantees ~0 cross-part overlap.)
+physicsConfig.debrisCollisionMode = 'all';
 
 // Shared Physics / Optimization / Features controls.
 mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });
