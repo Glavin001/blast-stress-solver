@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Destructible Structures — blast-stress-solver Demo</title>
+    <title>Courtyard Bungalow — blast-stress-solver Demo</title>
     <link rel="stylesheet" href="./styles/demo-common.css" />
     <script type="importmap">
       {
@@ -23,7 +23,7 @@
     <main class="layout">
       <section class="viewport">
         <canvas id="demo-canvas"></canvas>
-        <div class="viewport-hint">Click to shoot projectiles at the structure</div>
+        <div class="viewport-hint">Click to shoot projectiles at the bungalow</div>
         <!-- The frame-profiler overlay self-mounts here (createFrameProfilerOverlay). -->
       </section>
 
@@ -36,25 +36,16 @@
       <aside class="sidebar" id="sidebar">
         <header>
           <a href="./demo-index.html" class="back-link">← All Demos</a>
-          <h1>🏚️ Destructible Structures</h1>
-          <p>vibe-city's /destructible-stress presets on the blast-stress-solver/rapier + /three APIs</p>
+          <h1>🏡 Courtyard Bungalow</h1>
+          <p>vibe-city /destructible-stress preset on the blast-stress-solver/rapier + /three APIs</p>
         </header>
 
-        <!-- Structure picker (immediate – rebuilds on change) -->
         <section class="config-section">
           <h2 class="section-title">Structure</h2>
-          <div class="config-row">
-            <label class="config-label" for="cfg-structure">Preset</label>
-            <select id="cfg-structure" class="config-select">
-              <option value="frameTower">Multi-storey frame tower</option>
-              <option value="concreteHut">Mini concrete hut</option>
-              <option value="courtyardBungalow">Courtyard bungalow</option>
-            </select>
-          </div>
           <p class="section-note">
-            Each preset is a hollow voxel shell carved from a box — walls, floor
-            plates and openings — bonded on a regular lattice and held up by
-            per-axis bond-area normalization until you knock it down.
+            A low-rise home wrapping a central garden — a breezeway doorway,
+            lintels, a waist-high courtyard ring and clerestory openings — carved
+            from a voxel grid and bonded on a regular lattice.
           </p>
         </section>
 
@@ -183,6 +174,6 @@
     </main>
 
     <script type="module" src="./dist/demo-shell.js"></script>
-    <script type="module" src="./dist/destructible-structures.js"></script>
+    <script type="module" src="./dist/courtyard-bungalow.js"></script>
   </body>
 </html>
