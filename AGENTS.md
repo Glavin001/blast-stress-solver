@@ -271,3 +271,32 @@ castle work):
   large displacement). And `brokenBonds` alone is a misleading "it's fixed" signal.
 - Building a scenario CONSUMES `fragmentGeometries`. Build a FRESH scenario per
   core/test; reusing one across cores gives false negatives.
+
+## Touching-brick scenes — more gotchas (brick-castle thick-wall pass)
+
+- **Convex-hull colliders carry a ~6 mm collision margin.** Two bricks placed
+  face-to-face (gap 0, required by the exact vertical bonder) therefore overlap by
+  that margin and shove apart with a "pop" the instant a bond between them breaks —
+  it reads as a small explosion on a soft hit. Fix: give box bricks a slightly-inset
+  CUBOID collider (`colliderDescForNode`) instead of a hull. A cuboid is exact for a
+  box (0°/90° rotation is baked into the AABB half-extents), cheaper than a hull, and
+  a few-mm inset leaves clearance so neighbours don't touch. Verified with a 2-body
+  Rapier step: hull gap-0 separates ~5.7 mm, cuboid stays put.
+- **Use a 2:1 brick (depth = length/2).** It's what lets headers, half-brick closers
+  and cross-lapped corners tile exactly. With an arbitrary ratio (e.g. 0.9×0.5) the
+  thickness/corner maths leaves sub-brick gaps or overlaps.
+- **Running bond on a fixed-length run needs half-brick closers**, not a half-pitch
+  shift of the whole course. Shifting alone leaves a half-brick toothing notch (a
+  visible hole) at each end; a half-brick at each end of the offset course keeps the
+  run flush AND breaks the joint.
+- **Multi-wythe walls tie themselves.** Parallel leaves placed touching are bonded
+  leaf-to-leaf by the exact bonder (those are X/Z-normal contacts), so you get a
+  thick, walkable, stable wall without modelling header courses. Solid tower corners:
+  alternate which axis runs "full" (corner-to-corner) each course; the full leaves
+  fill the corner square and the perpendicular leaves butt them — cross-lapped quoin,
+  no holes, no overlap.
+- **"A whole tower tumbles as one piece" is not a render desync.** The bundle drives
+  every chunk's collider and visual from the same body transform (they can't
+  diverge). It is the island model: a still-bonded connected component is ONE rigid
+  body and bonded chunks don't self-collide, so a clean break sheds it as a monolith.
+  Thin structures shed big monoliths; thicker walls / more bonds break locally.
