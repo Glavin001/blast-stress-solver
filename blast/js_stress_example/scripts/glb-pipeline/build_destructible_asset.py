@@ -165,6 +165,59 @@ def clip_deinterpenetrate(pieces, iters=15, margin=0.01):
     return pieces
 
 
+def boolean_deinterpenetrate(flat, threshold, dilate=0.004):
+    """flat: [part_index, priority, hull] where hulls are the WATERTIGHT CONVEX CoACD
+    pieces — which is the whole point: boolean ops failed on the open-shell source
+    parts, but succeed on these solid convex hulls.
+
+    Process pieces smallest-volume first (small detail parts are authoritative and
+    keep their full shape); each piece has every already-placed SMALLER cross-part
+    piece subtracted from it, so the larger piece gets the exact overlap notched out.
+    The non-convex result is re-CoACD'd back into convex pieces. Exact de-interpen-
+    etration, no planar approximation, no small piece losing volume."""
+    order = sorted(range(len(flat)), key=lambda i: flat[i][2].volume)
+    placed = []   # finalized [part_index, hull] (smaller pieces, authoritative)
+    out = []
+    bool_err = {}
+    n_cut = n_dropped = n_recoacd = 0
+    for idx in order:
+        pidx, pri, h = flat[idx]
+        cut = h
+        cut_changed = False
+        for (fp, fh) in placed:
+            if fp == pidx or not aabb_overlap(cut, fh):
+                continue
+            try:
+                diff = cut.difference(fh)
+            except Exception as e:
+                bool_err[type(e).__name__] = bool_err.get(type(e).__name__, 0) + 1
+                continue
+            if diff is None or diff.is_empty:
+                cut = None
+                break
+            if diff.volume < cut.volume - 1e-9:  # actually removed material
+                cut = diff
+                cut_changed = True
+        if cut is None or cut.is_empty or float(cut.volume) < 1e-7:
+            n_dropped += 1
+            continue
+        if cut_changed:
+            n_cut += 1
+            sub = coacd_pieces(cut, threshold)
+            n_recoacd += len(sub)
+            for p in sub:
+                placed.append((pidx, p))
+                out.append([pidx, pri, p])
+        else:
+            placed.append((pidx, h))
+            out.append([pidx, pri, h])
+    print(f"[build] boolean de-interp: {n_cut} pieces notched -> {n_recoacd} re-CoACD pieces, "
+          f"{n_dropped} pieces fully consumed")
+    if bool_err:
+        print(f"[build] WARNING boolean de-interp: errors {bool_err}")
+    return out
+
+
 def coacd_pieces(mesh, threshold):
     cm = coacd.Mesh(mesh.vertices, mesh.faces)
     pieces = coacd.run_coacd(cm, threshold=threshold)
@@ -208,7 +261,8 @@ def main():
     out = args[args.index("-o") + 1] if "-o" in args else None
     threshold = float(args[args.index("--threshold") + 1]) if "--threshold" in args else 0.04
     inset = float(args[args.index("--inset") + 1]) if "--inset" in args else 0.02
-    do_deint = "--deint" in args  # boolean trim (off by default: these shells don't solid-overlap)
+    do_deint = "--deint" in args  # source-mesh boolean trim (off: open shells don't solid-overlap)
+    method = args[args.index("--method") + 1] if "--method" in args else "boolean"
     limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 0
 
     parts = drop_ground(load_parts(glb))
@@ -249,11 +303,17 @@ def main():
 
     nb, mxb, mnb = cross_part_overlap([(p[0], p[2]) for p in flat])
     print(f"[build] CoACD: {len(parts)} parts -> {len(flat)} hulls in {time.time()-t0:.0f}s")
-    print(f"[build] overlap BEFORE clip: pairs={nb}  maxDepth={mxb:.3f}m  meanDepth={mnb:.3f}m")
+    print(f"[build] overlap BEFORE {method}: pairs={nb}  maxDepth={mxb:.3f}m  meanDepth={mnb:.3f}m")
 
-    flat = clip_deinterpenetrate(flat)
+    t1 = time.time()
+    if method == "boolean":
+        flat = boolean_deinterpenetrate(flat, threshold)
+    elif method == "clip":
+        flat = clip_deinterpenetrate(flat)
+    else:
+        raise SystemExit(f"unknown --method {method!r} (expected boolean|clip)")
     na, mxa, mna = cross_part_overlap([(p[0], p[2]) for p in flat])
-    print(f"[build] overlap AFTER  clip: pairs={na}  maxDepth={mxa:.3f}m  meanDepth={mna:.3f}m")
+    print(f"[build] overlap AFTER  {method}: pairs={na}  maxDepth={mxa:.3f}m  meanDepth={mna:.3f}m  ({time.time()-t1:.0f}s, {len(flat)} hulls)")
 
     # Regroup hulls by part into the asset.
     by_part = {}
