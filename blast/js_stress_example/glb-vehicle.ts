@@ -678,6 +678,9 @@ export async function buildVehicleScenarioFromAsset(
 
   const fragments: FragmentInfo[] = [];
   const meta: FragMeta[] = [];
+  // Per-node COLLISION hull in GLB world space (pre-offset), used to assign original
+  // render triangles to the piece that actually contains them (see attachDetailedRenderGeometry).
+  const nodeHulls: Array<{ verts: number[][]; faces: number[][] }> = [];
   const roleCounts: Record<VehiclePartRole, number> = { frame: 0, wheel: 0, panel: 0, cargo: 0, accessory: 0 };
 
   for (let partId = 0; partId < asset.parts.length; partId++) {
@@ -723,6 +726,7 @@ export async function buildVehicleScenarioFromAsset(
         isSupport: false,
       });
       meta.push({ partId, role });
+      nodeHulls.push({ verts: piece.vertices, faces: piece.faces });
     }
   }
 
@@ -732,7 +736,7 @@ export async function buildVehicleScenarioFromAsset(
   // node with a slice of the original detailed model (render != collision).
   if (options.renderParts?.length) {
     try {
-      attachDetailedRenderGeometry(result.scenario, meta, offset, options.renderParts);
+      attachDetailedRenderGeometry(result.scenario, meta, nodeHulls, offset, options.renderParts);
     } catch (err) {
       console.warn('[glb-vehicle] detailed render attach failed; rendering hulls:', err);
     }
@@ -758,6 +762,7 @@ export async function buildVehicleScenarioFromAsset(
 function attachDetailedRenderGeometry(
   scenario: any,
   meta: FragMeta[],
+  nodeHulls: Array<{ verts: number[][]; faces: number[][] }>,
   offset: THREE.Vector3,
   renderParts: VehiclePart[],
 ): void {
@@ -766,82 +771,127 @@ function attachDetailedRenderGeometry(
   if (!nodeCount) return;
   const hulls = (scenario.parameters?.fragmentGeometries ?? []) as THREE.BufferGeometry[];
 
-  // Per-node world-space (pre-offset) centroid + role.
+  // Per-node local-frame centre (= mean of the piece's collision-hull verts, pre-offset
+  // world; identical to the recenter used for the hull geometry so the render slice lines
+  // up with the collider). Also per-node hull AABB + outward face planes for assignment.
   const cx = new Float64Array(nodeCount);
   const cy = new Float64Array(nodeCount);
   const cz = new Float64Array(nodeCount);
+  const aabb = new Float64Array(nodeCount * 6); // minx,miny,minz,maxx,maxy,maxz
+  const vol = new Float64Array(nodeCount);
   const roleOf: VehiclePartRole[] = new Array(nodeCount);
+  const planes: Array<Float64Array> = new Array(nodeCount); // [nx,ny,nz,d]* per face, outward
   let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
   for (let i = 0; i < nodeCount; i++) {
     const c = nodes[i].centroid;
-    const x = c.x - offset.x, y = c.y - offset.y, z = c.z - offset.z;
-    cx[i] = x; cy[i] = y; cz[i] = z;
+    cx[i] = c.x - offset.x; cy[i] = c.y - offset.y; cz[i] = c.z - offset.z;
     roleOf[i] = meta[i]?.role ?? 'frame';
-    if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
-    if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
+    const hull = nodeHulls[i];
+    const V = hull?.verts;
+    if (!V || !V.length) { planes[i] = new Float64Array(0); aabb.fill(0, i * 6, i * 6 + 6); vol[i] = 0; continue; }
+    let lminx = Infinity, lminy = Infinity, lminz = Infinity, lmaxx = -Infinity, lmaxy = -Infinity, lmaxz = -Infinity;
+    let mx = 0, my = 0, mz = 0;
+    for (const v of V) {
+      if (v[0] < lminx) lminx = v[0]; if (v[1] < lminy) lminy = v[1]; if (v[2] < lminz) lminz = v[2];
+      if (v[0] > lmaxx) lmaxx = v[0]; if (v[1] > lmaxy) lmaxy = v[1]; if (v[2] > lmaxz) lmaxz = v[2];
+      mx += v[0]; my += v[1]; mz += v[2];
+    }
+    mx /= V.length; my /= V.length; mz /= V.length; // hull-vert centroid (interior point)
+    aabb[i * 6] = lminx; aabb[i * 6 + 1] = lminy; aabb[i * 6 + 2] = lminz;
+    aabb[i * 6 + 3] = lmaxx; aabb[i * 6 + 4] = lmaxy; aabb[i * 6 + 5] = lmaxz;
+    vol[i] = Math.max((lmaxx - lminx) * (lmaxy - lminy) * (lmaxz - lminz), 1e-9);
+    if (lminx < minX) minX = lminx; if (lminy < minY) minY = lminy; if (lminz < minZ) minZ = lminz;
+    if (lmaxx > maxX) maxX = lmaxx; if (lmaxy > maxY) maxY = lmaxy; if (lmaxz > maxZ) maxZ = lmaxz;
+    const F = hull.faces ?? [];
+    const pl = new Float64Array(F.length * 4);
+    let pc = 0;
+    for (const f of F) {
+      const a = V[f[0]], b = V[f[1]], cc = V[f[2]];
+      if (!a || !b || !cc) continue;
+      const e1x = b[0] - a[0], e1y = b[1] - a[1], e1z = b[2] - a[2];
+      const e2x = cc[0] - a[0], e2y = cc[1] - a[1], e2z = cc[2] - a[2];
+      let nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+      const len = Math.hypot(nx, ny, nz);
+      if (len < 1e-12) continue;
+      nx /= len; ny /= len; nz /= len;
+      let d = nx * a[0] + ny * a[1] + nz * a[2];
+      if (nx * mx + ny * my + nz * mz - d > 0) { nx = -nx; ny = -ny; nz = -nz; d = -d; } // orient outward
+      pl[pc++] = nx; pl[pc++] = ny; pl[pc++] = nz; pl[pc++] = d;
+    }
+    planes[i] = pc === pl.length ? pl : pl.slice(0, pc);
   }
+  if (!Number.isFinite(minX)) { minX = minY = minZ = 0; maxX = maxY = maxZ = 1; }
 
-  // Uniform grid over node centroids for fast nearest-node queries.
-  const spanX = Math.max(1e-3, maxX - minX);
-  const spanY = Math.max(1e-3, maxY - minY);
-  const spanZ = Math.max(1e-3, maxZ - minZ);
-  const maxSpan = Math.max(spanX, spanY, spanZ);
-  const cell = Math.max(0.12, maxSpan / 24);
+  // Grid: insert each node into every cell its (padded) AABB overlaps, so a query
+  // point near a piece always finds it as a candidate.
+  const spanX = Math.max(1e-3, maxX - minX), spanY = Math.max(1e-3, maxY - minY), spanZ = Math.max(1e-3, maxZ - minZ);
+  const cell = Math.max(0.1, Math.max(spanX, spanY, spanZ) / 28);
   const inv = 1 / cell;
-  const gx = Math.max(1, Math.ceil(spanX * inv));
-  const gy = Math.max(1, Math.ceil(spanY * inv));
-  const gz = Math.max(1, Math.ceil(spanZ * inv));
-  const cellOf = (x: number, y: number, z: number) => {
-    let ix = Math.floor((x - minX) * inv); if (ix < 0) ix = 0; else if (ix >= gx) ix = gx - 1;
-    let iy = Math.floor((y - minY) * inv); if (iy < 0) iy = 0; else if (iy >= gy) iy = gy - 1;
-    let iz = Math.floor((z - minZ) * inv); if (iz < 0) iz = 0; else if (iz >= gz) iz = gz - 1;
-    return (ix * gy + iy) * gz + iz;
-  };
+  const gx = Math.max(1, Math.ceil(spanX * inv)), gy = Math.max(1, Math.ceil(spanY * inv)), gz = Math.max(1, Math.ceil(spanZ * inv));
+  const clampI = (v: number, hi: number) => (v < 0 ? 0 : v >= hi ? hi - 1 : v);
   const grid = new Map<number, number[]>();
+  const PAD = 0.05; // 5cm — the detailed mesh can poke a little beyond the coarse hull
   for (let i = 0; i < nodeCount; i++) {
-    const k = cellOf(cx[i], cy[i], cz[i]);
-    const list = grid.get(k);
-    if (list) list.push(i); else grid.set(k, [i]);
+    const ix0 = clampI(Math.floor((aabb[i * 6] - PAD - minX) * inv), gx), ix1 = clampI(Math.floor((aabb[i * 6 + 3] + PAD - minX) * inv), gx);
+    const iy0 = clampI(Math.floor((aabb[i * 6 + 1] - PAD - minY) * inv), gy), iy1 = clampI(Math.floor((aabb[i * 6 + 4] + PAD - minY) * inv), gy);
+    const iz0 = clampI(Math.floor((aabb[i * 6 + 2] - PAD - minZ) * inv), gz), iz1 = clampI(Math.floor((aabb[i * 6 + 5] + PAD - minZ) * inv), gz);
+    for (let a = ix0; a <= ix1; a++) for (let b = iy0; b <= iy1; b++) for (let c = iz0; c <= iz1; c++) {
+      const k = (a * gy + b) * gz + c;
+      const l = grid.get(k); if (l) l.push(i); else grid.set(k, [i]);
+    }
   }
 
-  /** Nearest node to (x,y,z): prefer the same role, fall back to any role. */
-  function nearestNode(x: number, y: number, z: number, role: VehiclePartRole): number {
-    let ix = Math.floor((x - minX) * inv); if (ix < 0) ix = 0; else if (ix >= gx) ix = gx - 1;
-    let iy = Math.floor((y - minY) * inv); if (iy < 0) iy = 0; else if (iy >= gy) iy = gy - 1;
-    let iz = Math.floor((z - minZ) * inv); if (iz < 0) iz = 0; else if (iz >= gz) iz = gz - 1;
-    let bestRole = -1, bestRoleD = Infinity;
-    let bestAny = -1, bestAnyD = Infinity;
+  const inside = (i: number, x: number, y: number, z: number, eps: number): boolean => {
+    const pl = planes[i]; if (!pl.length) return false;
+    for (let p = 0; p < pl.length; p += 4) {
+      if (pl[p] * x + pl[p + 1] * y + pl[p + 2] * z - pl[p + 3] > eps) return false;
+    }
+    return true;
+  };
+  const aabbDist2 = (i: number, x: number, y: number, z: number): number => {
+    const o = i * 6;
+    const dx = x < aabb[o] ? aabb[o] - x : x > aabb[o + 3] ? x - aabb[o + 3] : 0;
+    const dy = y < aabb[o + 1] ? aabb[o + 1] - y : y > aabb[o + 4] ? y - aabb[o + 4] : 0;
+    const dz = z < aabb[o + 2] ? aabb[o + 2] - z : z > aabb[o + 5] ? z - aabb[o + 5] : 0;
+    return dx * dx + dy * dy + dz * dz;
+  };
+
+  // Pieces that physically contain a triangle but belong to a DIFFERENT original part
+  // (e.g. a frame rail's hull passing over a barrel) would steal its surface triangles
+  // → wrong colour. So score candidates by geometric distance PLUS a role-mismatch
+  // penalty: a same-role piece up to ~sqrt(ROLE_PEN) m away beats a containing wrong-role
+  // piece, but a far same-role piece never wins (that produced spikes). Containment = 0.
+  const ROLE_PEN = 0.012; // ~11 cm² — how far a same-role piece may be and still win
+  /**
+   * Assign a point to the node whose hull best OWNS it: lowest cost =
+   * (hull-contained ? 0 : aabb-distance²) + (role mismatch ? ROLE_PEN : 0), tiebroken
+   * by smallest hull volume (tightest nested piece). Falls back to pure nearest-AABB if
+   * a point sits in a gap that no candidate contains.
+   */
+  function ownerNode(x: number, y: number, z: number, role: VehiclePartRole): number {
+    const ix = clampI(Math.floor((x - minX) * inv), gx), iy = clampI(Math.floor((y - minY) * inv), gy), iz = clampI(Math.floor((z - minZ) * inv), gz);
+    let best = -1, bestCost = Infinity, bestVol = Infinity;
     const maxR = Math.max(gx, gy, gz);
     let foundRing = -1;
     for (let r = 0; r <= maxR; r++) {
-      // Stop expanding once we are a full ring past the first hit (guarantees the
-      // true nearest within the searched roles is found).
       if (foundRing >= 0 && r > foundRing + 1) break;
       const x0 = Math.max(0, ix - r), x1 = Math.min(gx - 1, ix + r);
       const y0 = Math.max(0, iy - r), y1 = Math.min(gy - 1, iy + r);
       const z0 = Math.max(0, iz - r), z1 = Math.min(gz - 1, iz + r);
-      for (let a = x0; a <= x1; a++) {
-        for (let b = y0; b <= y1; b++) {
-          for (let c = z0; c <= z1; c++) {
-            // Only the shell of the (2r+1)^3 box is new for r>0.
-            if (r > 0 && a > x0 && a < x1 && b > y0 && b < y1 && c > z0 && c < z1) continue;
-            const list = grid.get((a * gy + b) * gz + c);
-            if (!list) continue;
-            for (const n of list) {
-              const dx = cx[n] - x, dy = cy[n] - y, dz = cz[n] - z;
-              const d = dx * dx + dy * dy + dz * dz;
-              if (d < bestAnyD) { bestAnyD = d; bestAny = n; }
-              if (roleOf[n] === role && d < bestRoleD) { bestRoleD = d; bestRole = n; }
-            }
+      for (let a = x0; a <= x1; a++) for (let b = y0; b <= y1; b++) for (let c = z0; c <= z1; c++) {
+        if (r > 0 && a > x0 && a < x1 && b > y0 && b < y1 && c > z0 && c < z1) continue;
+        const list = grid.get((a * gy + b) * gz + c); if (!list) continue;
+        for (const n of list) {
+          const geo = inside(n, x, y, z, 1e-3) ? 0 : aabbDist2(n, x, y, z);
+          const cost = geo + (roleOf[n] === role ? 0 : ROLE_PEN);
+          if (cost < bestCost - 1e-9 || (cost < bestCost + 1e-9 && vol[n] < bestVol)) {
+            bestCost = cost; best = n; bestVol = vol[n];
           }
         }
       }
-      if (foundRing < 0 && (bestAny >= 0 || bestRole >= 0)) foundRing = r;
+      if (foundRing < 0 && best >= 0) foundRing = r;
     }
-    // Prefer same-role unless it is much farther than the overall nearest (handles
-    // role classification drift between the asset and the original model).
-    if (bestRole >= 0 && (bestAny < 0 || bestRoleD <= bestAnyD * 2.25)) return bestRole;
-    return bestAny;
+    return best;
   }
 
   // Accumulate assigned triangles (world-space verts + normals) per node.
@@ -862,7 +912,7 @@ function attachDetailedRenderGeometry(
       const bx = posAttr.getX(b), by = posAttr.getY(b), bz = posAttr.getZ(b);
       const ccx = posAttr.getX(c), ccy = posAttr.getY(c), ccz = posAttr.getZ(c);
       const tcx = (ax + bx + ccx) / 3, tcy = (ay + by + ccy) / 3, tcz = (az + bz + ccz) / 3;
-      const node = nearestNode(tcx, tcy, tcz, part.role);
+      const node = ownerNode(tcx, tcy, tcz, part.role);
       if (node < 0) continue;
       const ap = accPos[node];
       ap.push(ax, ay, az, bx, by, bz, ccx, ccy, ccz);
