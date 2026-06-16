@@ -198,3 +198,29 @@ After running `npm start` at the root:
 - **Push** trigger: only runs on `feat/rapier-destruction` branch (production)
 - **Pull request** trigger: runs on all PRs
 - This prevents double CI runs when PRs are opened from feature branches
+
+## Destructible-scene tuning — hard rules (stability must be REAL, not faked)
+
+These are non-negotiable when building destructible scenes (e.g. the brick-castle
+demo) on the Blast stress solver. Stability must come from the scene being
+physically sound, NOT from masking instability.
+
+- **NEVER use an `onImpact` handler to drive breaking.** (The `onImpact` path is
+  being removed.) Destruction must emerge from the simulation, not from bespoke
+  hand-cut bonds on contact.
+- **NEVER raise `materialScale` to gain stability.** A high `materialScale` that
+  makes a structure "stand" is an unacceptable hack/cheat — it just makes
+  everything too strong to break, and hides that the structure isn't actually
+  self-supporting. Tune real, physical quantities (e.g. per-bond contact `area`,
+  geometry/contact) instead.
+- **The structure must be self-supporting as plain rigid bodies.** Before relying
+  on the stress solver, verify the scene SETTLES when every (non-support) chunk is
+  an independent dynamic rigid body with NO bonds — just gravity + friction +
+  contact. If it collapses with no bonds, the geometry is broken (gaps, no
+  bedding, too thin / too tall, no interlock) — fix the geometry. The stress solver
+  is then a performance OPTIMIZATION over an already-stable rigid-body pile (group
+  settled regions as one body), never a crutch that holds up an unstable one.
+- Island-skipping / lazy colliders are performance optimizations only. They must
+  not be used to keep an unstable structure from being computed (that just defers
+  the collapse to the first disturbance). They are legitimate only when the region
+  is genuinely stable.
