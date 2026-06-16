@@ -18,8 +18,10 @@ Steps:
         [--threshold 0.04] [--no-deint] [--limit N]
 """
 import sys
+import os
 import json
 import time
+import pickle
 import numpy as np
 import trimesh
 from trimesh import collision
@@ -106,7 +108,7 @@ def clip_deinterpenetrate(pieces, iters=4):
         # deepest contact per overlapping cross-part pair
         worst = {}
         for c in data:
-            a, b = int(c.names[0]), int(c.names[1])
+            a, b = (int(x) for x in c.names)  # c.names is a set
             if pieces[a][0] == pieces[b][0]:
                 continue
             key = (a, b)
@@ -189,21 +191,30 @@ def main():
 
     coacd.set_log_level("error")
     t0 = time.time()
-    # CoACD every part into tight hulls, collecting a flat piece list tagged with
-    # its part index and priority (bigger part = higher priority = keeps its volume).
-    flat = []  # [part_index, priority, hull]
-    part_meta = []
-    for i, (name, m) in enumerate(parts):
-        hulls = coacd_pieces(m, threshold)
-        if inset > 0:
-            hulls = [inset_hull(h, inset) for h in hulls]
-        pri = float(np.prod(m.extents))
-        for h in hulls:
-            flat.append([i, pri, h])
-        part_meta.append({"name": name, "centroid": [float(x) for x in m.bounds.mean(axis=0)],
-                          "extents": [float(x) for x in m.extents]})
-        if (i + 1) % 25 == 0:
-            print(f"  ...{i+1}/{len(parts)} parts, {len(flat)} hulls, {time.time()-t0:.0f}s")
+    # CoACD every part into tight hulls (cached — it's the slow step), collecting a
+    # flat piece list tagged with part index and priority (bigger part = higher
+    # priority = keeps its volume).
+    cache = f"/tmp/coacd_{os.path.basename(glb)}_{threshold}_{inset}_{limit}.pkl"
+    if os.path.exists(cache):
+        flat_raw, part_meta = pickle.load(open(cache, "rb"))
+        flat = [[pi, pr, trimesh.Trimesh(vertices=v, faces=f, process=False)] for pi, pr, v, f in flat_raw]
+        print(f"[build] loaded {len(flat)} CoACD hulls from cache")
+    else:
+        flat = []  # [part_index, priority, hull]
+        part_meta = []
+        for i, (name, m) in enumerate(parts):
+            hulls = coacd_pieces(m, threshold)
+            if inset > 0:
+                hulls = [inset_hull(h, inset) for h in hulls]
+            pri = float(np.prod(m.extents))
+            for h in hulls:
+                flat.append([i, pri, h])
+            part_meta.append({"name": name, "centroid": [float(x) for x in m.bounds.mean(axis=0)],
+                              "extents": [float(x) for x in m.extents]})
+            if (i + 1) % 25 == 0:
+                print(f"  ...{i+1}/{len(parts)} parts, {len(flat)} hulls, {time.time()-t0:.0f}s")
+        flat_raw = [[pi, pr, np.asarray(h.vertices), np.asarray(h.faces)] for pi, pr, h in flat]
+        pickle.dump((flat_raw, part_meta), open(cache, "wb"))
 
     nb, mxb, mnb = cross_part_overlap([(p[0], p[2]) for p in flat])
     print(f"[build] CoACD: {len(parts)} parts -> {len(flat)} hulls in {time.time()-t0:.0f}s")
