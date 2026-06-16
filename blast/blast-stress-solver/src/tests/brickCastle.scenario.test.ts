@@ -163,7 +163,10 @@ describe('brick-castle scenario (requires three-pinata)', () => {
       return Math.min(ox, oy, oz);
     };
     let deep = 0;
-    const DEEP = 0.1; // metres — anything past a generous mortar gap is a real overlap
+    // Bricks are placed TOUCHING (gap 0), so any real penetration is a bug. The
+    // half-extents bake in each brick's 0°/90° rotation, so this AABB test is exact
+    // for the castle. 1 cm only absorbs float error — it is NOT a mortar gap.
+    const DEEP = 0.01; // metres
     for (let i = 0; i < N; i++) {
       const c = cen[i];
       const cx = Math.floor(c.x / cell), cy = Math.floor(c.y / cell), cz = Math.floor(c.z / cell);

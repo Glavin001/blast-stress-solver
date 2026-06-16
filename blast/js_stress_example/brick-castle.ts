@@ -19,6 +19,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import Stats from 'three/addons/libs/stats.module.js';
+import RAPIER from '@dimforge/rapier3d-compat';
 import * as pinata from '@dgreenheck/three-pinata';
 import { buildDestructibleCore, createFrameProfilerOverlay, createRecordingOverlay } from 'blast-stress-solver/rapier';
 import { createDestructibleThreeBundle, RapierDebugRenderer, setPinataModule } from 'blast-stress-solver/three';
@@ -46,6 +47,9 @@ const CONFIG = {
   // Solid bricks by default (1 chunk each). Bump via the "Chunks / brick" slider +
   // Rebuild to fracture each brick into Voronoi pieces (intra-brick bonds hold them).
   chunksPerBrick: 1,
+  // Wall thickness in leaves (wythes). 3 = a proper walkable castle wall; 1 = a
+  // thin single-leaf wall that tips from a tap. Adjust via slider + Rebuild.
+  wallThicknessBricks: 3,
   battlements: true,
   // Strength hierarchy (deferred — applied on Rebuild).
   materialExp: 9.3, // materialScale = 10^materialExp ("stone strength")
@@ -185,14 +189,18 @@ async function initScene() {
   const hint = document.querySelector('.viewport-hint') as HTMLElement | null;
   if (hint) hint.textContent = `Building ${CONFIG.size} castle… (auto-bonding ~2–3k bricks)`;
 
+  await RAPIER.init(); // needed before the scenario's cuboid collider factories run
   const scenario = await buildBrickCastleScenario({
     ...SIZE_PRESETS[CONFIG.size],
     chunksPerBrick: CONFIG.chunksPerBrick,
+    wallThicknessBricks: CONFIG.wallThicknessBricks,
+    towerThicknessBricks: CONFIG.wallThicknessBricks,
     battlements: CONFIG.battlements,
     bondMode: 'auto',
     bondAcrossStructures: CONFIG.bondAcrossStructures,
     multipliers: { intraBrick: CONFIG.intra, mortar: CONFIG.mortar, interStructure: CONFIG.inter },
     pinata: pinata as any,
+    rapier: RAPIER as any,
   });
 
   const dims = (scenario.parameters as any)?.dims ?? { x: 60, y: 16, z: 60 };
@@ -425,6 +433,7 @@ bindCheckbox('cfg-bond-structures', () => CONFIG.bondAcrossStructures, (v) => { 
   }
 }
 bindSlider('cfg-chunks', CONFIG, 'chunksPerBrick', (v) => String(v));
+bindSlider('cfg-thickness', CONFIG, 'wallThicknessBricks', (v) => `${v} brick${v === 1 ? '' : 's'}`);
 bindCheckbox('cfg-battlements', () => CONFIG.battlements, (v) => { CONFIG.battlements = v; });
 
 // Scalability (live).
