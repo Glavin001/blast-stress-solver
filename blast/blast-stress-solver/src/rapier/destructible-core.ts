@@ -620,11 +620,17 @@ export async function buildDestructibleCore({
     const builder = (scenario.colliderDescForNode && Array.isArray(scenario.colliderDescForNode)) ? (scenario.colliderDescForNode[nodeIndex] ?? null) : null;
     let desc = typeof builder === 'function' ? builder() : null;
     if (!desc) {
-      // If fragmentGeometries are available, use convex hull for non-support fragments
-      const fragmentGeometries = (scenario.parameters?.fragmentGeometries ?? []) as Array<{ getAttribute?: (name: string) => { array?: unknown; count?: number } | null } | null>;
-      const fragGeom = fragmentGeometries[nodeIndex];
-      if (!isSupport && fragGeom) {
-        const posAttr = fragGeom.getAttribute?.('position');
+      // Prefer a DEDICATED collider-geometry channel when present, so render and
+      // collision geometry can differ per node (e.g. detailed render mesh +
+      // tight convex-hull collider). Falls back to fragmentGeometries (the render
+      // geometry) when no separate collider geometry is supplied — unchanged
+      // behavior for every existing scenario.
+      const geoms = scenario.parameters ?? {};
+      const colliderGeometries = (geoms.colliderGeometries ?? []) as Array<{ getAttribute?: (name: string) => { array?: unknown; count?: number } | null } | null>;
+      const fragmentGeometries = (geoms.fragmentGeometries ?? []) as Array<{ getAttribute?: (name: string) => { array?: unknown; count?: number } | null } | null>;
+      const colliderGeom = colliderGeometries[nodeIndex] ?? fragmentGeometries[nodeIndex];
+      if (!isSupport && colliderGeom) {
+        const posAttr = colliderGeom.getAttribute?.('position');
         const arr = posAttr?.array;
         if (arr instanceof Float32Array && arr.length >= 9) {
           desc = RAPIER.ColliderDesc.convexHull(arr);

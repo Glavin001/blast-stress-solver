@@ -12,7 +12,16 @@ import {
 } from './destructible-adapter';
 
 export type ScenarioThreeParameters = {
+  /** Per-node RENDER geometry (what the chunk mesh draws). */
   fragmentGeometries?: THREE.BufferGeometry[];
+  /**
+   * Optional per-node COLLISION geometry, used only to build the convex-hull
+   * collider for that node. When present the core prefers it over
+   * `fragmentGeometries` for collision, so the render mesh (detailed, possibly
+   * concave) and the collider (a tight convex hull) can differ. Omit to keep the
+   * legacy behavior of deriving the collider from the render geometry.
+   */
+  colliderGeometries?: THREE.BufferGeometry[];
 };
 
 export function getScenarioFragmentGeometries(
