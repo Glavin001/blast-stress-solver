@@ -908,6 +908,33 @@ function attachDetailedRenderGeometry(
   const accPos: number[][] = Array.from({ length: nodeCount }, () => []);
   const accNrm: number[][] = Array.from({ length: nodeCount }, () => []);
 
+  // CLIP each render triangle to its owner hull (+margin) so a fracture piece's render
+  // can never extend far beyond its collider — no oversized "spike" / "asterisk" slices,
+  // and clean planar cut edges. A small margin keeps the intact surface gap-free (the
+  // detailed mesh sits a few mm outside the simplified collision hull). Polygon verts
+  // carry barycentric coords (u,v,w) so normals interpolate smoothly across the cut.
+  const CLIP_MARGIN = 0.04;
+  type PV = [number, number, number, number, number, number]; // x,y,z,u,v,w
+  const clipPoly = (poly: PV[], nx: number, ny: number, nz: number, dM: number): PV[] => {
+    const out: PV[] = [];
+    const n = poly.length;
+    for (let i = 0; i < n; i++) {
+      const cur = poly[i], nxt = poly[(i + 1) % n];
+      const dc = nx * cur[0] + ny * cur[1] + nz * cur[2] - dM;
+      const dn = nx * nxt[0] + ny * nxt[1] + nz * nxt[2] - dM;
+      const ci = dc <= 0, ni = dn <= 0;
+      if (ci) out.push(cur);
+      if (ci !== ni) {
+        const t = dc / (dc - dn);
+        out.push([
+          cur[0] + (nxt[0] - cur[0]) * t, cur[1] + (nxt[1] - cur[1]) * t, cur[2] + (nxt[2] - cur[2]) * t,
+          cur[3] + (nxt[3] - cur[3]) * t, cur[4] + (nxt[4] - cur[4]) * t, cur[5] + (nxt[5] - cur[5]) * t,
+        ]);
+      }
+    }
+    return out;
+  };
+
   for (const part of renderParts) {
     const geom = part.geometry;
     const posAttr = geom.getAttribute('position') as THREE.BufferAttribute | undefined;
@@ -924,15 +951,48 @@ function attachDetailedRenderGeometry(
       const tcx = (ax + bx + ccx) / 3, tcy = (ay + by + ccy) / 3, tcz = (az + bz + ccz) / 3;
       const node = ownerNode(tcx, tcy, tcz, part.role);
       if (node < 0) continue;
-      const ap = accPos[node];
-      ap.push(ax, ay, az, bx, by, bz, ccx, ccy, ccz);
-      const an = accNrm[node];
+
+      // Source (or flat) normals at the 3 triangle verts.
+      let nax: number, nay: number, naz: number, nbx: number, nby: number, nbz: number, ncx: number, ncy: number, ncz: number;
       if (nrmAttr) {
-        an.push(
-          nrmAttr.getX(a), nrmAttr.getY(a), nrmAttr.getZ(a),
-          nrmAttr.getX(b), nrmAttr.getY(b), nrmAttr.getZ(b),
-          nrmAttr.getX(c), nrmAttr.getY(c), nrmAttr.getZ(c),
-        );
+        nax = nrmAttr.getX(a); nay = nrmAttr.getY(a); naz = nrmAttr.getZ(a);
+        nbx = nrmAttr.getX(b); nby = nrmAttr.getY(b); nbz = nrmAttr.getZ(b);
+        ncx = nrmAttr.getX(c); ncy = nrmAttr.getY(c); ncz = nrmAttr.getZ(c);
+      } else {
+        let fx = (by - ay) * (ccz - az) - (bz - az) * (ccy - ay);
+        let fy = (bz - az) * (ccx - ax) - (bx - ax) * (ccz - az);
+        let fz = (bx - ax) * (ccy - ay) - (by - ay) * (ccx - ax);
+        const fl = Math.hypot(fx, fy, fz) || 1; fx /= fl; fy /= fl; fz /= fl;
+        nax = nbx = ncx = fx; nay = nby = ncy = fy; naz = nbz = ncz = fz;
+      }
+
+      const ap = accPos[node];
+      const an = accNrm[node];
+      const pl = planes[node];
+      if (!pl.length) {
+        ap.push(ax, ay, az, bx, by, bz, ccx, ccy, ccz);
+        an.push(nax, nay, naz, nbx, nby, nbz, ncx, ncy, ncz);
+        continue;
+      }
+      // Clip the triangle against every face plane (pushed out by CLIP_MARGIN).
+      let poly: PV[] = [[ax, ay, az, 1, 0, 0], [bx, by, bz, 0, 1, 0], [ccx, ccy, ccz, 0, 0, 1]];
+      for (let p = 0; p < pl.length && poly.length >= 3; p += 4) {
+        poly = clipPoly(poly, pl[p], pl[p + 1], pl[p + 2], pl[p + 3] + CLIP_MARGIN);
+      }
+      if (poly.length < 3) continue;
+      // Fan-triangulate the clipped convex polygon; interpolate normals by barycentric.
+      const v0 = poly[0];
+      for (let k = 1; k < poly.length - 1; k++) {
+        const tri = [v0, poly[k], poly[k + 1]];
+        for (const vv of tri) {
+          ap.push(vv[0], vv[1], vv[2]);
+          const u = vv[3], vb = vv[4], w = vv[5];
+          let nxv = u * nax + vb * nbx + w * ncx;
+          let nyv = u * nay + vb * nby + w * ncy;
+          let nzv = u * naz + vb * nbz + w * ncz;
+          const ln = Math.hypot(nxv, nyv, nzv) || 1;
+          an.push(nxv / ln, nyv / ln, nzv / ln);
+        }
       }
     }
   }

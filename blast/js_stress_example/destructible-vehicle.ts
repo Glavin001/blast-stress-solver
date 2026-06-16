@@ -47,7 +47,7 @@ const ASSET_URL = './assets/buggy.pieces.json';
 // Original full-detail model — used ONLY for rendering (render != collision). Each
 // collider piece keeps its tight CoACD hull for physics but draws a slice of this
 // model, so the car looks like the real vehicle, not faceted hulls.
-const MODEL_URL = './assets/buggy-clean.glb';
+const MODEL_URL = './assets/buggy.glb';
 
 const CONFIG = {
   vehicle: {
