@@ -69,6 +69,19 @@ git tag blast-stress-solver-v<version>
 git push origin blast-stress-solver-v<version>
 ```
 
+## Local web and Rust GUI demos
+
+Browser (Three.js + Rapier + WASM) and native Bevy demos share one setup path on **`feat/rapier-destruction`**:
+
+```bash
+git checkout feat/rapier-destruction
+npm run setup:local -- --build   # apt + emsdk + rust + npm; builds assets
+npm start                        # http://localhost:8000 — open in Chrome
+npm run start:rust-demo          # native Bevy window (after source scripts/rust-demo-env.sh)
+```
+
+See [`AGENTS.md`](AGENTS.md) and [`scripts/setup-local-demos.sh`](scripts/setup-local-demos.sh) for details, preflight (`check:demos`, `check:rust-demo`), and skip flags.
+
 ## Community-Maintained Build Configuration Fork
 
 Please see [the O3DE Fork](https://github.com/o3de/PhysX) for community-maintained additional build configurations.

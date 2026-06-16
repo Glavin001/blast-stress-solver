@@ -29,13 +29,61 @@ This is the NVIDIA PhysX monorepo containing PhysX, Blast, and Flow SDKs. The ac
   The `~/.bashrc` should source it automatically. Verify with `emcc --version`.
 - If `/opt/emsdk` was cloned with `sudo`, fix ownership before `./emsdk install`: `sudo chown -R "$(whoami)" /opt/emsdk`.
 
-### First-time setup
+### First-time setup (web + Rust GUI)
+
+**Recommended one-shot setup** (Ubuntu/Debian: apt packages, Emscripten, Rust 1.85+, npm deps):
 
 ```bash
-# 1. Install everything needed for the demos
-cd /home/user/PhysX
+cd /home/user/PhysX   # or /workspace on Cursor Cloud
+git checkout feat/rapier-destruction
+npm run setup:local -- --build
+```
+
+`setup:local` runs `scripts/setup-local-demos.sh`, which installs:
+
+| Component | Purpose |
+|-----------|---------|
+| **apt:** `build-essential`, `g++`, `libstdc++-13-dev` | C++ FFI for `blast-stress-solver-rs` |
+| **apt:** X11 / xkb / Vulkan / ALSA dev + runtime libs | Bevy window (`blast-stress-demo-rs`) |
+| **Emscripten 3.1.51** at `/opt/emsdk` (or `$EMSDK_DIR`) | WASM build for browser demos |
+| **rustup stable** (≥ 1.85) | Bevy 0.18 / `edition2024` |
+| **npm** (`setup:demos`) | Root + `blast-stress-solver` + `js_stress_example` |
+
+Flags: `--build` also runs `npm run build:demos` and `npm run build:rust-demo`. Skip steps with env vars `SKIP_APT=1`, `SKIP_EMSDK=1`, `SKIP_RUST=1`, `SKIP_NPM=1`.
+
+**npm-only refresh** (VM startup / no system packages):
+
+```bash
 npm run setup:demos
 ```
+
+### Running web demos (Chrome)
+
+```bash
+source /opt/emsdk/emsdk_env.sh   # if emcc not on PATH
+npm start                        # check → build → serve :8000
+```
+
+Open in **Google Chrome** (or any modern browser):
+
+- http://localhost:8000/blast/js_stress_example/demo-index.html
+- http://localhost:8000/blast/js_stress_example/wall-demolition.html
+
+Click the 3D viewport to shoot projectiles.
+
+### Running Rust Bevy GUI
+
+```bash
+source scripts/rust-demo-env.sh   # CXX=g++, LIBRARY_PATH for libstdc++
+npm run build:rust-demo           # first time only
+npm run start:rust-demo           # default: wall scenario + meshes
+```
+
+Preflight: `npm run check:rust-demo`. Controls: **left-click** shoot, **R** reset. Requires `DISPLAY` (native desktop, not headless).
+
+Other scenarios: `BLAST_STRESS_DEMO_SCENARIO=bridge npm run start:rust-demo`. Prefer **wall** for mesh rendering on some GPUs; bridge may show a magenta fallback if PBR meshes fail.
+
+### First-time setup (legacy npm-only)
 
 ### Fast path for demos
 
@@ -177,7 +225,8 @@ After running `npm start` at the root:
 - The `blast/blast-stress-solver` build has benign `import.meta` CJS warnings from tsup — these do not affect functionality.
 - TypeScript strict checking (`tsc --noEmit`) in `blast/js_stress_example` shows pre-existing type errors; `noEmitOnError: false` in tsconfig ensures files are still emitted, and `npm run build:ts` intentionally continues so `npm run build:web` can finish.
 - The WASM build takes ~20 seconds per run (two targets: node-cjs + browser-esm).
-- `npm run setup:demos` installs root dependencies, `blast-stress-solver` dependencies with `--ignore-scripts`, and `js_stress_example` dependencies in one step.
+- `npm run setup:local` — full local setup via `scripts/setup-local-demos.sh` (system deps + emsdk + rust + npm; add `--build` for assets).
+- `npm run setup:demos` — npm install only (root + `blast-stress-solver` + `js_stress_example`); used for lightweight VM refresh.
 - `npm install --ignore-scripts` is used for `blast/blast-stress-solver` during dependency refresh to avoid triggering a full rebuild on install.
 - `blast/js_stress_example`'s `build:web` script uses **esbuild** for `wall-demolition`, `tower-collapse`, and `fractured-wall` because those demos rely on bare import specifiers resolved by the HTML import map at runtime.
 - If `npm start` fails in `check:demos` with a native dependency mismatch, reinstall the affected package's `node_modules` on the current machine instead of copying `node_modules` across platforms.
@@ -190,6 +239,8 @@ After running `npm start` at the root:
   3. Alternatively, set `BLAST_STRESS_SOLVER_SKIP_WASM_BUILD=1` to skip the WASM compilation and iterate on TypeScript only — but WASM-dependent tests will still fail.
   
   The 7 test files that do **not** require the WASM binary (scenario builders, Three.js adapter, bundle exports, split migrator, headless scenarios) will pass regardless.
+- **Rust GUI build:** Use `g++` (not default `clang++` without libc++). Source `scripts/rust-demo-env.sh` before `cargo build`. Link errors for `-lstdc++` mean `libstdc++-13-dev` is missing. Bevy needs `libxkbcommon-x11-0` at runtime.
+- **Rust toolchain:** Bevy 0.18 requires Rust **≥ 1.85** (`rustup update stable`). The image-bundled `/usr/local/cargo` 1.83 is too old; prefer `$HOME/.cargo/bin`.
 
 ### CI
 
