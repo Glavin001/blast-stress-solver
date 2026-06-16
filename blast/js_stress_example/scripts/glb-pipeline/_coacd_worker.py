@@ -20,7 +20,9 @@ def main():
     inp, outp, thr = sys.argv[1], sys.argv[2], float(sys.argv[3])
     d = np.load(inp)
     coacd.set_log_level("error")
-    pieces = coacd.run_coacd(coacd.Mesh(d["v"], d["f"]), threshold=thr)
+    pieces = coacd.run_coacd(coacd.Mesh(d["v"], d["f"]), threshold=thr,
+                             preprocess_resolution=30, resolution=1000, mcts_iterations=60,
+                             mcts_max_depth=2, max_convex_hull=24, decimate=True, max_ch_vertex=32)
     arrs = {"n": np.int32(len(pieces))}
     for i, (v, f) in enumerate(pieces):
         arrs[f"v{i}"] = np.asarray(v, np.float64)

@@ -259,9 +259,16 @@ def coacd_pieces_isolated(mesh, threshold, timeout=120):
         return hulls
 
 
+# Faster CoACD: lower preprocess/solve resolution + shorter MCTS search (the
+# default 2000/150 is slow on high-poly parts like the 14k-face wheels), cap pieces
+# per part, and decimate the convex hulls to keep the asset small and physics cheap.
+COACD_KW = dict(preprocess_resolution=30, resolution=1000, mcts_iterations=60,
+                mcts_max_depth=2, max_convex_hull=24, decimate=True, max_ch_vertex=32)
+
+
 def coacd_pieces(mesh, threshold):
     cm = coacd.Mesh(mesh.vertices, mesh.faces)
-    pieces = coacd.run_coacd(cm, threshold=threshold)
+    pieces = coacd.run_coacd(cm, threshold=threshold, **COACD_KW)
     hulls = []
     for verts, faces in pieces:
         h = trimesh.Trimesh(vertices=np.asarray(verts), faces=np.asarray(faces), process=False)
