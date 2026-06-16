@@ -33,8 +33,8 @@ def coacd_hulls(mesh, threshold):
         h = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
         try:
             h = h.convex_hull
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[coacd] WARNING convex_hull failed ({type(e).__name__}: {e}); using raw piece")
         hulls.append(h)
     return hulls
 
