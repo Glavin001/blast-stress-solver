@@ -19,8 +19,9 @@ Usage: scripts/run-rust-demo.sh [build|run]
   run     launch the GUI (default)
 
 Environment:
-  BLAST_STRESS_DEMO_SCENARIO=wall|bridge|tower|...
+  BLAST_STRESS_DEMO_SCENARIO=wall|bridge|tower|fractured-bridge|...
   BLAST_STRESS_DEMO_SHOW_MESHES=1|0
+  BLAST_STRESS_DEMO_GUI_SHOT_SCRIPT=auto_smoke|bridge_smoke|...  # scripted shots in GUI (same as headless)
   DISPLAY must be set for GUI mode (omit BLAST_STRESS_DEMO_HEADLESS).
 
 Examples:

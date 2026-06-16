@@ -2022,9 +2022,9 @@ fn run_app(headless: bool) -> AppExit {
 
     let physics = build_demo_physics(config.clone(), &toggles);
     let headless_shot_plan = if headless {
-        build_headless_shot_plan(kind, &config)
+        build_shot_plan(kind, &config, "BLAST_STRESS_DEMO_HEADLESS_SHOT_SCRIPT")
     } else {
-        None
+        build_shot_plan(kind, &config, "BLAST_STRESS_DEMO_GUI_SHOT_SCRIPT")
     };
     let mut profiler = DebugProfiler::default();
     profiler.config_summary = toggles.summary();
@@ -2093,6 +2093,7 @@ fn run_app(headless: bool) -> AppExit {
                     camera_orbit_system,
                     reset_scene_system,
                     projectile_mass_shortcuts_system,
+                    auto_fire_headless_projectiles_system,
                     shoot_projectile_system,
                     physics_step_system,
                     sync_visuals_system,
@@ -2444,11 +2445,12 @@ struct ScenarioBounds {
     dynamic: Bounds3,
 }
 
-fn build_headless_shot_plan(
+fn build_shot_plan(
     kind: DemoScenarioKind,
     config: &DemoConfig,
+    script_env_var: &str,
 ) -> Option<HeadlessShotPlan> {
-    let script_name = env::var("BLAST_STRESS_DEMO_HEADLESS_SHOT_SCRIPT")
+    let script_name = env::var(script_env_var)
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())?;
@@ -3725,16 +3727,14 @@ fn spawn_projectile(
 
 fn auto_fire_headless_projectiles_system(
     mut commands: Commands,
-    run_mode: Res<RunMode>,
     shot_plan: Option<ResMut<HeadlessShotPlan>>,
     toggles: Res<DemoRuntimeToggles>,
     mut profiler: ResMut<DebugProfiler>,
     mut state: NonSendMut<DemoPhysicsState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    run_mode: Res<RunMode>,
 ) {
-    if !run_mode.headless {
-        return;
-    }
-
     let Some(mut shot_plan) = shot_plan else {
         return;
     };
@@ -3742,6 +3742,11 @@ fn auto_fire_headless_projectiles_system(
     let frame_index = profiler.frame_index;
     for shot in shot_plan.due_shots(frame_index) {
         let direction = shot.launch_direction();
+        let visuals = if run_mode.headless {
+            None
+        } else {
+            Some((&mut *meshes, &mut *materials))
+        };
         spawn_projectile(
             &mut commands,
             &mut state,
@@ -3751,7 +3756,7 @@ fn auto_fire_headless_projectiles_system(
             shot.mass,
             shot.speed,
             shot.ttl,
-            None,
+            visuals,
         );
         if let Some(projectile) = state.projectiles.last_mut() {
             projectile.origin = shot.origin;
