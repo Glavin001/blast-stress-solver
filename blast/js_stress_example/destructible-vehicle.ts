@@ -415,7 +415,7 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
 // ground, just not off each other), which passes settle/light/heavy/drop in
 // scripts/soak-vehicle.mjs. Eliminating the slivers entirely (more aggressive
 // simplify) would let this be 'all'.
-physicsConfig.debrisCollisionMode = 'noDebrisPairs';
+physicsConfig.debrisCollisionMode = 'all';
 
 // Shared Physics / Optimization / Features controls.
 mountPhysicsControls({ getCore: () => coreRef, include: { debug: false } });

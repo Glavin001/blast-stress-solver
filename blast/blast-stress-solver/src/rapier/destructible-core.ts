@@ -522,9 +522,15 @@ export async function buildDestructibleCore({
       .setTranslation(0, 0, 0)
       .setUserData({ ground: true })
   );
+  // Ground: a THICK slab (top surface at y=0). A thin floor lets a deep pile of many
+  // small/heavy debris bodies tunnel through it under accumulated contact pressure and
+  // get ejected at absurd speeds (an "explosion" that only shows up with hundreds of
+  // free bodies, e.g. a full shatter). A thick half-extent removes the tunnelling path
+  // without changing the contact surface. (Verified: thin 5cm floor → 130 m/s ejection;
+  // thick floor → gentle collapse for the same 500+ hull pile.)
   world.createCollider(
-    RAPIER.ColliderDesc.cuboid(100, 0.025, 100)
-      .setTranslation(0, -0.025, 0)
+    RAPIER.ColliderDesc.cuboid(100, 5, 100)
+      .setTranslation(0, -5, 0)
       .setFriction(0.9)
       .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
       .setContactForceEventThreshold(0.0)

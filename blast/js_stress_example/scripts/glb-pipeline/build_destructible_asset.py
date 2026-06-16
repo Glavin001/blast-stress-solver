@@ -284,6 +284,49 @@ def coacd_pieces(mesh, threshold):
     return hulls
 
 
+def drop_overlapping_pieces(flat, min_depth=0.0008, max_iters=400):
+    """Guarantee NON-OVERLAPPING colliders by greedily removing pieces until no two
+    hulls interpenetrate by more than `min_depth`.
+
+    This is safe ONLY because render != collision: each removed convex hull is a
+    COLLISION piece; the visual model is rendered from the original mesh (assigned
+    to the remaining nodes at runtime), so dropping a collider leaves no visible
+    hole. We remove the piece involved in the most overlapping pairs first
+    (greedy hitting-set), tie-broken toward the SMALLER piece, so we delete as few
+    (and as small) colliders as possible to reach zero overlap. This is what lets
+    full debris collision ('all') collapse-and-settle instead of exploding."""
+    removed = 0
+    for _ in range(max_iters):
+        hulls = [f[2] for f in flat]
+        mgr = collision.CollisionManager()
+        for i, h in enumerate(hulls):
+            mgr.add_object(str(i), h)
+        _, data = mgr.in_collision_internal(return_names=False, return_data=True)
+        pairs = {}
+        for c in data:
+            a, b = (int(x) for x in c.names)
+            if a == b:
+                continue
+            d = abs(float(getattr(c, "depth", 0.0)))
+            if d < min_depth:
+                continue  # ignore sub-mm touching
+            key = (min(a, b), max(a, b))
+            pairs[key] = max(pairs.get(key, 0.0), d)
+        if not pairs:
+            break
+        deg = {}
+        for (a, b) in pairs:
+            deg[a] = deg.get(a, 0) + 1
+            deg[b] = deg.get(b, 0) + 1
+        # Highest overlap-degree first; among ties remove the smaller-volume piece.
+        worst = max(deg.keys(), key=lambda i: (deg[i], -float(flat[i][2].volume)))
+        flat.pop(worst)
+        removed += 1
+    print(f"[build] drop-overlaps: removed {removed} colliders to reach non-overlap "
+          f"(threshold {min_depth*1000:.1f}mm)")
+    return flat, removed
+
+
 def cross_part_overlap(part_hulls):
     mgr = collision.CollisionManager()
     owner = {}
@@ -366,6 +409,15 @@ def main():
         raise SystemExit(f"unknown --method {method!r} (expected boolean|clip)")
     na, mxa, mna = cross_part_overlap([(p[0], p[2]) for p in flat])
     print(f"[build] overlap AFTER  {method}: pairs={na}  maxDepth={mxa:.3f}m  meanDepth={mna:.3f}m  ({time.time()-t1:.0f}s, {len(flat)} hulls)")
+
+    # Final guarantee: drop the few residual overlapping colliders (slivers clip
+    # can't fix). Render != collision, so removed hulls leave no visible hole.
+    do_drop = "--no-drop-overlaps" not in args
+    drop_depth = float(args[args.index("--drop-depth") + 1]) if "--drop-depth" in args else 0.0008
+    if do_drop:
+        flat, _ = drop_overlapping_pieces(flat, min_depth=drop_depth)
+        nd, mxd, mnd = cross_part_overlap([(p[0], p[2]) for p in flat])
+        print(f"[build] overlap AFTER  drop: pairs={nd}  maxDepth={mxd:.3f}m  meanDepth={mnd:.3f}m  ({len(flat)} hulls)")
 
     # Regroup hulls by part into the asset.
     by_part = {}

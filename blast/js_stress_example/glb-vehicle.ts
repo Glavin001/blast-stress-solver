@@ -682,52 +682,13 @@ export async function buildVehicleScenarioFromAsset(
     const role = classifyVehiclePart(part.name, size, center, bounds);
     roleCounts[role]++;
 
-    // Wheels (3.b): a tyre is a cohesive rubbery prop — it should fall off as ONE
-    // unit and never shatter like glass. So collapse all of the wheel's CoACD
-    // pieces into a SINGLE node whose collider is one convex hull around the whole
-    // wheel (the runtime computes the hull from this point cloud). This also kills
-    // the wheel's many overlapping sub-hulls (a big source of shatter explosions).
-    if (role === 'wheel') {
-      // Concatenate every piece (verts + faces, with per-piece index offset) into
-      // ONE triangle mesh. Its convex hull (computed by the core) is a single wheel
-      // collider, and the triangles still feed the auto-bonder (wheel↔frame at hub).
-      const vAll: number[] = [];
-      const fAll: number[] = [];
-      let base = 0;
-      for (const piece of part.pieces) {
-        if (!piece.vertices?.length || !piece.faces?.length) continue;
-        for (const v of piece.vertices) vAll.push(v[0], v[1], v[2]);
-        for (const f of piece.faces) fAll.push(f[0] + base, f[1] + base, f[2] + base);
-        base += piece.vertices.length;
-      }
-      if (vAll.length >= 9 && fAll.length >= 3) {
-        const m = vAll.length / 3;
-        let cx = 0, cy = 0, cz = 0;
-        for (let i = 0; i < vAll.length; i += 3) { cx += vAll[i]; cy += vAll[i + 1]; cz += vAll[i + 2]; }
-        cx /= m; cy /= m; cz /= m;
-        const pos = new Float32Array(vAll.length);
-        let minx = Infinity, miny = Infinity, minz = Infinity, maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
-        for (let i = 0; i < vAll.length; i += 3) {
-          const lx = vAll[i] - cx, ly = vAll[i + 1] - cy, lz = vAll[i + 2] - cz;
-          pos[i] = lx; pos[i + 1] = ly; pos[i + 2] = lz;
-          if (lx < minx) minx = lx; if (ly < miny) miny = ly; if (lz < minz) minz = lz;
-          if (lx > maxx) maxx = lx; if (ly > maxy) maxy = ly; if (lz > maxz) maxz = lz;
-        }
-        const geom = new THREE.BufferGeometry();
-        geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-        geom.setIndex(fAll);
-        geom.computeVertexNormals();
-        fragments.push({
-          worldPosition: { x: cx + offset.x, y: cy + offset.y, z: cz + offset.z },
-          halfExtents: { x: (maxx - minx) * 0.5, y: (maxy - miny) * 0.5, z: (maxz - minz) * 0.5 },
-          geometry: geom,
-          isSupport: false,
-        });
-        meta.push({ partId, role });
-      }
-      continue; // wheel handled as one node
-    }
-
+    // Wheels (3.b): a tyre must never shatter like glass and the 4 wheels must stay
+    // separate. We keep the pipeline's tight, NON-OVERLAPPING CoACD hulls for the
+    // wheel (so debris collision stays explosion-free) and make the wheel behave as
+    // ONE rigid unit via UNBREAKABLE internal bonds (see INTERNAL_ROLE_MULTIPLIER).
+    // The wheel still RENDERS as the smooth detailed tyre (render != collision), so
+    // it never looks faceted. (No collider merge — that would reintroduce overlap
+    // with the hub/brake parts nested inside the tyre.)
     for (const piece of part.pieces) {
       if (!piece.vertices?.length || !piece.faces?.length) continue;
       // Piece vertices are in GLB world space; recentre to the piece origin and
