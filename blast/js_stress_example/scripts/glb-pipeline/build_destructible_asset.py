@@ -122,11 +122,11 @@ def clip_deinterpenetrate(pieces, iters=15, margin=0.01):
         for i, h in enumerate(hulls):
             mgr.add_object(str(i), h)
         _, data = mgr.in_collision_internal(return_names=False, return_data=True)
-        worst = {}  # deepest contact per overlapping cross-part pair
+        worst = {}  # deepest contact per overlapping pair (incl. same-part: a full
+        # shatter makes every piece its own body, so same-part pieces must not
+        # overlap either, or they explode when their bonds are cut)
         for c in data:
             a, b = (int(x) for x in c.names)  # c.names is a set
-            if pieces[a][0] == pieces[b][0]:
-                continue
             key = (a, b)
             d = abs(float(getattr(c, "depth", 0.0)))
             if d > worst.get(key, (0.0,))[0]:
@@ -287,8 +287,8 @@ def cross_part_overlap(part_hulls):
     pd = {}
     for c in data:
         a, b = c.names
-        if owner[a] == owner[b]:
-            continue
+        # Count ALL overlapping pairs (incl. same-part): on a full shatter every
+        # piece becomes its own body, so any overlap can explode.
         pd[tuple(sorted((a, b)))] = max(pd.get(tuple(sorted((a, b))), 0.0), abs(float(getattr(c, "depth", 0.0))))
     if not pd:
         return 0, 0.0, 0.0
