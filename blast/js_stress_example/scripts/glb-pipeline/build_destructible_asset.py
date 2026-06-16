@@ -311,6 +311,10 @@ def main():
     inset = float(args[args.index("--inset") + 1]) if "--inset" in args else 0.02
     do_deint = "--deint" in args  # source-mesh boolean trim (off: open shells don't solid-overlap)
     method = args[args.index("--method") + 1] if "--method" in args else "boolean"
+    # Clip over-margin: pieces end this far APART (just enough to not overlap and to
+    # stop touching-pairs re-detecting). Keep tiny so contact areas stay large ->
+    # strong bonds. 1mm default.
+    clip_margin = float(args[args.index("--clip-margin") + 1]) if "--clip-margin" in args else 0.001
     limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 0
 
     parts = drop_ground(load_parts(glb))
@@ -357,7 +361,7 @@ def main():
     if method == "boolean":
         flat = boolean_deinterpenetrate(flat, threshold)
     elif method == "clip":
-        flat = clip_deinterpenetrate(flat)
+        flat = clip_deinterpenetrate(flat, margin=clip_margin)
     else:
         raise SystemExit(f"unknown --method {method!r} (expected boolean|clip)")
     na, mxa, mna = cross_part_overlap([(p[0], p[2]) for p in flat])
