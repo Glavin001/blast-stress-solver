@@ -75,13 +75,22 @@ const INTER_ROLE_MULTIPLIER: Record<string, number> = {
   'accessory|accessory': 0.1,
 };
 
-/** Internal joints between chunks of the *same* fractured part. */
+/**
+ * Internal joints between collider pieces of the *same* part. Cohesive props —
+ * wheels, the bucket/chain (accessory) — must behave as ONE rigid body: their
+ * pieces give a tight CoACD collider but never fracture apart, so their internal
+ * bonds are effectively unbreakable. Frame and panels DO break into their pieces
+ * (the destructible skeleton), so theirs are moderate (and further scaled by piece
+ * thickness — thin bars weaker than thick rails). Cargo mostly holds (a crate
+ * sheds as a unit) but can break under a hard hit.
+ */
+const UNBREAKABLE = 1000;
 const INTERNAL_ROLE_MULTIPLIER: Record<VehiclePartRole, number> = {
   frame: 6.0,
-  wheel: 4.0,
-  panel: 2.5,
-  cargo: 1.5,
-  accessory: 1.2,
+  panel: 3.0,
+  cargo: 8.0,
+  wheel: UNBREAKABLE,
+  accessory: UNBREAKABLE,
 };
 
 function interRoleMultiplier(a: VehiclePartRole, b: VehiclePartRole): number {
@@ -577,9 +586,9 @@ async function assembleVehicleScenario(
       a.partId === b.partId
         ? INTERNAL_ROLE_MULTIPLIER[a.role]
         : interRoleMultiplier(a.role, b.role);
-    // Thinner member governs; clamp so very thin slivers stay bondable and very
-    // thick members don't run away (0.3×..2×).
-    const thinFactor = Math.min(2, Math.max(0.3, Math.min(thicknessOf(bond.node0), thicknessOf(bond.node1)) / REF_THICK));
+    // Thinner member governs; clamp so thin bars are weaker than thick rails but
+    // not so weak they drop under their own weight (0.5×..2×).
+    const thinFactor = Math.min(2, Math.max(0.5, Math.min(thicknessOf(bond.node0), thicknessOf(bond.node1)) / REF_THICK));
     bond.area = Math.max(bond.area * mult * rsOf(a.role) * rsOf(b.role) * thinFactor, 1e-6);
   }
 

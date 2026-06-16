@@ -68,12 +68,13 @@ const CONFIG = {
   },
   solver: {
     gravity: -9.81,
-    // Calibrated so the intact car holds rock-solid under its own weight at rest
-    // (gravity + the ground-contact reaction the solver already sees), yet a
-    // projectile/drop spikes local bond stress past the per-role limits so parts
-    // break off. Destruction is driven entirely by the stress solver — lower =
-    // more fragile. (Mechanism: freeBodyGroundStress.test.ts.)
-    materialScale: 1e11,
+    // Holds the intact car rock-solid at rest. The CoACD pieces have small contact
+    // areas (the de-interpenetration leaves ~1cm gaps), so the per-area bonds need
+    // a high materialScale to not sag under gravity — which currently also makes
+    // impacts under-break. The proper fix is rebuilding the asset with ~0 clip
+    // margin so pieces touch (bigger contact area → strong bonds at a lower scale
+    // that still breaks). Tracked for the weld+simplify rebuild pass.
+    materialScale: 1e13,
   },
   physics: {
     contactForceScale: 30,
