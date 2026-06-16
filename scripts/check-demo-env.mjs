@@ -70,7 +70,8 @@ function checkEmscripten() {
     failures.push({
       message: 'Emscripten is not available on PATH and the WASM runtime artifacts are missing.',
       fixCommands: [
-        '  source /opt/emsdk/emsdk_env.sh'
+        '  npm run setup:local',
+        '  # or: source /opt/emsdk/emsdk_env.sh'
       ]
     });
   }
@@ -95,5 +96,6 @@ if (failures.length > 0) {
 
   console.error('Then rerun:');
   console.error('  npm start');
+  console.error('Or run full local setup: npm run setup:local');
   process.exit(1);
 }

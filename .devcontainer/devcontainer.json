@@ -7,11 +7,17 @@
 	},
 	"features": {
 		"ghcr.io/devcontainers/features/common-utils:2": {},
-		"ghcr.io/devcontainers/features/node:1": {},
+		"ghcr.io/devcontainers/features/node:1": {
+			"version": "22"
+		},
 		"ghcr.io/devcontainers/features/rust:1": {},
 		"ghcr.io/stuartleeks/dev-container-features/shell-history:0": {},
-		"ghcr.io/ebaskoro/devcontainer-features/emscripten:1": {}
-	}
+		"ghcr.io/ebaskoro/devcontainer-features/emscripten:1": {
+			"version": "3.1.51"
+		}
+	},
+
+	"postCreateCommand": "bash scripts/setup-local-demos.sh --build"
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},
