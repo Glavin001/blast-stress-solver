@@ -135,7 +135,10 @@ def clip_deinterpenetrate(pieces, iters=15, margin=0.01):
             break
         changed = False
         for (a, b), (d, point, normal) in worst.items():
-            lo = a if pieces[a][1] <= pieces[b][1] else b
+            # Yield the LARGER piece so small detail pieces keep their full shape:
+            # clip the bigger piece's penetrating lobe away (the boolean ordering
+            # rationale, but planar so it never crashes CoACD).
+            lo = a if hulls[a].volume >= hulls[b].volume else b
             other = b if lo == a else a
             to_other = np.asarray(hulls[other].centroid) - np.asarray(hulls[lo].centroid)
             n = normal if np.dot(normal, to_other) > 0 else -normal
