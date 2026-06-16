@@ -23,6 +23,7 @@ import time
 import numpy as np
 import trimesh
 from trimesh import collision
+from scipy.spatial import ConvexHull, HalfspaceIntersection
 import coacd
 
 from diagnose_overlap import load_parts, drop_ground, convex
@@ -67,6 +68,30 @@ def deinterpenetrate(parts):
     return out
 
 
+def inset_hull(hull, delta):
+    """Shrink a convex hull by moving every face plane inward by `delta` (a true
+    inset, uniform in distance regardless of piece size). Removes residual convex
+    overshoot so neighbouring pieces no longer share space. Returns the original if
+    the piece is too thin to inset."""
+    try:
+        ch = ConvexHull(hull.vertices)
+    except Exception:
+        return hull
+    hs = ch.equations.copy()        # A x + b <= 0 (A outward-normal, |A|=1)
+    hs[:, -1] += delta              # push each plane inward by delta
+    interior = hull.vertices.mean(axis=0)
+    # The centroid must stay strictly inside the inset region, else the piece is
+    # thinner than 2*delta in some direction — keep it whole rather than vanish.
+    if np.any(hs[:, :3] @ interior + hs[:, -1] >= -1e-6):
+        return hull
+    try:
+        pts = HalfspaceIntersection(hs, interior).intersections
+        out = trimesh.Trimesh(vertices=pts).convex_hull
+        return out if len(out.vertices) >= 4 else hull
+    except Exception:
+        return hull
+
+
 def coacd_pieces(mesh, threshold):
     cm = coacd.Mesh(mesh.vertices, mesh.faces)
     pieces = coacd.run_coacd(cm, threshold=threshold)
@@ -106,14 +131,15 @@ def main():
     glb = next((a for a in args if not a.startswith("--") and a.endswith(".glb")), "assets/buggy.glb")
     out = args[args.index("-o") + 1] if "-o" in args else None
     threshold = float(args[args.index("--threshold") + 1]) if "--threshold" in args else 0.04
-    do_deint = "--no-deint" not in args
+    inset = float(args[args.index("--inset") + 1]) if "--inset" in args else 0.02
+    do_deint = "--deint" in args  # boolean trim (off by default: these shells don't solid-overlap)
     limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 0
 
     parts = drop_ground(load_parts(glb))
     if limit:
         parts.sort(key=lambda nm: -float(np.linalg.norm(nm[1].extents)))
         parts = parts[:limit]
-    print(f"\n[build] {glb}: {len(parts)} parts  (deint={do_deint}, threshold={threshold})")
+    print(f"\n[build] {glb}: {len(parts)} parts  (threshold={threshold}, inset={inset}, deint={do_deint})")
 
     if do_deint:
         parts = deinterpenetrate(parts)
@@ -124,6 +150,8 @@ def main():
     part_hulls = []  # (part_index, hull) for overlap measurement
     for i, (name, m) in enumerate(parts):
         hulls = coacd_pieces(m, threshold)
+        if inset > 0:
+            hulls = [inset_hull(h, inset) for h in hulls]
         pieces = [{"vertices": np.asarray(h.vertices, np.float32).round(5).tolist(),
                    "faces": np.asarray(h.faces, np.int32).tolist()} for h in hulls]
         c = m.bounds.mean(axis=0)
