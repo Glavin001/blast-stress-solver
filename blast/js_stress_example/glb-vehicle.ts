@@ -57,8 +57,13 @@ export const ROLE_LABELS: Record<VehiclePartRole, string> = {
 //
 // Symmetric role-pair multipliers applied to each bond's area. >1 strengthens a
 // joint, <1 weakens it. This table *is* the destructible hierarchy.
+// Tuned so the cage holds its own (distributed) weight at rest yet a concentrated
+// projectile impact overstresses and breaks it — the hierarchy is preserved (frame
+// welds strongest, payload weakest) and the global materialScale sets overall
+// fragility (calibrated in destructible-vehicle.ts so the car is "mostly
+// destructible" under fire while solid at rest).
 const INTER_ROLE_MULTIPLIER: Record<string, number> = {
-  'frame|frame': 8.0, // skeleton welds — strongest; keeps the shell together
+  'frame|frame': 6.0, // skeleton welds — strongest; keeps the shell together
   'frame|wheel': 5.0, // hub/axle to chassis — very strong
   'frame|panel': 3.0, // panels bolted to the frame
   'frame|cargo': 0.25, // payload lashed to the frame — weak, sheds first
@@ -86,10 +91,10 @@ const INTER_ROLE_MULTIPLIER: Record<string, number> = {
  */
 const UNBREAKABLE = 1000;
 const INTERNAL_ROLE_MULTIPLIER: Record<VehiclePartRole, number> = {
-  frame: 6.0,
+  frame: 5.0,
   panel: 3.0,
   cargo: 8.0,
-  wheel: UNBREAKABLE,
+  wheel: UNBREAKABLE, // wheels never shatter (one cohesive unit)
   accessory: UNBREAKABLE,
 };
 

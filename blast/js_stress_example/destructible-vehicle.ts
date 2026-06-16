@@ -67,25 +67,26 @@ const CONFIG = {
     // A heavy ball (~wrecking-ball): at the calibrated materialScale this sheds a
     // satisfying few parts per hit (cargo first, the cage holding) without
     // shattering the car or exploding. Swept in scripts/probe-vehicle.mjs.
-    radius: 0.25,
-    mass: 150,
-    speed: 45,
+    radius: 0.28,
+    mass: 220,
+    speed: 52,
     ttlMs: 8000,
   },
   solver: {
     gravity: -9.81,
-    // Holds the intact car rock-solid at rest. The CoACD pieces have small contact
-    // areas, so the per-area bonds need a high materialScale not to sag under
-    // gravity; impact breaking is then driven by contactForceScale (below) so a hit
-    // still spikes local bond stress past the limit. Soak-verified: holds at rest,
-    // sheds on light/heavy shots, stable drops.
-    materialScale: 1e13,
+    // Global material limit (Pa-ish) — the single fragility knob. Calibrated so the
+    // intact car holds under its own weight at rest, yet projectile hits overstress
+    // and progressively destroy it (not just the payload — the cage breaks under
+    // sustained fire). Lower = more fragile. Soak- and shatter-verified.
+    materialScale: 5e11,
   },
   physics: {
-    // High on purpose: with the strong (high-materialScale) bonds, this amplifies
-    // projectile/ground contact forces into the stress solver so a hit overstresses
-    // and sheds local parts (light shot ~3, heavy ~9 in the soak).
-    contactForceScale: 200,
+    // Modest amplification of real Rapier contact forces into the stress solver so a
+    // hit overstresses local bonds. Kept low (not the old 200×) so resting ground
+    // contacts don't churn near-limit bonds — the destruction comes from a sensibly
+    // fragile materialScale, not from cranking this. (Higher = breaks more on impact
+    // but also jitters the car at rest.)
+    contactForceScale: 80,
     skipSingleBodies: false,
   },
 };
