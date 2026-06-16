@@ -40,6 +40,14 @@ These three cost the most time. Internalize them before writing code.
    hull over that mesh spans the gaps — a nonsensical car-sized blob. You must split
    each mesh into its connected components, *and* fracture the welded-but-concave ones.
 
+4. **Render mesh ≠ collision mesh.** Convex-hull / CoACD colliders are great physics but
+   render as ugly faceted blobs. Keep them for *collision* and *render* a slice of the
+   original detailed model per node instead: assign each original triangle to the node
+   whose collider owns it, put the hulls in `scenario.parameters.colliderGeometries`
+   (the core prefers that channel for the collider) and leave `fragmentGeometries` for
+   the detailed render mesh. This is the single biggest visual-quality win, and it also
+   *frees* you to make colliders coarser / drop overlapping ones (looks are independent).
+
 ## The pipeline (in order)
 
 1. **Inspect.** `node scripts/analyze-glb.mjs model.glb --json manifest.json`. Prints
@@ -160,8 +168,13 @@ explosions and instability that only show up while the simulation runs.
    reaction + gravity (and projectile hits) stress the bonds, and the solver's
    overstressed-bond path breaks them. So calibrate `materialScale` (hold at rest, break
    on hit) — no `onImpact` scripting needed. (Pinned by `freeBodyGroundStress.test.ts`.)
-3. **`'all'` debris mode → explosion** when overlapping chunks detach together. Use
-   `'noDebrisPairs'` / `'debrisGroundOnly'`.
+3. **`'all'` debris mode → explosion** when overlapping chunks detach together — UNLESS
+   you (a) make the colliders genuinely non-overlapping (offline CoACD + a final
+   *drop-overlaps* pass; safe because render≠collision, see below) AND (b) use a THICK
+   ground slab. A thin (few-cm) ground lets a deep pile of hundreds of detached hulls
+   tunnel through and eject at >100 m/s — a "delayed explosion" that looks like overlap
+   but isn't (the core now uses a thick slab). With both, `'all'` collapses-and-settles;
+   verify with a shatter test (cut every bond → must settle, not explode).
 4. **The runtime builds a convex hull per node from `fragmentGeometries`** even if you
    don't pass a Rapier module (`destructible-core.ts` `buildColliderDescForNode`). So a
    disconnected/concave mesh → blob hull. Split + fracture before it ever gets there.

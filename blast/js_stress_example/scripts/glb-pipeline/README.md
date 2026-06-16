@@ -141,9 +141,13 @@ node clean-glb.mjs ../../assets/buggy.glb /tmp/buggy-clean.glb \
      --ratio 0.3 --error 0.01 --weld 0.0008
 
 # 2) decompose + de-interpenetrate -> the runtime asset
+#    The final `drop-overlaps` pass removes the few residual sliver overlaps clip
+#    can't fix, so the colliders are GUARANTEED non-overlapping (safe to drop a
+#    collider hull because render != collision — see runtime integration below).
 python3 build_destructible_asset.py /tmp/buggy-clean.glb \
      --threshold 0.1 --method clip --clip-margin 0.001 \
      -o ../../assets/buggy.pieces.json
+#    flags: --no-drop-overlaps to disable, --drop-depth <m> to set the threshold.
 ```
 
 Watch the build output — it reports, and **never fails silently**:
@@ -235,25 +239,33 @@ CI deploys a Vercel preview on every push to an open PR (`.github/workflows/ci.y
 
 ---
 
-## 6. Current state, limitations & next steps
+## 6. Current state
 
 **Working:** complete buggy, holds rock-solid at rest, sheds parts on shots/drops,
-no explosions. Soak-green.
+and **full `'all'` debris collision** (debris ↔ car, ground, AND other debris) with
+**no explosions** — `shatter-test.mjs` cuts every bond and the whole car collapses
+and settles. Soak-green.
 
-**Known limitation — `debris: 'noDebrisPairs'`, not `'all'`.** A handful of thin
-sliver pieces the source model still produces can't be fully de-interpenetrated
-(clipping would erase them → ~70 residual ~11 mm overlaps), which **cascade** into
-an explosion under full `'all'` debris collision in a mass shatter. `noDebrisPairs`
-(debris bounces off the car + ground, not each other) is robust and lively.
+Two things got it to full `'all'`:
 
-**To reach full `'all'`:** push the clean-up harder — `clean-glb.mjs --ratio 0.15
---error 0.02` (fewer slivers, blockier), and/or drop/merge pieces below a size
-threshold in `build_destructible_asset.py`, until `shatter-test.mjs` settles with
-`'all'`. Then set `debrisCollisionMode = 'all'` in `destructible-vehicle.ts`.
+1. **Guaranteed non-overlapping colliders.** The `drop-overlaps` pass (step 2)
+   greedily removes the residual sliver overlaps clip can't fix. Removing a
+   collider hull is harmless because **render ≠ collision** (below), so the visual
+   model is unchanged.
+2. **Thick ground in the core.** A 5 cm-thin floor let a deep pile of hundreds of
+   detached hulls tunnel through and eject at >100 m/s (the historical reason this
+   was `'noDebrisPairs'`). `destructible-core.ts` now uses a thick ground slab.
 
-**Other follow-ups:** drop the now-unused GLB-path imports from
-`destructible-vehicle.ts`; widen `bondMaxSeparation` if stitch "star" bonds remain;
-consider render mesh ≠ collider (keep original render mesh, CoACD only the
-collider) for higher visual fidelity (needs multi-collider-per-node in the core).
+### Render ≠ collision (the visual fix)
 
-**Branch:** `claude/glb-coacd-destructible-pipeline` (PR #72).
+The colliders are tight CoACD hulls (good physics, ugly to look at). The demo
+**renders the original detailed `buggy.glb`** instead: `glb-vehicle.ts`
+`attachDetailedRenderGeometry()` assigns each original triangle to the node whose
+collider owns it, stores the hulls in `scenario.parameters.colliderGeometries`
+(the core prefers that channel for the collider) and leaves `fragmentGeometries`
+for the detailed render mesh. So you get tight non-overlapping physics **and** the
+real vehicle silhouette — and because colliders are now independent of looks, the
+pipeline can drop/coarsen collider pieces freely.
+
+**Other follow-ups:** widen `bondMaxSeparation` if stitch "star" bonds remain;
+optionally raise the CoACD piece count for finer destruction (perf-test first).
