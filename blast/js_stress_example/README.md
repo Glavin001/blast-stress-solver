@@ -92,7 +92,8 @@ exposed on the runtime object returned by `loadStressSolver`.
 ## First-person shooter & dual-mode weapons (modern web demos)
 
 The modern Three.js + Rapier demos (`wall-demolition`, `tower-collapse`,
-`fractured-*`, `high-rise`, `mini-city`, `cracking`, `fracture-policy`) all share
+`fractured-*`, `high-rise`, `mini-city`, `destructible-structures`, `cracking`,
+`fracture-policy`) all share
 a first-person shooter layer (`shooter-fps.ts`, mounted the same way as
 `pipeline-controls.ts`). Serve them with `npm run serve` and open
 `demo-index.html`.

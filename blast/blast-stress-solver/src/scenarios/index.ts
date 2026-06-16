@@ -35,6 +35,20 @@ export {
 export type { SpinningBeamsOptions } from './spinningBeamsScenario';
 
 export {
+  buildRectilinearScenario,
+  buildFrameTowerScenario,
+  buildConcreteHutScenario,
+  buildCourtyardBungalowScenario,
+  buildStructurePreset,
+  STRUCTURE_PRESET_METADATA,
+} from './structurePresets';
+export type {
+  RectilinearOptions,
+  StructurePresetOptions,
+  StructurePresetId,
+} from './structurePresets';
+
+export {
   buildHouseScenario,
   buildHouseScenarioAsync,
   DEFAULT_HOUSE_OPTIONS,
