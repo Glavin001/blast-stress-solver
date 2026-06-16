@@ -402,6 +402,14 @@ export type BuildVehicleScenarioOptions = {
    * cargo is held). Default 1 for each. This is the main "make cargo weaker" knob.
    */
   roleStrength?: Partial<Record<VehiclePartRole, number>>;
+  /**
+   * Original full-detail model parts (world-space geometry + role), used ONLY for
+   * RENDERING. When supplied (asset path), each collider piece (node) keeps its
+   * tight CoACD convex hull for COLLISION but draws a slice of the original
+   * detailed mesh, so the car looks like the real model instead of faceted hulls.
+   * Produced by `extractVehicleParts(gltfScene)`. Omit to render the hulls.
+   */
+  renderParts?: VehiclePart[];
 };
 
 export type VehicleScenarioResult = {
@@ -705,7 +713,187 @@ export async function buildVehicleScenarioFromAsset(
     }
   }
 
-  return assembleVehicleScenario(fragments, meta, bounds, options, asset.parts.length, roleCounts);
+  const result = await assembleVehicleScenario(fragments, meta, bounds, options, asset.parts.length, roleCounts);
+
+  // High-fidelity render: keep the tight CoACD hulls for COLLISION, but draw each
+  // node with a slice of the original detailed model (render != collision).
+  if (options.renderParts?.length) {
+    try {
+      attachDetailedRenderGeometry(result.scenario, meta, offset, options.renderParts);
+    } catch (err) {
+      console.warn('[glb-vehicle] detailed render attach failed; rendering hulls:', err);
+    }
+  }
+  return result;
+}
+
+// ── High-fidelity render geometry (render != collision) ──────────────────────
+
+/**
+ * Replace each node's RENDER geometry with a slice of the original detailed model,
+ * while preserving the CoACD convex hull as the node's COLLISION geometry.
+ *
+ * The runtime builds one convex-hull collider per node from its geometry, so using
+ * the CoACD pieces as render geometry makes the car look like faceted hulls. Here we
+ * move those hulls to `scenario.parameters.colliderGeometries` (the core prefers
+ * that channel for collision) and rebuild `fragmentGeometries` (what the chunk mesh
+ * draws) from the original model: every original triangle is assigned to the node
+ * whose collider best owns it (nearest piece, role-preferred), so the union of the
+ * slices reproduces the original mesh and each slice rides with its node when it
+ * detaches. Nodes that collect no triangles keep their hull geometry.
+ */
+function attachDetailedRenderGeometry(
+  scenario: any,
+  meta: FragMeta[],
+  offset: THREE.Vector3,
+  renderParts: VehiclePart[],
+): void {
+  const nodes = scenario.nodes as Array<{ centroid: { x: number; y: number; z: number } }>;
+  const nodeCount = nodes.length;
+  if (!nodeCount) return;
+  const hulls = (scenario.parameters?.fragmentGeometries ?? []) as THREE.BufferGeometry[];
+
+  // Per-node world-space (pre-offset) centroid + role.
+  const cx = new Float64Array(nodeCount);
+  const cy = new Float64Array(nodeCount);
+  const cz = new Float64Array(nodeCount);
+  const roleOf: VehiclePartRole[] = new Array(nodeCount);
+  let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < nodeCount; i++) {
+    const c = nodes[i].centroid;
+    const x = c.x - offset.x, y = c.y - offset.y, z = c.z - offset.z;
+    cx[i] = x; cy[i] = y; cz[i] = z;
+    roleOf[i] = meta[i]?.role ?? 'frame';
+    if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
+  }
+
+  // Uniform grid over node centroids for fast nearest-node queries.
+  const spanX = Math.max(1e-3, maxX - minX);
+  const spanY = Math.max(1e-3, maxY - minY);
+  const spanZ = Math.max(1e-3, maxZ - minZ);
+  const maxSpan = Math.max(spanX, spanY, spanZ);
+  const cell = Math.max(0.12, maxSpan / 24);
+  const inv = 1 / cell;
+  const gx = Math.max(1, Math.ceil(spanX * inv));
+  const gy = Math.max(1, Math.ceil(spanY * inv));
+  const gz = Math.max(1, Math.ceil(spanZ * inv));
+  const cellOf = (x: number, y: number, z: number) => {
+    let ix = Math.floor((x - minX) * inv); if (ix < 0) ix = 0; else if (ix >= gx) ix = gx - 1;
+    let iy = Math.floor((y - minY) * inv); if (iy < 0) iy = 0; else if (iy >= gy) iy = gy - 1;
+    let iz = Math.floor((z - minZ) * inv); if (iz < 0) iz = 0; else if (iz >= gz) iz = gz - 1;
+    return (ix * gy + iy) * gz + iz;
+  };
+  const grid = new Map<number, number[]>();
+  for (let i = 0; i < nodeCount; i++) {
+    const k = cellOf(cx[i], cy[i], cz[i]);
+    const list = grid.get(k);
+    if (list) list.push(i); else grid.set(k, [i]);
+  }
+
+  /** Nearest node to (x,y,z): prefer the same role, fall back to any role. */
+  function nearestNode(x: number, y: number, z: number, role: VehiclePartRole): number {
+    let ix = Math.floor((x - minX) * inv); if (ix < 0) ix = 0; else if (ix >= gx) ix = gx - 1;
+    let iy = Math.floor((y - minY) * inv); if (iy < 0) iy = 0; else if (iy >= gy) iy = gy - 1;
+    let iz = Math.floor((z - minZ) * inv); if (iz < 0) iz = 0; else if (iz >= gz) iz = gz - 1;
+    let bestRole = -1, bestRoleD = Infinity;
+    let bestAny = -1, bestAnyD = Infinity;
+    const maxR = Math.max(gx, gy, gz);
+    let foundRing = -1;
+    for (let r = 0; r <= maxR; r++) {
+      // Stop expanding once we are a full ring past the first hit (guarantees the
+      // true nearest within the searched roles is found).
+      if (foundRing >= 0 && r > foundRing + 1) break;
+      const x0 = Math.max(0, ix - r), x1 = Math.min(gx - 1, ix + r);
+      const y0 = Math.max(0, iy - r), y1 = Math.min(gy - 1, iy + r);
+      const z0 = Math.max(0, iz - r), z1 = Math.min(gz - 1, iz + r);
+      for (let a = x0; a <= x1; a++) {
+        for (let b = y0; b <= y1; b++) {
+          for (let c = z0; c <= z1; c++) {
+            // Only the shell of the (2r+1)^3 box is new for r>0.
+            if (r > 0 && a > x0 && a < x1 && b > y0 && b < y1 && c > z0 && c < z1) continue;
+            const list = grid.get((a * gy + b) * gz + c);
+            if (!list) continue;
+            for (const n of list) {
+              const dx = cx[n] - x, dy = cy[n] - y, dz = cz[n] - z;
+              const d = dx * dx + dy * dy + dz * dz;
+              if (d < bestAnyD) { bestAnyD = d; bestAny = n; }
+              if (roleOf[n] === role && d < bestRoleD) { bestRoleD = d; bestRole = n; }
+            }
+          }
+        }
+      }
+      if (foundRing < 0 && (bestAny >= 0 || bestRole >= 0)) foundRing = r;
+    }
+    // Prefer same-role unless it is much farther than the overall nearest (handles
+    // role classification drift between the asset and the original model).
+    if (bestRole >= 0 && (bestAny < 0 || bestRoleD <= bestAnyD * 2.25)) return bestRole;
+    return bestAny;
+  }
+
+  // Accumulate assigned triangles (world-space verts + normals) per node.
+  const accPos: number[][] = Array.from({ length: nodeCount }, () => []);
+  const accNrm: number[][] = Array.from({ length: nodeCount }, () => []);
+
+  for (const part of renderParts) {
+    const geom = part.geometry;
+    const posAttr = geom.getAttribute('position') as THREE.BufferAttribute | undefined;
+    if (!posAttr) continue;
+    const nrmAttr = geom.getAttribute('normal') as THREE.BufferAttribute | undefined;
+    const index = geom.getIndex();
+    const triCount = Math.floor((index ? index.count : posAttr.count) / 3);
+    const vi = (t: number, k: number) => (index ? index.getX(t * 3 + k) : t * 3 + k);
+    for (let t = 0; t < triCount; t++) {
+      const a = vi(t, 0), b = vi(t, 1), c = vi(t, 2);
+      const ax = posAttr.getX(a), ay = posAttr.getY(a), az = posAttr.getZ(a);
+      const bx = posAttr.getX(b), by = posAttr.getY(b), bz = posAttr.getZ(b);
+      const ccx = posAttr.getX(c), ccy = posAttr.getY(c), ccz = posAttr.getZ(c);
+      const tcx = (ax + bx + ccx) / 3, tcy = (ay + by + ccy) / 3, tcz = (az + bz + ccz) / 3;
+      const node = nearestNode(tcx, tcy, tcz, part.role);
+      if (node < 0) continue;
+      const ap = accPos[node];
+      ap.push(ax, ay, az, bx, by, bz, ccx, ccy, ccz);
+      const an = accNrm[node];
+      if (nrmAttr) {
+        an.push(
+          nrmAttr.getX(a), nrmAttr.getY(a), nrmAttr.getZ(a),
+          nrmAttr.getX(b), nrmAttr.getY(b), nrmAttr.getZ(b),
+          nrmAttr.getX(c), nrmAttr.getY(c), nrmAttr.getZ(c),
+        );
+      }
+    }
+  }
+
+  // Build per-node render geometry; keep hulls for collision.
+  const renderGeoms: THREE.BufferGeometry[] = new Array(nodeCount);
+  let withDetail = 0, withoutDetail = 0;
+  for (let i = 0; i < nodeCount; i++) {
+    const ap = accPos[i];
+    if (ap.length >= 9) {
+      const local = new Float32Array(ap.length);
+      // Local frame = world - pieceCentroid (matches the hull geometry's frame).
+      for (let j = 0; j < ap.length; j += 3) {
+        local[j] = ap[j] - cx[i];
+        local[j + 1] = ap[j + 1] - cy[i];
+        local[j + 2] = ap[j + 2] - cz[i];
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(local, 3));
+      const an = accNrm[i];
+      if (an.length === ap.length) g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(an), 3));
+      else g.computeVertexNormals();
+      renderGeoms[i] = g;
+      withDetail++;
+    } else {
+      renderGeoms[i] = hulls[i]; // fall back to the hull when no triangles landed here
+      withoutDetail++;
+    }
+  }
+
+  scenario.parameters = scenario.parameters ?? {};
+  scenario.parameters.colliderGeometries = hulls; // tight convex hulls = collision
+  scenario.parameters.fragmentGeometries = renderGeoms; // detailed slices = render
+  console.log(`[glb-vehicle] detailed render: ${withDetail}/${nodeCount} nodes got model geometry, ${withoutDetail} fell back to hull`);
 }
 
 // ── Connectivity helpers ─────────────────────────────────────────────────────

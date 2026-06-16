@@ -31,8 +31,10 @@ import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './phy
 import { mountShooter } from './shooter-fps.js';
 import {
   buildVehicleScenarioFromAsset,
+  extractVehicleParts,
   ROLE_COLORS,
   ROLE_LABELS,
+  type VehiclePart,
   type VehiclePartRole,
   type VehiclePiecesAsset,
 } from './glb-vehicle.js';
@@ -42,6 +44,10 @@ import {
 // Pre-decomposed pieces asset (CoACD pipeline output): tight, non-overlapping
 // convex collider pieces, so full debris collision doesn't explode.
 const ASSET_URL = './assets/buggy.pieces.json';
+// Original full-detail model — used ONLY for rendering (render != collision). Each
+// collider piece keeps its tight CoACD hull for physics but draws a slice of this
+// model, so the car looks like the real vehicle, not faceted hulls.
+const MODEL_URL = './assets/buggy.glb';
 
 const CONFIG = {
   vehicle: {
@@ -179,6 +185,8 @@ let colorByRole = true;
 
 // Cached pieces asset so Reset / Drop rebuild without re-fetching.
 let piecesAsset: VehiclePiecesAsset | null = null;
+// Cached full-detail render parts (from buggy.glb) for the render!=collision path.
+let renderParts: VehiclePart[] | null = null;
 
 // Breaking is fully stress-driven: the solver sees gravity + the ground-contact
 // reaction + projectile contact forces, and breaks bonds wherever the stress
@@ -207,15 +215,33 @@ async function ensureAssetLoaded(): Promise<VehiclePiecesAsset> {
   return piecesAsset;
 }
 
+/** Load the original full-detail model and extract its world-space parts (render only). */
+async function ensureRenderPartsLoaded(): Promise<VehiclePart[] | null> {
+  if (renderParts) return renderParts;
+  try {
+    const loader = new GLTFLoader();
+    const gltf = await loader.loadAsync(MODEL_URL);
+    const { parts } = extractVehicleParts(gltf.scene, { splitComponents: false });
+    renderParts = parts;
+    console.log(`Loaded render model: ${parts.length} detail parts from ${MODEL_URL}`);
+  } catch (err) {
+    console.warn('Failed to load detailed render model; rendering collider hulls:', err);
+    renderParts = null;
+  }
+  return renderParts;
+}
+
 /** Build (or rebuild) the destructible vehicle. `dropHeight` lifts it for a drop test. */
 async function initScene(dropHeight = 0) {
   const asset = await ensureAssetLoaded();
+  const detailParts = await ensureRenderPartsLoaded();
 
   const { scenario, nodeColors, summary } = await buildVehicleScenarioFromAsset(asset, {
     totalMass: CONFIG.vehicle.totalMass,
     bondMaxSeparation: CONFIG.vehicle.bondMaxSeparation,
     roleStrength: CONFIG.vehicle.bondStrength,
     groundGap: 0.03 + Math.max(0, dropHeight),
+    renderParts: detailParts ?? undefined,
   });
 
   console.log(
