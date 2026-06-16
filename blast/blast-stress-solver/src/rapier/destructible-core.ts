@@ -3068,6 +3068,40 @@ export async function buildDestructibleCore({
   }
 
   /**
+   * Fracture EVERY remaining bond at once, so each connected component collapses
+   * down to its individual chunks (each becomes its own rigid body). Drives the
+   * real solver split path (applyFractureCommands → processSplitEvents) rather
+   * than cutNodeBonds, so the bodies actually separate — and imparts no velocity,
+   * so the only motion is gravity + collider resolution. Returns bonds fractured.
+   *
+   * This is the "full demolition" / acceptance probe for collider quality: with
+   * tight, non-overlapping colliders the result just collapses and settles; with
+   * overlapping convex hulls it explodes as the penetrations resolve.
+   */
+  function shatterAll(): number {
+    const actorList = (solver as any).actors?.() ?? [];
+    const nodeActor = new Map<number, number>();
+    for (const a of actorList) for (const n of a.nodes) nodeActor.set(n, a.actorIndex);
+    const byActor = new Map<number, Array<{ userdata: number; nodeIndex0: number; nodeIndex1: number; health: number }>>();
+    let count = 0;
+    for (let bi = 0; bi < bondTable.length; bi++) {
+      const b = bondTable[bi];
+      if (!b || removedBondIndices.has(bi)) continue;
+      const ai = nodeActor.get(b.node0) ?? nodeActor.get(b.node1) ?? 0;
+      let list = byActor.get(ai);
+      if (!list) byActor.set(ai, (list = []));
+      list.push({ userdata: bi, nodeIndex0: b.node0, nodeIndex1: b.node1, health: 1 });
+      removedBondIndices.add(bi);
+      count++;
+    }
+    if (count === 0) return 0;
+    const commands = [...byActor.entries()].map(([actorIndex, fractures]) => ({ actorIndex, fractures }));
+    const splitEvents = profiledApplyFractureCommands(commands);
+    processSplitEvents(splitEvents);
+    return count;
+  }
+
+  /**
    * Centralized node destruction handler. Marks the chunk as destroyed,
    * cuts its bonds from the WASM solver, cleans up collider/body links,
    * and notifies listeners. Matches vibe-city's handleNodeDestroyed pattern.
@@ -3289,6 +3323,7 @@ export async function buildDestructibleCore({
     getNodeBonds,
     cutBond,
     cutNodeBonds,
+    shatterAll,
     applyExternalForce,
     setSleepThresholds: (linear: number, angular: number) => updateSleepThresholds(linear, angular),
     setSleepMode: updateSleepMode,

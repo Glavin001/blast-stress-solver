@@ -474,6 +474,19 @@ window.addEventListener('resize', onResize);
     const shed = (core.chunks as any[]).filter((c) => c.detached || c.destroyed).length;
     return { maxSpeed, maxDist, fastBodies: fast, dynamicBodies: dyn, bodies: core.getRigidBodyCount(), shed };
   },
+  // Set debris collision mode at runtime (for the shatter test / QA).
+  setDebris(mode: string) { (coreRef as any)?.setDebrisCollisionMode?.(mode); },
+  // Acceptance test for non-overlapping colliders: cut every bond so all chunks
+  // become free rigid bodies at once. With debris collisions ON and tight,
+  // non-overlapping colliders, this must just collapse and settle — NOT explode.
+  // Overlapping convex hulls instead resolve their penetration as a blast.
+  shatterAll() {
+    const core = coreRef as any;
+    if (!core) return 0;
+    // Lift any body cap so every chunk can become its own rigid body.
+    try { core.setFracturePolicy?.({ maxDynamicBodies: 0, maxFracturesPerFrame: 0, maxNewBodiesPerFrame: 0 }); } catch {}
+    try { return core.shatterAll?.() ?? 0; } catch { return 0; }
+  },
 };
 
 // ── Boot ──────────────────────────────────────────────────────
