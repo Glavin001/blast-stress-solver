@@ -22,8 +22,8 @@ This is the NVIDIA PhysX monorepo containing PhysX, Blast, and Flow SDKs. The ac
   ```bash
   git clone https://github.com/emscripten-core/emsdk.git /opt/emsdk
   cd /opt/emsdk
-  ./emsdk install 3.1.51
-  ./emsdk activate 3.1.51
+  ./emsdk install 6.0.0
+  ./emsdk activate 6.0.0
   source /opt/emsdk/emsdk_env.sh
   ```
   The `~/.bashrc` should source it automatically. Verify with `emcc --version`.
