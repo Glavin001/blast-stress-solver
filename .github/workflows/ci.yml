@@ -71,6 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -169,6 +172,15 @@ jobs:
         # blocking guards, so this is currently a no-op placeholder for future repros.
         run: cargo test --features rapier,scenarios --no-fail-fast -- --ignored
         continue-on-error: true
+
+      - name: Run blast-stress-solver-rs Rapier invariants
+        working-directory: blast/blast-stress-solver-rs
+        run: cargo test --features "rapier scenarios" --test rapier_correctness_invariants_test -- --nocapture
+        continue-on-error: true  # includes known active failing regression for default split recentering teleport behavior
+
+      - name: Run blast-stress-solver-rs Rapier integration suite
+        working-directory: blast/blast-stress-solver-rs
+        run: cargo test --features "rapier scenarios" --test rapier_integration_test -- --nocapture
 
   wasm-smoke:
     # Regression tests that build a cdylib consumer for
