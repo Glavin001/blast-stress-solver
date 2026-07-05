@@ -18,6 +18,7 @@ import {
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
+import { RECOMMENDED_SLEEP } from './demo-optimization-preset.js';
 import { mountShooter } from './shooter-fps.js';
 import { buildTowerScenario } from 'blast-stress-solver/scenarios';
 
@@ -224,6 +225,7 @@ async function initScene() {
     materialScale: CONFIG.solver.materialScale,
     contactForceScale: CONFIG.physics.contactForceScale,
     skipSingleBodies: CONFIG.physics.skipSingleBodies,
+    ...RECOMMENDED_SLEEP,
     ...physicsCoreOverrides(),
     ...pipelineCoreOverrides(),
   });

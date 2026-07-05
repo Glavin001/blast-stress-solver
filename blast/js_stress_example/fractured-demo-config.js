@@ -1,3 +1,8 @@
+// NOTE: the A/B-validated "recommended" settling preset lives in
+// ./demo-optimization-preset.js: each demo spreads RECOMMENDED_SLEEP into its
+// buildDestructibleCore call, and physics-controls.ts spreads RECOMMENDED_DAMPING
+// into physicsCoreOverrides() (the damping *mode* stays a UI dropdown there).
+
 export const FRACTURED_WALL_DEMO_CONFIG = {
   key: 'fractured_wall',
   title: 'Fractured Wall',

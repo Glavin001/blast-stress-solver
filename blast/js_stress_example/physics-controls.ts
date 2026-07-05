@@ -11,6 +11,7 @@
  * debris cleanup after the first ground hit.
  */
 import type { DestructibleCore } from 'blast-stress-solver/rapier';
+import { RECOMMENDED_DAMPING } from './demo-optimization-preset.js';
 
 export type DebrisCollisionMode = 'all' | 'noDebrisPairs' | 'debrisGroundOnly' | 'debrisNone';
 export type DampingMode = 'off' | 'always' | 'afterGroundCollision';
@@ -60,9 +61,7 @@ export function physicsCoreOverrides() {
     debrisCollisionMode: physicsConfig.debrisCollisionMode as DebrisCollisionMode,
     smallBodyDamping: {
       mode: physicsConfig.smallBodyDampingMode as DampingMode,
-      colliderCountThreshold: 3,
-      minLinearDamping: 2,
-      minAngularDamping: 2,
+      ...RECOMMENDED_DAMPING,
     },
     debrisCleanup: {
       mode: physicsConfig.debrisCleanupMode as CleanupMode,

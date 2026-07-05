@@ -21,6 +21,7 @@ import { createDestructibleThreeBundle, RapierDebugRenderer, setPinataModule } f
 import { buildHighRiseScenario, buildHighRiseScenarioAsync, type HighRiseOptions } from 'blast-stress-solver/scenarios';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { mountPhysicsControls, physicsCoreOverrides, physicsConfig } from './physics-controls.js';
+import { RECOMMENDED_SLEEP } from './demo-optimization-preset.js';
 import { mountShooter } from './shooter-fps.js';
 
 // The scene defaults (camera, material limits, contact-damage tuning) still come from
@@ -242,6 +243,7 @@ async function initScene() {
       graphReductionLevel: CONFIG.solver.graphReduction,
     },
     contactForceScale: CONFIG.solver.contactForceScale,
+    ...RECOMMENDED_SLEEP,
     // Shared Physics/Optimization/Features controls (physics-controls.ts).
     ...physicsCoreOverrides(),
     // ...but keep the scene-pack's per-chunk damage tuning when the toggle is on.

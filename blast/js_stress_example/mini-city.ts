@@ -29,6 +29,7 @@ import {
 } from 'blast-stress-solver/three';
 import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-controls.js';
 import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
+import { RECOMMENDED_SLEEP } from './demo-optimization-preset.js';
 import { mountShooter } from './shooter-fps.js';
 import { buildFracturedTowerScenario } from 'blast-stress-solver/scenarios';
 
@@ -491,6 +492,7 @@ async function initScene() {
     gravity: CONFIG.solver.gravity,
     materialScale: CONFIG.solver.materialScale,
     contactForceScale: CONFIG.physics.contactForceScale,
+    ...RECOMMENDED_SLEEP,
     ...physicsCoreOverrides(),
     // Mini-city owns its island-solver / lazy-collider toggles (CONFIG.optimization), so its
     // explicit values override the shared physics-controls defaults spread above; the live
