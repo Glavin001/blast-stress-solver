@@ -50,6 +50,10 @@ Key docs:
 
 - crate usage and target support:
   [`blast/blast-stress-solver-rs/README.md`](blast/blast-stress-solver-rs/README.md)
+- physics-engine integration contract (what another rigid-body engine must
+  provide to replace Rapier — collider re-parenting, split handling, contact
+  events, resimulation):
+  [`blast/blast-stress-solver-rs/PHYSICS_ENGINE_CONTRACT.md`](blast/blast-stress-solver-rs/PHYSICS_ENGINE_CONTRACT.md)
 - staged release and publish flow:
   [`scripts/blast-stress-solver-package/RELEASING.md`](scripts/blast-stress-solver-package/RELEASING.md)
 
