@@ -19,8 +19,14 @@ The engine deliberately pushes this to userland; we have the domain knowledge it
 - A building = a connected component of the bond graph (union-find, supports included).
 - Before each `world.step`, a **conservative predictive AABB test** enables (`explodeBuilding`)
   any building whose AABB is overlapped by a mover's swept box (`pos → pos+v·dt` + radius + skin).
-  It cannot miss (every fragment lives inside the building AABB); a false positive is a physics
-  no-op. No proxy collider, no probe step, no rollback.
+  Movers are every awake non-fixed body in the world: projectiles, debris (chunk bodies, with a
+  fragment-derived radius), **and external bodies the host app created** — vehicles, character
+  controllers, thrown props — whose radius is bounded conservatively from their colliders
+  (`externalMoverRadius`). It cannot miss (every fragment lives inside the building AABB); a
+  false positive is a physics no-op. No proxy collider, no probe step, no rollback.
+- Dormant colliders are invisible to **manual world queries** (`world.castRay`, shape casts)
+  until something materializes them — hitscan against intact structures needs eager mode or an
+  explicit materialize-first step.
 - The bond/stress graph is untouched and **collider-independent**, so the hierarchy/LOD can never
   change *which* fractures happen — only the physical collision representation.
 

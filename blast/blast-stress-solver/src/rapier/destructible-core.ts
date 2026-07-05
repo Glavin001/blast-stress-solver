@@ -107,14 +107,28 @@ export type BuildDestructibleCoreOptions = {
   /** Controls fracture rate, body creation budget, and dynamic body limits.
    *  All fields default to -1 (unlimited = original behavior). */
   fracturePolicy?: FracturePolicy;
-  /** Collision-dormant intact buildings. When on, each disconnected component ("building") of
-   *  the initial bond graph is represented by ONE cheap convex-hull *proxy* collider on the
-   *  fixed root instead of one collider per fragment. The proxy is a tripwire only: when a mover
-   *  touches it, the world is rolled back (reusing the fracture-resim snapshot), the building is
-   *  "exploded" into its real per-fragment colliders, and the step is re-run — so the impact is
-   *  resolved on real geometry, same frame, with the exact Rapier contact fed to the stress
-   *  solver. Massively cuts the idle broadphase cost (≈1 collider/building vs 1/fragment).
-   *  Requires (and implies) resimulateOnFracture. Default false. */
+  /** Island-aware stress solve. When on, the stress solve runs per disconnected component
+   *  ("island") of the bond graph and skips components whose inputs are unchanged and that have
+   *  already converged ("settled"). Observationally identical to the whole-graph solve — a
+   *  settled island re-solves the same frame its load changes — but ~10× cheaper at city scale
+   *  when activity is localized (see docs/perf-city-scale-roadmap.md §1). Default **true**
+   *  (with `skipSettled: true`); pass `false` or `{ enabled: false }` for the legacy
+   *  whole-graph solve. */
+  islandSolver?: boolean | { enabled?: boolean; skipSettled?: boolean };
+  /** Collision-dormant intact buildings. When on, every fragment collider of a still-intact
+   *  bond-graph component ("building") starts DISABLED — out of the broadphase entirely — and a
+   *  predictive pass enables the leaves of the building's collision-LOD tree just-in-time,
+   *  BEFORE `world.step()`, for any mover whose swept AABB reaches them (projectiles, debris
+   *  bodies, and external bodies such as vehicles or character controllers). The impact then
+   *  resolves on real geometry, identically to the eager world — no proxy, no rollback.
+   *  Massively cuts the idle broadphase cost on large scenes (≈27× on an 8×8-tower city, see
+   *  `scripts/lod-bench.mjs`).
+   *
+   *  Caveats: dormant colliders are invisible to **manual world queries** (`world.castRay`,
+   *  shape casts, point projections) until something materializes them — keep this off (or
+   *  materialize first) if you hitscan against intact structures. Only meaningful for anchored
+   *  scenarios (the LOD AABBs assume fragments sit on the fixed root); ignored when the
+   *  scenario has no supports. Default false. */
   lazyIntactColliders?: boolean;
 };
 
@@ -221,6 +235,7 @@ export async function buildDestructibleCore({
   smallBodyDamping,
   debrisCleanup,
   fracturePolicy,
+  islandSolver,
   lazyIntactColliders = false,
 }: BuildDestructibleCoreOptions): Promise<DestructibleCore> {
   await RAPIER.init();
@@ -486,15 +501,19 @@ export async function buildDestructibleCore({
     console.warn('[Core] no supports (nodes with mass=0) found in scenario', scenario);
   }
 
-  // Island-aware solving (Stage 4 integration). Off by default so existing behavior is unchanged.
-  // When enabled, the stress solve runs per disconnected component ("island") and skips components
-  // that have settled — their velocity inputs are unchanged since the last solve and they already
-  // converged, so re-solving is a no-op. This is observationally identical to the whole-graph solve
-  // but far cheaper for large, partially-active worlds. A settled component re-solves the same frame
-  // its load changes (a new contact, or a neighbour waking shifts its input), so it is paused, never
-  // frozen or evicted: anything settled can always be loaded and fractured again.
-  let islandSolverEnabled = false;
-  let islandSolverSkipSettled = true;
+  // Island-aware solving (Stage 4 integration). ON by default: the stress solve runs per
+  // disconnected component ("island") and skips components that have settled — their velocity
+  // inputs are unchanged since the last solve and they already converged, so re-solving is a
+  // no-op. This is observationally identical to the whole-graph solve but far cheaper for large,
+  // partially-active worlds (~10× at city scale; docs/perf-city-scale-roadmap.md §1). A settled
+  // component re-solves the same frame its load changes (a new contact, or a neighbour waking
+  // shifts its input), so it is paused, never frozen or evicted: anything settled can always be
+  // loaded and fractured again. Opt out with `islandSolver: false` for the legacy whole-graph
+  // solve (also live-togglable via setIslandSolver).
+  const islandSolverOpts =
+    typeof islandSolver === 'boolean' ? { enabled: islandSolver } : islandSolver ?? {};
+  let islandSolverEnabled = islandSolverOpts.enabled ?? true;
+  let islandSolverSkipSettled = islandSolverOpts.skipSettled ?? true;
 
   const solver = runtime.createExtSolver({ nodes, bonds, settings: scaledSettings });
 
@@ -653,7 +672,13 @@ export async function buildDestructibleCore({
   // ── Lazy intact buildings (collision-dormant) ──
   // When on, an intact building (a connected component of the initial bond graph) carries ONE
   // cheap convex-hull proxy collider on the fixed root instead of one collider per fragment.
-  let lazyIntactCollidersEnabled = !!lazyIntactColliders;
+  // The collision-LOD tree stores world-space AABBs that assume intact fragments sit on the
+  // FIXED root at the origin. A free-floating scenario (no supports) has a DYNAMIC root that can
+  // move, so dormant colliders would desync from their AABBs — force the eager path there.
+  if (lazyIntactColliders && !hasSupports && isDev) {
+    console.warn('[Core] lazyIntactColliders requires an anchored scenario (supports); using eager colliders');
+  }
+  let lazyIntactCollidersEnabled = !!lazyIntactColliders && hasSupports;
   // Collision-LOD tree. Each root is a building; internal nodes group sub-regions; leaves carry
   // fragments. `enabled` = "every leaf collider under this node is active in the broadphase". A
   // dormant building has all leaves disabled; a mover descends the tree (predictiveExplodePass) and
@@ -2608,6 +2633,10 @@ export async function buildDestructibleCore({
   }
 
   function setLazyIntactColliders(enabled: boolean) {
+    if (enabled && !hasSupports) {
+      if (isDev) console.warn('[Core] lazyIntactColliders requires an anchored scenario (supports); ignoring enable');
+      return;
+    }
     if (!!enabled === lazyIntactCollidersEnabled) return;
     lazyIntactCollidersEnabled = !!enabled;
     if (!lazyIntactCollidersEnabled) {
@@ -2740,19 +2769,75 @@ export async function buildDestructibleCore({
       const t = body.translation(), v = body.linvel();
       considerMoverForExplode(t.x, t.y, t.z, v.x, v.y, v.z, dt, p.radius ?? 0.5);
     }
-    // Awake dynamic debris bodies (skip the fixed root, ground, and sleeping bodies).
-    for (const bh of nodesByBodyHandle.keys()) {
-      if (bh === rootBody.handle) continue;
-      const body = world.getRigidBody(bh);
-      if (!body || body.isFixed()) continue;
-      if (typeof (body as any).isSleeping === 'function' && (body as any).isSleeping()) continue;
+    // Every other awake non-fixed body: debris (chunk bodies) AND external bodies the host app
+    // created in this world — vehicles, character controllers, sticky charges. External bodies
+    // must wake dormant buildings too, or a driven car / walking player would pass straight
+    // through an intact building that no projectile has touched yet. (Projectiles were handled
+    // above with their exact radius; skip them here via the userData flag.)
+    world.forEachRigidBody((body) => {
+      if (body.isFixed()) return;
+      if (body.handle === rootBody.handle) return;
+      if ((body as BodyWithUserData).userData?.projectile) return;
+      if (typeof (body as any).isSleeping === 'function' && (body as any).isSleeping()) return;
       const t = body.translation(), v = body.linvel();
-      // Radius bound = largest fragment half-diagonal on this body.
       let r = 0.5;
-      const set = nodesByBodyHandle.get(bh);
-      if (set) for (const ni of set) { const c = chunks[ni]; if (c) r = Math.max(r, Math.hypot(c.size.x, c.size.y, c.size.z) * 0.5); }
+      const set = nodesByBodyHandle.get(body.handle);
+      if (set) {
+        // Chunk body: radius bound = largest fragment half-diagonal on this body.
+        for (const ni of set) { const c = chunks[ni]; if (c) r = Math.max(r, Math.hypot(c.size.x, c.size.y, c.size.z) * 0.5); }
+      } else {
+        // External body: conservative bounding radius from its colliders (offset from the body
+        // origin + a per-shape bound; convex hulls use their farthest vertex). External bodies
+        // are few (a vehicle, a character), so recomputing per pass beats caching by handle —
+        // Rapier reuses handles after removal, which would poison a cache.
+        r = Math.max(r, externalMoverRadius(body));
+      }
       considerMoverForExplode(t.x, t.y, t.z, v.x, v.y, v.z, dt, r);
+    });
+  }
+
+  // Conservative bounding radius of a non-chunk body: max over colliders of (collider offset
+  // from the body translation + shape bounding radius). Unknown shapes fall back to 0.75 m,
+  // which the predictive skin (1 m) further pads.
+  function externalMoverRadius(body: RAPIER.RigidBody): number {
+    let r = 0.75;
+    const bt = body.translation();
+    const count = typeof (body as RigidBodyWithColliderCount).numColliders === 'function'
+      ? (body as RigidBodyWithColliderCount & { numColliders: () => number }).numColliders()
+      : 0;
+    for (let i = 0; i < count; i++) {
+      let col: RAPIER.Collider | null = null;
+      try { col = (body as RAPIER.RigidBody & { collider: (i: number) => RAPIER.Collider }).collider(i); } catch { col = null; }
+      if (!col) continue;
+      let offset = 0;
+      try {
+        const ct = col.translation();
+        offset = Math.hypot(ct.x - bt.x, ct.y - bt.y, ct.z - bt.z);
+      } catch {}
+      let shapeR = 0.75;
+      try {
+        const sh = (col as RAPIER.Collider & { shape?: unknown }).shape as
+          | { radius?: number; halfExtents?: Vec3; halfHeight?: number; vertices?: Float32Array }
+          | undefined;
+        if (sh) {
+          if (sh.halfExtents) {
+            shapeR = Math.hypot(sh.halfExtents.x, sh.halfExtents.y, sh.halfExtents.z);
+          } else if (typeof sh.radius === 'number') {
+            shapeR = sh.radius + (typeof sh.halfHeight === 'number' ? sh.halfHeight : 0);
+          } else if (sh.vertices && sh.vertices.length >= 3) {
+            let m2 = 0;
+            for (let k = 0; k + 2 < sh.vertices.length; k += 3) {
+              const x = sh.vertices[k], y = sh.vertices[k + 1], z = sh.vertices[k + 2];
+              const d2 = x * x + y * y + z * z;
+              if (d2 > m2) m2 = d2;
+            }
+            shapeR = Math.sqrt(m2);
+          }
+        }
+      } catch {}
+      r = Math.max(r, offset + shapeR);
     }
+    return r;
   }
 
   let lastStepDt = readWorldDt();

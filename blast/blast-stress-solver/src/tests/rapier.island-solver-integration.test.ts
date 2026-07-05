@@ -4,7 +4,8 @@
  * Confirms that DestructibleCore.setIslandSolver() actually drives the solver, that settled islands
  * are skipped in the full pipeline (the per-actor gravity rotated by a sleeping body's constant
  * orientation is bit-stable, so the skip engages), and that enabling it does not change the outcome.
- * Off by default, so existing behavior is untouched.
+ * ON by default since the Tier-1 perf defaults (docs/perf-city-scale-roadmap.md §3); the
+ * `islandSolver: false` build option is the whole-graph opt-out.
  *
  * Requires the full WASM + TS build; skips gracefully if dist is unavailable.
  */
@@ -41,8 +42,7 @@ function twoPillars(h = 4, gap = 3) {
 }
 
 async function run(enabled: boolean) {
-  const core = await buildDestructibleCore({ scenario: twoPillars(), gravity: -9.81, materialScale: 1e10 });
-  if (enabled) core.setIslandSolver({ enabled: true });
+  const core = await buildDestructibleCore({ scenario: twoPillars(), gravity: -9.81, materialScale: 1e10, islandSolver: enabled });
   let maxIslandCount = 0;
   let maxSkipped = 0;
   for (let i = 0; i < 120; i++) {
@@ -57,8 +57,13 @@ async function run(enabled: boolean) {
 }
 
 describe.skipIf(!runtimeAvailable)('Island solver integration (requires WASM build)', () => {
-  it('is off by default and skips nothing', async () => {
+  it('is ON by default (with settled-skip); islandSolver:false opts out completely', async () => {
     await loadCore();
+    const def = await buildDestructibleCore({ scenario: twoPillars(), gravity: -9.81, materialScale: 1e10 });
+    expect(def.getIslandSolverStats().enabled).toBe(true);
+    expect(def.getIslandSolverStats().skipSettled).toBe(true);
+    def.dispose();
+
     const r = await run(false);
     expect(r.enabled).toBe(false);
     expect(r.maxSkipped).toBe(0);
@@ -77,7 +82,7 @@ describe.skipIf(!runtimeAvailable)('Island solver integration (requires WASM bui
 
   it('setIslandSolver drives the underlying solver flags (skip is gated by enabled)', async () => {
     await loadCore();
-    const core = await buildDestructibleCore({ scenario: twoPillars(), gravity: -9.81, materialScale: 1e10 });
+    const core = await buildDestructibleCore({ scenario: twoPillars(), gravity: -9.81, materialScale: 1e10, islandSolver: false });
     expect(core.solver.islandAware()).toBe(false);
     expect(core.solver.skipSettled()).toBe(false);
     core.setIslandSolver({ enabled: true });

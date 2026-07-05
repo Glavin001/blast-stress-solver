@@ -24,6 +24,8 @@ export type PhysicsConfig = {
   debrisCleanupMode: CleanupMode;
   debrisTtlMs: number;
   maxCollidersForDebris: number;
+  islandSolver: boolean;
+  lazyIntactColliders: boolean;
   centrifugal: boolean;
   damage: boolean;
   debug: boolean;
@@ -38,6 +40,13 @@ export const physicsConfig: PhysicsConfig = {
   debrisCleanupMode: 'afterGroundCollision',
   debrisTtlMs: 10000,
   maxCollidersForDebris: 3,
+  // Island-aware stress solve + settled-island skip: observationally identical, ~10× cheaper
+  // when activity is localized (docs/perf-city-scale-roadmap.md §1).
+  islandSolver: true,
+  // Collision-dormant intact structures with just-in-time predictive activation. Identical
+  // simulation output; dormant colliders are invisible to manual world.castRay-style queries
+  // (none of the shared demos do that against intact structures).
+  lazyIntactColliders: true,
   centrifugal: false,
   damage: false,
   debug: false,
@@ -60,6 +69,8 @@ export function physicsCoreOverrides() {
       debrisTtlMs: physicsConfig.debrisTtlMs,
       maxCollidersForDebris: physicsConfig.maxCollidersForDebris,
     },
+    islandSolver: physicsConfig.islandSolver,
+    lazyIntactColliders: physicsConfig.lazyIntactColliders,
     damage: { enabled: physicsConfig.damage },
   };
 }
@@ -94,6 +105,11 @@ export function mountPhysicsControls(opts: PhysicsControlsOptions): void {
     if (!sidebar || sidebar.__physWired) return;
     sidebar.__physWired = true;
 
+    // A demo that carries its OWN island-solver / lazy-collider toggles (mini-city) wires them
+    // itself — record that before injection so we neither duplicate the rows nor double-bind.
+    const demoOwnsIslandToggle = !!document.getElementById('cfg-island-solver');
+    const demoOwnsLazyToggle = !!document.getElementById('cfg-lazy-colliders');
+
     // If a demo still carries its inline Physics/Optimization rows, wire those in place;
     // otherwise inject the standard sections (the DRY path for demos that drop the markup).
     if (!document.getElementById('cfg-debris-collision')) {
@@ -124,7 +140,16 @@ export function mountPhysicsControls(opts: PhysicsControlsOptions): void {
       '<option value="always">Always</option><option value="afterGroundCollision">After ground hit</option></select></div>' +
       '<div class="config-row"><span class="config-label">Debris TTL &#9733;</span>' +
       '<input type="range" class="config-slider" id="cfg-debris-ttl" min="1000" max="30000" step="500" />' +
-      '<span class="config-value" id="cfg-debris-ttl-value"></span></div></section>';
+      '<span class="config-value" id="cfg-debris-ttl-value"></span></div>' +
+      (demoOwnsIslandToggle
+        ? ''
+        : '<label class="toggle-row"><input type="checkbox" id="cfg-island-solver" /><span class="toggle-text">Island-aware solve &#9733;' +
+          '<small>Per-island stress solve, settled islands skipped. Identical output, ~10&times; cheaper when action is localized.</small></span></label>') +
+      (demoOwnsLazyToggle
+        ? ''
+        : '<label class="toggle-row"><input type="checkbox" id="cfg-lazy-colliders" /><span class="toggle-text">Lazy intact colliders &#9733;' +
+          '<small>Intact structures stay out of the broadphase until a mover approaches (just-in-time, identical impacts).</small></span></label>') +
+      '</section>';
 
     const features =
       (inc.damage || inc.debug) ?
@@ -158,7 +183,10 @@ export function mountPhysicsControls(opts: PhysicsControlsOptions): void {
     else sidebar.appendChild(frag);
     }
 
-    wireControls(opts.getCore, opts.onDebug, rebuild, inc);
+    wireControls(opts.getCore, opts.onDebug, rebuild, inc, {
+      islandToggle: !demoOwnsIslandToggle,
+      lazyToggle: !demoOwnsLazyToggle,
+    });
   };
   if (document.body) mount();
   else window.addEventListener('DOMContentLoaded', mount);
@@ -184,6 +212,7 @@ function wireControls(
   onDebug: ((on: boolean) => void) | undefined,
   rebuild: () => void,
   inc: { centrifugal?: boolean; damage?: boolean; debug?: boolean },
+  own: { islandToggle: boolean; lazyToggle: boolean },
 ) {
   // Physics
   if (inc.centrifugal) {
@@ -208,6 +237,26 @@ function wireControls(
     (v) => getCore()?.setDebrisCleanup?.({ mode: v as CleanupMode, debrisTtlMs: physicsConfig.debrisTtlMs }));
   bindSlider('cfg-debris-ttl', () => physicsConfig.debrisTtlMs, (v) => { physicsConfig.debrisTtlMs = v; }, (v) => (v / 1000).toFixed(1) + 's',
     (v) => getCore()?.setDebrisCleanup?.({ mode: physicsConfig.debrisCleanupMode, debrisTtlMs: v }));
+  if (own.islandToggle) {
+    const isl = document.getElementById('cfg-island-solver') as HTMLInputElement | null;
+    if (isl) {
+      isl.checked = physicsConfig.islandSolver;
+      isl.addEventListener('change', () => {
+        physicsConfig.islandSolver = isl.checked;
+        getCore()?.setIslandSolver?.({ enabled: isl.checked });
+      });
+    }
+  }
+  if (own.lazyToggle) {
+    const lazy = document.getElementById('cfg-lazy-colliders') as HTMLInputElement | null;
+    if (lazy) {
+      lazy.checked = physicsConfig.lazyIntactColliders;
+      lazy.addEventListener('change', () => {
+        physicsConfig.lazyIntactColliders = lazy.checked;
+        getCore()?.setLazyIntactColliders?.(lazy.checked);
+      });
+    }
+  }
 
   // Features
   if (inc.damage) {

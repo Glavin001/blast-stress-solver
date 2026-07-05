@@ -485,7 +485,10 @@ async function initScene() {
     materialScale: CONFIG.solver.materialScale,
     contactForceScale: CONFIG.physics.contactForceScale,
     ...physicsCoreOverrides(),
-    // Lazy intact colliders is mini-city's own option (not part of the shared physics controls).
+    // Mini-city owns its island-solver / lazy-collider toggles (CONFIG.optimization), so its
+    // explicit values override the shared physics-controls defaults spread above; the live
+    // setters below re-apply them across rebuilds.
+    islandSolver: CONFIG.optimization.islandSolver,
     lazyIntactColliders: CONFIG.optimization.lazyIntactColliders,
     ...pipelineCoreOverrides(),
   });
