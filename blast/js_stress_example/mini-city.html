@@ -176,6 +176,9 @@
           <label class="toggle-row"><input type="checkbox" id="cfg-intact-proxies" checked />
             <span class="toggle-text">Intact building LOD &#9733;
               <small>Draw a still-intact building as one box once it is far from the camera instead of all its fragments &mdash; cuts the per-frame render cost on a settled city. Reverts to full detail when hit or approached.</small></span></label>
+          <label class="toggle-row"><input type="checkbox" id="cfg-fixed-step" checked />
+            <span class="toggle-text">Fixed 60&nbsp;Hz physics + interpolation &#9733;
+              <small>Step physics at a fixed 60&nbsp;Hz regardless of display rate and blend rendering between the last two physics states &mdash; identical simulation on every monitor, and a 120&nbsp;Hz display stops paying double physics.</small></span></label>
         </section>
 
         <!-- Actions -->
