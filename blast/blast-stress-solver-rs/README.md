@@ -9,6 +9,13 @@ This crate gives you two main layers:
 - `blast_stress_solver::rapier::DestructibleSet` for keeping Blast actors and
   Rapier rigid bodies in sync
 
+Evaluating a different physics engine? See
+[`PHYSICS_ENGINE_CONTRACT.md`](PHYSICS_ENGINE_CONTRACT.md) for the exact set of
+rigid-body/collider capabilities the destruction pipeline requires (body & collider
+lifecycle, collider re-parenting on split, contact/force feedback, resimulation),
+each mapped to its Rapier call and to the code that uses it — i.e. what it takes to
+port the integration off Rapier.
+
 ## Installation
 
 Core solver only:
