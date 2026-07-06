@@ -51,6 +51,22 @@ struct ExtStressSolverHandleImpl
     std::vector<uint8_t> splitScratch;
     std::vector<NvBlastActor*> splitActors;
     std::vector<NvBlastBondFractureData> fractureScratch;
+
+    // Static splash adjacency (CSR) for solver-side splash expansion
+    // (ext_stress_solver_add_splash_hits): hit node n's neighbours are entries
+    // [splashStarts[n], splashStarts[n+1]) of splashNeighbors / splashWeights /
+    // splashNeighborPos. Weights stay double and each neighbour force component is
+    // computed as float(double(f32 force) * double weight) — the exact rounding
+    // sequence of the JS expansion loop this replaces, so both paths are
+    // byte-identical. Neighbour application points are the authored node offsets,
+    // pre-rounded to f32 by the caller (same single rounding as the JS path).
+    std::vector<uint32_t> splashStarts;
+    std::vector<uint32_t> splashNeighbors;
+    std::vector<double> splashWeights;
+    std::vector<float> splashNeighborPos;
+    // 1 = node excluded from splash. Mirrors the JS `chunk.active` filter, which can go
+    // false (node destroyed) before the actor split that isolates the node is applied.
+    std::vector<uint8_t> splashNodeInactive;
 };
 
 uint32_t mapGraphNodeToInput(const ExtStressSolverHandleImpl& handle, uint32_t graphIndex)
@@ -556,6 +572,24 @@ inline void applyForceToInputNode(ExtStressSolverHandleImpl& handle,
     {
         if (entry->actor)
         {
+            // The actor overload of addForce exists to translate an arbitrary position
+            // into its nearest graph node with an O(actor nodes) scan — but every caller
+            // here applies the force AT a node's own centroid, so the nearest node IS
+            // `node_index`. When the input→graph mapping is 1:1 (graphReductionLevel 0 —
+            // the runtime's pinned setting) we can skip the scan and accumulate on the
+            // node directly. Two behaviours of the scan path are preserved exactly:
+            // single-node actors drop the force (the stress solve ignores them), and a
+            // merged/reduced graph (mapping not 1:1) falls back to the scan, where the
+            // nearest merged node is not guaranteed to be this node's group.
+            if (handle.graphNodeIndices.size() == handle.inputToGraph.size()
+                && graphIndex != UINT32_MAX)
+            {
+                if (NvBlastActorGetGraphNodeCount(entry->actor, kLogFn) > 1)
+                {
+                    handle.solver->addForce(graphIndex, force, mode);
+                }
+                return;
+            }
             handle.solver->addForce(*entry->actor, pos, force, mode);
             return;
         }
@@ -627,6 +661,135 @@ ext_stress_solver_add_all_forces(ExtStressSolverHandle* handlePtr,
         applyForceToInputNode(*handle, node_indices[i], pos, force, forceMode);
     }
     return count;
+}
+
+// ── Solver-side splash expansion ─────────────────────────────────────────────
+// The JS contact-injection pipeline used to expand each contact hit into its
+// precomputed splash neighbours in JS (one buffered force per neighbour), then
+// submit the whole batch. That expansion loop was the costliest part of contact
+// injection at scale (~3.4 ms mean during impacts on bench:large). These entry
+// points move the expansion across the FFI boundary: the caller ships the static
+// adjacency once, then per frame submits only the resolved HITS; the solver
+// expands hit → neighbours internally in the same (contact, neighbour) order and
+// with the same rounding sequence as the JS loop, so accumulated per-node forces
+// are byte-identical.
+
+extern "C" uint32_t
+ext_stress_solver_set_splash_adjacency(ExtStressSolverHandle* handlePtr,
+                                       const uint32_t* starts,
+                                       const uint32_t* neighbors,
+                                       const double* weights,
+                                       const float* neighbor_positions,
+                                       uint32_t node_count,
+                                       uint32_t entry_count)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !starts || node_count == 0U)
+    {
+        return 0U;
+    }
+    if (entry_count > 0U && (!neighbors || !weights || !neighbor_positions))
+    {
+        return 0U;
+    }
+    handle->splashStarts.assign(starts, starts + static_cast<size_t>(node_count) + 1U);
+    handle->splashNeighbors.assign(neighbors, neighbors + entry_count);
+    handle->splashWeights.assign(weights, weights + entry_count);
+    handle->splashNeighborPos.assign(neighbor_positions,
+                                     neighbor_positions + static_cast<size_t>(entry_count) * 3U);
+    handle->splashNodeInactive.assign(node_count, 0U);
+    return entry_count;
+}
+
+extern "C" void
+ext_stress_solver_set_splash_node_inactive(ExtStressSolverHandle* handlePtr, uint32_t node_index)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle)
+    {
+        return;
+    }
+    if (node_index < handle->splashNodeInactive.size())
+    {
+        handle->splashNodeInactive[node_index] = 1U;
+    }
+}
+
+extern "C" uint32_t
+ext_stress_solver_add_splash_hits(ExtStressSolverHandle* handlePtr,
+                                  const uint32_t* hit_nodes,
+                                  const float* hit_positions,
+                                  const float* hit_forces,
+                                  uint32_t count,
+                                  uint32_t mode)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || !hit_nodes || !hit_positions || !hit_forces || count == 0U)
+    {
+        return 0U;
+    }
+    if (handle->splashStarts.size() < 2U)
+    {
+        return 0U; // adjacency was never shipped — caller should use the JS path
+    }
+
+    const ExtForceMode::Enum forceMode = toForceMode(mode);
+    const uint32_t nodeCount = static_cast<uint32_t>(handle->splashStarts.size() - 1U);
+    uint32_t applied = 0U;
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const uint32_t hit = hit_nodes[i];
+        const float* hp = hit_positions + static_cast<size_t>(i) * 3U;
+        const float* hf = hit_forces + static_cast<size_t>(i) * 3U;
+        const NvcVec3 hitPos{hp[0], hp[1], hp[2]};
+        const NvcVec3 hitForce{hf[0], hf[1], hf[2]};
+
+        // Hit node first at full strength, then its splash neighbours — the same
+        // per-contact order as the JS loop, so accumulated per-node forces match.
+        applyForceToInputNode(*handle, hit, hitPos, hitForce, forceMode);
+        ++applied;
+
+        if (hit >= nodeCount)
+        {
+            continue;
+        }
+        // Same-body filter: the JS loop compares chunk bodyHandles; actors map 1:1 to
+        // bodies, so owning-actor identity is the same predicate on the solver side.
+        const auto* hitEntry = findActorOwningInputNode(*handle, hit);
+        if (!hitEntry)
+        {
+            continue;
+        }
+        const uint32_t aStart = handle->splashStarts[hit];
+        const uint32_t aEnd = handle->splashStarts[hit + 1U];
+        for (uint32_t k = aStart; k < aEnd; ++k)
+        {
+            const uint32_t j = handle->splashNeighbors[k];
+            if (j < handle->splashNodeInactive.size() && handle->splashNodeInactive[j] != 0U)
+            {
+                continue;
+            }
+            if (findActorOwningInputNode(*handle, j) != hitEntry)
+            {
+                continue;
+            }
+            const double w = handle->splashWeights[k];
+            // float(double(f32) * double) — the exact rounding the JS expansion performs
+            // (f32 stash force read back as f64, multiplied by the f64 weight, stored f32).
+            const NvcVec3 f{static_cast<float>(hf[0] * w),
+                            static_cast<float>(hf[1] * w),
+                            static_cast<float>(hf[2] * w)};
+            const float* np = handle->splashNeighborPos.data() + static_cast<size_t>(k) * 3U;
+            const NvcVec3 pos{np[0], np[1], np[2]};
+            // Shared primitive (same one the JS fallback's add_all_forces uses), so the
+            // two splash paths can never diverge — including its direct-graph-node fast
+            // path and single-node-actor drop.
+            applyForceToInputNode(*handle, j, pos, f, forceMode);
+            ++applied;
+        }
+    }
+    return applied;
 }
 
 extern "C" void

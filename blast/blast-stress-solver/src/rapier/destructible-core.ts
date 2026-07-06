@@ -115,6 +115,13 @@ export type BuildDestructibleCoreOptions = {
    *  (with `skipSettled: true`); pass `false` or `{ enabled: false }` for the legacy
    *  whole-graph solve. */
   islandSolver?: boolean | { enabled?: boolean; skipSettled?: boolean };
+  /** Expand contact splash forces inside the WASM solver (one FFI crossing per frame
+   *  carrying only the resolved hits) instead of the per-neighbour JS loop. Accumulated
+   *  forces are byte-identical between the two paths (pinned by
+   *  rapier.splash-parity.test.ts); this only moves the work across the boundary.
+   *  Default true; automatically falls back to the JS loop on runtimes that predate
+   *  the splash exports. */
+  splashInWasm?: boolean;
   /** Collision-dormant intact buildings. When on, every fragment collider of a still-intact
    *  bond-graph component ("building") starts DISABLED — out of the broadphase entirely — and a
    *  predictive pass enables the leaves of the building's collision-LOD tree just-in-time,
@@ -128,8 +135,7 @@ export type BuildDestructibleCoreOptions = {
    *  shape casts, point projections) until something materializes them — keep this off (or
    *  materialize first) if you hitscan against intact structures. Only meaningful for anchored
    *  scenarios (the LOD AABBs assume fragments sit on the fixed root); ignored when the
-   *  scenario has no supports. Default false. */
-  lazyIntactColliders?: boolean;
+   *  scenario has no supports. Default false. */  lazyIntactColliders?: boolean;
 };
 
 const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV !== 'production' : true;
@@ -236,6 +242,7 @@ export async function buildDestructibleCore({
   debrisCleanup,
   fracturePolicy,
   islandSolver,
+  splashInWasm = true,
   lazyIntactColliders = false,
 }: BuildDestructibleCoreOptions): Promise<DestructibleCore> {
   await RAPIER.init();
@@ -884,6 +891,42 @@ export async function buildDestructibleCore({
     splashAdjWeight = Float64Array.from(weightsOut);
   }
   buildSplashAdjacency();
+
+  // ── Solver-side splash expansion (WASM) ──
+  // The static CSR above is shipped to the solver ONCE; per frame only the resolved
+  // contact HITS cross the FFI (see the splash pass in processOneFracturePass) and the
+  // solver expands hit → same-actor neighbours internally — same (contact, neighbour)
+  // order and the same rounding sequence as the JS loop, so accumulated per-node forces
+  // are byte-identical (pinned by rapier.splash-parity.test.ts). Neighbour application
+  // points are the authored offsets pre-rounded to f32, exactly what the JS loop writes
+  // into its Float32Array force buffer. Falls back to the JS expansion when the runtime
+  // predates the exports or `splashInWasm: false`.
+  let wasmSplashActive = false;
+  function shipSplashAdjacencyToWasm() {
+    if (!splashInWasm) return;
+    const api = solver as unknown as {
+      supportsWasmSplash?: () => boolean;
+      setSplashAdjacency?: (starts: Uint32Array, neighbors: Uint32Array, weights: Float64Array, neighborPositions: Float32Array) => number;
+    };
+    if (!api.supportsWasmSplash?.() || !api.setSplashAdjacency) return;
+    const entryCount = splashAdjNode.length;
+    const starts = new Uint32Array(splashAdjStart.length);
+    for (let i = 0; i < splashAdjStart.length; i++) starts[i] = splashAdjStart[i];
+    const neighbors = new Uint32Array(entryCount);
+    const positions = new Float32Array(entryCount * 3);
+    for (let k = 0; k < entryCount; k++) {
+      const j = splashAdjNode[k];
+      neighbors[k] = j;
+      const off = chunks[j]?.baseLocalOffset;
+      if (off) {
+        positions[k * 3] = off.x;
+        positions[k * 3 + 1] = off.y;
+        positions[k * 3 + 2] = off.z;
+      }
+    }
+    wasmSplashActive = api.setSplashAdjacency(starts, neighbors, splashAdjWeight, positions) >= 0;
+  }
+  shipSplashAdjacencyToWasm();
 
   // ── Snapshot pool for reuse across frames ──
   let snapshotPool: BodySnapshot[] = [];
@@ -1815,11 +1858,18 @@ export async function buildDestructibleCore({
     stopTiming(gridT0, 'contactInjectGridMs');
 
     // Pass 2 — splash: for each stashed hit, apply the attenuated force to its
-    // precomputed same-body neighbours within the splash radius. Walks the static
-    // adjacency (no grid query, no Map lookups, no per-neighbour sqrt — the falloff
-    // weight is precomputed) and filters by current active/same-body state.
+    // precomputed same-body neighbours within the splash radius. On the WASM path the
+    // whole expansion happens solver-side from the stash arrays in ONE FFI crossing
+    // (same order + rounding as the JS loop below — byte-identical accumulation);
+    // otherwise walk the static adjacency in JS (no grid query, no Map lookups, no
+    // per-neighbour sqrt — the falloff weight is precomputed) and filter by current
+    // active/same-body state.
     const splashT0 = startTiming();
-    for (let si = 0; si < stashCount; si++) {
+    if (wasmSplashActive && stashCount > 0) {
+      (solver as unknown as {
+        addAllSplashHits: (hitNodes: Uint32Array, positions: Float32Array, forces: Float32Array, count: number) => number;
+      }).addAllSplashHits(stashNode, stashPos, stashForce, stashCount);
+    } else for (let si = 0; si < stashCount; si++) {
       const hitNode = stashNode[si];
       const bodyHandle = stashBody[si];
       const sb = si * 3;
@@ -3211,6 +3261,13 @@ export async function buildDestructibleCore({
     chunk.active = false;
     if (chunk.health != null) chunk.health = 0;
 
+    // Keep the solver-side splash filter in lockstep with `chunk.active`: a destroyed
+    // node can briefly share its actor with live neighbours (until the isolating split
+    // is applied), so the actor-equality check alone would still splash onto it.
+    if (wasmSplashActive) {
+      (solver as unknown as { setSplashNodeInactive?: (n: number) => void }).setSplashNodeInactive?.(nodeIndex);
+    }
+
     // Cut bonds from the WASM solver so it stops computing stress on destroyed nodes
     try { cutNodeBonds(nodeIndex); } catch {}
 
@@ -3476,6 +3533,11 @@ export async function buildDestructibleCore({
     }
     return { radius: SPLASH_RADIUS, perNode };
   };
+
+  // Test/debug accessor: which splash-expansion path this core is using.
+  (core as DestructibleCore & {
+    __splashPipeline?: () => { wasmActive: boolean };
+  }).__splashPipeline = () => ({ wasmActive: wasmSplashActive });
 
   return core;
 }

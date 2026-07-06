@@ -672,6 +672,9 @@ class ExtStressSolver implements ExtStressSolverType {
   /** Cached presence of the batched-force WASM export; resolved lazily on first
    *  use. `undefined` = not yet probed. */
   _batchedForcesSupported?: boolean;
+  /** Cached presence of the solver-side splash-expansion exports; resolved lazily
+   *  on first use. `undefined` = not yet probed. */
+  _wasmSplashSupported?: boolean;
 
   constructor(module: any, memory: ModuleMemory, sizes: RuntimeSizes, description: ExtStressSolverDescription) {
     if (!description) throw new Error('ExtStressSolver description is required');
@@ -856,6 +859,110 @@ class ExtStressSolver implements ExtStressSolverType {
     this._forceBatchPosPtr = this.memory.alloc(cap * 3 * 4); // xyz f32 per slot
     this._forceBatchVecPtr = this.memory.alloc(cap * 3 * 4);
     this._forceBatchCapacity = cap;
+  }
+
+  /** Whether the runtime carries the solver-side splash-expansion exports
+   *  ({@link setSplashAdjacency} / {@link addAllSplashHits}). Older runtimes
+   *  return false so callers keep the JS expansion loop. */
+  supportsWasmSplash(): boolean {
+    if (this._wasmSplashSupported === undefined) {
+      this._wasmSplashSupported =
+        typeof this.module['_ext_stress_solver_set_splash_adjacency'] === 'function' &&
+        typeof this.module['_ext_stress_solver_add_splash_hits'] === 'function' &&
+        typeof this.module['_ext_stress_solver_set_splash_node_inactive'] === 'function';
+    }
+    return this._wasmSplashSupported;
+  }
+
+  /** Ship the static splash adjacency (CSR) to the solver once, enabling
+   *  {@link addAllSplashHits}. `starts` has nodeCount+1 entries; `neighbors`,
+   *  `weights` (f64 — the solver multiplies in double to match the JS rounding)
+   *  and `neighborPositions` (xyz f32 per entry: the authored node offsets) run
+   *  in parallel. Returns the entry count accepted, or -1 if unsupported. */
+  setSplashAdjacency(
+    starts: Uint32Array,
+    neighbors: Uint32Array,
+    weights: Float64Array,
+    neighborPositions: Float32Array,
+  ): number {
+    if (!this.handle) return 0;
+    if (!this.supportsWasmSplash()) return -1;
+    const nodeCount = starts.length - 1;
+    const entryCount = neighbors.length;
+    if (nodeCount <= 0) return 0;
+
+    // One-shot upload: transient heap buffers, freed immediately after the call.
+    const startsPtr = this.memory.alloc(starts.length * 4);
+    const neighborsPtr = this.memory.alloc(Math.max(4, entryCount * 4));
+    const weightsPtr = this.memory.alloc(Math.max(8, entryCount * 8));
+    const positionsPtr = this.memory.alloc(Math.max(4, entryCount * 3 * 4));
+    try {
+      (this.module.HEAPU32 as Uint32Array).set(starts, startsPtr >>> 2);
+      if (entryCount > 0) {
+        (this.module.HEAPU32 as Uint32Array).set(neighbors, neighborsPtr >>> 2);
+        (this.module.HEAPF64 as Float64Array).set(weights.subarray(0, entryCount), weightsPtr >>> 3);
+        (this.module.HEAPF32 as Float32Array).set(
+          neighborPositions.subarray(0, entryCount * 3),
+          positionsPtr >>> 2,
+        );
+      }
+      return this.module.ccall(
+        'ext_stress_solver_set_splash_adjacency',
+        'number',
+        ['number', 'number', 'number', 'number', 'number', 'number', 'number'],
+        [this.handle, startsPtr, neighborsPtr, weightsPtr, positionsPtr, nodeCount >>> 0, entryCount >>> 0],
+      ) >>> 0;
+    } finally {
+      this.memory.free(startsPtr);
+      this.memory.free(neighborsPtr);
+      this.memory.free(weightsPtr);
+      this.memory.free(positionsPtr);
+    }
+  }
+
+  /** Exclude a node from solver-side splash expansion (mirrors the JS
+   *  `chunk.active === false` filter for destroyed nodes). */
+  setSplashNodeInactive(nodeIndex: number): void {
+    if (!this.handle || !this.supportsWasmSplash()) return;
+    this.module.ccall(
+      'ext_stress_solver_set_splash_node_inactive',
+      null,
+      ['number', 'number'],
+      [this.handle, nodeIndex >>> 0],
+    );
+  }
+
+  /** Submit a frame's resolved contact HITS in one FFI crossing; the solver
+   *  expands each hit into its same-actor splash neighbours internally (same
+   *  order and rounding as the JS loop — byte-identical accumulation). Requires
+   *  {@link setSplashAdjacency} first. Returns forces applied (hits + splash),
+   *  or -1 when the runtime predates the export. */
+  addAllSplashHits(
+    hitNodes: Uint32Array,
+    positions: Float32Array,
+    forces: Float32Array,
+    count: number,
+    mode: ExtForceModeValue = ExtForceMode.Force,
+  ): number {
+    if (!this.handle) return 0;
+    if (!this.supportsWasmSplash()) return -1;
+    const n = Math.min(count >>> 0, hitNodes.length, Math.floor(positions.length / 3), Math.floor(forces.length / 3));
+    if (n <= 0) return 0;
+
+    this._ensureForceBatchCapacity(n);
+    // Reuse the force-batch scratch: identical layout (u32 + two xyz f32 triples per
+    // slot), and the two batched entry points are never in flight simultaneously.
+    (this.module.HEAPU32 as Uint32Array).set(hitNodes.subarray(0, n), this._forceBatchIdxPtr >>> 2);
+    const heapF32 = this.module.HEAPF32 as Float32Array;
+    heapF32.set(positions.subarray(0, n * 3), this._forceBatchPosPtr >>> 2);
+    heapF32.set(forces.subarray(0, n * 3), this._forceBatchVecPtr >>> 2);
+
+    return this.module.ccall(
+      'ext_stress_solver_add_splash_hits',
+      'number',
+      ['number', 'number', 'number', 'number', 'number', 'number'],
+      [this.handle, this._forceBatchIdxPtr, this._forceBatchPosPtr, this._forceBatchVecPtr, n >>> 0, mode >>> 0],
+    ) >>> 0;
   }
 
   /** Apply many external forces in a single FFI crossing, mirroring
