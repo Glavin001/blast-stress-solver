@@ -389,6 +389,10 @@ export type DestructibleCore = {
   hasBodyCollidedWithGround?: (bodyHandle: number) => boolean;
   // Debris cleanup API - automatically remove small bodies after TTL
   setDebrisCleanup?: (opts: DebrisCleanupOptions) => void;
+  /** Settled-debris freeze lifecycle (opt-in): live-tune or disable; disabling thaws
+   *  every frozen body back to dynamic. */
+  setDebrisSettle?: (opts: { mode?: 'off' | 'freeze'; settleDelayMs?: number; maxCollidersForSettle?: number; unfreezeImpulse?: number; unfreezeNeighborRadius?: number }) => void;
+  getDebrisSettleStats?: () => { mode: 'off' | 'freeze'; frozenCount: number; sleepTracked: number };
   getDebrisCleanupSettings?: () => DebrisCleanupOptions & { mode: OptimizationMode };
   setMaxCollidersForDebris?: (n: number) => void;
   /** Stage-1 island settled-state measurement: connected components of the live
