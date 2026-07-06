@@ -174,6 +174,15 @@ reassociation may differ.
    buffers already follow this pattern). Same for the per-chunk
    `worldPosition`/`worldQuaternion` fresh objects (`destructible-core.ts:2880`)
    — mutate in place. **Bit-exact**; guard: existing integration suite.
+   **Status: implemented — and re-scoped by measurement.** `--trace-gc` over
+   bench:large shows ~2.1 GB of heap churn per 360-frame run on BOTH sides:
+   the dominant allocator is **Rapier's JS binding temporaries** (every
+   `translation()`/`rotation()`/`linvel()` read returns a fresh object —
+   tens of thousands per frame across snapshot capture, contact drain, and
+   transform readout), not our buffers. Mark-Compact counts dropped (11 → 6)
+   but pause time is noise-level. The real Tier-2 GC lever is therefore
+   **batched/raw body reads** (e.g. reading body poses straight from Rapier's
+   WASM heap once per frame into a flat buffer) — tracked as follow-up.
 4. **Scoped resim, island-exact (second attempt).** PR #41 froze non-affected
    bodies and diverged 12.8 m on cascades because contact-*loss* coupling was
    missed. The exact formulation: freeze only entire **Rapier islands** that

@@ -105,9 +105,11 @@ describe.skipIf(!runtimeAvailable)('Idle scene chunk-transform skip', () => {
     core.step(dt);
     const ref2 = chunk.worldPosition;
 
-    // The body is falling, so its pose changes every frame → transform is recomputed (new object,
-    // lower y). The skip must NOT engage for a body that actually moved.
-    expect(ref2).not.toBe(ref1);
+    // The body is falling, so its pose changes every frame → the transform is recomputed
+    // (lower y). The skip must NOT engage for a body that actually moved. The pose object
+    // itself is now MUTATED IN PLACE (identity is stable by design — the per-moving-chunk
+    // object allocations were removed), so the recompute is observed through the value.
+    expect(ref2).toBe(ref1);
     expect(ref2.y).toBeLessThan(y1);
 
     core.dispose?.();

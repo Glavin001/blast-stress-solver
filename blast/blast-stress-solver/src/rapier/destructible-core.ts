@@ -980,7 +980,10 @@ export async function buildDestructibleCore({
   // chunk's body assignment can change without the body's pose bits changing.
   type BodyXformPose = { px: number; py: number; pz: number; qx: number; qy: number; qz: number; qw: number };
   const lastBodyXformPose = new Map<number, BodyXformPose>();
-  const frameBodyXformPose = new Map<number, (BodyXformPose & { skip: boolean }) | null>();
+  // Per-frame entries are pooled and generation-stamped (`gen`) rather than cleared and
+  // re-allocated each frame; `missing` replaces the old `null` sentinel for vanished bodies.
+  const frameBodyXformPose = new Map<number, BodyXformPose & { skip: boolean; missing: boolean; gen: number }>();
+  let frameXformGen = 0;
 
   function pushSolverForce(nodeIndex: number, px: number, py: number, pz: number, fx: number, fy: number, fz: number): void {
     const i = solverForceCount;
@@ -1129,13 +1132,33 @@ export async function buildDestructibleCore({
   }
 
   // --- Solver force injection (contact forces → stress solver) ---
-  const bufferedExternalContacts: Array<{
-    nodeIndex: number;
-    otherBodyHandle: number;
-    totalForceMagnitude: number;
-    maxForceMagnitude: number;
-    totalForceWorld?: Vec3;
-  }> = [];
+  // SoA buffers instead of one object per contact per frame: a debris-pile impact
+  // storm produces thousands of contact events, and the per-event `{...}` pushes
+  // were pure GC pressure landing on exactly the worst frames. Only the fields the
+  // resolve pass actually reads are kept (node index + world force); the old
+  // object's `otherBodyHandle` / force magnitudes were write-only. Forces stay f64
+  // — the resolve math runs in doubles, exactly as it did on the object fields.
+  let extContactCapacity = 256;
+  let extContactCount = 0;
+  let extContactNode = new Uint32Array(extContactCapacity);
+  let extContactForce = new Float64Array(extContactCapacity * 3);
+  let extContactHasForce = new Uint8Array(extContactCapacity);
+  function pushExternalContact(nodeIndex: number, fx: number, fy: number, fz: number, hasForce: boolean) {
+    if (extContactCount === extContactCapacity) {
+      const cap = extContactCapacity * 2;
+      const n = new Uint32Array(cap); n.set(extContactNode); extContactNode = n;
+      const f = new Float64Array(cap * 3); f.set(extContactForce); extContactForce = f;
+      const h = new Uint8Array(cap); h.set(extContactHasForce); extContactHasForce = h;
+      extContactCapacity = cap;
+    }
+    const i = extContactCount++;
+    extContactNode[i] = nodeIndex;
+    const b = i * 3;
+    extContactForce[b] = fx;
+    extContactForce[b + 1] = fy;
+    extContactForce[b + 2] = fz;
+    extContactHasForce[i] = hasForce ? 1 : 0;
+  }
   // Internal (same-body, node↔node) contacts were previously materialised into a
   // full object array that nothing consumed except the profiler counter below.
   // We keep only the count (used by the `bufferedInternalContacts` profiler
@@ -1155,7 +1178,7 @@ export async function buildDestructibleCore({
 
   function drainContactForces() {
     const t0 = startTiming();
-    bufferedExternalContacts.length = 0;
+    extContactCount = 0;
     bufferedInternalContactCount = 0;
     contactReplayBuffer.clear();
 
@@ -1277,13 +1300,7 @@ export async function buildDestructibleCore({
           }
         } else {
           if (chunk1) {
-            bufferedExternalContacts.push({
-              nodeIndex: node1,
-              otherBodyHandle: chunk2?.bodyHandle ?? -1,
-              totalForceMagnitude: totalForce,
-              maxForceMagnitude: maxForce,
-              totalForceWorld: forceVec,
-            });
+            pushExternalContact(node1, forceVec?.x ?? 0, forceVec?.y ?? 0, forceVec?.z ?? 0, !!forceVec);
             if (damageOn) {
               contactReplayBuffer.recordExternal({
                 nodeIndex: node1, effMag, dt,
@@ -1292,13 +1309,7 @@ export async function buildDestructibleCore({
             }
           }
           if (chunk2) {
-            bufferedExternalContacts.push({
-              nodeIndex: node2,
-              otherBodyHandle: chunk1?.bodyHandle ?? -1,
-              totalForceMagnitude: totalForce,
-              maxForceMagnitude: maxForce,
-              totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
-            });
+            pushExternalContact(node2, -(forceVec?.x ?? 0), -(forceVec?.y ?? 0), -(forceVec?.z ?? 0), !!forceVec);
             if (damageOn) {
               contactReplayBuffer.recordExternal({
                 nodeIndex: node2, effMag, dt,
@@ -1310,13 +1321,7 @@ export async function buildDestructibleCore({
       } else if (node1 != null) {
         const chunk = chunks[node1];
         if (chunk) {
-          bufferedExternalContacts.push({
-            nodeIndex: node1,
-            otherBodyHandle: -1,
-            totalForceMagnitude: totalForce,
-            maxForceMagnitude: maxForce,
-            totalForceWorld: forceVec,
-          });
+          pushExternalContact(node1, forceVec?.x ?? 0, forceVec?.y ?? 0, forceVec?.z ?? 0, !!forceVec);
           if (damageOn) {
             contactReplayBuffer.recordExternal({
               nodeIndex: node1, effMag, dt,
@@ -1331,13 +1336,7 @@ export async function buildDestructibleCore({
       } else if (node2 != null) {
         const chunk = chunks[node2];
         if (chunk) {
-          bufferedExternalContacts.push({
-            nodeIndex: node2,
-            otherBodyHandle: -1,
-            totalForceMagnitude: totalForce,
-            maxForceMagnitude: maxForce,
-            totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
-          });
+          pushExternalContact(node2, -(forceVec?.x ?? 0), -(forceVec?.y ?? 0), -(forceVec?.z ?? 0), !!forceVec);
           if (damageOn) {
             contactReplayBuffer.recordExternal({
               nodeIndex: node2, effMag, dt,
@@ -1643,7 +1642,7 @@ export async function buildDestructibleCore({
     // the predicate's inputs, so hoisting it here is value-identical. The predicate re-arms
     // automatically the moment activity resumes (a new contact, a non-converged residual, or
     // an active fracture countdown — all already accounted for here).
-    const hasExternalForces = bufferedExternalContacts.length > 0 || pendingExternalForces.length > 0;
+    const hasExternalForces = extContactCount > 0 || pendingExternalForces.length > 0;
     const solverConverged = typeof solver.converged === 'function' ? solver.converged() : false;
     const shouldSkipSolver = fracturePolicySettings.idleSkip && !hasExternalForces && solverFractureCountdown <= 0 && solverConverged && passIndex === 0 && safeFrames > 2;
 
@@ -1773,10 +1772,9 @@ export async function buildDestructibleCore({
     // rotation, buffer the full-strength hit force, and stash the hit for splash.
     const resolveT0 = startTiming();
     contactRotCache.clear();
-    for (const contact of bufferedExternalContacts) {
-      const fw = contact.totalForceWorld;
-      if (!fw) continue;
-      const hitChunk = chunks[contact.nodeIndex];
+    for (let ci = 0; ci < extContactCount; ci++) {
+      if (extContactHasForce[ci] === 0) continue;
+      const hitChunk = chunks[extContactNode[ci]];
       if (!hitChunk || !hitChunk.active || hitChunk.bodyHandle == null) continue;
       const bodyHandle = hitChunk.bodyHandle;
       // Fetch each body's rotation once per frame; reuse it for every other contact
@@ -1791,7 +1789,8 @@ export async function buildDestructibleCore({
       if (!rot) continue;
       // Rotate force from world space to body-local space
       const qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
-      const fx = fw.x, fy = fw.y, fz = fw.z;
+      const cb = ci * 3;
+      const fx = extContactForce[cb], fy = extContactForce[cb + 1], fz = extContactForce[cb + 2];
       // Inverse quaternion rotation (conjugate)
       const lx = qw * qw * fx - 2 * qy * qw * fz + 2 * qz * qw * fy + qx * qx * fx - 2 * qy * qx * fy - 2 * qz * qx * fz - qz * qz * fx - qy * qy * fx
         + 2 * qx * qy * fy + 2 * qx * qz * fz;
@@ -1805,7 +1804,7 @@ export async function buildDestructibleCore({
       // original interleaved loop — float addition isn't associative, so this
       // change is purely about *where the time is attributed*, not the result.
       const hitPos = hitChunk.baseLocalOffset;
-      pushContactStash(contact.nodeIndex, hitChunk.bodyHandle, hitPos.x, hitPos.y, hitPos.z, sfx, sfy, sfz);
+      pushContactStash(extContactNode[ci], hitChunk.bodyHandle, hitPos.x, hitPos.y, hitPos.z, sfx, sfy, sfz);
     }
     stopTiming(resolveT0, 'contactInjectResolveMs');
 
@@ -2151,9 +2150,10 @@ export async function buildDestructibleCore({
       nodesByBodyHandle.delete(bh);
       debrisCreationTimes.delete(bh);
       bodyRestoreProvenance.delete(bh);
-      // Drop the cached pose so a future body that reuses this handle can't match a stale
+      // Drop the cached poses so a future body that reuses this handle can't match a stale
       // pose and be wrongly skipped by the chunk-transform readout cache.
       lastBodyXformPose.delete(bh);
+      frameBodyXformPose.delete(bh);
     }
     bodiesToRemove.clear();
     stopTiming(t0, 'cleanupDisabledMs');
@@ -2901,7 +2901,7 @@ export async function buildDestructibleCore({
     drainContactForces();
 
     if (activeProfilerSample) {
-      activeProfilerSample.bufferedExternalContacts = bufferedExternalContacts.length;
+      activeProfilerSample.bufferedExternalContacts = extContactCount;
       activeProfilerSample.bufferedInternalContacts = bufferedInternalContactCount;
     }
 
@@ -2961,24 +2961,35 @@ export async function buildDestructibleCore({
     // chunk to a new body or change its localOffset while the (old or new) body's pose bits
     // are unchanged, so those frames must recompute every chunk unconditionally.
     const allowXformSkip = !hadFracture && !needsResim;
-    frameBodyXformPose.clear();
+    // Per-frame body entries are generation-stamped instead of cleared: clearing the Map
+    // and allocating one `{px..skip}` object per awake body per frame was steady GC
+    // churn. An entry whose `gen` matches this frame has already been fetched/decided.
+    frameXformGen++;
+    const xformGen = frameXformGen;
     for (let ci = 0; ci < chunks.length; ci++) {
       const chunk = chunks[ci];
       if (!chunk.active || chunk.bodyHandle == null) continue;
       const bh = chunk.bodyHandle;
       // Fetch each body's pose once per frame; decide skip vs recompute for the whole body.
       let entry = frameBodyXformPose.get(bh);
-      if (entry === undefined) {
+      if (entry === undefined || entry.gen !== xformGen) {
+        if (entry === undefined) {
+          entry = { px: 0, py: 0, pz: 0, qx: 0, qy: 0, qz: 0, qw: 1, skip: false, missing: false, gen: xformGen };
+          frameBodyXformPose.set(bh, entry);
+        }
+        entry.gen = xformGen;
         const body = world.getRigidBody(bh);
-        if (!body) { frameBodyXformPose.set(bh, null); continue; }
+        if (!body) { entry.missing = true; continue; }
+        entry.missing = false;
         const pos = body.translation();
         const rot = body.rotation();
         const last = lastBodyXformPose.get(bh);
         const unchanged = allowXformSkip && last != null
           && last.px === pos.x && last.py === pos.y && last.pz === pos.z
           && last.qx === rot.x && last.qy === rot.y && last.qz === rot.z && last.qw === rot.w;
-        entry = { px: pos.x, py: pos.y, pz: pos.z, qx: rot.x, qy: rot.y, qz: rot.z, qw: rot.w, skip: unchanged };
-        frameBodyXformPose.set(bh, entry);
+        entry.px = pos.x; entry.py = pos.y; entry.pz = pos.z;
+        entry.qx = rot.x; entry.qy = rot.y; entry.qz = rot.z; entry.qw = rot.w;
+        entry.skip = unchanged;
         if (!unchanged) {
           if (last) {
             last.px = pos.x; last.py = pos.y; last.pz = pos.z;
@@ -2988,7 +2999,7 @@ export async function buildDestructibleCore({
           }
         }
       }
-      if (entry === null || entry.skip) continue; // body unchanged → chunk transform already current
+      if (entry.missing || entry.skip) continue; // body unchanged/missing → chunk transform already current
       const lx = chunk.localOffset.x, ly = chunk.localOffset.y, lz = chunk.localOffset.z;
       const px = entry.px, py = entry.py, pz = entry.pz;
       const qx = entry.qx, qy = entry.qy, qz = entry.qz, qw = entry.qw;
@@ -2996,12 +3007,17 @@ export async function buildDestructibleCore({
       const ry = qw * ly + qz * lx - qx * lz;
       const rz = qw * lz + qx * ly - qy * lx;
       const rw = -(qx * lx + qy * ly + qz * lz);
-      chunk.worldPosition = {
-        x: px + rw * (-qx) + rx * qw + ry * (-qz) - rz * (-qy),
-        y: py + rw * (-qy) + ry * qw + rz * (-qx) - rx * (-qz),
-        z: pz + rw * (-qz) + rz * qw + rx * (-qy) - ry * (-qx),
-      };
-      chunk.worldQuaternion = { x: qx, y: qy, z: qz, w: qw };
+      // Mutate the existing pose objects (created once per chunk): replacing them
+      // allocated two fresh objects per MOVING chunk per frame — thousands of
+      // allocations during collapses. Consumers read components, never identity.
+      let wp = chunk.worldPosition;
+      if (!wp) { wp = { x: 0, y: 0, z: 0 }; chunk.worldPosition = wp; }
+      wp.x = px + rw * (-qx) + rx * qw + ry * (-qz) - rz * (-qy);
+      wp.y = py + rw * (-qy) + ry * qw + rz * (-qx) - rx * (-qz);
+      wp.z = pz + rw * (-qz) + rz * qw + rx * (-qy) - ry * (-qx);
+      let wq = chunk.worldQuaternion;
+      if (!wq) { wq = { x: 0, y: 0, z: 0, w: 1 }; chunk.worldQuaternion = wq; }
+      wq.x = qx; wq.y = qy; wq.z = qz; wq.w = qw;
     }
 
     if (activeProfilerSample) {
