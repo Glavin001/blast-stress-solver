@@ -31,6 +31,7 @@ import { pipelineCoreOverrides, mountPipelineControls } from './pipeline-control
 import { mountPhysicsControls, physicsCoreOverrides } from './physics-controls.js';
 import { RECOMMENDED_SLEEP } from './demo-optimization-preset.js';
 import { mountShooter } from './shooter-fps.js';
+import { createWorkerCore, workerPhysicsSupported } from './worker-physics.js';
 import { buildFracturedTowerScenario } from 'blast-stress-solver/scenarios';
 
 type Vec3 = { x: number; y: number; z: number };
@@ -91,6 +92,17 @@ const CONFIG = {
     // rate; a 120 Hz monitor renders 120 smooth frames while physics steps 60×/s.
     fixedStep: true,
     fixedStepHz: 60,
+    // Skip the directional-light shadow re-render on frames where nothing moved (no batched
+    // instance writes, no projectiles, no proxy flips). Visually identical: shadows refresh
+    // the moment anything moves. Live toggle.
+    shadowGating: true,
+    // EXPERIMENTAL: run the whole physics stack (Rapier + stress WASM) in a Web Worker,
+    // mirroring poses through a SharedArrayBuffer. Requires cross-origin isolation
+    // (COOP/COEP — both demo servers send the headers). Render thread stops paying for
+    // physics entirely. Debug wireframes / profiler / recorder / FPS mode are main-thread
+    // tools and are disabled while this is on; the worker steps at a fixed 60 Hz
+    // internally, so the main-thread fixed-step driver + interpolation are bypassed.
+    workerPhysics: false,
   },
   features: { debug: false, lodTree: false },
 };
@@ -102,6 +114,11 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// Shadow gating (CONFIG.optimization.shadowGating): we drive shadow-map refreshes
+// manually from the render loop — autoUpdate would re-render the depth pass every frame
+// even on a fully settled city.
+renderer.shadowMap.autoUpdate = false;
+renderer.shadowMap.needsUpdate = true;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0a0d13);
@@ -158,6 +175,7 @@ stats.dom.style.left = '0';
 // ── Stats / perf ──────────────────────────────────────────────
 let _physicsMs = 0;
 let _renderMs = 0;
+let _lastProxiedCount = -1;
 const EMA = 0.12;
 let initialBonds = 0;
 
@@ -429,6 +447,7 @@ let visualsRef: ReturnType<typeof createDestructibleThreeBundle> | null = null;
 let stepLoopRef: ReturnType<typeof createFixedStepLoop> | null = null;
 let poseInterpRef: ReturnType<typeof createPoseInterpolator> | null = null;
 let shooter: ReturnType<typeof mountShooter> | null = null;
+let workerModeActive = false;
 let cityGroup: THREE.Group | null = null;
 let rapierDebug: RapierDebugRenderer | null = null;
 let rebuilding = false;
@@ -487,8 +506,7 @@ async function initScene() {
     `Mini-city: ${buildings.length} buildings, ${scenario.nodes.length} nodes, ${scenario.bonds.length} bonds`,
   );
 
-  const core = await buildDestructibleCore({
-    scenario,
+  const coreOptions = {
     gravity: CONFIG.solver.gravity,
     materialScale: CONFIG.solver.materialScale,
     contactForceScale: CONFIG.physics.contactForceScale,
@@ -500,7 +518,14 @@ async function initScene() {
     islandSolver: CONFIG.optimization.islandSolver,
     lazyIntactColliders: CONFIG.optimization.lazyIntactColliders,
     ...pipelineCoreOverrides(),
-  });
+  };
+  workerModeActive = CONFIG.optimization.workerPhysics && workerPhysicsSupported();
+  if (CONFIG.optimization.workerPhysics && !workerModeActive) {
+    console.warn('[mini-city] worker physics requested but SharedArrayBuffer/cross-origin isolation is unavailable; using main-thread physics');
+  }
+  const core = workerModeActive
+    ? ((await createWorkerCore(scenario as any, coreOptions)) as any)
+    : await buildDestructibleCore({ scenario, ...coreOptions });
 
   const group = new THREE.Group();
   scene.add(group);
@@ -519,9 +544,9 @@ async function initScene() {
   });
 
   rapierDebug?.dispose();
-  rapierDebug = new RapierDebugRenderer(scene, core.world as any, {
-    enabled: CONFIG.features.debug,
-  });
+  rapierDebug = workerModeActive
+    ? null // the Rapier world lives in the worker; the debug renderer needs local access
+    : new RapierDebugRenderer(scene, core.world as any, { enabled: CONFIG.features.debug });
 
   lodViz?.dispose();
   lodViz = new LodTreeViz(scene);
@@ -531,19 +556,29 @@ async function initScene() {
   coreRef = core;
   core.setIslandSolver?.({ enabled: CONFIG.optimization.islandSolver }); // persist the toggle across rebuilds
   core.setLazyIntactColliders?.(CONFIG.optimization.lazyIntactColliders);
-  recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
-  profiler.attach(core);
+  if (!workerModeActive) {
+    // Profiler + recorder attach to a local core (per-phase timers, body trajectories);
+    // in worker mode the HUD stats arrive from the worker instead.
+    recorder.attach(core, { scenario, meta: { demo: 'mini-city', config: CONFIG } });
+    profiler.attach(core);
+  }
   visualsRef = visuals;
   // Fixed-timestep driver + interpolator are bound to THIS core (the step closure and the
-  // chunk buffers); rebuild them with it.
-  poseInterpRef = createPoseInterpolator(core);
-  stepLoopRef = createFixedStepLoop({
-    hz: CONFIG.optimization.fixedStepHz,
-    maxStepsPerTick: 3,
-    step: (fixedDt) => core.step(fixedDt),
-    onBeforeStep: () => poseInterpRef?.beforeStep(),
-    onAfterStep: () => poseInterpRef?.afterStep(),
-  });
+  // chunk buffers); rebuild them with it. Worker mode steps inside the worker, so the
+  // main-thread driver is skipped entirely there.
+  if (workerModeActive) {
+    poseInterpRef = null;
+    stepLoopRef = null;
+  } else {
+    poseInterpRef = createPoseInterpolator(core);
+    stepLoopRef = createFixedStepLoop({
+      hz: CONFIG.optimization.fixedStepHz,
+      maxStepsPerTick: 3,
+      step: (fixedDt) => core.step(fixedDt),
+      onBeforeStep: () => poseInterpRef?.beforeStep(),
+      onAfterStep: () => poseInterpRef?.afterStep(),
+    });
+  }
   cityGroup = group;
   initialBonds = core.getActiveBondsCount();
 
@@ -789,6 +824,12 @@ bindToggle('cfg-fixed-step', CONFIG.optimization, 'fixedStep', (v) => {
   stepLoopRef?.reset();
   if (v) poseInterpRef?.reset();
 });
+bindToggle('cfg-shadow-gating', CONFIG.optimization, 'shadowGating', (v) => {
+  // Gating off → classic per-frame shadow updates; on → loop-driven refreshes.
+  renderer.shadowMap.autoUpdate = !v;
+  renderer.shadowMap.needsUpdate = true;
+});
+bindToggle('cfg-worker-physics', CONFIG.optimization, 'workerPhysics', () => void rebuild());
 bindToggle('cfg-intact-proxies', CONFIG.optimization, 'intactProxies', (v) =>
   visualsRef?.intactProxies?.setEnabled(v),
 );
@@ -833,7 +874,12 @@ function loop() {
 
     const t0 = performance.now();
     let interpolation: ReturnType<NonNullable<typeof poseInterpRef>['view']> | undefined;
-    if (CONFIG.optimization.fixedStep && stepLoopRef && poseInterpRef) {
+    if (workerModeActive) {
+      // Worker mode: the worker runs its own fixed 60 Hz accumulator; step() just pumps
+      // wall-clock time and mirrors the freshest published poses (no main-thread
+      // interpolation in v1 — the SAB carries a single pose buffer).
+      coreRef.step(dt);
+    } else if (CONFIG.optimization.fixedStep && stepLoopRef && poseInterpRef) {
       // Fixed 60 Hz physics; the render blends between the last two physics states.
       const res = stepLoopRef.tick(dt);
       interpolation = poseInterpRef.view(res.alpha);
@@ -841,11 +887,26 @@ function loop() {
       coreRef.step(dt); // legacy: one variable-dt step per display frame
     }
     _physicsMs += (performance.now() - t0 - _physicsMs) * EMA;
-    visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true, camera, interpolation });
+    const renderSync = visualsRef.update({ debug: CONFIG.features.debug, updateBVH: false, updateProjectiles: true, camera, interpolation });
     rapierDebug?.update();
     lodViz?.update(coreRef);
     updateStatus(coreRef);
     recorder.render();
+
+    // Shadow gating: re-render the (expensive) shadow depth pass only when something on
+    // screen can have moved — any batched instance write, a live projectile, a proxy flip,
+    // or FPS mode (whose meshes the batch doesn't track). Identical shadows otherwise:
+    // a frame with zero writes is pixel-for-pixel the previous frame's casters.
+    if (CONFIG.optimization.shadowGating) {
+      const proxied = visualsRef.intactProxies?.proxiedCount() ?? 0;
+      const anyMotion =
+        (renderSync?.batchedWrites ?? 1) > 0 ||
+        coreRef.projectiles.length > 0 ||
+        proxied !== _lastProxiedCount ||
+        document.pointerLockElement != null;
+      _lastProxiedCount = proxied;
+      if (anyMotion) renderer.shadowMap.needsUpdate = true;
+    }
   }
 
   shooter?.update();
@@ -870,7 +931,8 @@ shooter = mountShooter({
   camera,
   controls,
   scene,
-  getCore: () => coreRef,
+  // FPS / drive mode spawns bodies in the local world — unavailable in worker mode.
+  getCore: () => (workerModeActive ? null : coreRef),
   getBallParams: () => CONFIG.projectile,
 });
 initScene()

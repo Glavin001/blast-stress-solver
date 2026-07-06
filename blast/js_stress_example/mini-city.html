@@ -179,6 +179,12 @@
           <label class="toggle-row"><input type="checkbox" id="cfg-fixed-step" checked />
             <span class="toggle-text">Fixed 60&nbsp;Hz physics + interpolation &#9733;
               <small>Step physics at a fixed 60&nbsp;Hz regardless of display rate and blend rendering between the last two physics states &mdash; identical simulation on every monitor, and a 120&nbsp;Hz display stops paying double physics.</small></span></label>
+          <label class="toggle-row"><input type="checkbox" id="cfg-shadow-gating" checked />
+            <span class="toggle-text">Shadow update gating &#9733;
+              <small>Re-render the shadow map only on frames where something moved (instance writes, projectiles, proxy flips). A settled city stops paying the full shadow depth pass &mdash; identical shadows whenever anything moves.</small></span></label>
+          <label class="toggle-row"><input type="checkbox" id="cfg-worker-physics" />
+            <span class="toggle-text">Physics in Worker (experimental)
+              <small>Run Rapier + the stress solver in a Web Worker and mirror poses through SharedArrayBuffer &mdash; the render thread stops paying for physics entirely. Needs cross-origin isolation; debug wireframes, profiler, recorder and FPS mode are disabled while on; fixed-step interpolation is bypassed (the worker steps at a fixed 60&nbsp;Hz internally). Rebuilds the city.</small></span></label>
         </section>
 
         <!-- Actions -->

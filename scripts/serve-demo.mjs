@@ -186,7 +186,11 @@ const server = createServer(async (req, res) => {
 
         res.writeHead(200, {
             'Content-Type': contentType,
-            'Content-Length': fileStat.size
+            'Content-Length': fileStat.size,
+            // Cross-origin isolation: enables SharedArrayBuffer for the worker-physics
+            // mode (matches the production headers in vercel.json).
+            'Cross-Origin-Opener-Policy': 'same-origin',
+            'Cross-Origin-Embedder-Policy': 'require-corp'
         })
 
         createReadStream(resolvedPath).pipe(res)

@@ -73,7 +73,7 @@ export type DestructibleThreeBundle = {
      *  chunk instances and projectile meshes blend between the last two physics states.
      *  Batched-mesh mode only. */
     interpolation?: InterpolatedPoseView;
-  }) => void;
+  }) => { batchedWrites: number } | undefined;
   /** Flip between material colors (true) and physics-state colors (false) at runtime. */
   setMaterialColors: (on: boolean) => void;
   dispose: () => void;
@@ -173,17 +173,18 @@ export function createDestructibleThreeBundle(
     update: (updateOptions) => {
       const nc =
         (updateOptions?.materialColors ?? materialColorsEnabled) ? nodeColors : undefined;
+      let batchedWrites: number | undefined;
       if (batchedBuild) {
         // Decide proxy-vs-fragments first so the hidden mask reflects this frame's camera.
         if (intactProxies && updateOptions?.camera) {
           intactProxies.update(updateOptions.camera);
         }
-        updateBatchedChunkMesh(core, batchedBuild.batchedMesh, batchedBuild.chunkToInstanceId, {
+        batchedWrites = updateBatchedChunkMesh(core, batchedBuild.batchedMesh, batchedBuild.chunkToInstanceId, {
           updateBVH: updateOptions?.updateBVH,
           nodeColors: nc,
           instanceHidden: intactProxies?.instanceHidden,
           interpolation: updateOptions?.interpolation,
-        });
+        }).writes;
       } else if (chunkBuild) {
         updateChunkMeshes(core, chunkBuild.objects, { nodeColors: nc });
       }
@@ -200,6 +201,7 @@ export function createDestructibleThreeBundle(
           debugHelper.update(core, [], false);
         }
       }
+      return batchedWrites === undefined ? undefined : { batchedWrites };
     },
     setMaterialColors: (on: boolean) => {
       materialColorsEnabled = on;
