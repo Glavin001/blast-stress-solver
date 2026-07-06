@@ -115,6 +115,16 @@ export type BuildDestructibleCoreOptions = {
    *  (with `skipSettled: true`); pass `false` or `{ enabled: false }` for the legacy
    *  whole-graph solve. */
   islandSolver?: boolean | { enabled?: boolean; skipSettled?: boolean };
+  /** Skip buffering contact forces whose hit node sits on a single-chunk body. The WASM
+   *  solver provably DROPS those forces (its actor force path requires >1 graph node —
+   *  single-node actors carry no bonds to stress), and such a node has no same-body splash
+   *  neighbours either, so the entire buffer→resolve→rotate→splash pipeline for them is
+   *  dead work. In a settled debris pile almost every contact event is debris↔debris on
+   *  single-chunk bodies, so this guts contact-injection cost exactly in the worst regime.
+   *  Damage recording, ground-collision tracking and onImpact callbacks are unaffected
+   *  (they still see every event). Trajectory- and fracture-identical (pinned by
+   *  rapier.contact-filter.test.ts). Default true; set false for the legacy buffering. */
+  skipSolverIrrelevantContacts?: boolean;
   /** Collision-dormant intact buildings. When on, every fragment collider of a still-intact
    *  bond-graph component ("building") starts DISABLED — out of the broadphase entirely — and a
    *  predictive pass enables the leaves of the building's collision-LOD tree just-in-time,
@@ -236,6 +246,7 @@ export async function buildDestructibleCore({
   debrisCleanup,
   fracturePolicy,
   islandSolver,
+  skipSolverIrrelevantContacts = true,
   lazyIntactColliders = false,
 }: BuildDestructibleCoreOptions): Promise<DestructibleCore> {
   await RAPIER.init();
@@ -1153,9 +1164,23 @@ export async function buildDestructibleCore({
     fastSpeedFactor: damageOptions.fastSpeedFactor,
   };
 
+  // A node's contact force can only influence the stress solve when its actor has >1
+  // graph node (the solver's actor force path drops single-node actors — they carry no
+  // bonds) AND it could splash onto same-body neighbours (none exist on a single-chunk
+  // body). Bodies mirror actors 1:1, so "this chunk's body owns >1 chunk" is the exact
+  // JS-visible form of that predicate.
+  function contactCanAffectSolver(bodyHandle: number | null | undefined): boolean {
+    if (!skipSolverIrrelevantContacts) return true;
+    if (bodyHandle == null) return false; // bodiless chunk: the resolve pass would skip it
+    const set = nodesByBodyHandle.get(bodyHandle);
+    return set !== undefined && set.size > 1;
+  }
+  let solverIrrelevantContactsSkipped = 0;
+
   function drainContactForces() {
     const t0 = startTiming();
     bufferedExternalContacts.length = 0;
+    solverIrrelevantContactsSkipped = 0;
     bufferedInternalContactCount = 0;
     contactReplayBuffer.clear();
 
@@ -1277,13 +1302,15 @@ export async function buildDestructibleCore({
           }
         } else {
           if (chunk1) {
-            bufferedExternalContacts.push({
-              nodeIndex: node1,
-              otherBodyHandle: chunk2?.bodyHandle ?? -1,
-              totalForceMagnitude: totalForce,
-              maxForceMagnitude: maxForce,
-              totalForceWorld: forceVec,
-            });
+            if (contactCanAffectSolver(chunk1.bodyHandle)) {
+              bufferedExternalContacts.push({
+                nodeIndex: node1,
+                otherBodyHandle: chunk2?.bodyHandle ?? -1,
+                totalForceMagnitude: totalForce,
+                maxForceMagnitude: maxForce,
+                totalForceWorld: forceVec,
+              });
+            } else solverIrrelevantContactsSkipped += 1;
             if (damageOn) {
               contactReplayBuffer.recordExternal({
                 nodeIndex: node1, effMag, dt,
@@ -1292,13 +1319,15 @@ export async function buildDestructibleCore({
             }
           }
           if (chunk2) {
-            bufferedExternalContacts.push({
-              nodeIndex: node2,
-              otherBodyHandle: chunk1?.bodyHandle ?? -1,
-              totalForceMagnitude: totalForce,
-              maxForceMagnitude: maxForce,
-              totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
-            });
+            if (contactCanAffectSolver(chunk2.bodyHandle)) {
+              bufferedExternalContacts.push({
+                nodeIndex: node2,
+                otherBodyHandle: chunk1?.bodyHandle ?? -1,
+                totalForceMagnitude: totalForce,
+                maxForceMagnitude: maxForce,
+                totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
+              });
+            } else solverIrrelevantContactsSkipped += 1;
             if (damageOn) {
               contactReplayBuffer.recordExternal({
                 nodeIndex: node2, effMag, dt,
@@ -1310,13 +1339,15 @@ export async function buildDestructibleCore({
       } else if (node1 != null) {
         const chunk = chunks[node1];
         if (chunk) {
-          bufferedExternalContacts.push({
-            nodeIndex: node1,
-            otherBodyHandle: -1,
-            totalForceMagnitude: totalForce,
-            maxForceMagnitude: maxForce,
-            totalForceWorld: forceVec,
-          });
+          if (contactCanAffectSolver(chunk.bodyHandle)) {
+            bufferedExternalContacts.push({
+              nodeIndex: node1,
+              otherBodyHandle: -1,
+              totalForceMagnitude: totalForce,
+              maxForceMagnitude: maxForce,
+              totalForceWorld: forceVec,
+            });
+          } else solverIrrelevantContactsSkipped += 1;
           if (damageOn) {
             contactReplayBuffer.recordExternal({
               nodeIndex: node1, effMag, dt,
@@ -1331,13 +1362,15 @@ export async function buildDestructibleCore({
       } else if (node2 != null) {
         const chunk = chunks[node2];
         if (chunk) {
-          bufferedExternalContacts.push({
-            nodeIndex: node2,
-            otherBodyHandle: -1,
-            totalForceMagnitude: totalForce,
-            maxForceMagnitude: maxForce,
-            totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
-          });
+          if (contactCanAffectSolver(chunk.bodyHandle)) {
+            bufferedExternalContacts.push({
+              nodeIndex: node2,
+              otherBodyHandle: -1,
+              totalForceMagnitude: totalForce,
+              maxForceMagnitude: maxForce,
+              totalForceWorld: forceVec ? { x: -forceVec.x, y: -forceVec.y, z: -forceVec.z } : undefined,
+            });
+          } else solverIrrelevantContactsSkipped += 1;
           if (damageOn) {
             contactReplayBuffer.recordExternal({
               nodeIndex: node2, effMag, dt,
@@ -3459,6 +3492,12 @@ export async function buildDestructibleCore({
   }).__clearDebugSplitContinuityLog = () => {
     splitContinuityLog.length = 0;
   };
+
+  // Test/debug accessor: how many contact events the solver-irrelevance filter skipped
+  // on the most recent drain (single-chunk-body hits whose forces the WASM drops anyway).
+  (core as DestructibleCore & {
+    __solverIrrelevantContactsSkipped?: () => number;
+  }).__solverIrrelevantContactsSkipped = () => solverIrrelevantContactsSkipped;
 
   // Test/debug accessor: surfaces the precomputed static splash adjacency (per node,
   // the same-radius neighbours and their quadratic falloff weights) so the precompute
