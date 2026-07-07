@@ -192,6 +192,14 @@ fn main() {
     // exist). The `force-scalar-solver` feature (or `BLAST_FORCE_SCALAR=1`) forces
     // the scalar path everywhere — an escape hatch for reproducibility or odd CPUs.
     println!("cargo:rerun-if-env-changed=BLAST_FORCE_SCALAR");
+
+    // A/B escape hatch: BLAST_NO_BONDSTRESS_SKIP=1 disables the settled-bond stress-recompute skip
+    // in updateBondStress, so a build can be compared bit-for-bit against the optimized default.
+    println!("cargo:rerun-if-env-changed=BLAST_NO_BONDSTRESS_SKIP");
+    if env::var_os("BLAST_NO_BONDSTRESS_SKIP").is_some() {
+        build.define("STRESS_NO_BONDSTRESS_SKIP", None);
+    }
+
     let x86 = matches!(target_arch.as_str(), "x86" | "x86_64");
     let force_scalar = is_wasm
         || !x86

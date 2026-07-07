@@ -195,6 +195,9 @@ public:
     uint32_t getIslandsSkipped() const { return m_stressProcessor.getLastIslandsSkipped(); }
     uint32_t getIslandsTotal() const { return m_stressProcessor.getLastIslandsTotal(); }
 
+    // Whether the given solver bond's island was skipped as settled in the last solve (impulses unchanged).
+    bool bondSettledSkipped(uint32_t bond) const { return m_stressProcessor.wasBondSettledSkipped(bond); }
+
     bool calcError(float& linear, float& angular) const
     {
         linear = sqrtf(m_error_sq.lin);
@@ -633,6 +636,20 @@ private:
     {
         m_overstressedBondCount = 0;
 
+        // Settled-bond stress skip (output-preserving). A bond group whose island the solver skipped as
+        // settled has *unchanged impulses*; its stresses change only if its bond health (area) changed,
+        // which only happens via stress damage, which only happens when a bond was overstressed. So when
+        // (a) some islands were skipped this solve AND (b) nothing was overstressed last frame (→ no damage
+        // applied → health frozen), a skipped group's recomputed stresses are bit-identical to the stored
+        // ones — we keep them. Any overstress, topology change, or velocity change re-arms a full recompute.
+        // A skipped group is never overstressed (it can't newly cross a limit with frozen impulses+health),
+        // so it contributes 0 to the count exactly as before. STRESS_NO_BONDSTRESS_SKIP disables this for A/B.
+#if defined(STRESS_NO_BONDSTRESS_SKIP)
+        const bool canSkipSettled = false;
+#else
+        const bool canSkipSettled = (m_solver.getIslandsSkipped() > 0) && (m_prevOverstressedBondCount == 0);
+#endif
+
         // Reuse a persistent scratch buffer instead of allocating one every solve.
         // NsArray::clear() keeps capacity, so reserve() only allocates on the first call
         // (or when the bond count grows); this loop runs every frame the solver is active.
@@ -641,6 +658,8 @@ private:
         bondIndicesToRemove.reserve(getBondCount());
         for (uint32_t i = 0; i < m_solverBondsData.size(); ++i)
         {
+            // Skipped-settled island: impulses and health unchanged → stored stresses are still exact.
+            if (canSkipSettled && m_solver.bondSettledSkipped(i)) continue;
             // calculate the total area of all bonds involved so pressure can be calculated
             float totalArea = 0.0f;
             // calculate an average normal and centroid for all bonds as well, weighted by their area
@@ -745,6 +764,10 @@ private:
         {
             removeBondIfExists(bondIndex);
         }
+
+        // Remember this frame's overstress for the next frame's settled-skip gate: if anything was
+        // overstressed, stress damage may have changed bond health, so the next frame must recompute.
+        m_prevOverstressedBondCount = m_overstressedBondCount;
     }
 
     void sync(const NvBlastBond* bonds, bool islandAware)
@@ -1077,6 +1100,7 @@ private:
     bool                                m_bondsDirty;
 
     uint32_t                            m_overstressedBondCount;
+    uint32_t                            m_prevOverstressedBondCount = 0;  // previous frame's count; gates the settled-bond stress skip
 
     // Island partitioning (connected components of the solver graph)
     Array<uint32_t>::type               m_islandParent;
