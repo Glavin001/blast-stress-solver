@@ -198,3 +198,105 @@ After running `npm start` at the root:
 - **Push** trigger: only runs on `feat/rapier-destruction` branch (production)
 - **Pull request** trigger: runs on all PRs
 - This prevents double CI runs when PRs are opened from feature branches
+
+## Destructible-scene tuning — hard rules (stability must be REAL, not faked)
+
+These are non-negotiable when building destructible scenes (e.g. the brick-castle
+demo) on the Blast stress solver. Stability must come from the scene being
+physically sound, NOT from masking instability.
+
+- **NEVER use an `onImpact` handler to drive breaking.** (The `onImpact` path is
+  being removed.) Destruction must emerge from the simulation, not from bespoke
+  hand-cut bonds on contact.
+- **NEVER raise `materialScale` to gain stability.** A high `materialScale` that
+  makes a structure "stand" is an unacceptable hack/cheat — it just makes
+  everything too strong to break, and hides that the structure isn't actually
+  self-supporting. Tune real, physical quantities (e.g. per-bond contact `area`,
+  geometry/contact) instead.
+- **The structure must be self-supporting as plain rigid bodies.** Before relying
+  on the stress solver, verify the scene SETTLES when every (non-support) chunk is
+  an independent dynamic rigid body with NO bonds — just gravity + friction +
+  contact. If it collapses with no bonds, the geometry is broken (gaps, no
+  bedding, too thin / too tall, no interlock) — fix the geometry. The stress solver
+  is then a performance OPTIMIZATION over an already-stable rigid-body pile (group
+  settled regions as one body), never a crutch that holds up an unstable one.
+- Island-skipping / lazy colliders are performance optimizations only. They must
+  not be used to keep an unstable structure from being computed (that just defers
+  the collapse to the first disturbance). They are legitimate only when the region
+  is genuinely stable.
+
+## Auto-bonding (`createBondsFromTriangles`) — gotchas that cost hours
+
+The triangle auto-bonder has two modes with very different behaviour. Verified
+empirically by feeding it two boxes separated along each axis (see the brick
+castle work):
+
+- **`'average'` mode silently drops EVERY vertical (Y-normal) contact.** It bonds
+  side-by-side (X/Z-normal) faces fine but never bonds a box resting on top of
+  another — even at gap 0. Symptom: a stacked/coursed structure (wall, tower,
+  castle) auto-bonds with plenty of horizontal bonds but almost no course-to-course
+  bonds, so the stress solver sees disconnected courses and the whole thing
+  collapses under self-weight on the first frame. This is NOT a stability/tuning
+  problem; it is missing bonds. Always check the vertical-vs-horizontal bond split
+  (bond normal · up) — if vertical ≈ 0 on a coursed structure, this is why.
+- **`'exact'` mode bonds all axes** (including vertical) **but only when the
+  touching faces are coincident (separation ~0).** A few-mm gap → 0 bonds. It does
+  real coplanar-overlap area (running-bond half-offset → half-area bond), so it is
+  the right choice for axis-aligned masonry: place bricks TOUCHING (mortarGap 0) so
+  adjacent faces coincide, then use `mode:'exact'`. This also bonds Voronoi
+  intra-brick faces (already coincident) for free.
+- `maxSeparation` only applies to `'average'`. It is ignored by `'exact'`.
+- Quick probe to characterise the bonder before trusting it: two unit boxes,
+  separate by `size+gap` along x, then y, then z, and print `bonds`/`area`/`normal`
+  for each mode. Cheap, deterministic, and exposes the Y-axis hole immediately.
+
+## Headless verification recipes (brick-castle)
+
+- **Bond/overlap/support audit** (no browser): import the built `dist/scenarios.js`
+  + `dist/three.js`, `buildBrickCastleScenario({...})`, then on the returned
+  `scenario` check: (a) inter-brick collider penetration via a spatial hash over
+  `nodes[i].centroid` ± `fragmentSizes[i]/2` (skip same-`brickIdByNode` siblings) —
+  must be 0 past ~0.1 m; (b) per-brick bond degree from `scenario.bonds` mapped
+  through `brickIdByNode` — every non-support brick must have ≥1 inter-brick bond;
+  (c) `tierCounts`. Runs in ~1 s and catches the vertical-bond hole and authored
+  overlaps without spinning up physics.
+- **Stability/siege soak** (`scripts/soak-castle.mjs`, Playwright): the settle phase
+  is the key gate — `peakSpeed ≈ 0` and `broken ≈ 0/total` while UNTOUCHED proves
+  the structure stands on bonds alone. Then siege phases assert collapse without
+  explosion (no body > ~120 m/s, 0 bodies > 60 m/s). Serve the built
+  `.vercel/output/static` (flat paths, e.g. `/brick-castle.html`).
+- **Measuring "did it move"**: read `core.chunks[i].worldPosition` (dormant chunks
+  keep their initial position). Do NOT read `world.getRigidBody(handle).translation()`
+  for chunks parented to a static root — it returns the root's transform (bogus
+  large displacement). And `brokenBonds` alone is a misleading "it's fixed" signal.
+- Building a scenario CONSUMES `fragmentGeometries`. Build a FRESH scenario per
+  core/test; reusing one across cores gives false negatives.
+
+## Touching-brick scenes — more gotchas (brick-castle thick-wall pass)
+
+- **Convex-hull colliders carry a ~6 mm collision margin.** Two bricks placed
+  face-to-face (gap 0, required by the exact vertical bonder) therefore overlap by
+  that margin and shove apart with a "pop" the instant a bond between them breaks —
+  it reads as a small explosion on a soft hit. Fix: give box bricks a slightly-inset
+  CUBOID collider (`colliderDescForNode`) instead of a hull. A cuboid is exact for a
+  box (0°/90° rotation is baked into the AABB half-extents), cheaper than a hull, and
+  a few-mm inset leaves clearance so neighbours don't touch. Verified with a 2-body
+  Rapier step: hull gap-0 separates ~5.7 mm, cuboid stays put.
+- **Use a 2:1 brick (depth = length/2).** It's what lets headers, half-brick closers
+  and cross-lapped corners tile exactly. With an arbitrary ratio (e.g. 0.9×0.5) the
+  thickness/corner maths leaves sub-brick gaps or overlaps.
+- **Running bond on a fixed-length run needs half-brick closers**, not a half-pitch
+  shift of the whole course. Shifting alone leaves a half-brick toothing notch (a
+  visible hole) at each end; a half-brick at each end of the offset course keeps the
+  run flush AND breaks the joint.
+- **Multi-wythe walls tie themselves.** Parallel leaves placed touching are bonded
+  leaf-to-leaf by the exact bonder (those are X/Z-normal contacts), so you get a
+  thick, walkable, stable wall without modelling header courses. Solid tower corners:
+  alternate which axis runs "full" (corner-to-corner) each course; the full leaves
+  fill the corner square and the perpendicular leaves butt them — cross-lapped quoin,
+  no holes, no overlap.
+- **"A whole tower tumbles as one piece" is not a render desync.** The bundle drives
+  every chunk's collider and visual from the same body transform (they can't
+  diverge). It is the island model: a still-bonded connected component is ONE rigid
+  body and bonded chunks don't self-collide, so a clean break sheds it as a monolith.
+  Thin structures shed big monoliths; thicker walls / more bonds break locally.

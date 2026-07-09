@@ -13,6 +13,18 @@ export type { FracturedWallOptions } from './fracturedWallScenario';
 export { buildFracturedTowerScenario } from './fracturedTowerScenario';
 export type { FracturedTowerOptions } from './fracturedTowerScenario';
 
+export {
+  buildBrickCastleScenario,
+  DEFAULT_CASTLE_BOND_MULTIPLIERS,
+  CASTLE_STONE_DENSITY,
+  CastleBondTier,
+} from './brickCastleScenario';
+export type {
+  BrickCastleOptions,
+  CastleBondMultipliers,
+  CastleStructureKind,
+} from './brickCastleScenario';
+
 export { buildFracturedBridgeScenario } from './fracturedBridgeScenario';
 export type { FracturedBridgeOptions } from './fracturedBridgeScenario';
 

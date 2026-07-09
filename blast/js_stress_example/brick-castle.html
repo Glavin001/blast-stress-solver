@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Brick Castle Siege — blast-stress-solver Demo</title>
+    <link rel="stylesheet" href="./styles/demo-common.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three/build/three.module.js",
+          "three/addons/": "/vendor/three/examples/jsm/",
+          "@dimforge/rapier3d-compat": "/vendor/rapier/rapier.mjs",
+          "@dgreenheck/three-pinata": "/vendor/three-pinata/three-pinata.es.js",
+          "blast-stress-solver": "/vendor/blast-stress-solver/index.js",
+          "blast-stress-solver/rapier": "/vendor/blast-stress-solver/rapier.js",
+          "blast-stress-solver/three": "/vendor/blast-stress-solver/three.js",
+          "blast-stress-solver/scenarios": "/vendor/blast-stress-solver/scenarios.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="viewport">
+        <canvas id="demo-canvas"></canvas>
+        <div class="viewport-hint">Building castle…</div>
+      </section>
+
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle settings panel">
+        <span class="icon-open">☰</span>
+        <span class="icon-close">✕</span>
+      </button>
+      <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+      <aside class="sidebar" id="sidebar">
+        <header>
+          <a href="./demo-index.html" class="back-link">← All Demos</a>
+          <h1>🏰 Brick Castle Siege</h1>
+          <p>
+            ~2,700 fractured bricks, auto-bonded from surface contact into a
+            stone&nbsp;≫&nbsp;mortar strength hierarchy. Each wall, tower and the
+            keep is its own anchored stress island, so a hit breaches it
+            <em>locally</em> and the rest stands — progressive, not all-at-once.
+            Lazy colliders + island solver keep the big scene interactive.
+          </p>
+        </header>
+
+        <!-- Siege tools -->
+        <section class="config-section">
+          <h2 class="section-title">⚔️ Siege</h2>
+          <p class="section-note">Click the castle to fire a cannonball, or unleash a tool:</p>
+          <div class="control-actions">
+            <button id="btn-wrecking" class="button button-primary">🔨 Wrecking Ball</button>
+            <button id="btn-storm" class="button">☄️ Boulder Storm</button>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-proj-radius">Cannonball radius</label>
+            <input type="range" id="cfg-proj-radius" class="config-slider" min="0.15" max="1.2" step="0.05" value="0.6" />
+            <span class="config-value"><span id="cfg-proj-radius-value">0.60</span> m</span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-proj-mass">Cannonball mass</label>
+            <input type="range" id="cfg-proj-mass" class="config-slider" min="100" max="8000" step="100" value="2500" />
+            <span class="config-value"><span id="cfg-proj-mass-value">2,500</span> kg</span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-proj-speed">Cannonball speed</label>
+            <input type="range" id="cfg-proj-speed" class="config-slider" min="20" max="140" step="1" value="72" />
+            <span class="config-value"><span id="cfg-proj-speed-value">72</span> m/s</span>
+          </div>
+        </section>
+
+        <!-- Strength hierarchy (deferred — bond areas are baked at build) -->
+        <section class="config-section">
+          <h2 class="section-title">🧱 Strength hierarchy (Rebuild to apply)</h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-material">Stone strength</label>
+            <input type="range" id="cfg-material" class="config-slider" min="6" max="13" step="0.1" value="9.3" />
+            <span class="config-value"><span id="cfg-material-value">1e9.3</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-intra">Intra-brick ×</label>
+            <input type="range" id="cfg-intra" class="config-slider" min="1" max="20" step="0.5" value="9" />
+            <span class="config-value"><span id="cfg-intra-value">9.0</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-mortar">Mortar ×</label>
+            <input type="range" id="cfg-mortar" class="config-slider" min="0.2" max="6" step="0.1" value="1.6" />
+            <span class="config-value"><span id="cfg-mortar-value">1.6</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-bond-structures">Bond across structures</label>
+            <input type="checkbox" id="cfg-bond-structures" />
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-inter">Inter-structure × <small>(needs ↑)</small></label>
+            <input type="range" id="cfg-inter" class="config-slider" min="0.1" max="3" step="0.1" value="0.5" />
+            <span class="config-value"><span id="cfg-inter-value">0.5</span></span>
+          </div>
+        </section>
+
+        <!-- Castle (deferred — needs Reset) -->
+        <section class="config-section">
+          <h2 class="section-title">Castle (Reset to apply)</h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-scale">Size</label>
+            <input type="range" id="cfg-scale" class="config-slider" min="0" max="3" step="1" value="2" />
+            <span class="config-value"><span id="cfg-scale-value">Hero</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-chunks">Chunks / brick</label>
+            <input type="range" id="cfg-chunks" class="config-slider" min="1" max="4" step="1" value="1" />
+            <span class="config-value"><span id="cfg-chunks-value">1</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-thickness">Wall thickness</label>
+            <input type="range" id="cfg-thickness" class="config-slider" min="1" max="4" step="1" value="3" />
+            <span class="config-value"><span id="cfg-thickness-value">3 bricks</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-battlements">Battlements</label>
+            <input type="checkbox" id="cfg-battlements" checked />
+          </div>
+        </section>
+
+        <!-- Scalability (live) -->
+        <section class="config-section">
+          <h2 class="section-title">⚡ Scalability</h2>
+          <div class="config-row">
+            <label class="config-label" for="cfg-lazy">Lazy intact colliders</label>
+            <input type="checkbox" id="cfg-lazy" checked />
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-island">Island solver (skip settled)</label>
+            <input type="checkbox" id="cfg-island" checked />
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-sleep">Sleep settled bodies</label>
+            <input type="checkbox" id="cfg-sleep" checked />
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-gravity">Gravity</label>
+            <input type="range" id="cfg-gravity" class="config-slider" min="-30" max="0" step="0.5" value="-9.81" />
+            <span class="config-value"><span id="cfg-gravity-value">-9.8</span> m/s²</span>
+          </div>
+        </section>
+
+        <!-- Actions -->
+        <div class="control-actions">
+          <button id="btn-reset" class="button button-primary">↻ Rebuild Castle</button>
+          <button id="btn-color" class="button">🎨 Colour: Stone</button>
+          <button id="btn-debug" class="button">◇ Show Debug</button>
+        </div>
+
+        <!-- Status -->
+        <section class="status-panel">
+          <h2>Simulation</h2>
+          <div class="status-grid">
+            <div class="status-item">
+              <span class="status-label">Bodies</span>
+              <span class="status-value" id="stat-bodies">0</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Bonds</span>
+              <span class="status-value" id="stat-bonds">0</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Broken</span>
+              <span class="status-value" id="stat-broken">0</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Chunks</span>
+              <span class="status-value" id="stat-chunks">0</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Islands (settled)</span>
+              <span class="status-value" id="stat-islands">0</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Live colliders</span>
+              <span class="status-value" id="stat-colliders">0</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Performance -->
+        <section class="status-panel">
+          <h2>Performance</h2>
+          <div class="status-grid">
+            <div class="status-item">
+              <span class="status-label">Physics</span>
+              <span class="status-value" id="stat-physics-ms">— ms</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Render</span>
+              <span class="status-value" id="stat-render-ms">— ms</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Draw Calls</span>
+              <span class="status-value" id="stat-draw-calls">0</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Triangles</span>
+              <span class="status-value" id="stat-triangles">0</span>
+            </div>
+          </div>
+        </section>
+        <!-- Session recorder docks here. -->
+        <section class="config-section recorder-section" id="recorder-slot"></section>
+      </aside>
+    </main>
+
+    <script type="module" src="./dist/demo-shell.js"></script>
+    <script type="module" src="./dist/brick-castle.js"></script>
+  </body>
+</html>

@@ -159,6 +159,12 @@ explosions and instability that only show up while the simulation runs.
 6. **Don't fracture/split wheels** (cohesive rubbery props). Role-gate both passes.
 7. **Use `createBondsFromTriangles` `mode:'average'`**, not proximity and not `'exact'`.
    Proximity = centroid star; exact = no bonds (separate meshes share no faces).
+   CAVEAT — `'average'` silently drops EVERY vertical (Y-normal) contact: it never
+   bonds one part resting on top of another. Fine for a car (contacts are mostly
+   lateral) but FATAL for stacked/coursed structures (walls, towers, masonry), which
+   then collapse for lack of course-to-course bonds. For axis-aligned masonry place
+   parts TOUCHING (gap 0) and use `'exact'` instead — it bonds all axes incl.
+   vertical, by coplanar-overlap area. See repo AGENTS.md "Auto-bonding gotchas".
 8. **A big spanning part auto-bonds to everything from a central centroid** → both the
    blob hull and the green bond-star. Fracturing it (gotcha #5) fixes both at once.
 9. **maxSeparation is a double-edged sword.** Too small → wheels/loose parts find no
