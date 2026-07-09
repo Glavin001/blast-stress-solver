@@ -1961,25 +1961,105 @@ function renderDebugLines() {
     return;
   }
 
-  const body = world.getRigidBody(bodyHandle);
-  if (!body) {
+  if (!world.getRigidBody(bodyHandle)) {
     updateDebugLineObject(helper, [], false);
     return;
   }
 
-  const tr = body.translation();
-  const rot = body.rotation();
-  const q = new THREE.Quaternion(rot.x, rot.y, rot.z, rot.w);
-  const t = new THREE.Vector3(tr.x, tr.y, tr.z);
-
-  // Transform to world-space for rendering
-  const worldLines = debugLines.map((line) => {
-    const p0 = new THREE.Vector3(line.p0.x, line.p0.y, line.p0.z).applyQuaternion(q).add(t);
-    const p1 = new THREE.Vector3(line.p1.x, line.p1.y, line.p1.z).applyQuaternion(q).add(t);
-    return { p0: { x: p0.x, y: p0.y, z: p0.z }, p1: { x: p1.x, y: p1.y, z: p1.z }, color0: line.color0, color1: line.color1 };
-  });
+  // Each debug-line endpoint is a node centroid in bridge-local space — the same
+  // value syncMeshes uses (chunk.baseLocalOffset) to place that chunk's mesh.
+  // Transform each endpoint by the body that CURRENTLY owns its chunk so the
+  // overlay follows fragments onto their own rigid bodies after a split, instead
+  // of drawing every line at the single root pose (which left green lines floating
+  // where the intact structure used to be). Unresolved endpoints fall back to root.
+  const worldLines = stressLinesToWorld(
+    world,
+    state.chunks,
+    bodyHandle,
+    debugLines,
+    (c: any) => c.baseLocalOffset,
+  );
 
   updateDebugLineObject(helper, worldLines, true);
+}
+
+/**
+ * Resolve each debug-line endpoint to the chunk whose rest centroid it coincides
+ * with, then transform it by that chunk's current rigid body. Unresolved endpoints
+ * fall back to the root body, so this is never worse than a single-body transform.
+ * A coarse spatial grid keeps the per-endpoint nearest-chunk lookup cheap.
+ */
+const STRESS_LINE_GRID = 2.0;
+function stressLinesToWorld(
+  world: any,
+  chunks: any[],
+  rootBodyHandle: any,
+  debugLines: any[],
+  getRest: (c: any) => { x: number; y: number; z: number } | undefined,
+) {
+  const cell = (n: number) => Math.floor(n / STRESS_LINE_GRID);
+  const grid = new Map<string, number[]>();
+  for (let i = 0; i < chunks.length; i++) {
+    const r = getRest(chunks[i]);
+    if (!r) continue;
+    const k = `${cell(r.x)},${cell(r.y)},${cell(r.z)}`;
+    let a = grid.get(k);
+    if (!a) { a = []; grid.set(k, a); }
+    a.push(i);
+  }
+
+  const nearest = (x: number, y: number, z: number) => {
+    let best = -1;
+    let bd = Infinity;
+    const cx = cell(x), cy = cell(y), cz = cell(z);
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+      const a = grid.get(`${cx + dx},${cy + dy},${cz + dz}`);
+      if (!a) continue;
+      for (const i of a) {
+        const r = getRest(chunks[i]);
+        if (!r) continue;
+        const ex = r.x - x, ey = r.y - y, ez = r.z - z;
+        const d = ex * ex + ey * ey + ez * ez;
+        if (d < bd) { bd = d; best = i; }
+      }
+    }
+    return best;
+  };
+
+  const poses = new Map<any, { q: THREE.Quaternion; t: THREE.Vector3 } | null>();
+  const poseForBody = (bh: any) => {
+    if (poses.has(bh)) return poses.get(bh)!;
+    const body = world.getRigidBody(bh);
+    let p: { q: THREE.Quaternion; t: THREE.Vector3 } | null = null;
+    if (body) {
+      const t = body.translation();
+      const r = body.rotation();
+      p = { q: new THREE.Quaternion(r.x, r.y, r.z, r.w), t: new THREE.Vector3(t.x, t.y, t.z) };
+    }
+    poses.set(bh, p);
+    return p;
+  };
+
+  const v = new THREE.Vector3();
+  const out: any[] = [];
+  for (const line of debugLines) {
+    const ch0 = chunks[nearest(line.p0.x, line.p0.y, line.p0.z)];
+    const ch1 = chunks[nearest(line.p1.x, line.p1.y, line.p1.z)];
+    // Only draw a bond that sits on ONE live, non-destroyed body — skip bonds that
+    // span two fragments or reference a destroyed/hidden chunk. Those produced the
+    // stray lines floating with nothing attached.
+    if (!ch0 || !ch1 || ch0.destroyed || ch1.destroyed) continue;
+    const bh = ch0.bodyHandle;
+    if (bh == null || bh !== ch1.bodyHandle) continue;
+    const pose = poseForBody(bh);
+    if (!pose) continue;
+    v.set(line.p0.x, line.p0.y, line.p0.z).applyQuaternion(pose.q).add(pose.t);
+    const a = { x: v.x, y: v.y, z: v.z };
+    v.set(line.p1.x, line.p1.y, line.p1.z).applyQuaternion(pose.q).add(pose.t);
+    const b = { x: v.x, y: v.y, z: v.z };
+    out.push({ p0: a, p1: b, color0: line.color0, color1: line.color1 });
+  }
+  return out;
 }
 
 // Compute stress percentages for compression/tension/shear by decoding debug colors.
