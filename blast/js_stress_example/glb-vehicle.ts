@@ -75,13 +75,22 @@ const INTER_ROLE_MULTIPLIER: Record<string, number> = {
   'accessory|accessory': 0.1,
 };
 
-/** Internal joints between chunks of the *same* fractured part. */
+/**
+ * Internal joints between collider pieces of the *same* part. Cohesive props —
+ * wheels, the bucket/chain (accessory) — must behave as ONE rigid body: their
+ * pieces give a tight CoACD collider but never fracture apart, so their internal
+ * bonds are effectively unbreakable. Frame and panels DO break into their pieces
+ * (the destructible skeleton), so theirs are moderate (and further scaled by piece
+ * thickness — thin bars weaker than thick rails). Cargo mostly holds (a crate
+ * sheds as a unit) but can break under a hard hit.
+ */
+const UNBREAKABLE = 1000;
 const INTERNAL_ROLE_MULTIPLIER: Record<VehiclePartRole, number> = {
   frame: 6.0,
-  wheel: 4.0,
-  panel: 2.5,
-  cargo: 1.5,
-  accessory: 1.2,
+  panel: 3.0,
+  cargo: 8.0,
+  wheel: UNBREAKABLE,
+  accessory: UNBREAKABLE,
 };
 
 function interRoleMultiplier(a: VehiclePartRole, b: VehiclePartRole): number {
@@ -514,26 +523,36 @@ export async function buildVehicleScenario(
     meta.push({ partId, role: part.role });
   }
 
-  // Bond the parts. Default: WASM triangle-surface auto-bonding — it connects
-  // parts where their meshes actually touch (wheel↔axle↔frame, cargo↔the surface
-  // it rests on) with real contact area/normal/location, so the assembly comes
-  // apart along real seams instead of a centroid star. areaNormalization 'none'
-  // keeps the real contact areas; role multipliers below set material strength.
+  const partRoleCounts: Record<VehiclePartRole, number> = { frame: 0, wheel: 0, panel: 0, cargo: 0, accessory: 0 };
+  for (const p of parts) partRoleCounts[p.role]++;
+  return assembleVehicleScenario(fragments, meta, bounds, options, parts.length, partRoleCounts);
+}
+
+/**
+ * Shared tail: bond the fragments, scale bond strength by the role hierarchy and by
+ * piece geometry (thin members are weaker than thick ones), cap resting cargo,
+ * stitch connectivity, and package the result. Used by both the GLB path
+ * (buildVehicleScenario) and the pre-decomposed asset path.
+ */
+async function assembleVehicleScenario(
+  fragments: FragmentInfo[],
+  meta: FragMeta[],
+  bounds: VehicleBounds,
+  options: BuildVehicleScenarioOptions,
+  partCount: number,
+  roleCounts: Record<VehiclePartRole, number>,
+): Promise<VehicleScenarioResult> {
+  const totalMass = options.totalMass ?? 1500;
   const bondMode = options.bondMode ?? 'auto';
   const bondMaxSeparation = options.bondMaxSeparation ?? 0.06;
   const dimensions = { x: bounds.size.x, y: bounds.size.y, z: bounds.size.z };
-  const proximityOptions = {
-    // Fallback proximity detection (also used if auto-bonding yields nothing).
-    toleranceFactor: 0.25,
-    minGapTolerance: 0.02,
-    minOverlapRatio: 0.12,
-  };
+  const proximityOptions = { toleranceFactor: 0.25, minGapTolerance: 0.02, minOverlapRatio: 0.12 };
   const scenario =
     bondMode === 'auto'
       ? await buildScenarioFromFragmentsAsync(fragments, {
           totalMass,
           bondMode: 'auto',
-          areaNormalization: 'none', // keep real triangle-contact areas
+          areaNormalization: 'none',
           dimensions,
           bondDetectionOptions: proximityOptions,
           autoBondingOptions: { mode: 'average', maxSeparation: bondMaxSeparation, label: 'vehicle' },
@@ -545,12 +564,18 @@ export async function buildVehicleScenario(
           bondDetectionOptions: proximityOptions,
         });
 
-  // A representative base area (median of the normalised areas) used for the
-  // stitch bonds we may add for connectivity.
   const baseArea = medianArea(scenario.bonds) || 0.1;
 
-  // Scale each bond by its role-pair (or same-part internal) multiplier, then by
-  // the per-role attachment-strength knobs (both endpoints).
+  // Geometry-aware strength: a bond is only as strong as the thinnest member it
+  // joins (a thin metal bar should fail before a thick frame rail). thickness =
+  // the piece's smallest cross-section (2*min half-extent); the bond is scaled by
+  // the thinner of the two pieces, normalised so a ~10cm member is the baseline.
+  const REF_THICK = 0.1; // m — reference cross-section (×1)
+  const thicknessOf = (i: number) => {
+    const h = fragments[i]?.halfExtents;
+    return h ? 2 * Math.min(h.x, h.y, h.z) : REF_THICK;
+  };
+
   const rs = options.roleStrength ?? {};
   const rsOf = (r: VehiclePartRole) => (rs[r] ?? 1);
   for (const bond of scenario.bonds) {
@@ -561,15 +586,15 @@ export async function buildVehicleScenario(
       a.partId === b.partId
         ? INTERNAL_ROLE_MULTIPLIER[a.role]
         : interRoleMultiplier(a.role, b.role);
-    bond.area = Math.max(bond.area * mult * rsOf(a.role) * rsOf(b.role), 1e-6);
+    // Thinner member governs; clamp so thin bars are weaker than thick rails but
+    // not so weak they drop under their own weight (0.5×..2×).
+    const thinFactor = Math.min(2, Math.max(0.5, Math.min(thicknessOf(bond.node0), thicknessOf(bond.node1)) / REF_THICK));
+    bond.area = Math.max(bond.area * mult * rsOf(a.role) * rsOf(b.role) * thinFactor, 1e-6);
   }
 
-  // Guarantee the bond graph is a single connected component, otherwise an
-  // isolated part would split off and drop on the first solver step.
+  const cappedBonds = capRestingBonds(scenario, meta, { roles: ['cargo', 'accessory'], maxBondsPerNode: 1 });
   const stitched = stitchConnectivity(scenario, fragments, meta, baseArea);
 
-  // ── Diagnostics ───────────────────────────────────────────────────────────
-  // Bond distribution by role pair (verifies sensible connectivity).
   const bondsByRolePair: Record<string, number> = {};
   for (const bond of scenario.bonds) {
     const a = meta[bond.node0]?.role;
@@ -578,52 +603,109 @@ export async function buildVehicleScenario(
     const key = [a, b].sort().join('↔');
     bondsByRolePair[key] = (bondsByRolePair[key] ?? 0) + 1;
   }
-  let undefMeta = 0;
-  let maxNode = -1;
-  for (const bond of scenario.bonds) {
-    if (!meta[bond.node0] || !meta[bond.node1]) undefMeta++;
-    maxNode = Math.max(maxNode, bond.node0, bond.node1);
-  }
   console.log(
     '[glb-vehicle] bonds by role pair:', JSON.stringify(bondsByRolePair),
-    `| total=${scenario.bonds.length} nodes=${scenario.nodes.length} meta=${meta.length} maxNodeIdx=${maxNode} undefMeta=${undefMeta}`,
+    `| total=${scenario.bonds.length} nodes=${scenario.nodes.length} parts=${partCount}`,
   );
-  // Orphan stitches (centroid bonds) — these are the long "star" debug lines.
-  console.log(`[glb-vehicle] orphan stitches added: ${stitched}`);
-  // Parts whose collider spans a large fraction of the vehicle (likely a single
-  // mesh holding multiple disconnected shapes — e.g. wheel-nuts across wheels).
-  const carLen = Math.max(bounds.size.x, bounds.size.z) || 1;
-  const spanning = fragments
-    .map((f, i) => ({ i, role: meta[i].role, span: 2 * Math.max(f.halfExtents.x, f.halfExtents.y, f.halfExtents.z) }))
-    .filter((p) => p.span > 0.45 * carLen)
-    .sort((a, b) => b.span - a.span);
-  if (spanning.length) {
-    console.log(
-      `[glb-vehicle] ${spanning.length} spanning parts (>${(0.45 * carLen).toFixed(2)}m):`,
-      spanning.slice(0, 10).map((p) => `node${p.i}/${p.role}=${p.span.toFixed(2)}m`).join(', '),
-    );
-  }
+  console.log(`[glb-vehicle] resting bonds capped: ${cappedBonds} | orphan stitches added: ${stitched}`);
 
-  // Per-node colours + roles for the hierarchy view / HUD.
   const nodeColors: THREE.Color[] = meta.map((m) => new THREE.Color(ROLE_COLORS[m.role]));
   const nodeRoles: VehiclePartRole[] = meta.map((m) => m.role);
-
-  const roleCounts: Record<VehiclePartRole, number> = {
-    frame: 0, wheel: 0, panel: 0, cargo: 0, accessory: 0,
-  };
-  for (const p of parts) roleCounts[p.role]++;
 
   return {
     scenario,
     nodeColors,
     nodeRoles,
-    summary: {
-      parts: parts.length,
-      nodes: scenario.nodes.length,
-      bonds: scenario.bonds.length,
-      roleCounts,
-    },
+    summary: { parts: partCount, nodes: scenario.nodes.length, bonds: scenario.bonds.length, roleCounts },
   };
+}
+
+// ── Pre-decomposed asset (CoACD pipeline output) ─────────────────────────────
+
+export type VehiclePiecesAsset = {
+  source?: string;
+  parts: Array<{
+    name: string;
+    centroid: [number, number, number];
+    extents: [number, number, number];
+    pieces: Array<{ vertices: number[][]; faces: number[][] }>;
+  }>;
+};
+
+/**
+ * Build the destructible scenario from a pre-decomposed pieces asset (produced by
+ * scripts/glb-pipeline/build_destructible_asset.py: split → CoACD → clip so every
+ * collider piece is a tight convex hull and no two pieces of different parts
+ * overlap). Each piece becomes a node (render + collider); pieces of the same part
+ * share a partId so they get strong INTERNAL bonds and behave as one unit until a
+ * hard enough hit. This is the high-quality path — non-overlapping colliders mean
+ * full debris collision doesn't explode.
+ */
+export async function buildVehicleScenarioFromAsset(
+  asset: VehiclePiecesAsset,
+  options: BuildVehicleScenarioOptions = {},
+): Promise<VehicleScenarioResult> {
+  const totalMass = options.totalMass ?? 1500;
+  const groundGap = options.groundGap ?? 0.03;
+
+  // Whole-vehicle bounds from part centroids ± extents.
+  _box.makeEmpty();
+  for (const p of asset.parts) {
+    const c = new THREE.Vector3(p.centroid[0], p.centroid[1], p.centroid[2]);
+    const h = new THREE.Vector3(p.extents[0], p.extents[1], p.extents[2]).multiplyScalar(0.5);
+    _box.expandByPoint(c.clone().sub(h));
+    _box.expandByPoint(c.clone().add(h));
+  }
+  const bounds: VehicleBounds = { lo: _box.min.clone(), size: _box.getSize(new THREE.Vector3()) };
+  const offset = new THREE.Vector3(
+    -(bounds.lo.x + bounds.size.x * 0.5),
+    -bounds.lo.y + groundGap,
+    -(bounds.lo.z + bounds.size.z * 0.5),
+  );
+
+  const fragments: FragmentInfo[] = [];
+  const meta: FragMeta[] = [];
+  const roleCounts: Record<VehiclePartRole, number> = { frame: 0, wheel: 0, panel: 0, cargo: 0, accessory: 0 };
+
+  for (let partId = 0; partId < asset.parts.length; partId++) {
+    const part = asset.parts[partId];
+    const size = new THREE.Vector3(...part.extents);
+    const center = new THREE.Vector3(...part.centroid);
+    const role = classifyVehiclePart(part.name, size, center, bounds);
+    roleCounts[role]++;
+    for (const piece of part.pieces) {
+      if (!piece.vertices?.length || !piece.faces?.length) continue;
+      // Piece vertices are in GLB world space; recentre to the piece origin and
+      // place it via worldPosition = pieceCentroid + global offset.
+      let cx = 0, cy = 0, cz = 0;
+      for (const v of piece.vertices) { cx += v[0]; cy += v[1]; cz += v[2]; }
+      const n = piece.vertices.length;
+      cx /= n; cy /= n; cz /= n;
+      const pos = new Float32Array(n * 3);
+      let minx = Infinity, miny = Infinity, minz = Infinity, maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
+      for (let i = 0; i < n; i++) {
+        const lx = piece.vertices[i][0] - cx, ly = piece.vertices[i][1] - cy, lz = piece.vertices[i][2] - cz;
+        pos[i * 3] = lx; pos[i * 3 + 1] = ly; pos[i * 3 + 2] = lz;
+        if (lx < minx) minx = lx; if (ly < miny) miny = ly; if (lz < minz) minz = lz;
+        if (lx > maxx) maxx = lx; if (ly > maxy) maxy = ly; if (lz > maxz) maxz = lz;
+      }
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      const idx: number[] = [];
+      for (const f of piece.faces) { idx.push(f[0], f[1], f[2]); }
+      geom.setIndex(idx);
+      geom.computeVertexNormals();
+      fragments.push({
+        worldPosition: { x: cx + offset.x, y: cy + offset.y, z: cz + offset.z },
+        halfExtents: { x: (maxx - minx) * 0.5, y: (maxy - miny) * 0.5, z: (maxz - minz) * 0.5 },
+        geometry: geom,
+        isSupport: false,
+      });
+      meta.push({ partId, role });
+    }
+  }
+
+  return assembleVehicleScenario(fragments, meta, bounds, options, asset.parts.length, roleCounts);
 }
 
 // ── Connectivity helpers ─────────────────────────────────────────────────────
@@ -632,6 +714,60 @@ function medianArea(bonds: Array<{ area: number }>): number {
   if (!bonds.length) return 0;
   const a = bonds.map((b) => b.area).sort((x, y) => x - y);
   return a[Math.floor(a.length / 2)];
+}
+
+/**
+ * Cargo / accessories are NOT structurally attached — they just rest in the
+ * vehicle. Their bonds exist only so they ride along as one reduced rigid body
+ * until disturbed (a perf convenience), not because they are welded on. The
+ * triangle-surface auto-bonder, however, glues a resting box along its whole
+ * contact footprint (many bonds), which over-constrains it into "welded".
+ *
+ * Reduce each such part to a single strongest bond so it behaves like a resting
+ * contact: one weak link that lets go cleanly under the slightest stress. A bond
+ * is kept if it is a top-`maxBondsPerNode` bond (by area) of EITHER endpoint, so
+ * every capped node keeps at least its best link; full disconnection (if any) is
+ * repaired afterwards by stitchConnectivity. Bonds between two un-capped
+ * (structural) parts are never touched.
+ *
+ * Exported for unit testing the pure graph logic without a GLB.
+ */
+export function capRestingBonds(
+  scenario: { bonds: Array<{ node0: number; node1: number; area: number }> },
+  meta: Array<{ role: VehiclePartRole } | undefined>,
+  options: { roles?: VehiclePartRole[]; maxBondsPerNode?: number } = {},
+): number {
+  const roles = new Set<VehiclePartRole>(options.roles ?? ['cargo', 'accessory']);
+  const maxPer = Math.max(1, Math.floor(options.maxBondsPerNode ?? 1));
+  const bonds = scenario.bonds;
+  const isCapped = (n: number) => roles.has(meta[n]?.role as VehiclePartRole);
+
+  // Collect bond indices touching each capped node.
+  const perNode = new Map<number, number[]>();
+  for (let bi = 0; bi < bonds.length; bi++) {
+    const { node0, node1 } = bonds[bi];
+    if (isCapped(node0)) (perNode.get(node0) ?? perNode.set(node0, []).get(node0)!).push(bi);
+    if (isCapped(node1)) (perNode.get(node1) ?? perNode.set(node1, []).get(node1)!).push(bi);
+  }
+  if (perNode.size === 0) return 0;
+
+  // Keep each capped node's strongest `maxPer` bonds (by area).
+  const keep = new Set<number>();
+  for (const biList of perNode.values()) {
+    biList.sort((a, b) => bonds[b].area - bonds[a].area);
+    for (let k = 0; k < Math.min(maxPer, biList.length); k++) keep.add(biList[k]);
+  }
+
+  // Drop bonds that touch a capped node but aren't kept by either endpoint.
+  const next: typeof bonds = [];
+  let removed = 0;
+  for (let bi = 0; bi < bonds.length; bi++) {
+    const { node0, node1 } = bonds[bi];
+    if ((isCapped(node0) || isCapped(node1)) && !keep.has(bi)) { removed++; continue; }
+    next.push(bonds[bi]);
+  }
+  scenario.bonds = next;
+  return removed;
 }
 
 /**

@@ -1,0 +1,10 @@
+# Python deps for the GLB -> destructible-collider pipeline.
+#   pip3 install -r requirements.txt
+coacd==1.0.11           # convex decomposition (SarahWeiii/CoACD)
+trimesh==4.12.2         # mesh IO, convex hulls, plane slicing
+numpy==2.4.6
+python-fcl==0.7.0.11    # exact penetration-depth collision queries
+networkx==3.6.1         # trimesh connected-component split
+scipy==1.17.1           # trimesh connected-component split + halfspace inset
+shapely==2.1.2          # trimesh slice_plane cap polygons (REQUIRED for the clip)
+manifold3d==3.5.1       # trimesh boolean backend (--method boolean variant)

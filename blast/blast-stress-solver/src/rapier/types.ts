@@ -377,6 +377,8 @@ export type DestructibleCore = {
   getNodeBonds: (nodeIndex: number) => BondRef[];
   cutBond: (bondIndex: number) => boolean;
   cutNodeBonds: (nodeIndex: number) => boolean;
+  /** Fracture every remaining bond so each chunk becomes its own rigid body (full demolition). Returns bonds fractured. */
+  shatterAll: () => number;
   // External force application (non-contact force injection)
   applyExternalForce: (nodeIndex: number, worldPoint: Vec3, worldForce: Vec3) => void;
   setSleepThresholds?: (linear: number, angular: number) => void;
