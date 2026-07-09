@@ -379,6 +379,23 @@ pub fn blast_tick() -> u32 {
 That build still emits one final application wasm file. There is no extra Blast
 runtime bundle to host or load manually.
 
+## Showcase example: flywheel overspeed burst test
+
+For a self-contained tour of the core API that goes beyond gravity-loaded
+walls, run:
+
+```bash
+cargo run --release --example flywheel_burst
+```
+
+It spins a hub-and-spoke flywheel in a virtual test rig until rotation alone
+tears it apart, using `add_centrifugal_acceleration` (a position-dependent
+ω²r load no uniform field can reproduce), the full
+overstress → fracture → split loop, per-fragment classification with
+`get_excess_forces` fling forces, and a final sweep verifying that burst RPM
+scales with the square root of material strength. It needs no cargo features:
+everything runs on the core solver.
+
 ## Features
 
 - `rapier`: enables Rapier3D integration helpers
