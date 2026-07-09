@@ -98,14 +98,9 @@
             <span class="config-value"><span id="cfg-street-value">9 m</span></span>
           </div>
           <div class="config-row">
-            <label class="config-label" for="cfg-min-floors">Min Floors</label>
-            <input type="range" id="cfg-min-floors" class="config-slider" min="1" max="8" step="1" value="2" />
-            <span class="config-value"><span id="cfg-min-floors-value">2</span></span>
-          </div>
-          <div class="config-row">
-            <label class="config-label" for="cfg-max-floors">Max Floors</label>
-            <input type="range" id="cfg-max-floors" class="config-slider" min="2" max="12" step="1" value="6" />
-            <span class="config-value"><span id="cfg-max-floors-value">6</span></span>
+            <label class="config-label" for="cfg-max-floors">Max Floors (high-rise)</label>
+            <input type="range" id="cfg-max-floors" class="config-slider" min="2" max="16" step="1" value="8" />
+            <span class="config-value"><span id="cfg-max-floors-value">8</span></span>
           </div>
           <div class="config-row">
             <label class="config-label" for="cfg-frags">Fragments / Wall</label>
@@ -126,6 +121,51 @@
             <label class="config-label" for="cfg-mass-density-max">Mass Density (max)</label>
             <input type="range" id="cfg-mass-density-max" class="config-slider" min="100" max="3000" step="50" value="1200" />
             <span class="config-value"><span id="cfg-mass-density-max-value">1,200 kg/m²/fl</span></span>
+          </div>
+        </section>
+
+        <!-- Composition / Zoning (deferred – needs Rebuild) -->
+        <section class="config-section">
+          <h2 class="section-title">Composition (Rebuild to apply)</h2>
+          <p style="margin:.2rem 0 .6rem;opacity:.6;font-size:.8rem">A downtown core of tall buildings ringed by clusters of houses. Tune the zones below, then Rebuild.</p>
+          <div class="config-row">
+            <label class="config-label" for="cfg-downtown">Downtown Size</label>
+            <input type="range" id="cfg-downtown" class="config-slider" min="0" max="1" step="0.05" value="0.45" />
+            <span class="config-value"><span id="cfg-downtown-value">45%</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-highrise-share">High-Rise Share</label>
+            <input type="range" id="cfg-highrise-share" class="config-slider" min="0" max="1" step="0.05" value="0.4" />
+            <span class="config-value"><span id="cfg-highrise-share-value">40%</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-suburb-shops">Suburb Shops</label>
+            <input type="range" id="cfg-suburb-shops" class="config-slider" min="0" max="1" step="0.05" value="0.15" />
+            <span class="config-value"><span id="cfg-suburb-shops-value">15%</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-empty-lots">Empty Lots</label>
+            <input type="range" id="cfg-empty-lots" class="config-slider" min="0" max="0.5" step="0.02" value="0.08" />
+            <span class="config-value"><span id="cfg-empty-lots-value">8%</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-midrise-floors">Mid-Rise Max Floors</label>
+            <input type="range" id="cfg-midrise-floors" class="config-slider" min="2" max="8" step="1" value="4" />
+            <span class="config-value"><span id="cfg-midrise-floors-value">4</span></span>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-midrise-construction">Mid-Rise Build</label>
+            <select id="cfg-midrise-construction" class="config-slider">
+              <option value="fractured">Fractured tower</option>
+              <option value="skeleton">High-rise skeleton</option>
+            </select>
+          </div>
+          <div class="config-row">
+            <label class="config-label" for="cfg-highrise-construction">High-Rise Build</label>
+            <select id="cfg-highrise-construction" class="config-slider">
+              <option value="fractured">Fractured tower</option>
+              <option value="skeleton">High-rise skeleton</option>
+            </select>
           </div>
         </section>
 

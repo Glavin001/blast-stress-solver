@@ -136,6 +136,16 @@ export type ScenarioBond = {
 export type CollisionGroup = {
   children?: CollisionGroup[];
   fragments?: number[];
+  /**
+   * Optional render-LOD proxy shape for the intact-building render proxy (purely cosmetic;
+   * collision ignores it). `'box'` (default) draws the node's AABB as a box; `'prism'` draws a
+   * triangular gable prism (ridge along the longer horizontal axis of the AABB) so a pitched roof
+   * reads as a ridge line instead of a flat-topped block. When a node carries a `shape`, the
+   * intact render-LOD emits ONE proxy for the whole node (its AABB) and does NOT descend into its
+   * children — so e.g. a roof authored as two sloped slabs renders as a single gable prism while
+   * still keeping its slabs as separate collision leaves.
+   */
+  shape?: 'box' | 'prism';
 };
 
 export type ScenarioDesc = {
@@ -420,7 +430,7 @@ export type DestructibleCore = {
   /** Per-building render-LOD state: stable AABB + member fragment node indices, plus a live
    *  `intact` flag (true while the whole building is still un-split/un-destroyed on the root).
    *  Lets a renderer collapse an intact building to one proxy box. Tree is built on demand. */
-  getBuildingRenderStates?: () => Array<{ buildingId: number; intact: boolean; aabbMin: Vec3; aabbMax: Vec3; fragments: number[] }>;
+  getBuildingRenderStates?: () => Array<{ buildingId: number; intact: boolean; aabbMin: Vec3; aabbMax: Vec3; fragments: number[]; parts?: Array<{ aabbMin: Vec3; aabbMax: Vec3; shape?: 'box' | 'prism' }> }>;
   // Damageable chunks API (present when damage is enabled)
   applyNodeDamage?: (nodeIndex: number, amount: number, reason?: string) => void;
   getNodeHealth?: (nodeIndex: number) => { health: number; maxHealth: number; destroyed: boolean } | null;
