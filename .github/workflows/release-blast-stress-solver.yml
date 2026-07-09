@@ -36,7 +36,7 @@ jobs:
       - name: Install Emscripten SDK
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: 3.1.51
+          version: 6.0.0
 
       - name: Validate tag matches crate version
         id: meta
@@ -117,7 +117,7 @@ jobs:
       - name: Install Emscripten SDK
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: 3.1.51
+          version: 6.0.0
 
       - name: Rebuild staged crate
         run: |

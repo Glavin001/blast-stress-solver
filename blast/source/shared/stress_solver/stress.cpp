@@ -58,6 +58,14 @@ static inline bool angLin6Equal(const AngLin6& a, const AngLin6& b)
 #if defined(STRESS_SOLVER_FORCE_SCALAR)
 const bool
 StressProcessor::s_use_simd = false;
+#elif defined(__wasm__)
+// WASM target with `-mavx`: wasm-simd128 is required by the runtime and there
+// is no device feature to probe from inside the sandbox.  Native AVX support
+// landed in emscripten 3.1.68 (256-bit ops emulated as two 128-bit
+// wasm-simd128 instructions); we always have it, so SIMD is unconditionally
+// on for this configuration.
+const bool
+StressProcessor::s_use_simd = true;
 #elif defined(STRESS_SOLVER_NO_DEVICE_QUERY)
 const bool
 StressProcessor::s_use_simd = false;

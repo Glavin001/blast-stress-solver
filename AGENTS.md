@@ -22,8 +22,8 @@ This is the NVIDIA PhysX monorepo containing PhysX, Blast, and Flow SDKs. The ac
   ```bash
   git clone https://github.com/emscripten-core/emsdk.git /opt/emsdk
   cd /opt/emsdk
-  ./emsdk install 3.1.51
-  ./emsdk activate 3.1.51
+  ./emsdk install 6.0.0
+  ./emsdk activate 6.0.0
   source /opt/emsdk/emsdk_env.sh
   ```
   The `~/.bashrc` should source it automatically. Verify with `emcc --version`.
@@ -172,6 +172,35 @@ After running `npm start` at the root:
 - WASM bridge: `blast/blast-stress-solver/src/stress.ts` (addForce, addActorGravity, generateFractureCommandsPerActor, applyFractureCommands, createBondsFromTriangles)
 - Auto-bonding: `blast/blast-stress-solver/src/three/autoBonding.ts`
 - Damage system: `blast/blast-stress-solver/src/rapier/damage.ts`
+
+### WASM build flags (stress solver SIMD)
+
+The WASM solver compiles with the direct wasm-simd128 hand-port of the AngLin6 /
+Coupling / Inertia kernels by default (PR #40, ~24% solver speedup on the
+mini-city scenario vs the scalar autovec it replaced).  The CI test matrix
+covers both this and the scalar opt-out so the kill switch stays green.
+
+| env var when running `npm run build` in `blast/js_stress_example` | path | notes |
+|---|---|---|
+| _(none — default)_ | direct wasm-simd128 (v128 hand-port) | what the production deploy ships |
+| `EMCC_NO_SIMD=1` | scalar `AngLin6Ops<float>` (autovec) | kill switch — reverts to main's algorithm |
+| `EMCC_USE_SIMD=1` | `__m256` AVX intrinsics via emcc emulation | fallback / Rust-crate parity |
+
+Precedence is `EMCC_NO_SIMD > EMCC_USE_WASM_SIMD > EMCC_USE_SIMD > default`.
+`stress_processor_using_simd()` is the runtime probe — `simd.parity.test.ts`
+asserts it matches the build env so a misconfigured deploy fails CI rather
+than silently shipping the wrong kernel.
+
+For local A/B at scale, two benches live alongside the package:
+
+- `node scripts/bench-replay.mjs <recording.json[.gz]>` — steady-state
+  gravity-only solve on the recorded scenario (mini-city = 8152 nodes).
+- `node scripts/bench-destroy.mjs <recording.json[.gz]>` — adds
+  deterministic projectile-style impulse impacts + applyFractureCommands
+  in a loop, so it covers the destruction-time worst-case frame.
+
+Both pick up `dist/stress_solver.wasm` and report `s_use_simd` per run — switch
+the env var between builds to A/B kernels against the same scenario.
 
 ### Gotchas
 

@@ -82,6 +82,31 @@ struct InertiaMatrixOps
 };
 
 #if !defined(STRESS_SOLVER_NO_SIMD)
+#if defined(STRESS_SOLVER_WASM_SIMD_DIRECT)
+#include <wasm_simd128.h>
+
+template<>
+struct InertiaMatrixOps<SIMD_Scalar>
+{
+    inline void
+    mul(AngLin6* y, const InertiaS* I, const AngLin6* x, uint32_t N)
+    {
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const InertiaS& I_i = I[i];
+            const AngLin6& x_i = x[i];
+            AngLin6& y_i = y[i];
+
+            v128_t xa = wasm_v128_load(&x_i.ang.x);
+            v128_t xl = wasm_v128_load(&x_i.lin.x);
+            v128_t Iv = wasm_f32x4_splat(I_i.I);
+            v128_t mv = wasm_f32x4_splat(I_i.m);
+            wasm_v128_store(&y_i.ang.x, wasm_f32x4_mul(Iv, xa));
+            wasm_v128_store(&y_i.lin.x, wasm_f32x4_mul(mv, xl));
+        }
+    }
+};
+#else
 template<>
 struct InertiaMatrixOps<SIMD_Scalar>
 {
@@ -115,4 +140,5 @@ struct InertiaMatrixOps<SIMD_Scalar>
         }
     }
 };
+#endif // STRESS_SOLVER_WASM_SIMD_DIRECT
 #endif // !STRESS_SOLVER_NO_SIMD

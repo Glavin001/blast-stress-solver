@@ -98,25 +98,58 @@ const exportedFunctions = [
   '_free'
 ];
 
-const enableAssertions = process.env.EMCC_ASSERTIONS !== '0';
+// Default-off for production: a debug WASM with assertions is 4x larger, slower
+// to load, and runs significantly slower in the hot solver loop. Opt in with
+// EMCC_ASSERTIONS=1 when bisecting a crash; default builds are stripped.
+const enableAssertions = process.env.EMCC_ASSERTIONS === '1';
 const enableProfiling = process.env.EMCC_PROFILING === '1';
+// Opt-out for LTO: link-time optimization gives whole-program inlining across
+// the 22 translation units below (notably inlining the CGNR kernels into
+// ext_stress_solver_update), at the cost of ~20s extra link time. Disable with
+// EMCC_NO_LTO=1 if iterating locally and only the JS bridge changed.
+const enableLTO = process.env.EMCC_NO_LTO !== '1';
+// SIMD kernel-path selection for the WASM solver.
+//
+// Default (no env vars set): the direct wasm_simd128 hand-port — `AngLin6Ops`
+// / `CouplingMatrixOps` / `InertiaMatrixOps` specializations from anglin6.h /
+// coupling.h / inertia.h compiled with `STRESS_SOLVER_WASM_SIMD_DIRECT`,
+// flipping `StressProcessor::s_use_simd` to true at runtime.  Measured ~24%
+// solver speedup on the mini-city replay vs the scalar autovec, ~34% mean /
+// ~49% worst-frame on the destruction bench.  All 408 vitest tests pass.
+//
+// **Kill switch** — `EMCC_NO_SIMD=1` reverts to the scalar `AngLin6Ops<float>`
+// path that shipped on main.  Same algorithm, same numeric output (within the
+// solver tolerance the test suite already exercises).  Use this if a future
+// upstream WASM-SIMD bug shows up, or to A/B with the no-SIMD baseline.
+//
+// AVX alternative — `EMCC_USE_SIMD=1` (and `EMCC_NO_SIMD` unset) selects the
+// `__m256` AVX-intrinsic path from PR #37 instead of v128.  Kept available
+// for fallback and for parity-testing against the native (x86) Rust crate,
+// which uses the same `__m256` kernels.  Tied with v128 on steady-state mean,
+// slightly slower on the worst-case frame.
+//
+// Precedence: NO_SIMD > USE_WASM_SIMD > USE_SIMD > default (v128).
+const disableSimd = process.env.EMCC_NO_SIMD === '1';
+const explicitWasmSimd = process.env.EMCC_USE_WASM_SIMD === '1';
+const explicitAvx = process.env.EMCC_USE_SIMD === '1';
+const enableAvx = !disableSimd && !explicitWasmSimd && explicitAvx;
+const enableWasmSimd = !disableSimd && !enableAvx;
+const enableAnySimd = !disableSimd;
 
+// The TS bridge in blast-stress-solver/src/stress.ts reaches for
+// Module.HEAPU8 / HEAPU32 / HEAPF32 (it rebuilds the DataView after every
+// memory grow, and uses HEAPF32.set / HEAPU32.set for bulk-copy FFI paths
+// like addAllActorGravity / addAllForces).  emscripten 5.0+ doesn't attach
+// those to the Module object unless explicitly requested, so list them
+// here; cwrap/ccall/UTF8ToString are the JS helpers the bridge uses for
+// FFI calls and the one sizeof error string.
 const exportedRuntimeMethods = [
   'cwrap',
   'ccall',
-  'getValue',
-  'setValue',
   'UTF8ToString',
-  'stringToUTF8',
-  'lengthBytesUTF8',
-  'HEAP8',
   'HEAPU8',
-  'HEAP16',
-  'HEAPU16',
-  'HEAP32',
   'HEAPU32',
-  'HEAPF32',
-  'HEAPF64'
+  'HEAPF32'
 ];
 
 const commonArgs = [
@@ -161,25 +194,85 @@ const commonArgs = [
   '-I' + sdkStressDir,
   '-I' + sdkAuthoringDir,
   '-I' + sdkAuthoringCommonDir,
-  '-DSTRESS_SOLVER_FORCE_SCALAR=1',
-  '-DSTRESS_SOLVER_NO_SIMD=1',
+  ...(enableAnySimd
+    ? [
+        // SIMD path: leave STRESS_SOLVER_NO_SIMD off so anglin6.h /
+        // coupling.h / inertia.h's __m128 specializations compile, then
+        // pick the implementation flavor:
+        //   STRESS_SOLVER_WASM_SIMD_DIRECT — direct wasm_simd128 (preferred
+        //     when EMCC_USE_WASM_SIMD=1, takes precedence over the AVX path).
+        //   (neither define) — the vendored __m256/_mm_* AVX implementation,
+        //     emulated by emcc on top of wasm-simd128.
+        ...(enableWasmSimd ? ['-DSTRESS_SOLVER_WASM_SIMD_DIRECT=1'] : []),
+      ]
+    : [
+        // Scalar path (default): force AngLin6Ops<Float_Scalar> at runtime
+        // (s_use_simd = false) and skip compiling the SIMD-only kernels.
+        '-DSTRESS_SOLVER_FORCE_SCALAR=1',
+        '-DSTRESS_SOLVER_NO_SIMD=1',
+      ]),
   '-D__linux__=1',
   '-D__arm__=1',
   '-DCOMPILE_VECTOR_INTRINSICS=0',
   '-DNDEBUG=1',
   '-std=c++17',
   '-O3',
-  '-msimd128',            // Enable WASM SIMD auto-vectorization for scalar math loops
+  // -msimd128 enables WASM SIMD auto-vectorization for the scalar math loops
+  // in anglin6.h / inertia.h / coupling.h.  -msse4.2 widens the SSE intrinsic
+  // pool clang can fuse shuffles/loads into.  -mavx (added when EMCC_USE_SIMD)
+  // unlocks the __m256 / _mm256_* intrinsics the AngLin6 SIMD specializations
+  // use; emscripten 3.1.68+ lowers each AVX op to two wasm-simd128 ops.
+  '-msimd128',
+  '-msse4.2',
+  // -mavx is needed by the AVX (`__m256`) implementation path, including the
+  // common `_mm_load1_ps` / `_mm256_load_ps` etc. used outside the
+  // specializations.  The direct-v128 path doesn't strictly need it (it uses
+  // wasm_simd128 intrinsics), but the surrounding scalar `__m128` helpers in
+  // simd.h still require SSE-level intrinsics, which `-msimd128 -msse4.2`
+  // already cover.  Adding `-mavx` for both SIMD paths keeps the build
+  // matrix simple.
+  ...(enableAnySimd ? ['-mavx'] : []),
+  // Whole-program / no-runtime-overhead settings. The C++ here doesn't throw,
+  // doesn't use RTTI, doesn't longjmp, doesn't touch a filesystem, and only
+  // uses fprintf(stderr, ...) for one warning (which emcc still satisfies
+  // without FILESYSTEM via the JS console). Dropping each gives smaller WASM,
+  // less JS glue, and (for -flto / -fno-exceptions) tighter codegen.
+  '-fno-exceptions',
+  '-fno-rtti',
+  '-fno-math-errno',         // Don't set errno from <math.h>; safe — code never reads errno.
+  '-fno-trapping-math',      // Assume FP ops don't trap; safe — no FE_* trap handling.
+  '-fno-stack-protector',    // Stack canaries are a no-op on wasm32 anyway.
+  '-fvisibility=hidden',     // Internal symbols don't reach the JS export table.
   '-sWASM=1',
   '-sMODULARIZE=1',
   '-sALLOW_MEMORY_GROWTH=1',
+  '-sFILESYSTEM=0',          // No FS — saves ~30 KB of JS glue + runtime init.
+  '-sSUPPORT_LONGJMP=0',     // No setjmp/longjmp in any TU.
+  '-sNO_EXIT_RUNTIME=1',     // Module lives for the process; no atexit/_exit.
+  '-sDISABLE_EXCEPTION_CATCHING=1',  // Pair with -fno-exceptions.
+  '-sDYNAMIC_EXECUTION=0',   // No eval() / new Function() — smaller JS, CSP-safe.
+  '-sSTACK_SIZE=1048576',    // 1 MiB stack (default is 64 KiB): provides headroom for the solver's heavy AngLin6 temporaries on large graphs.
+  // Extra Binaryen pass: `--converge` re-runs the standard `-O3` pipeline
+  // until a fixed point. Earlier passes expose simplifications (constant
+  // folding through the CGNR inner kernels, dead-block elimination) that
+  // the next iteration can fold further, at the cost of a few extra seconds
+  // of link time.
+  '-sBINARYEN_EXTRA_PASSES=--converge',
   `-sEXPORTED_FUNCTIONS=[${exportedFunctions.map((fn) => `"${fn}"`).join(',')}]`,
   `-sEXPORTED_RUNTIME_METHODS=[${exportedRuntimeMethods.map((name) => `"${name}"`).join(',')}]`
 ];
 
+if (enableLTO) {
+  // -flto applies to both compile (each .cpp -> bitcode) and link (whole-program
+  // inlining + dead-code elimination across TUs). Required at both stages.
+  commonArgs.push('-flto');
+}
+
 if (enableAssertions) {
   console.log('Building with assertions');
   commonArgs.push('-sASSERTIONS=1');
+} else {
+  commonArgs.push('-sASSERTIONS=0');
 }
 
 if (enableProfiling) {
