@@ -55,23 +55,23 @@ const CONFIG = {
     // impact and motion shedding instantly.
     bondStrength: { frame: 1, wheel: 1, panel: 1, cargo: 1, accessory: 1 } as Record<VehiclePartRole, number>,
   },
-  // Live breaking knobs (no Reset needed).
-  breaking: {
-    impactSensitivity: 1.0, // global: how easily a direct hit detaches a part
-    shedOnMotion: 1.0, // global: how readily parts tear off a violently moving body (0 = off)
-  },
   projectile: {
+    // A heavy ball (~wrecking-ball): at the calibrated materialScale this sheds a
+    // satisfying few parts per hit (cargo first, the cage holding) without
+    // shattering the car or exploding. Swept in scripts/probe-vehicle.mjs.
     radius: 0.25,
     mass: 150,
-    speed: 38,
+    speed: 45,
     ttlMs: 8000,
   },
   solver: {
     gravity: -9.81,
-    // High on purpose: the stress solver should hold the car rock-solid under
-    // gravity. All breaking is driven by the controlled onImpact path, not stress,
-    // so a free body never sags or sheds parts just sitting/settling.
-    materialScale: 1e12,
+    // Calibrated so the intact car holds rock-solid under its own weight at rest
+    // (gravity + the ground-contact reaction the solver already sees), yet a
+    // projectile/drop spikes local bond stress past the per-role limits so parts
+    // break off. Destruction is driven entirely by the stress solver — lower =
+    // more fragile. (Mechanism: freeBodyGroundStress.test.ts.)
+    materialScale: 1e11,
   },
   physics: {
     contactForceScale: 30,
@@ -158,8 +158,9 @@ function updateStatus(core: any) {
   el('stat-bodies')!.textContent = String(core.getRigidBodyCount());
   el('stat-bonds')!.textContent = String(core.getActiveBondsCount());
   el('stat-projectiles')!.textContent = String(core.projectiles.length);
-  // Parts shed via impact (cutNodeBonds doesn't set chunk.detached, so track cuts).
-  el('stat-detached')!.textContent = `${_impactCuts} / ${core.chunks.length}`;
+  // Parts the stress solver has broken off (their own dynamic bodies now).
+  const detached = (core.chunks as any[]).filter((c) => c.detached || c.destroyed).length;
+  el('stat-detached')!.textContent = `${detached} / ${core.chunks.length}`;
 }
 
 // ── Main ──────────────────────────────────────────────────────
@@ -174,127 +175,11 @@ let colorByRole = true;
 // Cached parsed model so Reset / Drop rebuild without re-fetching 8 MB.
 let gltfScene: THREE.Object3D | null = null;
 
-// Per-node role + centroid for the impact handler (free-body breaking).
-let nodeRolesRef: VehiclePartRole[] | null = null;
-let nodeCentroidsRef: Array<{ x: number; y: number; z: number }> | null = null;
-
-// Impact → detach response. A free-floating car barely stresses its bonds under a
-// hit, so instead we detach weak parts locally on impact: when a node is struck
-// hard enough for its role, cut its bonds (it falls off as debris, keeping its
-// mesh) and splash to nearby same-or-weaker parts for a harder hit. Frame/wheels
-// need a much harder hit; cargo/accessories shed easily.
-// Contact-force (N) needed to tear a part of each role off. Calibrated against
-// observed impacts: a ~4 m drop lands wheels at ~7–13 kN, a fast heavy projectile
-// hits much harder. Cargo/accessories shed easily; wheels only pop off on a hard
-// hit (and as a whole unit); the frame only lets go under a catastrophic blow.
-const IMPACT_DETACH_THRESHOLD: Record<VehiclePartRole, number> = {
-  accessory: 500,
-  cargo: 1500,
-  panel: 5000,
-  wheel: 16000,
-  frame: 22000,
-};
-// Weaker (lower) parts shed before stronger ones in a splash.
-const ROLE_RANK: Record<VehiclePartRole, number> = { accessory: 0, cargo: 1, panel: 2, wheel: 3, frame: 4 };
-let _impactCuts = 0;
-// Ignore impacts briefly after (re)build so the vehicle can settle onto the
-// ground without shedding parts. A drop from height lands well after this.
-let sceneSettleUntil = 0;
-
-// Effective detach threshold = base × the role's live attachment strength,
-// divided by the global impact-sensitivity. So the per-role sliders and the
-// global slider both take effect immediately on the next hit (no Reset). This is
-// what actually governs destruction (the stress solver is kept stiff on purpose).
-const thrOf = (role: VehiclePartRole) =>
-  (IMPACT_DETACH_THRESHOLD[role] * (CONFIG.vehicle.bondStrength[role] ?? 1)) /
-  Math.max(0.02, CONFIG.breaking.impactSensitivity);
-
-function handleImpact(e: { nodeIndex: number; force: number; otherBodyHandle: number }) {
-  const roles = nodeRolesRef;
-  const cents = nodeCentroidsRef;
-  const core = coreRef;
-  if (!roles || !cents || !core) return;
-  if (performance.now() < sceneSettleUntil) return; // let it settle on spawn
-  const role = roles[e.nodeIndex];
-  if (!role) return;
-  const thr = thrOf(role);
-  if (e.force < thr) return;
-
-  // Detach the struck part (cut its bonds → it falls off as debris, keeps mesh).
-  if (core.cutNodeBonds(e.nodeIndex)) _impactCuts++;
-
-  // Harder hits shed a small local cluster of same-or-weaker parts (splash),
-  // tightly bounded in both radius and count so one hit can't level the vehicle.
-  const over = Math.min(4, e.force / thr);
-  if (over > 1.5) {
-    const radius = 0.25 + 0.06 * over; // ~0.34 .. 0.49 m
-    const r2 = radius * radius;
-    const maxSplash = Math.round(1 + over); // ~3 .. 5 extra parts
-    const c0 = cents[e.nodeIndex];
-    const rank = ROLE_RANK[role];
-    const cand: Array<{ j: number; d2: number }> = [];
-    for (let j = 0; j < roles.length; j++) {
-      if (j === e.nodeIndex) continue;
-      const rj = roles[j];
-      if (!rj || ROLE_RANK[rj] > rank) continue; // only same-or-weaker
-      if (e.force < thrOf(rj)) continue;
-      const cj = cents[j];
-      const dx = c0.x - cj.x, dy = c0.y - cj.y, dz = c0.z - cj.z;
-      const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < r2) cand.push({ j, d2 });
-    }
-    cand.sort((a, b) => a.d2 - b.d2);
-    for (let k = 0; k < Math.min(maxSplash, cand.length); k++) {
-      if (core.cutNodeBonds(cand[k].j)) _impactCuts++;
-    }
-  }
-}
-
-// Inertial shedding: a free body that's flung/spun hard doesn't stress its bonds
-// in the solver, but physically the loosely-lashed cargo would tear off. So when
-// a body carrying cargo/accessories moves or spins violently, progressively cut
-// those weak parts' bonds (they fly off as debris). "Shed on motion" scales it.
-// Base "violence" (m/s-equivalent: linear speed + weighted spin) at which each
-// role starts to tear loose from a flung/spinning body. Cargo/accessories are
-// low (shed readily); frame/wheels are high (only a savage tumble shakes them
-// off) — but "Shed on motion" can scale all of it for full control.
-const INERTIAL_SHED_BASE: Record<VehiclePartRole, number> = {
-  accessory: 6, cargo: 9, panel: 28, wheel: 55, frame: 80,
-};
-
-function processInertialShedding() {
-  const roles = nodeRolesRef;
-  const core = coreRef;
-  if (!roles || !core) return;
-  if (performance.now() < sceneSettleUntil) return;
-  const sens = CONFIG.breaking.shedOnMotion;
-  if (sens <= 0) return;
-
-  // "Violence" per body = linear speed + a weighting of angular speed (spin).
-  const violence = new Map<number, number>();
-  for (const ch of core.chunks as any[]) {
-    if (!ch.active || ch.bodyHandle == null || violence.has(ch.bodyHandle)) continue;
-    const body = core.world.getRigidBody(ch.bodyHandle);
-    if (!body || body.isFixed?.()) continue;
-    const v = body.linvel();
-    const w = body.angvel();
-    violence.set(ch.bodyHandle, Math.hypot(v.x, v.y, v.z) + Math.hypot(w.x, w.y, w.z) * 1.2);
-  }
-
-  for (let i = 0; i < core.chunks.length; i++) {
-    const ch = (core.chunks as any[])[i];
-    if (!ch.active || ch.bodyHandle == null) continue;
-    const role = roles[i];
-    if (!role) continue;
-    const vv = violence.get(ch.bodyHandle) ?? 0;
-    // Threshold scales with the role's live attachment strength, so the same
-    // per-role sliders that govern impact breaking also govern motion shedding.
-    const thr = (INERTIAL_SHED_BASE[role] * (CONFIG.vehicle.bondStrength[role] ?? 1)) / sens;
-    if (vv > thr && Math.random() < Math.min(0.5, 0.05 * (vv / thr - 1))) {
-      if (core.cutNodeBonds(i)) _impactCuts++;
-    }
-  }
-}
+// Breaking is fully stress-driven: the solver sees gravity + the ground-contact
+// reaction + projectile contact forces, and breaks bonds wherever the stress
+// exceeds the (area-encoded) per-role limit. No scripted onImpact/inertial-shed
+// path — `materialScale` is calibrated so the intact car holds at rest yet a
+// hit/drop overstresses the weak joints. (See freeBodyGroundStress.test.ts.)
 
 const profiler = createFrameProfilerOverlay();
 const recorder = createRecordingOverlay({
@@ -325,7 +210,7 @@ async function initScene(dropHeight = 0) {
   // rebuilds never accumulate transforms.
   const { parts, bounds } = extractVehicleParts(root);
 
-  const { scenario, nodeColors, nodeRoles, summary } = await buildVehicleScenario(parts, bounds, {
+  const { scenario, nodeColors, summary } = await buildVehicleScenario(parts, bounds, {
     totalMass: CONFIG.vehicle.totalMass,
     fractureCellSize: CONFIG.vehicle.fractureCellSize,
     bondMaxSeparation: CONFIG.vehicle.bondMaxSeparation,
@@ -333,11 +218,6 @@ async function initScene(dropHeight = 0) {
     pinata,
     groundGap: 0.03 + Math.max(0, dropHeight),
   });
-  nodeRolesRef = nodeRoles;
-  nodeCentroidsRef = scenario.nodes.map((n: any) => n.centroid);
-  _impactCuts = 0;
-  // Grace window: settle a resting spawn (~0.1 s) or let a height-drop fall first.
-  sceneSettleUntil = performance.now() + (dropHeight > 0 ? 350 : 600);
 
   console.log(
     `Destructible vehicle: ${summary.parts} parts → ${summary.nodes} nodes, ${summary.bonds} bonds`,
@@ -350,8 +230,6 @@ async function initScene(dropHeight = 0) {
     materialScale: CONFIG.solver.materialScale,
     contactForceScale: CONFIG.physics.contactForceScale,
     skipSingleBodies: CONFIG.physics.skipSingleBodies,
-    onImpact: handleImpact,
-    onImpactMinForce: 1,
     ...physicsCoreOverrides(),
     ...pipelineCoreOverrides(),
   });
@@ -479,12 +357,6 @@ bindSlider('cfg-bs-panel', CONFIG.vehicle.bondStrength, 'panel', strengthFmt);
 bindSlider('cfg-bs-cargo', CONFIG.vehicle.bondStrength, 'cargo', strengthFmt);
 bindSlider('cfg-bs-accessory', CONFIG.vehicle.bondStrength, 'accessory', strengthFmt);
 
-// Breaking sensitivity — LIVE (no Reset).
-bindSlider('cfg-impact-sens', CONFIG.breaking, 'impactSensitivity', (v) => v.toFixed(2) + '×');
-bindSlider('cfg-shed-motion', CONFIG.breaking, 'shedOnMotion', (v) =>
-  v <= 0 ? 'off' : v.toFixed(2) + '×',
-);
-
 // Projectile (immediate)
 bindSlider('cfg-proj-radius', CONFIG.projectile, 'radius', (v) => v.toFixed(2) + ' m');
 bindSlider('cfg-proj-mass', CONFIG.projectile, 'mass', (v) => v.toLocaleString() + ' kg');
@@ -507,12 +379,14 @@ bindSlider('cfg-gravity', CONFIG.solver, 'gravity', (v) => v.toFixed(1));
   }
 }
 
-// Detached debris bounces off the intact body and the ground, but NOT off other
-// debris. Fractured/split chunks have overlapping convex hulls, so allowing
-// debris-vs-debris contact lets a pile of just-detached overlapping chunks resolve
-// their penetration as a violent explosion. 'noDebrisPairs' keeps debris lively
-// (cargo bounces off the car) while removing that failure mode. Verified stable
-// under heavy destruction by scripts/soak-vehicle.mjs.
+// Detached debris bounces off the intact car and the ground, but NOT off other
+// debris. This is the one genuine collider-fidelity mitigation: the runtime builds
+// a single convex hull per node, and fractured/concave pieces have *overlapping*
+// hulls, so under sustained heavy destruction debris-vs-debris contacts resolve
+// their mutual penetration as an explosion (full 'all' mode survives settle/light
+// shots/drops but blows up on rapid heavy fire — see scripts/soak-vehicle.mjs).
+// 'noDebrisPairs' keeps debris lively (it still bounces off the car) while removing
+// that failure mode. The real fix would be convex decomposition (out of scope).
 physicsConfig.debrisCollisionMode = 'noDebrisPairs';
 
 // Shared Physics / Optimization / Features controls.
@@ -536,7 +410,6 @@ function loop() {
   if (coreRef && visualsRef) {
     const t0 = performance.now();
     coreRef.step(dt);
-    processInertialShedding(); // cargo tears off a flung/spinning body
     _physicsMs += ((performance.now() - t0) - _physicsMs) * EMA;
 
     visualsRef.update({ debug: showDebug, updateBVH: false, updateProjectiles: true });
@@ -598,7 +471,8 @@ window.addEventListener('resize', onResize);
       if (sp > 60) fast++; // way above projectile speed → exploding debris
       dyn++;
     });
-    return { maxSpeed, maxDist, fastBodies: fast, dynamicBodies: dyn, bodies: core.getRigidBodyCount(), shed: _impactCuts };
+    const shed = (core.chunks as any[]).filter((c) => c.detached || c.destroyed).length;
+    return { maxSpeed, maxDist, fastBodies: fast, dynamicBodies: dyn, bodies: core.getRigidBodyCount(), shed };
   },
 };
 

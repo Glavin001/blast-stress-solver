@@ -74,18 +74,36 @@ State** to instead see intact-vs-detached state).
 
 ## Breaking model
 
-Breaking is **not** stress-driven (a free body barely stresses its bonds on a
-hit). Two controlled paths drive it instead:
+Breaking is **fully stress-driven** — there is no scripted `onImpact` path. The
+key realisation is that a free body is only stress-free in *free-fall*; once it
+**rests on the ground**, the ground-contact reaction (which the core already
+injects into the stress solver alongside gravity) plus any projectile contact
+force create a real internal load path, and the solver's existing
+overstressed-bond fracture path breaks bonds wherever the stress exceeds the
+(area-encoded) per-role limit. So:
 
-- **Direct impact** (`onImpact`): a hit past a role-based force threshold cuts the
-  struck part's bonds (it detaches and falls), with a small bounded splash.
-- **Inertial shedding:** when a body carrying cargo/accessories is flung or spun
-  hard, those weakly-lashed parts progressively tear off and bounce away — so a
-  car that's hit and goes tumbling sheds its payload, not just the part you hit.
+- **At rest:** gravity + the ground reaction hold the intact car solid (stress
+  stays under every bond limit).
+- **A hit / drop:** the contact force spikes local bond stress past the weak
+  joints' limits, so cargo/accessories shed first and the cage holds until a hard
+  enough hit overstresses the frame welds too.
 
-Detached debris uses `debrisCollisionMode: 'noDebrisPairs'` — it bounces off the
-car and ground but not off other debris (overlapping just-detached chunks colliding
-with each other is what caused the early "explosion").
+`materialScale` sets the single (global) material limit — it's calibrated so the
+intact car holds under its own weight yet a hit overstresses the weak joints.
+Lower = more fragile. The mechanism is pinned by a headless test,
+[`freeBodyGroundStress.test.ts`](../blast-stress-solver/src/tests/freeBodyGroundStress.test.ts)
+(a free column breaks under self-weight when resting, stays intact in free-fall).
+
+Two supporting details:
+- **Resting cargo** is reduced to a single weak bond (`capRestingBonds` in
+  `glb-vehicle.ts`) so it sheds like a resting contact, not a welded seam.
+- Detached debris uses `debrisCollisionMode: 'noDebrisPairs'` — it bounces off the
+  intact car and the ground but not off *other debris*. This is the one real
+  collider-fidelity mitigation: the runtime builds a single convex hull per node,
+  so fractured/concave pieces have overlapping hulls, and under sustained heavy
+  fire debris-vs-debris contacts resolve their mutual penetration as an explosion.
+  (No per-frame fracture cap is needed — at the calibrated `materialScale` a hit
+  already peels off only a few parts at a time.)
 
 ## Controls
 
@@ -93,12 +111,10 @@ Tuning GUI in the sidebar:
 - **Bond Strength by Role** — per-role attachment strength (frame / wheel / panel /
   cargo / accessory), the main hierarchy knobs (needs *Reset*). Cargo/accessories
   start weak so they shed readily.
-- **Breaking Sensitivity (live)** — *Impact break ease* (how easily a direct hit
-  detaches a part) and *Shed on motion* (how readily cargo tears off a flung/
-  spinning car). Both apply immediately, no Reset.
 - **Total Mass**, **Fracture Cell Size**, **Bond Reach** — vehicle build (*Reset*).
 - **Projectile** radius / mass / speed — live.
-- **Material Scale** (kept high so the car is solid at rest) / **Gravity** (*Reset*).
+- **Material Scale** — the global material limit; calibrated so the car is solid
+  at rest yet breaks on a hit. Lower = more fragile (*Reset*). **Gravity** (*Reset*).
 - Shared **Physics / Optimization** controls plus the live frame profiler and
   session recorder.
 
@@ -147,18 +163,22 @@ exports (`buildScenarioFromFragmentsAsync`, `fractureGeometryAsync`,
 - Voronoi fracture (three-pinata) runs on meshes that may be non-manifold; it's
   guarded with a per-part fallback to "keep whole", so a model that doesn't
   fracture cleanly still works.
-- **Impact breaking is contact-driven.** A free-floating car barely stresses its
-  bonds on impact, so breaking is driven by the core's `onImpact` callback: a hit
-  past a role-based force threshold cuts the struck part's bonds (it detaches and
-  falls), with a small bounded splash. `materialScale` is kept high so the stress
-  solver holds the car rock-solid under gravity; all breaking goes through the
-  impact path.
-- **Debris collides with the ground only** (`debrisCollisionMode:
-  'debrisGroundOnly'`). Fractured/split chunks have overlapping convex hulls;
-  fine while welded into one body, but when many detach at once, debris-vs-body
-  penetration would otherwise resolve as a violent explosion. Ground-only keeps it
-  stable (the trade-off is that shed parts fall through each other rather than
-  piling).
+- **Breaking is stress-driven, with one global material.** The Blast stress
+  solver has a single material (global stress limits, in Pa); per-bond strength is
+  expressed only through bond **area** (`stress = force / area`, and area is also
+  the bond's "health" / effective cross-section). That is a clean per-bond
+  strength knob — area does not affect the rigid solve, only the break threshold —
+  so the role hierarchy lives entirely in the area multipliers. Genuinely
+  different *materials* per bond, or tension-free "resting" contacts, would need a
+  fork of the vendored solver; the single-bond cargo approximation avoids that.
+- **A heavy projectile launches debris fast.** Because breaking is physical, a
+  heavy/fast projectile transfers real momentum to the struck part as it detaches,
+  so it flies off faster than the old scripted model produced — momentum, not an
+  explosion. An *absurd* mass (a 2.5-tonne ram) launches parts past the soak's
+  60 m/s "explosion" check, so the soak uses a plausible 600 kg heavy instead.
+- **Debris doesn't collide with other debris** (`'noDebrisPairs'`) — see the
+  Breaking model section. It bounces off the car and ground (lively), just not off
+  other just-detached overlapping hulls (which would explode under heavy fire).
 
 ## Headless QA
 
