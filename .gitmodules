@@ -1,0 +1,3 @@
+[submodule "blast/deps/simde"]
+	path = blast/deps/simde
+	url = https://github.com/simd-everywhere/simde.git

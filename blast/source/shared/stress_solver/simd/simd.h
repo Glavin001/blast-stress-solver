@@ -26,11 +26,121 @@
 
 #pragma once
 
+#if defined(STRESS_SOLVER_WASM_SIMD)
+// WASM build with the AVX kernels rerouted through simde
+// (https://github.com/simd-everywhere/simde) onto wasm-simd128.  The vendored
+// headers in this directory key on `__m128`/`__m256` and the AVX/FMA intrinsics
+// — simde provides one-to-one emulations of those that lower to v128 ops at
+// compile time, so the existing AVX code in anglin6.h / coupling.h / inertia.h
+// builds unchanged.
+//
+// SIMDE_ENABLE_NATIVE_ALIASES makes `_mm256_*` / `__m256` etc. expand to the
+// `simde_*` / `simde__m256` equivalents without source changes elsewhere.
+#define SIMDE_ENABLE_NATIVE_ALIASES
+#include <simde/x86/sse.h>
+#include <simde/x86/sse2.h>
+#include <simde/x86/sse3.h>
+#include <simde/x86/ssse3.h>
+#include <simde/x86/sse4.1.h>
+#include <simde/x86/avx.h>
+#include <simde/x86/fma.h>
+
+// On WASM there is no hardware FMA in baseline simd128 (only relaxed-simd has
+// `f32x4.relaxed_madd`, and its rounding is implementation-defined so we keep
+// off it for determinism).  simde's 128-bit FMA fallback runs a 4-iteration
+// scalar loop through a `simde__m128_private` union; clang's vectorizer cannot
+// re-lift it back to f32x4 ops, so the autovec scalar AngLin6 path actually
+// out-codegens a "naïve" simde build.  Override the four FMA intrinsics the
+// AngLin6 kernels use with explicit (mul + add/sub) v128 sequences so the
+// emitted WASM stays vectorized.  Numeric impact: 2 roundings instead of 1 per
+// op — the same as `-O3 -msimd128` already does for the scalar path, so this
+// matches existing semantics rather than introducing new drift.
+#include <wasm_simd128.h>
+
+#undef _mm_fmadd_ps
+#undef _mm_fnmadd_ps
+#undef _mm_fmsub_ps
+#define _mm_fmadd_ps(a, b, c)  wasm_f32x4_add(wasm_f32x4_mul((a), (b)), (c))
+#define _mm_fnmadd_ps(a, b, c) wasm_f32x4_sub((c), wasm_f32x4_mul((a), (b)))
+#define _mm_fmsub_ps(a, b, c)  wasm_f32x4_sub(wasm_f32x4_mul((a), (b)), (c))
+
+// For the 256-bit variants simde represents __m256 as a union of two 128-bit
+// halves; reach into that representation via simde's public accessors so the
+// override keeps the same struct layout simde expects.
+static inline simde__m256 _stress_mm256_fmadd_ps(simde__m256 a, simde__m256 b, simde__m256 c) {
+    simde__m256_private a_ = simde__m256_to_private(a), b_ = simde__m256_to_private(b),
+                        c_ = simde__m256_to_private(c), r_;
+    r_.m128[0] = _mm_fmadd_ps(a_.m128[0], b_.m128[0], c_.m128[0]);
+    r_.m128[1] = _mm_fmadd_ps(a_.m128[1], b_.m128[1], c_.m128[1]);
+    return simde__m256_from_private(r_);
+}
+static inline simde__m256 _stress_mm256_fnmadd_ps(simde__m256 a, simde__m256 b, simde__m256 c) {
+    simde__m256_private a_ = simde__m256_to_private(a), b_ = simde__m256_to_private(b),
+                        c_ = simde__m256_to_private(c), r_;
+    r_.m128[0] = _mm_fnmadd_ps(a_.m128[0], b_.m128[0], c_.m128[0]);
+    r_.m128[1] = _mm_fnmadd_ps(a_.m128[1], b_.m128[1], c_.m128[1]);
+    return simde__m256_from_private(r_);
+}
+static inline simde__m256 _stress_mm256_fmsub_ps(simde__m256 a, simde__m256 b, simde__m256 c) {
+    simde__m256_private a_ = simde__m256_to_private(a), b_ = simde__m256_to_private(b),
+                        c_ = simde__m256_to_private(c), r_;
+    r_.m128[0] = _mm_fmsub_ps(a_.m128[0], b_.m128[0], c_.m128[0]);
+    r_.m128[1] = _mm_fmsub_ps(a_.m128[1], b_.m128[1], c_.m128[1]);
+    return simde__m256_from_private(r_);
+}
+#undef _mm256_fmadd_ps
+#undef _mm256_fnmadd_ps
+#undef _mm256_fmsub_ps
+#define _mm256_fmadd_ps(a, b, c)  _stress_mm256_fmadd_ps((a), (b), (c))
+#define _mm256_fnmadd_ps(a, b, c) _stress_mm256_fnmadd_ps((a), (b), (c))
+#define _mm256_fmsub_ps(a, b, c)  _stress_mm256_fmsub_ps((a), (b), (c))
+
+// Same story as FMA for the SSE4.1 dot-product: simde's WASM fallback runs a
+// scalar reduction loop over `simde__m128_private`, which clang doesn't lift
+// back to v128.  All three call sites in anglin6.h use the same imm8 = 0x7f
+// (multiply lanes 0..2 of the AngLin6's ang OR lin half, broadcast the sum to
+// all four lanes), so override just that case with an explicit horizontal-add
+// sequence — `mul`, zero lane 3, shuffle + add twice, splat.  Five v128 ops
+// vs. simde's per-lane scalar reduction.  simde uses `simde_mm_dp_ps` for its
+// own internal callers (not the macro alias), so the override only affects the
+// AngLin6 kernels.
+static inline simde__m128 _stress_mm_dp_ps_7f(simde__m128 a, simde__m128 b) {
+    v128_t aw = simde__m128_to_wasm_v128(a);
+    v128_t bw = simde__m128_to_wasm_v128(b);
+    v128_t mul = wasm_f32x4_mul(aw, bw);
+    mul = wasm_f32x4_replace_lane(mul, 3, 0.0f);  // imm8 high nibble 0x7 drops lane 3
+    v128_t hi  = wasm_i32x4_shuffle(mul, mul, 2, 3, 2, 3);
+    v128_t s1  = wasm_f32x4_add(mul, hi);
+    v128_t s1h = wasm_i32x4_shuffle(s1, s1, 1, 1, 1, 1);
+    v128_t sum = wasm_f32x4_add(s1, s1h);
+    v128_t bcast = wasm_i32x4_shuffle(sum, sum, 0, 0, 0, 0);  // imm8 low nibble 0xf splats
+    return simde__m128_from_wasm_v128(bcast);
+}
+static inline simde__m256 _stress_mm256_dp_ps_7f(simde__m256 a, simde__m256 b) {
+    simde__m256_private a_ = simde__m256_to_private(a), b_ = simde__m256_to_private(b), r_;
+    r_.m128[0] = _stress_mm_dp_ps_7f(a_.m128[0], b_.m128[0]);
+    r_.m128[1] = _stress_mm_dp_ps_7f(a_.m128[1], b_.m128[1]);
+    return simde__m256_from_private(r_);
+}
+#undef _mm_dp_ps
+#undef _mm256_dp_ps
+// Only 0x7f is used in this codebase.  Trap any other value at compile time so
+// a future change to anglin6.h that uses a different imm8 surfaces here rather
+// than silently regressing to the scalar fallback.
+#define _mm_dp_ps(a, b, imm8) \
+    ((imm8) == 0x7f ? _stress_mm_dp_ps_7f((a), (b)) \
+                    : (__builtin_unreachable(), simde_mm_dp_ps((a), (b), (imm8))))
+#define _mm256_dp_ps(a, b, imm8) \
+    ((imm8) == 0x7f ? _stress_mm256_dp_ps_7f((a), (b)) \
+                    : (__builtin_unreachable(), simde_mm256_dp_ps((a), (b), (imm8))))
+
+#else
 #include <xmmintrin.h>
 #include <emmintrin.h>
 #include <immintrin.h>
+#endif
 
-#if defined(__GNUC__)   // missing with gcc
+#if defined(__GNUC__) && !defined(STRESS_SOLVER_WASM_SIMD)  // missing with gcc; simde already provides it
 #define _mm256_set_m128(vh, vl) _mm256_insertf128_ps(_mm256_castps128_ps256(vl), (vh), 1)
 #endif
 
