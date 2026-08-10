@@ -31,18 +31,33 @@ const outputStem =
   floorCount === 9 && !localDamage
     ? 'high-rise'
     : `high-rise-${floorCount}f${localDamage ? '-local' : ''}`;
+// Local-damage authoring = civil load-path model, not collapse choreography.
+//
+// Real buildings stand because connection *capacity* exceeds gravity *demand*
+// along a designed path (slab → column → footing). They collapse when damage
+// removes a capacity link and demand redistributes onto neighbors that then
+// fail — progressive collapse. Uniform bond strength reads as glass because
+// every joint is equally likely to run away once one crack starts.
+//
+// Connection hierarchy (bond-area multipliers on concrete stress limits):
+//   footing anchors  >>  column/slab frame  >>  slab diaphragm  >>  facade
+// Facade is non-structural (drywall/cladding): ripping it must not drop the
+// tower. Frame joints are strong but finite so a direct hit can remove a
+// column; floors can still break under the right load/angle, just not as
+// easily as walls. Only the foundation is world-fixed (mass 0).
 const LOCAL_DAMAGE_MULTIPLIERS = {
-  // Footing joints are few (12) and take the whole tower reaction, so they need
-  // essentially unbreakable area or the intact box tips as one body. Facade
-  // attachments stay paper-thin so impacts spend energy on local wall blowout.
+  // Foundation-only world fix + real column/slab mass. Bond health is seeded
+  // from authored area (ext_stress_bridge), so these multipliers set capacity:
+  // footing >> frame >> diaphragm >> facade. Facade stays paper-thin.
   foundationColumn: 50000.0,
   foundationSkeleton: 25000.0,
-  columnColumn: 48.0,
-  columnSlab: 40.0,
-  slabSlab: 18.0,
-  infillInfill: 0.0012,
-  slabInfill: 0.0006,
-  frameInfill: 0.0004,
+  columnColumn: 1000000.0,
+  columnSlab: 800000.0,
+  slabSlab: 200000.0,
+  // Facade hangs under gravity (health=area) but stays << frame under impact.
+  infillInfill: 2.0,
+  slabInfill: 1.5,
+  frameInfill: 1.0,
 };
 
 // Canonical output for the Rust/Bevy demo + Rust headless tests, plus a copy in the
@@ -186,13 +201,13 @@ async function main() {
   const pack = serializeScenePack(scenario);
 
   if (localDamage) {
-    // Pin the concrete frame (foundation + columns) as kinematic supports so the
-    // tower cannot tip as one body. Facade/infill keeps real mass and can peel
-    // off through weak bonds (adapter allows support↔light-node fractures).
+    // World-fix only true ground anchors. Columns/slabs keep authored mass so
+    // gravity demand flows through the stress graph: remove a column → neighbors
+    // pick up load → joints that exceed capacity fail. Pinning columns to mass 0
+    // made them immortal kinematics (balls bounced; towers never crumbled).
     const types = pack.scenario.nodeTypes ?? [];
     for (let i = 0; i < pack.scenario.nodes.length; ++i) {
-      const type = types[i];
-      if (type === 'foundation' || type === 'column') {
+      if (types[i] === 'foundation') {
         pack.scenario.nodes[i].mass = 0;
       }
     }

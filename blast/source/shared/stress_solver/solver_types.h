@@ -69,4 +69,7 @@ struct SolverBond
 {
     NvcVec3     centroid;
     uint32_t    nodes[2];   // Index into accompanying SolverNode<InertiaType> array.
+    // Contact area used when converting solved impulses to stress (pressure).
+    // Authoring stronger joints (larger area) lowers stress for the same force.
+    float       area{1.0f};
 };

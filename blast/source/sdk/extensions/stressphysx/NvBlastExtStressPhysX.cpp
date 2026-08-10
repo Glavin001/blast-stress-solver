@@ -721,16 +721,21 @@ public:
             return 0;
         }
         const TelemetryClock::time_point captureStart = TelemetryClock::now();
-        m_resimSnapshot.clear();
         m_resimIndexByBodyId.clear();
         m_resimProvenance.clear();
-        m_resimSnapshot.reserve(m_actorBodies.size());
+        m_resimSeeds.clear();
 
         SceneWriteLock lock(m_scene);
+        const uint32_t bodyCount = static_cast<uint32_t>(m_actorBodies.size());
+        if (m_resimSnapshot.size() < bodyCount)
+        {
+            m_resimSnapshot.resize(bodyCount);
+        }
+        uint32_t written = 0;
         for (const auto& entry : m_actorBodies)
         {
             const BodyState& body = *entry.second;
-            ResimBodySnapshot snapshot;
+            ResimBodySnapshot& snapshot = m_resimSnapshot[written];
             snapshot.bodyId = body.bodyId;
             snapshot.globalPose = body.body->getGlobalPose();
             snapshot.kinematic = isKinematic(body);
@@ -741,21 +746,29 @@ public:
                 snapshot.sleeping = body.body->isSleeping();
                 snapshot.wakeCounter = body.body->getWakeCounter();
             }
+            else
+            {
+                snapshot.linearVelocity = PxVec3(0.0f);
+                snapshot.angularVelocity = PxVec3(0.0f);
+                snapshot.sleeping = false;
+                snapshot.wakeCounter = 0.0f;
+            }
             snapshot.worldCenterOfMass =
                 snapshot.globalPose.transform(body.body->getCMassLocalPose().p);
-            m_resimIndexByBodyId.emplace(
-                snapshot.bodyId,
-                static_cast<uint32_t>(m_resimSnapshot.size()));
-            m_resimSnapshot.push_back(snapshot);
+            m_resimIndexByBodyId.emplace(snapshot.bodyId, written);
+            ++written;
         }
+        m_resimSnapshot.resize(written);
         m_resimSnapshotValid = true;
         ++m_telemetry.resimulationCaptures;
         m_telemetry.resimulationCaptureMilliseconds +=
             elapsedMilliseconds(captureStart);
-        return static_cast<uint32_t>(m_resimSnapshot.size());
+        return written;
     }
 
-    bool restoreResimulationSnapshot() override
+    bool restoreResimulationSnapshot(
+        PxRigidDynamic* const* activeBodies,
+        uint32_t activeCount) override
     {
         if (m_tickPhase != TickPhase::Idle)
         {
@@ -774,6 +787,20 @@ public:
         const TelemetryClock::time_point restoreStart = TelemetryClock::now();
         SceneWriteLock lock(m_scene);
 
+        std::unordered_set<PxRigidDynamic*> activeSet;
+        const bool scoped = activeBodies != nullptr && activeCount > 0;
+        if (scoped)
+        {
+            activeSet.reserve(activeCount);
+            for (uint32_t i = 0; i < activeCount; ++i)
+            {
+                if (activeBodies[i])
+                {
+                    activeSet.insert(activeBodies[i]);
+                }
+            }
+        }
+
         std::unordered_map<ExtStressPhysXId, BodyState*> bodiesById;
         bodiesById.reserve(m_actorBodies.size());
         for (auto& entry : m_actorBodies)
@@ -784,17 +811,19 @@ public:
         for (auto& entry : m_actorBodies)
         {
             BodyState& body = *entry.second;
+            if (scoped && activeSet.count(body.body) == 0)
+            {
+                continue;
+            }
             const auto found = m_resimIndexByBodyId.find(body.bodyId);
             if (found == m_resimIndexByBodyId.end())
             {
-                continue; // Created since capture; re-derived from provenance below.
+                continue;
             }
             restoreBodyMotion(body, m_resimSnapshot[found->second]);
             ++m_telemetry.resimulationBodiesRestored;
         }
 
-        // Re-place fracture children relative to their source parent's restored
-        // state, in creation order so parents resolve before their children.
         for (const ResimBodyProvenance& provenance : m_resimProvenance)
         {
             const auto childFound = bodiesById.find(provenance.bodyId);
@@ -805,6 +834,10 @@ public:
             }
             BodyState& child = *childFound->second;
             const BodyState& parent = *parentFound->second;
+            if (scoped && activeSet.count(parent.body) == 0 && activeSet.count(child.body) == 0)
+            {
+                continue;
+            }
             const PxTransform previousPose = child.body->getGlobalPose();
             const PxTransform childPose =
                 parent.body->getGlobalPose() * provenance.parentRelativePose;
@@ -841,6 +874,66 @@ public:
         m_telemetry.resimulationRestoreMilliseconds +=
             elapsedMilliseconds(restoreStart);
         return true;
+    }
+
+    bool needsResimulationSnapshot() const override
+    {
+        if (!m_settings.idleSkip)
+        {
+            return true;
+        }
+        return m_framesSinceFracture <= 2 || !m_contacts.empty() || m_hadForcesLastTick;
+    }
+
+    uint32_t getResimulationSeedBodies(
+        PxRigidDynamic** bodies,
+        uint32_t capacity) const override
+    {
+        if (!bodies || capacity == 0)
+        {
+            return static_cast<uint32_t>(m_resimSeeds.size());
+        }
+        const uint32_t count = std::min(
+            capacity, static_cast<uint32_t>(m_resimSeeds.size()));
+        std::copy_n(m_resimSeeds.begin(), count, bodies);
+        return count;
+    }
+
+    uint32_t applyBaseStepSleep() override
+    {
+        if (!m_settings.baseStepSleep)
+        {
+            return 0;
+        }
+        // Do not sleep through support-loss windows: recently fractured or
+        // contacted bodies may look settled for a frame then free-fall when a
+        // neighbor splits (PR #41 class of failure).
+        if (m_framesSinceFracture <= 60 || m_hadForcesLastTick || !m_contacts.empty())
+        {
+            return 0;
+        }
+        SceneWriteLock lock(m_scene);
+        uint32_t slept = 0;
+        const float linThr2 =
+            m_settings.settledLinearSpeed * m_settings.settledLinearSpeed;
+        const float angThr2 =
+            m_settings.settledAngularSpeed * m_settings.settledAngularSpeed;
+        for (auto& entry : m_actorBodies)
+        {
+            BodyState& body = *entry.second;
+            if (isKinematic(body) || body.body->isSleeping())
+            {
+                continue;
+            }
+            const float lin2 = body.body->getLinearVelocity().magnitudeSquared();
+            const float ang2 = body.body->getAngularVelocity().magnitudeSquared();
+            if (lin2 <= linThr2 && ang2 <= angThr2)
+            {
+                body.body->putToSleep();
+                ++slept;
+            }
+        }
+        return slept;
     }
 
     ExtStressPhysXId getBodyId(const PxRigidDynamic* body) const override
@@ -1720,6 +1813,11 @@ private:
                 child.body = std::move(parentBody);
                 child.body->actorIndex = plan.actorIndex;
                 ++m_telemetry.bodiesReused;
+                // Island-exact seeds must be bodies that existed at capture /
+                // contact time. The reused parent keeps the same PxRigidDynamic*
+                // and is the only safe graph seed; brand-new children are absent
+                // from the pre-fracture contact graph and would force fallback.
+                m_resimSeeds.push_back(child.body->body);
             }
             else
             {
@@ -2016,7 +2114,10 @@ private:
     std::vector<ResimBodySnapshot> m_resimSnapshot;
     std::unordered_map<ExtStressPhysXId, uint32_t> m_resimIndexByBodyId;
     std::vector<ResimBodyProvenance> m_resimProvenance;
+    std::vector<PxRigidDynamic*> m_resimSeeds;
     bool m_resimSnapshotValid{false};
+    bool m_hadForcesLastTick{false};
+    uint32_t m_framesSinceFracture{1000};
     ExtStressPhysXTelemetry m_telemetry;
     ExtStressPhysXId m_nextBodyId{1};
     ExtStressPhysXId m_nextShapeId{1};

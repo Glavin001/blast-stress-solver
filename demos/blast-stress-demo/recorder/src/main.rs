@@ -104,6 +104,10 @@ struct RecordArgs {
     #[arg(long)]
     chase_projectile: bool,
 
+    /// Disable darkening sleeping bodies in the offline renderer.
+    #[arg(long)]
+    no_sleep_tint: bool,
+
     /// Additional argument passed verbatim to the simulation; may be repeated.
     #[arg(long = "sim-arg", allow_hyphen_values = true)]
     sim_args: Vec<OsString>,
@@ -122,6 +126,10 @@ struct RenderArgs {
     /// Replace the fourth pane with a close projectile chase camera.
     #[arg(long)]
     chase_projectile: bool,
+
+    /// Disable darkening sleeping bodies in the offline renderer.
+    #[arg(long)]
+    no_sleep_tint: bool,
 
     /// Per-step simulation CSV to render as a synchronized diagnostics overlay.
     #[arg(long)]
@@ -247,6 +255,7 @@ fn record(args: RecordArgs) -> Result<()> {
         &state_path,
         &output,
         args.chase_projectile,
+        !args.no_sleep_tint,
         Some(&frame_telemetry_path),
     )?;
     verify_video(&output)?;
@@ -267,6 +276,7 @@ fn render(args: &RenderArgs) -> Result<()> {
         &args.state,
         &args.output,
         args.chase_projectile,
+        !args.no_sleep_tint,
         args.frame_telemetry.as_deref(),
     )?;
     verify_video(&args.output)
@@ -276,6 +286,7 @@ fn render_with_telemetry(
     state_path: &Path,
     output: &Path,
     chase_projectile: bool,
+    sleep_tint: bool,
     simulation_frames: Option<&Path>,
 ) -> Result<()> {
     let render_csv = phase_path(output, "render.gpu.csv");
@@ -287,6 +298,7 @@ fn render_with_telemetry(
         state_path,
         output,
         chase_projectile,
+        sleep_tint,
         simulation_frames,
         &render_frames,
         &render_frame_summary,

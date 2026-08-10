@@ -43,6 +43,8 @@ name=candidate-a
   --stress-limit-scale 1.0 \
   --excess-force-scale 0.018 \
   --resim-passes 1 \
+  --scoped-resim \
+  --quiet-capture-skip \
   --metadata /tmp/highrise-tune/$name.metadata.json \
   --frame-telemetry /tmp/highrise-tune/$name.frames.csv \
   --output-state ''

@@ -218,6 +218,42 @@ target_link_libraries(resim_punchthrough_test PRIVATE
     ${PHYSX_LINK_LIBS})
 add_test(NAME blast_stress_physx_resim_punchthrough COMMAND resim_punchthrough_test)
 
+add_executable(resim_scoped_cascade_test
+    tests/resim_scoped_cascade_test.cpp
+    physx_scene.cpp)
+target_include_directories(resim_scoped_cascade_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${BLAST_ROOT}/include/extensions/stressphysx"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(resim_scoped_cascade_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(resim_scoped_cascade_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(resim_scoped_cascade_test PRIVATE
+    NvBlastExtStressPhysX
+    ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_physx_resim_scoped_cascade COMMAND resim_scoped_cascade_test)
+
+add_executable(direct_gpu_resim_test
+    tests/direct_gpu_resim_test.cpp
+    physx_scene.cpp)
+target_include_directories(direct_gpu_resim_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${BLAST_ROOT}/include/extensions/stressphysx"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(direct_gpu_resim_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(direct_gpu_resim_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(direct_gpu_resim_test PRIVATE
+    NvBlastExtStressPhysX
+    ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_physx_direct_gpu_resim COMMAND direct_gpu_resim_test)
+
 add_executable(scene_pack_test
     tests/scene_pack_test.cpp
     scene_pack.cpp)

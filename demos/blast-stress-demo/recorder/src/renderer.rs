@@ -295,6 +295,7 @@ pub fn render_recording(
     state_path: &Path,
     output_path: &Path,
     chase_projectile: bool,
+    sleep_tint: bool,
     simulation_telemetry_path: Option<&Path>,
     render_frames_path: &Path,
     render_summary_path: &Path,
@@ -303,6 +304,7 @@ pub fn render_recording(
         state_path,
         output_path,
         chase_projectile,
+        sleep_tint,
         simulation_telemetry_path,
         render_frames_path,
         render_summary_path,
@@ -313,6 +315,7 @@ async fn render_recording_async(
     state_path: &Path,
     output_path: &Path,
     chase_projectile: bool,
+    sleep_tint: bool,
     simulation_telemetry_path: Option<&Path>,
     render_frames_path: &Path,
     render_summary_path: &Path,
@@ -616,7 +619,7 @@ async fn render_recording_async(
             .at_time(frame_index as f32 / fps as f32);
         let orbit_uniform = camera_uniform(orbit, camera_aspect);
         queue.write_buffer(&camera_buffers[0], 0, bytemuck::bytes_of(&orbit_uniform));
-        let (boxes, spheres) = collect_instances(&state.actors);
+        let (boxes, spheres) = collect_instances(&state.actors, sleep_tint);
         box_buffer.upload(&device, &queue, "box-instances", &boxes);
         sphere_buffer.upload(&device, &queue, "sphere-instances", &spheres);
 
@@ -789,12 +792,15 @@ fn draw_instances<'a>(
     pass.draw_indexed(0..mesh.index_count, 0, 0..instance_count);
 }
 
-fn collect_instances(actors: &[Actor]) -> (Vec<InstanceRaw>, Vec<InstanceRaw>) {
+fn collect_instances(
+    actors: &[Actor],
+    sleep_tint: bool,
+) -> (Vec<InstanceRaw>, Vec<InstanceRaw>) {
     let mut boxes = Vec::with_capacity(INITIAL_INSTANCE_CAPACITY);
     let mut spheres = Vec::with_capacity(16);
     for actor in actors.iter().filter(|actor| actor.visible) {
         let actor_matrix = transform_matrix(actor.pose);
-        let color = part_color(actor.part, actor.sleeping);
+        let color = part_color(actor.part, actor.sleeping && sleep_tint);
         for shape in &actor.shapes {
             match shape {
                 Shape::Box {
@@ -827,7 +833,10 @@ fn transform_matrix(transform: Transform) -> Mat4 {
     Mat4::from_rotation_translation(transform.rotation, transform.position)
 }
 
-fn part_color(part: u8, sleeping: bool) -> [f32; 4] {
+fn part_color(part: u8, apply_sleep_tint: bool) -> [f32; 4] {
+    // Part palette is authored by structural role / building index. Sleep tint
+    // (when enabled) darkens settled bodies so awake debris reads brighter —
+    // disable with --no-sleep-tint for uniform materials.
     let mut rgb = match part {
         0 => [0.72, 0.70, 0.64],
         1 => [0.28, 0.33, 0.42],
@@ -838,7 +847,7 @@ fn part_color(part: u8, sleeping: bool) -> [f32; 4] {
         7 => [0.42, 0.42, 0.40],
         _ => [0.70, 0.70, 0.70],
     };
-    if sleeping {
+    if apply_sleep_tint {
         for channel in &mut rgb {
             *channel *= 0.25;
         }

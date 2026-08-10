@@ -413,7 +413,17 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
     }
 
     NvBlastActorDesc actorDesc{};
-    actorDesc.uniformInitialBondHealth = 1.0f;
+    // Bond health is remaining contact area. Seed each bond from its authored
+    // area so strong frame joints (large area) take far more damage to break
+    // than facade clips. Uniform health=1 made every joint equally fragile and
+    // erased the civil load-path hierarchy under GPU and CPU stress alike.
+    std::vector<float> initialBondHealths(bond_count);
+    for (uint32_t i = 0; i < bond_count; ++i)
+    {
+        initialBondHealths[i] = bonds[i].area > 0.0f ? bonds[i].area : 1.0f;
+    }
+    actorDesc.initialBondHealths = initialBondHealths.data();
+    actorDesc.uniformInitialBondHealth = 0.0f;
     actorDesc.uniformInitialLowerSupportChunkHealth = 1.0f;
 
     const size_t actorScratchSize = NvBlastFamilyGetRequiredScratchForCreateFirstActor(handle->family, kLogFn);

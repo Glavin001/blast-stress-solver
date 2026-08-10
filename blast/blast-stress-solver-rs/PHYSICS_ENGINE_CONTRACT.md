@@ -358,13 +358,18 @@ with fracture-frame resimulation (`ExtStressPhysXFrameStepper`), CPU contract
 tests including a behavioral penetrate-vs-deflect resimulation probe, and
 strict GPU activation/capacity health checks.
 
-Deferred: sibling contact grace, debris collision tiers/TTL cleanup, body
-pooling, scoped (island-limited) resimulation, and Direct GPU API state
-access. The current adapter intentionally uses regular PhysX object APIs
-between `fetchResults()` and the next `simulate()` because fractures change
-actor/shape topology; restore writes are ordinary CPU-side calls in that same
-mutation window. A future Direct GPU path must preserve that window while
-adding GPU-index/buffer ownership and batched state reads/writes.
+Deferred: sibling contact grace, debris collision tiers/TTL cleanup, and body
+pooling. Scoped (island-limited) resimulation is implemented in
+`ExtStressPhysXFrameStepper` (`scopedResim`, default on) using the island-exact
+algorithm: pre-fracture dynamic contact components seeded by this tick's
+fracture bodies; settled outsiders skip restore and sleep through the re-step;
+missing-seed graphs fall back to full-scene restore. Quiet-frame capture skip,
+snapshot buffer reuse, and optional `baseStepSleep` are available. Direct GPU
+batched motion state (`ExtStressPhysXDirectGpuMotionBuffer`) and contact-pair
+drain (`ExtStressPhysXDirectGpuContactDrain`) are available behind
+`useDirectGpuMotionState` / a Direct-GPU scene; topology edits still use the
+CPU mutation window, and production city demos keep CPU `onContact` inject
+unless the host opts into the Direct GPU path.
 
 Determinism caveat: the restore itself is exact, but PhysX solver warm-start
 and contact caches do not survive a rollback, so a re-stepped frame is

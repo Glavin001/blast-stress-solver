@@ -150,6 +150,10 @@ struct ExtStressPhysXSettings
     // and fatal, take a few percent health damage, and never split on the hit
     // frame — so fracture-frame resimulation never gets a hole to push through.
     bool fatalizeImpactContactBonds;
+    bool idleSkip;
+    bool baseStepSleep;
+    float settledLinearSpeed;
+    float settledAngularSpeed;
     float maximumLinearVelocity;
     float maximumAngularVelocity;
     float minimumSeparationVelocity;
@@ -176,6 +180,10 @@ struct ExtStressPhysXSettings
         , protectSupportBonds(true)
         , supportPeelMaxMass(1000.0f)
         , fatalizeImpactContactBonds(true)
+        , idleSkip(true)
+        , baseStepSleep(false)
+        , settledLinearSpeed(0.15f)
+        , settledAngularSpeed(0.15f)
         , maximumLinearVelocity(0.0f)
         , maximumAngularVelocity(0.0f)
         , minimumSeparationVelocity(0.0f)
@@ -388,7 +396,21 @@ public:
      * restore returns false if no capture is held or the phase is wrong.
      */
     virtual uint32_t captureResimulationSnapshot() = 0;
-    virtual bool restoreResimulationSnapshot() = 0;
+    /**
+     * Restore motion for captured bodies. When activeBodies is null / activeCount
+     * is 0, every captured body is restored (full-scene §2.8). Otherwise only
+     * bodies present in the active set are rewound; provenance children of
+     * restored parents are still re-derived.
+     */
+    virtual bool restoreResimulationSnapshot(
+        physx::PxRigidDynamic* const* activeBodies = nullptr,
+        uint32_t activeCount = 0) = 0;
+
+    virtual bool needsResimulationSnapshot() const = 0;
+    virtual uint32_t getResimulationSeedBodies(
+        physx::PxRigidDynamic** bodies,
+        uint32_t capacity) const = 0;
+    virtual uint32_t applyBaseStepSleep() = 0;
 
     virtual ExtStressPhysXId getBodyId(const physx::PxRigidDynamic* body) const = 0;
     virtual ExtStressPhysXId getShapeId(const physx::PxShape* shape) const = 0;

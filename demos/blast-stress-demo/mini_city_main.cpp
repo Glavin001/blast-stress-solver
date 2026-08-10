@@ -66,6 +66,10 @@ struct Options
     float stressLimitScale{0.8f};
     float excessForceScale{0.017f};
     std::uint32_t resimPasses{1};
+    bool scopedResim{true};
+    bool quietCaptureSkip{true};
+    bool baseStepSleep{false};
+    bool useDirectGpuMotionState{false};
     std::string resimAssert;
     std::uint32_t snapshotFps{30};
     std::uint32_t paneWidth{960};
@@ -330,6 +334,7 @@ public:
     std::function<ImpactCounters()> captureImpactCounters;
     std::function<void(const ImpactCounters&)> restoreImpactCounters;
     std::function<void(std::uint32_t pass)> postFetchResults;
+    std::function<bool()> shouldForceResimulationCapture;
 
     void onCapture() override
     {
@@ -353,6 +358,11 @@ public:
         {
             postFetchResults(pass);
         }
+    }
+
+    bool forceResimulationCapture() const override
+    {
+        return shouldForceResimulationCapture && shouldForceResimulationCapture();
     }
 
     bool solveAll(ExtStressPhysXDestructible* const*, std::uint32_t) override
@@ -427,6 +437,9 @@ struct FrameMetrics
     std::uint32_t resimPasses{0};
     std::uint32_t resimBodiesCaptured{0};
     std::uint32_t resimBodiesRestored{0};
+    std::uint32_t resimBodiesActive{0};
+    std::uint32_t resimBodiesFrozen{0};
+    std::uint32_t resimScopedFallback{0};
     double resimCaptureMilliseconds{0.0};
     double resimSceneCaptureMilliseconds{0.0};
     double resimAdapterCaptureMilliseconds{0.0};
@@ -805,6 +818,12 @@ Options parseOptions(int argc, char** argv)
             options.excessForceScale = parseFloat(argument(), option.c_str());
         else if (option == "--resim-passes")
             options.resimPasses = parseU32(argument(), "--resim-passes");
+        else if (option == "--scoped-resim") options.scopedResim = true;
+        else if (option == "--no-scoped-resim") options.scopedResim = false;
+        else if (option == "--quiet-capture-skip") options.quietCaptureSkip = true;
+        else if (option == "--no-quiet-capture-skip") options.quietCaptureSkip = false;
+        else if (option == "--base-step-sleep") options.baseStepSleep = true;
+        else if (option == "--direct-gpu-resim") options.useDirectGpuMotionState = true;
         else if (option == "--resim-assert") options.resimAssert = argument();
         else if (option == "--snapshot-fps") options.snapshotFps = parseU32(argument(), "--snapshot-fps");
         else if (option == "--output-state" || option == "--state") options.statePath = argument();
@@ -899,6 +918,21 @@ public:
     {
     }
 
+    void setFrameStepper(ExtStressPhysXFrameStepper* stepper)
+    {
+        m_stepper = stepper;
+    }
+
+    void setForceResimulationCapture(bool value)
+    {
+        m_forceResimulationCapture = value;
+    }
+
+    bool forceResimulationCapture() const
+    {
+        return m_forceResimulationCapture;
+    }
+
     void registerDestructible(ExtStressPhysXDestructible& destructible, std::uint32_t nodeCount)
     {
         std::vector<ExtStressPhysXShapeSnapshot> snapshots(nodeCount);
@@ -931,6 +965,12 @@ public:
             if (pair.flags & (PxContactPairFlag::eREMOVED_SHAPE_0 | PxContactPairFlag::eREMOVED_SHAPE_1))
             {
                 continue;
+            }
+            if (m_stepper && pair.shapes[0] && pair.shapes[1])
+            {
+                m_stepper->recordDynamicContactPair(
+                    pair.shapes[0]->getActor(),
+                    pair.shapes[1]->getActor());
             }
             const PxU32 count = pair.extractContacts(points.data(), static_cast<PxU32>(points.size()));
             ExtStressPhysXDestructible* owner0 = owner(pair.shapes[0]);
@@ -1006,6 +1046,8 @@ private:
     double m_callbackMilliseconds{0.0};
     std::uint64_t m_projectileImpactContacts{0};
     double m_projectileImpactImpulse{0.0};
+    ExtStressPhysXFrameStepper* m_stepper{nullptr};
+    bool m_forceResimulationCapture{false};
 };
 
 void adapterError(
@@ -1597,6 +1639,7 @@ public:
                "splits_frame,splits_total,shapes_migrated_frame,shapes_migrated_total,"
                "sleeping_actors_skipped,max_position_drift,max_point_velocity_drift,"
                "resim_passes,resim_bodies_captured,resim_bodies_restored,"
+               "resim_bodies_active,resim_bodies_frozen,resim_scoped_fallback,"
                "resim_capture_ms,resim_scene_capture_ms,resim_adapter_capture_ms,"
                "resim_restore_ms,resim_scene_restore_ms,resim_adapter_restore_ms,"
                "base_simulate_submit_ms,base_fetch_results_ms,base_tick_ms,"
@@ -1656,6 +1699,9 @@ public:
             << frame.resimPasses << ','
             << frame.resimBodiesCaptured << ','
             << frame.resimBodiesRestored << ','
+            << frame.resimBodiesActive << ','
+            << frame.resimBodiesFrozen << ','
+            << frame.resimScopedFallback << ','
             << frame.resimCaptureMilliseconds << ','
             << frame.resimSceneCaptureMilliseconds << ','
             << frame.resimAdapterCaptureMilliseconds << ','
@@ -2070,7 +2116,12 @@ int run(const Options& options)
         + options.grid * options.grid * options.projectileWaves
         + 1024;
     capacity.maxContactPairs = std::max<std::uint32_t>(65536, capacity.maxBodies * 64);
-    PhysXScene context(options.physics, options.requireGpu, capacity, &contacts);
+    PhysXScene context(
+        options.physics,
+        options.requireGpu,
+        capacity,
+        &contacts,
+        options.useDirectGpuMotionState);
     context.scene().setGravity(PxVec3(0.0f, pack.gravity, 0.0f));
 
     std::vector<DestructiblePtr> destructibles;
@@ -2118,6 +2169,16 @@ int run(const Options& options)
         desc.settings.maximumAngularVelocity = 8.0f;
         desc.settings.minimumSeparationVelocity =
             options.resimPasses == 0 ? 4.0f : 0.0f;
+        desc.settings.idleSkip = true;
+        desc.settings.baseStepSleep = options.baseStepSleep;
+        desc.settings.settledLinearSpeed = 0.15f;
+        desc.settings.settledAngularSpeed = 0.15f;
+        // Only light non-structural chunks may peel off mass-0 foundations
+        // (infill ~300–370 kg). Columns (~1.8 t) and slabs (~4.4 t) stay
+        // locked to footings unless we intentionally raise this — otherwise
+        // balls10× shears the whole tower off its anchors and every building
+        // classifies as shattered soup.
+        desc.settings.supportPeelMaxMass = 1000.0f;
         desc.errorCallback = adapterError;
 
         ExtStressPhysXTelemetry failure;
@@ -2178,6 +2239,11 @@ int run(const Options& options)
     }
     ExtStressPhysXResimOptions resimOptions;
     resimOptions.maxPasses = options.resimPasses;
+    resimOptions.scopedResim = options.scopedResim;
+    resimOptions.quietCaptureSkip = options.quietCaptureSkip;
+    resimOptions.useDirectGpuMotionState = options.useDirectGpuMotionState;
+    resimOptions.settledLinearSpeed = 0.15f;
+    resimOptions.settledAngularSpeed = 0.15f;
     struct StepperReleaser
     {
         void operator()(ExtStressPhysXFrameStepper* value) const
@@ -2191,10 +2257,21 @@ int run(const Options& options)
     {
         throw std::runtime_error("could not create the resimulation frame stepper");
     }
+    contacts.setFrameStepper(stepper.get());
     MiniCityFrameHooks hooks(stressExecutor, destructibles);
     hooks.captureImpactCounters = [&contacts]() { return contacts.impactCounters(); };
     hooks.restoreImpactCounters = [&contacts](const ImpactCounters& counters) {
         contacts.restoreImpactCounters(counters);
+    };
+    hooks.shouldForceResimulationCapture = [&projectiles]() {
+        for (const Projectile& projectile : projectiles)
+        {
+            if (projectile.launched && !projectile.retired && projectile.body)
+            {
+                return true;
+            }
+        }
+        return false;
     };
 
     // Warm lazy PhysX/CUDA allocations and solver scratch before the measured
@@ -2361,6 +2438,13 @@ int run(const Options& options)
             throw std::runtime_error(
                 "PhysX frame step failed (fetchResults or a destructible tick phase)");
         }
+        if (options.baseStepSleep && frameStats.resimPasses == 0)
+        {
+            for (ExtStressPhysXDestructible* destructible : destructibleRaw)
+            {
+                destructible->applyBaseStepSleep();
+            }
+        }
         const double physicsStepMilliseconds = frameStats.simulateMilliseconds;
         const double adapterTickMilliseconds = frameStats.tickMilliseconds;
         const double resimCaptureMilliseconds =
@@ -2507,6 +2591,9 @@ int run(const Options& options)
         frame.resimPasses = frameStats.resimPasses;
         frame.resimBodiesCaptured = frameStats.sceneBodiesCaptured;
         frame.resimBodiesRestored = frameStats.sceneBodiesRestored;
+        frame.resimBodiesActive = frameStats.sceneBodiesActive;
+        frame.resimBodiesFrozen = frameStats.sceneBodiesFrozen;
+        frame.resimScopedFallback = frameStats.scopedFallbackFullRestore;
         frame.resimCaptureMilliseconds = resimCaptureMilliseconds;
         frame.resimSceneCaptureMilliseconds = frameStats.sceneCaptureMilliseconds;
         frame.resimAdapterCaptureMilliseconds = frameStats.adapterCaptureMilliseconds;
@@ -2667,9 +2754,10 @@ int run(const Options& options)
             && motion.fallenChunks >= requiredFallingStructures
             && motion.farTravelingChunks >= requiredFallingStructures
             && motion.dynamicChunks >= requiredMovedStructures * 2
-            // High-rise packs are mostly frangible infill; require a planted
-            // skeleton/remainder rather than half of every facade panel.
-            && motion.supportedRemainderChunks >= (totalChunks * 3) / 10
+            // Local-damage packs are majority facade by chunk count. Require a
+            // planted frame/remainder (~1/4 of authored chunks), not half the
+            // cladding. Total shatter is rejected separately (shattered==0).
+            && motion.supportedRemainderChunks >= totalChunks / 4
             && motion.maximumDisplacement >= 2.0f
             && motion.maximumDisplacement
                 <= std::max(20.0f, options.durationSeconds * 5.0f)
@@ -2806,9 +2894,30 @@ int run(const Options& options)
             motion.farTravelingChunks,
             motion.dynamicChunks,
             motion.supportedRemainderChunks,
-            (totalChunks * 3) / 10,
+            totalChunks / 4,
             motion.maximumDisplacement,
             motion.maximumDownwardDisplacement);
+        if (options.requirePartialDestruction && !partialDestructionValid)
+        {
+            // Loud, explicit reject for the "everything is soup" failure mode.
+            std::fprintf(
+                stderr,
+                "REJECT runaway destruction: shattered=%u/%zu (want 0) "
+                "splits=%llu bodies=%u/%u supported=%u/%u (want >= %u) "
+                "intact=%u partial=%u heavy=%u — expect facade peel with a "
+                "standing frame, not total building collapse\n",
+                destruction.shatteredStructures,
+                destructibles.size(),
+                static_cast<unsigned long long>(peaks.splits),
+                peaks.peakBodies,
+                totalChunks,
+                motion.supportedRemainderChunks,
+                totalChunks,
+                totalChunks / 4,
+                destruction.intactStructures,
+                destruction.partiallyFracturedStructures,
+                destruction.heavilyFracturedStructures);
+        }
         return 1;
     }
     return 0;

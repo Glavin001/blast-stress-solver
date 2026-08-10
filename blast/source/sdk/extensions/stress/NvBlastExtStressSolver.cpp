@@ -169,8 +169,11 @@ public:
                 gpu.centroid[0] = bond.centroid.x;
                 gpu.centroid[1] = bond.centroid.y;
                 gpu.centroid[2] = bond.centroid.z;
+                // Normals are recomputed from node geometry in ExtStressGpuSolver.
                 gpu.normal[0] = gpu.normal[1] = gpu.normal[2] = 0.0f;
-                gpu.area = 1.0f;
+                // Preserve authored contact area so stronger joints (frame) take
+                // less stress than weak facade joints for the same impulse.
+                gpu.area = bond.area > 0.0f ? bond.area : 1.0f;
                 gpu.health = 1.0f;
             }
             m_gpuSolver = ExtStressGpuSolver::create(
@@ -269,16 +272,27 @@ public:
         v.lin = { velocityLinear.x, velocityLinear.y, velocityLinear.z };
     }
 
-    uint32_t addBond(uint32_t node0, uint32_t node1, const NvVec3& bondCentroid)
+    uint32_t addBond(uint32_t node0, uint32_t node1, const NvVec3& bondCentroid, float area = 1.0f)
     {
         SolverBond b;
         b.nodes[0] = node0;
         b.nodes[1] = node1;
         b.centroid = { bondCentroid.x, bondCentroid.y, bondCentroid.z };
+        b.area = area > 0.0f ? area : 1.0f;
         m_bonds.pushBack(b);
         m_impulses.push_back({{0,0,0},{0,0,0}});
         m_forceColdStart = true;
         return m_bonds.size() - 1;
+    }
+
+    void addBondArea(uint32_t bondIndex, float area)
+    {
+        NVBLAST_ASSERT(bondIndex < m_bonds.size());
+        if (area > 0.0f)
+        {
+            m_bonds[bondIndex].area += area;
+            m_forceColdStart = true;
+        }
     }
 
     void replaceWithLast(uint32_t bondIndex)
@@ -1251,17 +1265,19 @@ private:
             BondKey key(node0.solverNode, node1.solverNode);
             auto entry = m_solverBondsMap.find(key);
             SolverBondData* data;
+            const float bondArea = bonds[bond.blastBondIndex].area;
             if (!entry)
             {
                 m_solverBondsData.pushBack(SolverBondData());
                 data = &m_solverBondsData.back();
                 m_solverBondsMap[key] = m_solverBondsData.size() - 1;
 
-                m_solver.addBond(node0.solverNode, node1.solverNode, bond.centroid);
+                m_solver.addBond(node0.solverNode, node1.solverNode, bond.centroid, bondArea);
             }
             else
             {
                 data = &m_solverBondsData[entry->second];
+                m_solver.addBondArea(entry->second, bondArea);
             }
             data->blastBondIndices.pushBack(bond.blastBondIndex);
         }
