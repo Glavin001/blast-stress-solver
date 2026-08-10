@@ -5,6 +5,7 @@
 #include "state_writer.h"
 
 #include <NvBlastExtStressPhysX.h>
+#include <NvBlastExtStressPhysXResim.h>
 
 #include <algorithm>
 #include <array>
@@ -63,6 +64,8 @@ struct Options
     float minimumStressContactImpulse{0.0f};
     float stressLimitScale{0.8f};
     float excessForceScale{0.017f};
+    std::uint32_t resimPasses{1};
+    std::string resimAssert;
     std::uint32_t snapshotFps{30};
     std::uint32_t paneWidth{960};
     std::uint32_t paneHeight{540};
@@ -301,6 +304,67 @@ void tickDestructibles(
     }
 }
 
+// A resimulation rollback replays the frame's contacts, so the physics-meaning
+// projectile impact counters must be rewound with it; wall-clock callback cost
+// keeps accumulating.
+struct ImpactCounters
+{
+    std::uint64_t contacts{0};
+    double impulse{0.0};
+};
+
+// Bridges the library frame stepper to demo-owned state: parallel stress
+// solves, the ContactRouter impact counters (rewound so gates see only the
+// final pass), and the self-test contact injection (pass 0 only, or the
+// rollback would re-inject into the already-fractured graph).
+class MiniCityFrameHooks final : public ExtStressPhysXFrameHooks
+{
+public:
+    MiniCityFrameHooks(StressExecutor& executor, std::vector<DestructiblePtr>& destructibles)
+        : m_executor(executor)
+        , m_destructibles(destructibles)
+    {
+    }
+
+    std::function<ImpactCounters()> captureImpactCounters;
+    std::function<void(const ImpactCounters&)> restoreImpactCounters;
+    std::function<void(std::uint32_t pass)> postFetchResults;
+
+    void onCapture() override
+    {
+        if (captureImpactCounters)
+        {
+            m_impactBaseline = captureImpactCounters();
+        }
+    }
+
+    void onRestore() override
+    {
+        if (restoreImpactCounters)
+        {
+            restoreImpactCounters(m_impactBaseline);
+        }
+    }
+
+    void onPostFetchResults(std::uint32_t pass) override
+    {
+        if (postFetchResults)
+        {
+            postFetchResults(pass);
+        }
+    }
+
+    bool solveAll(ExtStressPhysXDestructible* const*, std::uint32_t) override
+    {
+        return m_executor.solve(m_destructibles);
+    }
+
+private:
+    StressExecutor& m_executor;
+    std::vector<DestructiblePtr>& m_destructibles;
+    ImpactCounters m_impactBaseline;
+};
+
 struct Projectile
 {
     PxRigidDynamic* body{nullptr};
@@ -359,6 +423,9 @@ struct FrameMetrics
     double mappingValidationMilliseconds{0.0};
     double stateExportMilliseconds{0.0};
     double frameHostMilliseconds{0.0};
+    std::uint32_t resimPasses{0};
+    double resimCaptureMilliseconds{0.0};
+    double resimRestoreMilliseconds{0.0};
     AggregateTelemetry telemetry;
     std::uint64_t frameContacts{0};
     std::uint64_t frameSplits{0};
@@ -380,6 +447,10 @@ struct RuntimeTimings
     std::uint32_t destructionBudgetMissFrames{0};
     std::uint32_t destructionFrameSamples{0};
     double maximumDestructionFrameMilliseconds{0.0};
+    std::uint64_t resimPassesTotal{0};
+    std::uint32_t resimFrames{0};
+    double resimCaptureMilliseconds{0.0};
+    double resimRestoreMilliseconds{0.0};
 };
 
 struct DestructionDistribution
@@ -559,6 +630,12 @@ void usage(const char* executable)
         "  --stress-limit-scale X       Multiply all elastic/fatal stress limits\n"
         "  --excess-force-scale X       Scale released bond load applied to new debris\n"
         "  --impact-transfer-scale X    Alias for --excess-force-scale\n"
+        "  --resim-passes N        Rollback + re-step passes on fracture frames (default 1;\n"
+        "                          0 disables and re-enables the excess-force kick; a resim\n"
+        "                          frame costs ~2x physics, so pin 0 with --require-realtime)\n"
+        "  --resim-assert penetrate|deflect  Self-test probe: assert the projectile keeps\n"
+        "                          (penetrate) or loses (deflect) forward speed on the\n"
+        "                          fracture frame; requires --self-test\n"
         "  --snapshot-fps FPS      60 Hz divisor (default 30)\n"
         "  --output-state PATH     TWSTATE1 output (`--state` is an alias)\n"
         "  --metadata PATH         JSON telemetry output\n"
@@ -683,6 +760,9 @@ Options parseOptions(int argc, char** argv)
             options.stressLimitScale = parseFloat(argument(), "--stress-limit-scale");
         else if (option == "--excess-force-scale" || option == "--impact-transfer-scale")
             options.excessForceScale = parseFloat(argument(), option.c_str());
+        else if (option == "--resim-passes")
+            options.resimPasses = parseU32(argument(), "--resim-passes");
+        else if (option == "--resim-assert") options.resimAssert = argument();
         else if (option == "--snapshot-fps") options.snapshotFps = parseU32(argument(), "--snapshot-fps");
         else if (option == "--output-state" || option == "--state") options.statePath = argument();
         else if (option == "--metadata") options.metadataPath = argument();
@@ -728,6 +808,21 @@ Options parseOptions(int argc, char** argv)
     {
         throw std::runtime_error("--snapshot-fps must be a positive divisor of 60");
     }
+    if (options.resimPasses > 8)
+    {
+        throw std::runtime_error("--resim-passes must be between 0 and 8");
+    }
+    if (!options.resimAssert.empty())
+    {
+        if (options.resimAssert != "penetrate" && options.resimAssert != "deflect")
+        {
+            throw std::runtime_error("--resim-assert must be penetrate or deflect");
+        }
+        if (!options.selfTest)
+        {
+            throw std::runtime_error("--resim-assert requires --self-test");
+        }
+    }
     if (options.selfTest)
     {
         options.physics = PhysicsMode::Cpu;
@@ -737,7 +832,9 @@ Options parseOptions(int argc, char** argv)
         options.grid = 1;
         options.stressWorkers = 1;
         options.variedBuildingHeights = false;
-        options.durationSeconds = 0.5f;
+        // The resim probe needs flight time to reach the facade and a settled
+        // structure afterwards; the synthetic-injection path stays short.
+        options.durationSeconds = options.resimAssert.empty() ? 0.5f : 1.5f;
         options.settleSeconds = 0.0f;
         options.statePath.clear();
         options.metadataPath.clear();
@@ -820,6 +917,17 @@ public:
     double callbackMilliseconds() const { return m_callbackMilliseconds; }
     std::uint64_t projectileImpactContacts() const { return m_projectileImpactContacts; }
     double projectileImpactImpulse() const { return m_projectileImpactImpulse; }
+
+    ImpactCounters impactCounters() const
+    {
+        return {m_projectileImpactContacts, m_projectileImpactImpulse};
+    }
+
+    void restoreImpactCounters(const ImpactCounters& counters)
+    {
+        m_projectileImpactContacts = counters.contacts;
+        m_projectileImpactImpulse = counters.impulse;
+    }
 
     void onConstraintBreak(PxConstraintInfo*, PxU32) override {}
     void onWake(PxActor**, PxU32) override {}
@@ -1111,6 +1219,58 @@ std::vector<Projectile> createProjectiles(
     return projectiles;
 }
 
+// One heavy projectile aimed at the lone self-test structure's facade,
+// launched right after warmup: the fracture source for --resim-assert. Mass
+// and speed are boosted so a single hit reliably crosses the fracture
+// threshold that the multi-wave demo crosses cumulatively.
+Projectile createSelfTestProbe(
+    PhysXScene& context,
+    const ScenePack& pack,
+    const Options& options,
+    const PxVec3& offset,
+    float buildingHeight)
+{
+    // Aim at the base panel row: static weight preloads those bonds near
+    // their limits, so a single hit reliably breaks out the panel actually
+    // struck (mid-facade hits shed their load into the base row instead).
+    const float targetHeight = std::min(2.0f, std::max(1.5f, buildingHeight * 0.2f));
+    const PxVec3 target = offset + PxVec3(0.0f, targetHeight, 0.0f);
+    const PxVec3 start = target + PxVec3(0.0f, 0.5f, -9.0f);
+    const PxVec3 velocity = (target - start).getNormalized()
+        * pack.projectileSpeed
+        * options.projectileSpeedScale
+        * 1.3f;
+
+    PxRigidDynamic* body = context.physics().createRigidDynamic(
+        PxTransform(PxVec3(0.0f, -1000.0f, 0.0f)));
+    if (!body)
+    {
+        throw std::runtime_error("could not create resim probe body");
+    }
+    PxShape* shape = context.physics().createShape(
+        PxSphereGeometry(pack.projectileRadius * options.projectileRadiusScale),
+        context.material(),
+        false);
+    if (!shape || !body->attachShape(*shape))
+    {
+        if (shape) shape->release();
+        body->release();
+        throw std::runtime_error("could not create resim probe shape");
+    }
+    body->setMass(pack.projectileMass * options.projectileMassScale * 2.0f);
+    body->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
+    context.scene().addActor(*body);
+
+    Projectile projectile;
+    projectile.body = body;
+    projectile.shape = shape;
+    projectile.launchAt = 0.0f;
+    projectile.retireAt = options.durationSeconds + options.settleSeconds + 10.0f;
+    projectile.launchPosition = start;
+    projectile.launchVelocity = velocity;
+    return projectile;
+}
+
 void releaseProjectiles(std::vector<Projectile>& projectiles)
 {
     for (Projectile& projectile : projectiles)
@@ -1387,7 +1547,8 @@ public:
                "projectile_impacts_frame,projectile_impacts_total,"
                "projectile_impulse_frame,projectile_impulse_total,"
                "splits_frame,splits_total,shapes_migrated_frame,shapes_migrated_total,"
-               "sleeping_actors_skipped,max_position_drift,max_point_velocity_drift\n";
+               "sleeping_actors_skipped,max_position_drift,max_point_velocity_drift,"
+               "resim_passes,resim_capture_ms,resim_restore_ms\n";
     }
 
     void write(const FrameMetrics& frame)
@@ -1433,7 +1594,10 @@ public:
             << frame.telemetry.shapesMigrated << ','
             << frame.telemetry.sleepingActorsSkipped << ','
             << frame.telemetry.maxPositionDrift << ','
-            << frame.telemetry.maxVelocityDrift << '\n';
+            << frame.telemetry.maxVelocityDrift << ','
+            << frame.resimPasses << ','
+            << frame.resimCaptureMilliseconds << ','
+            << frame.resimRestoreMilliseconds << '\n';
     }
 
 private:
@@ -1531,6 +1695,13 @@ void writeMetadata(
         << "  \"gpuStressSerialized\": "
         << (options.serializeGpuStress ? "true" : "false") << ",\n"
         << "  \"realtimeRequired\": " << (options.requireRealtime ? "true" : "false") << ",\n"
+        << "  \"resimulation\": {\n"
+        << "    \"maxPasses\": " << options.resimPasses << ",\n"
+        << "    \"passesTotal\": " << timings.resimPassesTotal << ",\n"
+        << "    \"framesWithResim\": " << timings.resimFrames << ",\n"
+        << "    \"captureMilliseconds\": " << timings.resimCaptureMilliseconds << ",\n"
+        << "    \"restoreMilliseconds\": " << timings.resimRestoreMilliseconds << "\n"
+        << "  },\n"
         << "  \"minimumAuthoredChunksRequired\": "
         << options.requireMinimumAuthoredChunks << ",\n"
         << "  \"variedBuildingHeightsRequired\": "
@@ -1826,14 +1997,20 @@ int run(const Options& options)
         desc.settings.gpuStressSolver = options.gpuStress;
         desc.settings.gpuStressMinimumBondCount = options.gpuStressMinimumBonds;
         desc.settings.recordSplitContinuity = true;
-        desc.settings.applyExcessForces = true;
+        // Resimulation re-solves the impact contact against the fractured
+        // pieces, so it replaces the synthetic momentum paths: the excess-force
+        // kick and the outward separation impulse would double-count with the
+        // re-solved contact. The velocity clamps stay — they are stability
+        // bounds, not momentum sources.
+        desc.settings.applyExcessForces = options.resimPasses == 0;
         desc.settings.excessForceScale = options.excessForceScale;
         desc.settings.maximumBodies = options.maximumBodiesPerStructure;
         desc.settings.maximumFracturesPerActorPerTick =
             options.maximumFracturesPerActorPerTick;
         desc.settings.maximumLinearVelocity = 6.0f;
         desc.settings.maximumAngularVelocity = 8.0f;
-        desc.settings.minimumSeparationVelocity = 4.0f;
+        desc.settings.minimumSeparationVelocity =
+            options.resimPasses == 0 ? 4.0f : 0.0f;
         desc.errorCallback = adapterError;
 
         ExtStressPhysXTelemetry failure;
@@ -1869,6 +2046,15 @@ int run(const Options& options)
             totalAuthoredChunks,
             options.settleSeconds);
     }
+    else if (!options.resimAssert.empty())
+    {
+        projectiles.push_back(createSelfTestProbe(
+            context,
+            pack,
+            options,
+            offsets.front(),
+            buildingHeights.front()));
+    }
     for (const Projectile& projectile : projectiles)
     {
         contacts.registerProjectile(*projectile.shape);
@@ -1876,6 +2062,33 @@ int run(const Options& options)
     StressExecutor stressExecutor(
         resolveStressWorkerCount(options.stressWorkers),
         options.serializeGpuStress);
+
+    std::vector<ExtStressPhysXDestructible*> destructibleRaw;
+    destructibleRaw.reserve(destructibles.size());
+    for (const DestructiblePtr& destructible : destructibles)
+    {
+        destructibleRaw.push_back(destructible.get());
+    }
+    ExtStressPhysXResimOptions resimOptions;
+    resimOptions.maxPasses = options.resimPasses;
+    struct StepperReleaser
+    {
+        void operator()(ExtStressPhysXFrameStepper* value) const
+        {
+            if (value) value->release();
+        }
+    };
+    std::unique_ptr<ExtStressPhysXFrameStepper, StepperReleaser> stepper(
+        ExtStressPhysXFrameStepper::create(context.scene()));
+    if (!stepper)
+    {
+        throw std::runtime_error("could not create the resimulation frame stepper");
+    }
+    MiniCityFrameHooks hooks(stressExecutor, destructibles);
+    hooks.captureImpactCounters = [&contacts]() { return contacts.impactCounters(); };
+    hooks.restoreImpactCounters = [&contacts](const ImpactCounters& counters) {
+        contacts.restoreImpactCounters(counters);
+    };
 
     // Warm lazy PhysX/CUDA allocations and solver scratch before the measured
     // fixed-step interval. The structures and projectiles are still kinematic,
@@ -1978,60 +2191,80 @@ int run(const Options& options)
     const auto start = std::chrono::steady_clock::now();
     std::uint32_t writtenFrames = 1;
     std::uint64_t splitsBeforeFirstImpact = 0;
+    std::uint32_t currentStep = 0;
+    hooks.postFetchResults = [&](std::uint32_t pass) {
+        // Synthetic contract impulses fire on the base pass only: a rollback
+        // re-injecting them into the already-fractured graph would over-split.
+        // The --resim-assert probe replaces them with a real projectile.
+        if (!options.selfTest || !options.resimAssert.empty()
+            || currentStep != 0 || pass != 0)
+        {
+            return;
+        }
+        for (std::size_t structure = 0; structure < destructibles.size(); ++structure)
+        {
+            const DestructiblePtr& destructible = destructibles[structure];
+            const ScenePack& buildingPack = *buildingPacks[structure];
+            std::vector<ExtStressPhysXShapeSnapshot> shapes(buildingPack.nodes.size());
+            destructible->getShapeSnapshots(
+                shapes.data(),
+                static_cast<std::uint32_t>(shapes.size()));
+            for (const ExtStressPhysXShapeSnapshot& shape : shapes)
+            {
+                if (buildingPack.nodes[shape.nodeIndex].mass > 0.0f)
+                {
+                    destructible->queueContact(
+                        *shape.shape,
+                        shape.worldPose.p,
+                        PxVec3(2.0e8f, 5.0e8f, -3.0e8f));
+                    if (shape.nodeIndex > 8)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    std::int64_t probeFractureStep = -1;
+    float probeForwardVelocity = 0.0f;
+    PxVec3 probeLaunchDirection(1.0f, 0.0f, 0.0f);
+    float probeLaunchSpeed = 0.0f;
+    if (!options.resimAssert.empty())
+    {
+        probeLaunchSpeed = projectiles.front().launchVelocity.magnitude();
+        probeLaunchDirection = projectiles.front().launchVelocity / probeLaunchSpeed;
+    }
     for (std::uint32_t step = 0; step < physicsSteps; ++step)
     {
         const auto frameStart = std::chrono::steady_clock::now();
         const float simulationTime = step * physicsDt;
         launchProjectiles(projectiles, simulationTime);
+        currentStep = step;
 
-        const auto physicsStart = std::chrono::steady_clock::now();
-        context.scene().simulate(physicsDt);
-        if (!context.scene().fetchResults(true))
+        ExtStressPhysXFrameStats frameStats;
+        if (!stepper->stepFrame(
+                physicsDt,
+                PxVec3(0.0f, pack.gravity, 0.0f),
+                destructibleRaw.data(),
+                static_cast<std::uint32_t>(destructibleRaw.size()),
+                resimOptions,
+                &hooks,
+                &frameStats))
         {
-            throw std::runtime_error("PxScene::fetchResults failed");
+            throw std::runtime_error(
+                "PhysX frame step failed (fetchResults or a destructible tick phase)");
         }
-        const double physicsStepMilliseconds =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - physicsStart).count();
+        const double physicsStepMilliseconds = frameStats.simulateMilliseconds;
+        const double adapterTickMilliseconds = frameStats.tickMilliseconds;
         const double contactCallbackMilliseconds =
             contacts.callbackMilliseconds() - previousContactCallbackMilliseconds;
-
-        if (options.selfTest && step == 0)
+        runtimeTimings.resimPassesTotal += frameStats.resimPasses;
+        if (frameStats.resimPasses > 0)
         {
-            for (std::size_t structure = 0; structure < destructibles.size(); ++structure)
-            {
-                const DestructiblePtr& destructible = destructibles[structure];
-                const ScenePack& buildingPack = *buildingPacks[structure];
-                std::vector<ExtStressPhysXShapeSnapshot> shapes(buildingPack.nodes.size());
-                destructible->getShapeSnapshots(
-                    shapes.data(),
-                    static_cast<std::uint32_t>(shapes.size()));
-                for (const ExtStressPhysXShapeSnapshot& shape : shapes)
-                {
-                    if (buildingPack.nodes[shape.nodeIndex].mass > 0.0f)
-                    {
-                        destructible->queueContact(
-                            *shape.shape,
-                            shape.worldPose.p,
-                            PxVec3(2.0e8f, 5.0e8f, -3.0e8f));
-                        if (shape.nodeIndex > 8)
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
+            ++runtimeTimings.resimFrames;
         }
-
-        const auto adapterStart = std::chrono::steady_clock::now();
-        tickDestructibles(
-            destructibles,
-            stressExecutor,
-            physicsDt,
-            PxVec3(0.0f, pack.gravity, 0.0f));
-        const double adapterTickMilliseconds =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - adapterStart).count();
+        runtimeTimings.resimCaptureMilliseconds += frameStats.sceneCaptureMilliseconds;
+        runtimeTimings.resimRestoreMilliseconds += frameStats.sceneRestoreMilliseconds;
 
         // Fracture validates immediately inside the adapter. This periodic full
         // audit catches latent mapping drift without adding an O(nodes) scan to
@@ -2057,6 +2290,14 @@ int run(const Options& options)
         if (simulationTime < options.settleSeconds)
         {
             splitsBeforeFirstImpact = current.splits;
+        }
+        if (!options.resimAssert.empty() && probeFractureStep < 0 && current.splits > 0)
+        {
+            // The behavioral criterion: on the frame the wall fractures, does
+            // the probe keep moving forward (resim on) or bounce (resim off)?
+            probeFractureStep = static_cast<std::int64_t>(step);
+            probeForwardVelocity =
+                projectiles.front().body->getLinearVelocity().dot(probeLaunchDirection);
         }
         const std::uint32_t previousPeakBodies = peaks.peakBodies;
         const std::uint32_t previousPeakAwake = peaks.peakAwakeBodies;
@@ -2125,6 +2366,9 @@ int run(const Options& options)
         frame.projectileImpactImpulse = contacts.projectileImpactImpulse();
         frame.frameProjectileImpactImpulse =
             frame.projectileImpactImpulse - previousProjectileImpactImpulse;
+        frame.resimPasses = frameStats.resimPasses;
+        frame.resimCaptureMilliseconds = frameStats.sceneCaptureMilliseconds;
+        frame.resimRestoreMilliseconds = frameStats.sceneRestoreMilliseconds;
         frame.frameHostMilliseconds =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - frameStart).count();
@@ -2303,14 +2547,46 @@ int run(const Options& options)
             destructibles.front()->getActiveShapeSnapshots(
                 activeShapes.data(),
                 static_cast<std::uint32_t>(activeShapes.size()));
+        // The probe variant runs long enough for debris to settle and sleep,
+        // so the awake-body export is legitimately empty at end of run; the
+        // synthetic-injection variant still enforces a non-empty export.
         requireContract(
-            activeShapeCount > 0,
+            activeShapeCount > 0 || !options.resimAssert.empty(),
             "active-shape delta export omitted moving fracture bodies");
         for (std::uint32_t i = 0; i < activeShapeCount; ++i)
         {
             requireContract(
                 !activeShapes[i].bodyKinematic,
                 "active-shape delta export included a supported body");
+        }
+    }
+    if (options.selfTest && !options.resimAssert.empty())
+    {
+        std::printf(
+            "resim probe: fracture-step=%lld forward-velocity=%.3f launch-speed=%.3f "
+            "passes-total=%llu\n",
+            static_cast<long long>(probeFractureStep),
+            probeForwardVelocity,
+            probeLaunchSpeed,
+            static_cast<unsigned long long>(runtimeTimings.resimPassesTotal));
+        requireContract(
+            probeFractureStep >= 0,
+            "resim probe never fractured the structure");
+        const float forwardThreshold = 0.25f * probeLaunchSpeed;
+        if (options.resimAssert == "penetrate")
+        {
+            requireContract(
+                runtimeTimings.resimPassesTotal > 0,
+                "resim probe fractured but no resimulation pass ran");
+            requireContract(
+                probeForwardVelocity > forwardThreshold,
+                "projectile bounced off the monolith on the fracture frame despite resim");
+        }
+        else
+        {
+            requireContract(
+                probeForwardVelocity < forwardThreshold,
+                "projectile kept forward speed against the monolithic wall without resim");
         }
     }
     releaseProjectiles(projectiles);

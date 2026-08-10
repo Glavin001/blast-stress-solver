@@ -327,6 +327,23 @@ The implementation maps the contract to PhysX as follows:
 - Stable adapter-owned 64-bit body and shape IDs provide deterministic mapping
   independent of PhysX pointer values. Snapshot APIs expose the resulting
   bodies/shapes for rendering and validation.
+- §2.8 snapshot/restore is implemented per destructible
+  (`captureResimulationSnapshot`/`restoreResimulationSnapshot`, keyed by stable
+  body ID) and orchestrated by the library-owned `ExtStressPhysXFrameStepper`
+  (`NvBlastExtStressPhysXResim.h`), which owns the full §4 loop:
+  simulate/fetchResults → tick → on fracture, rollback + re-step up to
+  `maxPasses` times, skipping the dead re-capture on the final pass. The
+  scene-wide rollback restores every `PxRigidDynamic` that existed at capture
+  (host projectiles included — the Rapier "every non-fixed body" semantics);
+  restore order matches the Rust reference (pose → velocities → force/torque
+  clear → sleep state), with two PhysX-specific rules: kinematic bodies are
+  pose-only (velocity writes are rejected), and the stored linvel is
+  re-expressed at the current COM (`linvel += ω × ΔCOM`) because a split moves
+  a reused body's mass frame. Bodies created since the capture carry
+  provenance (source parent + parent-relative pose) and are re-derived from
+  their parent's restored state, the TS `restoreCreatedBodyFromSource`
+  behavior. Excess forces and the separation impulse are disabled by the host
+  when resimulation is on — the re-solved contact is the momentum source.
 - GPU mode validates a `PxCudaContextManager`, enables
   `PxSceneFlag::eENABLE_GPU_DYNAMICS`, selects `PxBroadPhaseType::eGPU`, cooks
   GPU convex data, and sizes fixed GPU buffers from scene capacity.
@@ -336,20 +353,27 @@ The implementation maps the contract to PhysX as follows:
 Implemented: dynamic/kinematic body creation and removal, stable IDs, in-place
 support mutation, cuboid/convex shape creation, shape migration and local-pose
 updates, aggregate mass properties, pose/velocity/sleep access, contact impulse
-feedback, body wake-up, continuity checks, CPU contract tests, and strict GPU
-activation/capacity health checks.
+feedback, body wake-up, continuity checks, §2.8 body-state snapshot/restore
+with fracture-frame resimulation (`ExtStressPhysXFrameStepper`), CPU contract
+tests including a behavioral penetrate-vs-deflect resimulation probe, and
+strict GPU activation/capacity health checks.
 
-Deferred: complete body-state restore and fracture-frame resimulation, sibling
-contact grace, debris collision tiers/TTL cleanup, body pooling, and Direct GPU
-API state access. The current adapter intentionally uses regular PhysX object
-APIs between `fetchResults()` and the next `simulate()` because fractures change
-actor/shape topology. A future Direct GPU path must preserve that mutation
-window while adding GPU-index/buffer ownership and batched state reads/writes.
+Deferred: sibling contact grace, debris collision tiers/TTL cleanup, body
+pooling, scoped (island-limited) resimulation, and Direct GPU API state
+access. The current adapter intentionally uses regular PhysX object APIs
+between `fetchResults()` and the next `simulate()` because fractures change
+actor/shape topology; restore writes are ordinary CPU-side calls in that same
+mutation window. A future Direct GPU path must preserve that window while
+adding GPU-index/buffer ownership and batched state reads/writes.
 
-The C++ snapshot API is currently read-only integration output; it does **not**
-satisfy §2.8 restore semantics. Until restore/resimulation is implemented,
-fragment motion continuity comes from pre-split point-velocity fitting and
-post-migration COM reconciliation.
+Determinism caveat: the restore itself is exact, but PhysX solver warm-start
+and contact caches do not survive a rollback, so a re-stepped frame is
+output-faithful rather than bit-identical (and GPU PhysX is not bit-reproducible
+regardless). Tests assert behavioral outcomes, not bit equality — per the
+product guidance, do not chase it.
+
+The older `getBodySnapshots`/`getShapeSnapshots` APIs remain read-only
+integration output for rendering/validation and are unrelated to §2.8.
 
 For reproducible commands, recorder details, measured GPU/CPU results, and
 known limits, see `demos/blast-stress-demo/README.md`.

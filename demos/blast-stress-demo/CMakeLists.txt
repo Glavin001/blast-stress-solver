@@ -125,6 +125,22 @@ if(BLAST_ENABLE_CUDA_STRESS)
     target_link_libraries(blast_stress_core PUBLIC NvBlastExtStressGpu)
 endif()
 
+set(PHYSX_LINK_LIBS
+    "-Wl,--start-group"
+    ${PHYSX_EXTENSIONS}
+    ${PHYSX_CUDA_MANAGER}
+    ${PHYSX_CORE}
+    ${PHYSX_PVD}
+    ${PHYSX_COOKING}
+    ${PHYSX_COMMON}
+    ${PHYSX_FOUNDATION}
+    "-Wl,--end-group"
+    ${PVD_RUNTIME}
+    cuda
+    dl
+    pthread
+    rt)
+
 add_executable(blast_stress_demo
     mini_city_main.cpp
     physx_scene.cpp
@@ -142,20 +158,7 @@ target_link_options(blast_stress_demo PRIVATE
     "-Wl,--gc-sections")
 target_link_libraries(blast_stress_demo PRIVATE
     NvBlastExtStressPhysX
-    "-Wl,--start-group"
-    ${PHYSX_EXTENSIONS}
-    ${PHYSX_CUDA_MANAGER}
-    ${PHYSX_CORE}
-    ${PHYSX_PVD}
-    ${PHYSX_COOKING}
-    ${PHYSX_COMMON}
-    ${PHYSX_FOUNDATION}
-    "-Wl,--end-group"
-    ${PVD_RUNTIME}
-    cuda
-    dl
-    pthread
-    rt)
+    ${PHYSX_LINK_LIBS})
 
 add_executable(blast_direct_gpu_p0
     direct_gpu_p0.cpp
@@ -167,24 +170,35 @@ target_link_options(blast_direct_gpu_p0 PRIVATE
     "-Wl,-rpath,${PHYSX_LIB_DIR}"
     "-Wl,--gc-sections")
 target_link_libraries(blast_direct_gpu_p0 PRIVATE
-    "-Wl,--start-group"
-    ${PHYSX_EXTENSIONS}
-    ${PHYSX_CUDA_MANAGER}
-    ${PHYSX_CORE}
-    ${PHYSX_PVD}
-    ${PHYSX_COOKING}
-    ${PHYSX_COMMON}
-    ${PHYSX_FOUNDATION}
-    "-Wl,--end-group"
-    ${PVD_RUNTIME}
-    cuda
-    dl
-    pthread
-    rt)
+    ${PHYSX_LINK_LIBS})
 
 enable_testing()
 add_test(NAME blast_stress_physx_cpu_contract
     COMMAND blast_stress_demo --self-test --physics cpu)
+add_test(NAME blast_stress_physx_resim_penetration
+    COMMAND blast_stress_demo --self-test --physics cpu
+        --resim-passes 1 --resim-assert penetrate)
+add_test(NAME blast_stress_physx_resim_baseline
+    COMMAND blast_stress_demo --self-test --physics cpu
+        --resim-passes 0 --resim-assert deflect)
+
+add_executable(resim_snapshot_test
+    tests/resim_snapshot_test.cpp
+    physx_scene.cpp)
+target_include_directories(resim_snapshot_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${BLAST_ROOT}/include/extensions/stressphysx"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(resim_snapshot_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(resim_snapshot_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(resim_snapshot_test PRIVATE
+    NvBlastExtStressPhysX
+    ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_physx_resim_snapshot COMMAND resim_snapshot_test)
 
 add_executable(scene_pack_test
     tests/scene_pack_test.cpp

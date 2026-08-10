@@ -202,6 +202,13 @@ struct ExtStressPhysXTelemetry
     double gpuStressSolveMilliseconds;
     uint64_t gpuStressHostToDeviceBytes;
     uint64_t gpuStressDeviceToHostBytes;
+    uint64_t resimulationCaptures;
+    uint64_t resimulationRestores;
+    uint64_t resimulationBodiesRestored;
+    uint64_t resimulationBodiesRederived;
+    double resimulationCaptureMilliseconds;
+    double resimulationRestoreMilliseconds;
+    float resimulationMaxRederivedDriftMeters;
     ExtStressPhysXError lastError;
     uint32_t lastErrorNode;
 
@@ -347,6 +354,26 @@ public:
     virtual uint32_t getSplitContinuity(
         ExtStressPhysXSplitContinuity* records,
         uint32_t capacity) const = 0;
+
+    /**
+     * Fracture-frame resimulation (engine contract §2.8). Capture before
+     * PxScene::simulate; if the following tick fractured, restore between
+     * fetchResults and the re-run simulate, then step and tick again so
+     * contacts resolve against the already-split pieces.
+     *
+     * Restore rewinds motion state only — fracture topology, masses, shapes,
+     * and kinematic flags are kept. Bodies that existed at capture get their
+     * pose, velocities, and sleep state back (with a COM-shift velocity
+     * correction for bodies whose mass frame moved during a split); bodies
+     * created since the capture are re-placed relative to their source
+     * parent's restored state. Kinematic bodies are pose-only.
+     *
+     * Both calls require the Idle tick phase and must run outside
+     * simulate/fetchResults. capture returns the number of bodies recorded;
+     * restore returns false if no capture is held or the phase is wrong.
+     */
+    virtual uint32_t captureResimulationSnapshot() = 0;
+    virtual bool restoreResimulationSnapshot() = 0;
 
     virtual ExtStressPhysXId getBodyId(const physx::PxRigidDynamic* body) const = 0;
     virtual ExtStressPhysXId getShapeId(const physx::PxShape* shape) const = 0;

@@ -137,6 +137,13 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , gpuStressSolveMilliseconds(0.0)
     , gpuStressHostToDeviceBytes(0)
     , gpuStressDeviceToHostBytes(0)
+    , resimulationCaptures(0)
+    , resimulationRestores(0)
+    , resimulationBodiesRestored(0)
+    , resimulationBodiesRederived(0)
+    , resimulationCaptureMilliseconds(0.0)
+    , resimulationRestoreMilliseconds(0.0)
+    , resimulationMaxRederivedDriftMeters(0.0f)
     , lastError(ExtStressPhysXError::None)
     , lastErrorNode(INVALID_INDEX)
 {
@@ -702,6 +709,139 @@ public:
         return count;
     }
 
+    uint32_t captureResimulationSnapshot() override
+    {
+        if (m_tickPhase != TickPhase::Idle)
+        {
+            fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "captureResimulationSnapshot requires the Idle tick phase.");
+            return 0;
+        }
+        const TelemetryClock::time_point captureStart = TelemetryClock::now();
+        m_resimSnapshot.clear();
+        m_resimIndexByBodyId.clear();
+        m_resimProvenance.clear();
+        m_resimSnapshot.reserve(m_actorBodies.size());
+
+        SceneWriteLock lock(m_scene);
+        for (const auto& entry : m_actorBodies)
+        {
+            const BodyState& body = *entry.second;
+            ResimBodySnapshot snapshot;
+            snapshot.bodyId = body.bodyId;
+            snapshot.globalPose = body.body->getGlobalPose();
+            snapshot.kinematic = isKinematic(body);
+            if (!snapshot.kinematic)
+            {
+                snapshot.linearVelocity = body.body->getLinearVelocity();
+                snapshot.angularVelocity = body.body->getAngularVelocity();
+                snapshot.sleeping = body.body->isSleeping();
+                snapshot.wakeCounter = body.body->getWakeCounter();
+            }
+            snapshot.worldCenterOfMass =
+                snapshot.globalPose.transform(body.body->getCMassLocalPose().p);
+            m_resimIndexByBodyId.emplace(
+                snapshot.bodyId,
+                static_cast<uint32_t>(m_resimSnapshot.size()));
+            m_resimSnapshot.push_back(snapshot);
+        }
+        m_resimSnapshotValid = true;
+        ++m_telemetry.resimulationCaptures;
+        m_telemetry.resimulationCaptureMilliseconds +=
+            elapsedMilliseconds(captureStart);
+        return static_cast<uint32_t>(m_resimSnapshot.size());
+    }
+
+    bool restoreResimulationSnapshot() override
+    {
+        if (m_tickPhase != TickPhase::Idle)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "restoreResimulationSnapshot requires the Idle tick phase.");
+        }
+        if (!m_resimSnapshotValid)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "restoreResimulationSnapshot requires a prior capture.");
+        }
+        const TelemetryClock::time_point restoreStart = TelemetryClock::now();
+        SceneWriteLock lock(m_scene);
+
+        std::unordered_map<ExtStressPhysXId, BodyState*> bodiesById;
+        bodiesById.reserve(m_actorBodies.size());
+        for (auto& entry : m_actorBodies)
+        {
+            bodiesById.emplace(entry.second->bodyId, entry.second.get());
+        }
+
+        for (auto& entry : m_actorBodies)
+        {
+            BodyState& body = *entry.second;
+            const auto found = m_resimIndexByBodyId.find(body.bodyId);
+            if (found == m_resimIndexByBodyId.end())
+            {
+                continue; // Created since capture; re-derived from provenance below.
+            }
+            restoreBodyMotion(body, m_resimSnapshot[found->second]);
+            ++m_telemetry.resimulationBodiesRestored;
+        }
+
+        // Re-place fracture children relative to their source parent's restored
+        // state, in creation order so parents resolve before their children.
+        for (const ResimBodyProvenance& provenance : m_resimProvenance)
+        {
+            const auto childFound = bodiesById.find(provenance.bodyId);
+            const auto parentFound = bodiesById.find(provenance.sourceParentBodyId);
+            if (childFound == bodiesById.end() || parentFound == bodiesById.end())
+            {
+                continue;
+            }
+            BodyState& child = *childFound->second;
+            const BodyState& parent = *parentFound->second;
+            const PxTransform previousPose = child.body->getGlobalPose();
+            const PxTransform childPose =
+                parent.body->getGlobalPose() * provenance.parentRelativePose;
+            child.body->setGlobalPose(childPose, false);
+            if (!isKinematic(child))
+            {
+                PxVec3 linearVelocity(0.0f);
+                PxVec3 angularVelocity(0.0f);
+                if (!isKinematic(parent))
+                {
+                    const PxVec3 parentCenter = parent.body->getGlobalPose().transform(
+                        parent.body->getCMassLocalPose().p);
+                    const PxVec3 childCenter =
+                        childPose.transform(child.body->getCMassLocalPose().p);
+                    angularVelocity = parent.body->getAngularVelocity();
+                    linearVelocity = parent.body->getLinearVelocity() +
+                        angularVelocity.cross(childCenter - parentCenter);
+                }
+                child.body->setLinearVelocity(linearVelocity, false);
+                child.body->setAngularVelocity(angularVelocity, false);
+                child.body->clearForce(PxForceMode::eFORCE);
+                child.body->clearForce(PxForceMode::eIMPULSE);
+                child.body->clearTorque(PxForceMode::eFORCE);
+                child.body->clearTorque(PxForceMode::eIMPULSE);
+                child.body->wakeUp();
+            }
+            m_telemetry.resimulationMaxRederivedDriftMeters = std::max(
+                m_telemetry.resimulationMaxRederivedDriftMeters,
+                vectorLength(childPose.p - previousPose.p));
+            ++m_telemetry.resimulationBodiesRederived;
+        }
+
+        ++m_telemetry.resimulationRestores;
+        m_telemetry.resimulationRestoreMilliseconds +=
+            elapsedMilliseconds(restoreStart);
+        return true;
+    }
+
     ExtStressPhysXId getBodyId(const PxRigidDynamic* body) const override
     {
         const auto found = m_bodyToId.find(body);
@@ -760,6 +900,33 @@ private:
         uint32_t nodeIndex{INVALID_INDEX};
         PxVec3 position{0.0f};
         PxVec3 impulse{0.0f};
+    };
+
+    // Motion state of one body at capture time, keyed by the stable bodyId
+    // (actorIndex is reassigned across splits). worldCenterOfMass feeds the
+    // COM-shift velocity correction: a reused body's mass frame moves when
+    // shapes migrate away, so the stored linvel is re-expressed at the new COM.
+    struct ResimBodySnapshot
+    {
+        ExtStressPhysXId bodyId{0};
+        PxTransform globalPose{PxIdentity};
+        PxVec3 linearVelocity{0.0f};
+        PxVec3 angularVelocity{0.0f};
+        PxVec3 worldCenterOfMass{0.0f};
+        float wakeCounter{0.0f};
+        bool kinematic{false};
+        bool sleeping{false};
+    };
+
+    // One entry per body created since the last capture, in creation order so
+    // a chain (child of a same-frame child) re-derives parents first. The
+    // source parent always survives a split: the largest-overlap child reuses
+    // the parent PxRigidDynamic.
+    struct ResimBodyProvenance
+    {
+        ExtStressPhysXId bodyId{0};
+        ExtStressPhysXId sourceParentBodyId{0};
+        PxTransform parentRelativePose{PxIdentity};
     };
 
     bool fail(ExtStressPhysXError error, uint32_t nodeIndex, const char* message)
@@ -945,6 +1112,43 @@ private:
             {
                 body.body->wakeUp();
             }
+        }
+    }
+
+    void restoreBodyMotion(BodyState& body, const ResimBodySnapshot& snapshot)
+    {
+        body.body->setGlobalPose(snapshot.globalPose, false);
+        // Kinematic status derives from the kept (post-fracture) topology, so
+        // test the body's current flag, not the captured one: velocity writes
+        // are rejected on kinematic actors.
+        if (isKinematic(body))
+        {
+            return;
+        }
+        // The stored linvel is the velocity at the captured center of mass. A
+        // split may have moved this body's mass frame, so re-express it at the
+        // current COM under the restored pose; the term is zero when unchanged.
+        const PxVec3 restoredCenter =
+            snapshot.globalPose.transform(body.body->getCMassLocalPose().p);
+        const PxVec3 linearVelocity = snapshot.linearVelocity +
+            snapshot.angularVelocity.cross(restoredCenter - snapshot.worldCenterOfMass);
+        body.body->setLinearVelocity(linearVelocity, false);
+        body.body->setAngularVelocity(snapshot.angularVelocity, false);
+        body.body->clearForce(PxForceMode::eFORCE);
+        body.body->clearForce(PxForceMode::eIMPULSE);
+        body.body->clearTorque(PxForceMode::eFORCE);
+        body.body->clearTorque(PxForceMode::eIMPULSE);
+        if (snapshot.sleeping)
+        {
+            body.body->putToSleep();
+        }
+        else
+        {
+            if (body.body->isSleeping())
+            {
+                body.body->wakeUp();
+            }
+            body.body->setWakeCounter(snapshot.wakeCounter);
         }
     }
 
@@ -1463,6 +1667,18 @@ private:
                 {
                     return false;
                 }
+                if (m_resimSnapshotValid)
+                {
+                    // parent.pose is the pre-mutation pose of the surviving
+                    // (reused) parent body, so a later restore can re-place
+                    // this child from the parent's rewound state.
+                    ResimBodyProvenance provenance;
+                    provenance.bodyId = child.body->bodyId;
+                    provenance.sourceParentBodyId = parent.bodyId;
+                    provenance.parentRelativePose =
+                        parent.pose.getInverse() * pose;
+                    m_resimProvenance.push_back(provenance);
+                }
             }
             child.body->nodes = plan.nodes;
             assigned.push_back(std::move(child));
@@ -1735,6 +1951,10 @@ private:
     std::vector<float> m_contactLocalPositions;
     std::vector<float> m_contactLocalForces;
     std::vector<ExtStressPhysXSplitContinuity> m_continuity;
+    std::vector<ResimBodySnapshot> m_resimSnapshot;
+    std::unordered_map<ExtStressPhysXId, uint32_t> m_resimIndexByBodyId;
+    std::vector<ResimBodyProvenance> m_resimProvenance;
+    bool m_resimSnapshotValid{false};
     ExtStressPhysXTelemetry m_telemetry;
     ExtStressPhysXId m_nextBodyId{1};
     ExtStressPhysXId m_nextShapeId{1};

@@ -45,7 +45,9 @@ ctest --test-dir demos/blast-stress-demo/build --output-on-failure
 
 The tests cover the CPU split/migration contract, ScenePack loading,
 GPU-compatible convex-hull reduction, CUDA/CPU stress equivalence, bond-health
-invariants, and compact GPU break-event generation.
+invariants, compact GPU break-event generation, the resimulation snapshot
+round-trip/provenance unit test, and the behavioral resimulation pair (probe
+projectile penetrates with `--resim-passes 1`, deflects with `0`).
 
 ## Run the simulation
 
@@ -100,11 +102,17 @@ cargo run --release --locked -- record \
   --sim-arg=--projectile-mass-scale --sim-arg=1.8 \
   --sim-arg=--contact-force-scale --sim-arg=3.1 \
   --sim-arg=--excess-force-scale --sim-arg=0.012 \
+  --sim-arg=--resim-passes --sim-arg=0 \
   --sim-arg=--require-realtime \
   --sim-arg=--require-min-authored-chunks --sim-arg=20000 \
   --sim-arg=--require-varied-building-heights \
   --output /root/recordings/blast-gpu-varied-12x12-20k-optimized-benchmark.mp4
 ```
+
+`--resim-passes 0` pins the recorded realtime benchmark to the excess-force
+path: a resimulation frame re-runs `simulate()` and the 12×12 gate has under a
+millisecond of worst-frame headroom. Drop that pin (default `--resim-passes 1`)
+to run the resimulation quality path instead.
 
 All project-generated videos should be written under `/root/recordings/`.
 The same canonical run is available as
@@ -265,11 +273,31 @@ design.
   Blast fracture-command generation on active large graphs. The resident GPU
   damage path already emits compact break indices; replacing that validation
   bridge with compact damage/split descriptors is the next PCIe optimization.
-- Full snapshot/restore and fracture-frame resimulation are not implemented.
-  Splits preserve motion by fitting child state and reconciling PhysX COM/inertia.
+- Fracture-frame resimulation is implemented and on by default (`--resim-passes
+  1`, engine contract §2.8/§4): the library-owned `ExtStressPhysXFrameStepper`
+  (`NvBlastExtStressPhysXResim.h`) captures every scene `PxRigidDynamic` before
+  `simulate()`, and on a fracture tick rolls motion state back (keeping the new
+  topology), re-steps, and re-ticks so the projectile's contact resolves
+  against the already-split pieces. Fracture children are re-derived from their
+  parent's restored state via creation provenance. With resimulation on, the
+  excess-force kick and separation impulse are disabled — the re-solved contact
+  is the momentum source; splits still fit child state and reconcile PhysX
+  COM/inertia for continuity. `--resim-passes 0` restores the previous
+  excess-force behavior exactly. Caveats: a resim frame re-runs `simulate()`
+  (~2× physics cost on fracture frames), so the recorded 12×12 realtime
+  benchmark pins `--resim-passes 0`; re-solved contacts also dislodge more
+  debris than the capped kick, which can lower `supportedRemainderChunks`
+  under `--require-partial-destruction` on configurations where that gate is
+  already borderline. The re-stepped frame is output-faithful, not
+  bit-identical (solver warm-start/contact caches do not survive rollback).
+  CTest covers the snapshot round-trip and provenance re-derivation
+  (`resim_snapshot_test`) plus the behavioral criterion: with `--resim-passes
+  1` a probe projectile keeps forward speed through the wall it breaks on the
+  fracture frame (`--resim-assert penetrate`), and with `--resim-passes 0` it
+  bounces off the still-monolithic body (`--resim-assert deflect`).
 - Support-containing actors are kinematic `PxRigidDynamic` objects, allowing
   support status to change in place; they are not immutable static actors.
 - Convex input is reduced to 64 points. ScenePack geometry that cannot produce a
   valid four-point hull is rejected.
-- Debris TTL/collision tiers, sibling contact grace, and scoped resimulation
-  remain future scaling work.
+- Debris TTL/collision tiers, sibling contact grace, and scoped
+  (island-limited) resimulation remain future scaling work.
