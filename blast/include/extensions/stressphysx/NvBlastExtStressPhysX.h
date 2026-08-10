@@ -379,6 +379,26 @@ public:
         uint32_t capacity) const = 0;
 
     /**
+     * Per-bond stress from the last solve, indexed by the authored bond index
+     * (the order bonds were supplied in ExtStressPhysXDescriptor::bonds), so a
+     * host can relate stress back to the joint it authored.
+     *
+     * Compression and tension are mutually exclusive; shear is independent.
+     * Values are pressures directly comparable to the descriptor's stress
+     * limits: limit / stress is that joint's safety factor. Broken bonds read 0.
+     * Any output pointer may be null. Returns the number of entries written.
+     *
+     * Sampling this after gravity settle and before any impact is the load-path
+     * check: it says how much of each joint's capacity the structure's own
+     * weight already consumes.
+     */
+    virtual uint32_t getBondStresses(
+        float* compression,
+        float* tension,
+        float* shear,
+        uint32_t capacity) const = 0;
+
+    /**
      * Fracture-frame resimulation (engine contract §2.8). Capture before
      * PxScene::simulate; if the following tick fractured, restore between
      * fetchResults and the re-run simulate, then step and tick again so

@@ -59,7 +59,11 @@ Outputs (gitignored):
 `blast/blast-stress-demo-rs/assets/scenes/high-rise-10f.json`  
 `blast/blast-stress-demo-rs/assets/scenes/high-rise-10f-local.json`  
 
-Local pack: weak infill bond areas, strong footings, `mass=0` on foundation+columns (kinematic frame). Pass via:
+Local pack: `mass=0` on **foundations only** — columns and slabs keep real mass so
+gravity actually flows through the stress graph. Joint capacity comes from bond-area
+multipliers that stay within an order of magnitude of geometric truth (footing 2.0,
+frame 1.5–2.0, facade 0.09–1.5), which yields safety factors of ~2.7 (facade) to ~39
+(base anchor) under self-weight. Pass via:
 
 `--sim-arg=--scene --sim-arg=/root/workspace/blast-stress-solver/blast/blast-stress-demo-rs/assets/scenes/high-rise-10f-local.json`
 
@@ -67,11 +71,14 @@ Local pack: weak infill bond areas, strong footings, `mass=0` on foundation+colu
 
 | Knob | Role |
 |------|------|
-| `--projectile-mass-scale` | Ball mass (pack default 2500 kg × scale) |
+| `--projectile-radius-scale` | **Preferred energy dial.** Scale radius and mass together (mass ∝ r³) to keep the ball at a real density |
+| `--projectile-mass-scale` | Ball mass (pack default 2500 kg × scale). Raising this alone makes the ball denser — check the density you end up with |
 | `--projectile-speed-scale` | Impact speed |
-| `--contact-force-scale` | Contact → stress injection |
-| `--stress-limit-scale` | Material strength (<1 breaks easier) |
+| `--contact-force-scale` | Contact → stress injection. **1.0 is physically correct** (the adapter already divides impulse by dt); treat ≠1 as a sensitivity experiment, not tuning |
+| `--stress-limit-scale` | Material strength (<1 breaks easier). **1.0 = the concrete the pack claims to be made of** |
 | `--excess-force-scale` | Post-split kick (used when resim off) |
+| `--require-min-safety-factor` | Fail if any joint class can't carry self-weight with this margin |
+| `--require-max-safety-factor` | Fail if any joint class is so over-authored it carries no load and cannot break |
 | `--resim-passes` | `1` = fracture-frame rollback+re-step (default); `0` = excess-force path / realtime pin |
 | `--max-bodies-per-structure` | **Default 0 = unlimited.** Opt-in hard stop only; do not use as a perf budget (falsifies fracture/resim) |
 | `--max-fractures-per-actor-per-tick` | **Default 0 = unlimited.** Opt-in; artificial caps degrade quality |
@@ -90,6 +97,7 @@ Pass demo flags through the recorder as repeated `--sim-arg=FLAG --sim-arg=VALUE
 **`*.metadata.json`**
 - `tuning.*` — effective mass/speed/contact/limits/caps
 - `destructionDistribution` — intact/partial/heavy/shattered, bodies/structure
+- `gravityLoadPath` — per joint class: bonds, peak/mean utilisation, safety factor, peak compression/tension/shear (Pa) under self-weight
 - `destructionMotion` — moved/fallen/far chunks, `supportedRemainderChunks`, max displacement
 - `frameTelemetry` — `budgetMissFrames`, mean/p95/max host ms, destruction misses
 - `projectileImpactContacts` / `projectileImpactImpulse`
@@ -122,6 +130,30 @@ PY
 - **Don’t** add synthetic momentum, ghost/no-solve projectile contacts, or other fake penetration hacks — rejected as non-physical.
 - `--resim-passes 0` keeps the older excess-force continuity path and is what the hard realtime 12×12 benchmark pins.
 
+### Get more destruction by adding energy, not gain
+
+`--contact-force-scale` and `--stress-limit-scale` should both stay at **1.0**. They are the two ends of the same equation; moving either one breaks the correspondence between the simulation and the material the pack says it is made of, and the effects cancel so the run still "looks fine".
+
+If a run is not destructive enough, raise the **projectile's physical energy** — bigger radius (with mass ∝ r³ so density stays real), higher speed, or more waves. A 20 t / r = 1.2 m ball at 18 m/s is a 2763 kg/m³ sphere: heavy, and buildable. A 650 t / r = 0.6 m ball is 718,000 kg/m³ — 32× osmium — and only "works" because it is cancelling an authoring error elsewhere.
+
+### Read the gravity load path before tuning anything
+
+Every run prints, before the self-weight gate:
+
+```
+gravity load path (utilisation = peak stress / elastic limit):
+  infill~slab       bonds=836   peakUtil=0.371    safetyFactor=2.696  ...
+  column~slab       bonds=342   peakUtil=0.0418   safetyFactor=23.92  ...
+```
+
+and writes the same table to `metadata.gravityLoadPath`. Utilisation is how much of a joint class's capacity the structure's own weight already consumes; safety factor is its reciprocal.
+
+- Safety factor **< 1** → that class cannot hold the building up; it will fail during warmup.
+- Safety factor **in the 2–40 band** → a real structure. Facade should be the weakest class, the frame stronger, the base anchor strongest.
+- Safety factor **in the thousands or more** → the joint carries no load and **cannot be broken by any impulse the sim can produce**. Destruction results are then vacuous: damage gates pass because the structure is indestructible, not because the load path works.
+
+Pin both ends on any run you trust: `--require-min-safety-factor 2 --require-max-safety-factor 200`.
+
 ## Acceptance videos (reference)
 
 | File | Intent |
@@ -133,6 +165,8 @@ PY
 | `blast-gpu-highrise-5x5-14k-10floor-heavy-blast.mp4` | Aggressive destruction; may report 60 Hz misses if gate relaxed |
 
 Sidecars share the stem: `.metadata.json`, `.frames.csv`, `.render.*`, `.simulation.*`.
+
+**These were all recorded before the authoring fix** (bond areas up to 1.5e6 m², contact-force gain 30–99×, projectiles up to 650 t / 718,000 kg m⁻³). Their destruction numbers are not comparable to runs made with unity gain and the safety-factor gates on, and they should be re-recorded rather than used as a target. As of the fix, `record_stress_benchmark.sh` (12×12 on `fractured-tower.json`) fails its own `--require-partial-destruction` and `--require-realtime` gates — this predates the fix and is tracked separately; that pack has no `nodeTypes` and sits at safety factor ≈1.1 under self-weight, i.e. it is marginal on its own.
 
 ## Hard realtime vs quality
 

@@ -259,6 +259,57 @@ GPU rigid-body execution and the high-rise stress crossover are both measured.
 Contact routing and PhysX actor/shape topology edits remain CPU-side by API
 design.
 
+## Load path: capacity vs demand
+
+Every run prints, and writes to `metadata.gravityLoadPath`, how much of each
+joint class's capacity the structure's own weight consumes after settle and
+before any impact:
+
+```
+gravity load path (utilisation = peak stress / elastic limit):
+  infill~slab       bonds=836   peakUtil=0.371     safetyFactor=2.696   peak(c/t/s)=5.67e+05/5.43e+04/5.94e+05 Pa
+  infill~infill     bonds=1100  peakUtil=0.294     safetyFactor=3.401   ...
+  column~infill     bonds=400   peakUtil=0.186     safetyFactor=5.362   ...
+  slab~slab         bonds=890   peakUtil=0.071     safetyFactor=14.06   ...
+  column~slab       bonds=342   peakUtil=0.042     safetyFactor=23.92   ...
+  column~foundation bonds=12    peakUtil=0.026     safetyFactor=38.74   ...
+```
+
+This is backed by `ExtStressPhysXDestructible::getBondStresses`, which reads the
+solver's per-bond compression/tension/shear indexed by authored bond index.
+Safety factor is `1 / utilisation`.
+
+The report exists because bond area is both the denominator of stress and the
+bond's damage pool, which makes "give the joint more area" look like a way to
+strengthen a structure. Past a point it is not: the joint stops carrying
+measurable load and can no longer be broken by any impulse the simulation
+produces, so damage gates keep passing against a structure that is simply
+indestructible. A safety factor in the thousands is a bug, not a strong
+building. Two gates pin both ends:
+
+- `--require-min-safety-factor X` — fails a structure that cannot carry its own
+  weight (it would fracture during warmup).
+- `--require-max-safety-factor X` — fails an over-authored asset whose joints
+  carry no load, naming the offending class.
+
+`--require-min-safety-factor 2 --require-max-safety-factor 200` is the
+recommended pair for any run whose destruction numbers are meant to be trusted.
+`blast_stress_load_path` (CTest) covers the underlying API: self-weight stress
+is measurable and decreases up a column, stress scales inversely with authored
+area, and readback survives a topology edit.
+
+### Fudge factors are set to unity
+
+`contactForceScale` and `stressLimitScale` both default to **1.0**. The
+adapter already converts a solved contact impulse to a force by dividing by
+`dt` (`NvBlastExtStressPhysX.cpp`, `consumeContacts`), so 1.0 is the physically
+correct transfer, and the pack's `solver.limits` are real concrete values
+(12 MPa compressive / 1.2 MPa tensile). To make a run more destructive, raise
+the projectile's physical energy — `--projectile-radius-scale R` together with
+`--projectile-mass-scale R³` scales energy while holding density constant —
+rather than the coupling constants, which cancel each other and leave a run
+that cannot be compared to any other run.
+
 ## Known limitations and deferred work
 
 - PhysX Direct GPU API is not enabled in the production demo. The
@@ -299,5 +350,13 @@ design.
   support status to change in place; they are not immutable static actors.
 - Convex input is reduced to 64 points. ScenePack geometry that cannot produce a
   valid four-point hull is rejected.
+- The stress solver carries one global set of material limits per solver, so
+  per-joint strength can only be expressed through bond area. That works — the
+  high-rise pack's joint classes span 0.005–41 m² and produce a textbook safety
+  factor hierarchy — but it conflates "this joint is made of a stronger
+  material" with "this joint has more contact area", and area also sets the
+  damage pool. A per-bond limit scale (with GPU parity) would let a
+  rebar-reinforced column joint be materially stronger than a drywall clip
+  without borrowing geometry to say so.
 - Debris TTL/collision tiers, sibling contact grace, and scoped
   (island-limited) resimulation remain future scaling work.

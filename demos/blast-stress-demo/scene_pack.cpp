@@ -560,6 +560,20 @@ ScenePack loadScenePack(const std::string& path)
         pack.nodes.push_back(std::move(node));
     }
 
+    // Optional: authored node roles, used only for reporting joint classes.
+    const Json* nodeTypes = scenario.find("nodeTypes");
+    if (nodeTypes != nullptr
+        && nodeTypes->kind == Json::Kind::Array
+        && nodeTypes->array.size() == pack.nodes.size())
+    {
+        pack.nodeTypes.reserve(pack.nodes.size());
+        for (const Json& entry : nodeTypes->array)
+        {
+            pack.nodeTypes.push_back(
+                entry.kind == Json::Kind::String ? entry.string : std::string());
+        }
+    }
+
     pack.bonds.reserve(bonds.array.size());
     for (const Json& source : bonds.array)
     {

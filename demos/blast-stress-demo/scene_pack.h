@@ -58,6 +58,10 @@ struct ScenePack
     std::string title;
     std::vector<SceneNode> nodes;
     std::vector<SceneBond> bonds;
+    // Optional authored node roles ("foundation", "column", "slab", "infill", ...),
+    // parallel to `nodes`. Empty when the pack omits `scenario.nodeTypes`. Used to
+    // label joint classes in the load-path safety-factor report.
+    std::vector<std::string> nodeTypes;
     float gravity{-9.81f};
     float projectileRadius{0.6f};
     float projectileMass{1500.0f};
@@ -65,7 +69,11 @@ struct ScenePack
     float projectileTtlSeconds{8.0f};
     float friction{0.25f};
     float restitution{0.0f};
-    float contactForceScale{30.0f};
+    // Contact impulse -> stress force transfer. 1.0 is the physically correct
+    // value: the adapter divides the solved impulse by dt to get a force
+    // (NvBlastExtStressPhysX.cpp, consumeContacts). Values above 1 are gain
+    // that has to be cancelled elsewhere.
+    float contactForceScale{1.0f};
     StressLimits stressLimits;
 };
 

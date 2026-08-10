@@ -19,6 +19,8 @@
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -46,6 +48,12 @@ struct Options
     bool requireRealtime{false};
     std::uint32_t requireMinimumAuthoredChunks{0};
     bool requireVariedBuildingHeights{false};
+    // Minimum safety factor (elastic limit / peak self-weight stress) any joint
+    // class must have. 0 disables. This is the authoring gate: it fails both a
+    // structure too weak to stand and — via --require-max-safety-factor — one
+    // so over-authored that nothing can break it.
+    float requireMinSafetyFactor{0.0f};
+    float requireMaxSafetyFactor{0.0f};
     bool selfTest{false};
     std::uint32_t grid{3};
     std::uint32_t stressWorkers{0};
@@ -61,9 +69,14 @@ struct Options
     float projectileRadiusScale{1.0f};
     float projectileTtlScale{0.4f};
     std::uint32_t projectileWaves{4};
-    float contactForceScale{1.5f};
+    // Multiplies the pack's contactForceScale. 1.0 keeps the physically
+    // correct impulse/dt transfer; deviate only to characterize sensitivity,
+    // never to compensate for authored bond areas.
+    float contactForceScale{1.0f};
     float minimumStressContactImpulse{0.0f};
-    float stressLimitScale{0.8f};
+    // Multiplies the pack's authored material limits. 1.0 = the concrete the
+    // pack claims to be made of.
+    float stressLimitScale{1.0f};
     float excessForceScale{0.017f};
     std::uint32_t resimPasses{1};
     bool scopedResim{true};
@@ -662,6 +675,12 @@ void usage(const char* executable)
         "  --require-realtime      Fail if any post-settle frame exceeds 16.67 ms\n"
         "  --require-min-authored-chunks N  Fail unless the latent scene has at least N chunks\n"
         "  --require-varied-building-heights  Fail unless all three skyline heights are present\n"
+        "  --require-min-safety-factor X  Fail if any joint class consumes more than 1/X of\n"
+        "                          its elastic capacity under self-weight (structure cannot\n"
+        "                          carry its own load)\n"
+        "  --require-max-safety-factor X  Fail if any joint class is loaded LESS than 1/X\n"
+        "                          under self-weight — an over-authored bond area that makes\n"
+        "                          the joint unbreakable and destruction results vacuous\n"
         "  --scene PATH            ScenePack v1 JSON\n"
         "  --grid N                N by N city (default 3)\n"
         "  --stress-workers N      Parallel per-building stress solves (default auto, max 64)\n"
@@ -777,6 +796,12 @@ Options parseOptions(int argc, char** argv)
                 parseU32(argument(), "--require-min-authored-chunks");
         else if (option == "--require-varied-building-heights")
             options.requireVariedBuildingHeights = true;
+        else if (option == "--require-min-safety-factor")
+            options.requireMinSafetyFactor =
+                parseFloat(argument(), "--require-min-safety-factor");
+        else if (option == "--require-max-safety-factor")
+            options.requireMaxSafetyFactor =
+                parseFloat(argument(), "--require-max-safety-factor");
         else if (option == "--self-test") options.selfTest = true;
         else if (option == "--scene") options.scenePath = argument();
         else if (option == "--grid") options.grid = parseU32(argument(), "--grid");
@@ -1486,6 +1511,108 @@ DestructionDistribution destructionDistribution(
     return result;
 }
 
+// ── Load-path capacity vs demand ────────────────────────────────────────────
+//
+// Civil engineering's ground truth for "does this structure stand": for every
+// joint class, how much of the joint's capacity does the structure's own weight
+// already consume? Utilisation = stress / elasticLimit; safety factor is its
+// reciprocal. Sampled after gravity settle and before any impact.
+//
+// This is the readout that makes authoring mistakes visible. Bond area is both
+// the stress denominator and the damage pool, so inflating it to "make a joint
+// strong" silently drives utilisation to ~0 and produces a structure nothing
+// can break — which reads as a passing destruction gate. A safety factor of
+// 1e5 is not a strong building; it is a bug.
+struct JointClassLoad
+{
+    std::string name;
+    std::uint32_t bonds{0};
+    float peakCompression{0.0f};
+    float peakTension{0.0f};
+    float peakShear{0.0f};
+    float peakUtilisation{0.0f};
+    double meanUtilisation{0.0};
+};
+
+std::string jointClassName(
+    const std::vector<std::string>& nodeTypes,
+    std::uint32_t node0,
+    std::uint32_t node1)
+{
+    if (nodeTypes.empty() || node0 >= nodeTypes.size() || node1 >= nodeTypes.size())
+    {
+        return "unclassified";
+    }
+    const std::string& a = nodeTypes[node0];
+    const std::string& b = nodeTypes[node1];
+    return a <= b ? a + "~" + b : b + "~" + a;
+}
+
+std::vector<JointClassLoad> sampleLoadPath(
+    const std::vector<DestructiblePtr>& destructibles,
+    const std::vector<const ScenePack*>& packs,
+    const StressLimits& limits)
+{
+    std::map<std::string, JointClassLoad> byClass;
+    std::vector<float> compression;
+    std::vector<float> tension;
+    std::vector<float> shear;
+    std::map<std::string, double> utilisationSum;
+
+    for (std::size_t structure = 0; structure < destructibles.size(); ++structure)
+    {
+        const ScenePack& pack = *packs[structure];
+        const std::uint32_t bondCount = static_cast<std::uint32_t>(pack.bonds.size());
+        compression.assign(bondCount, 0.0f);
+        tension.assign(bondCount, 0.0f);
+        shear.assign(bondCount, 0.0f);
+        const std::uint32_t written = destructibles[structure]->getBondStresses(
+            compression.data(), tension.data(), shear.data(), bondCount);
+
+        for (std::uint32_t bond = 0; bond < written; ++bond)
+        {
+            const SceneBond& source = pack.bonds[bond];
+            const std::string name =
+                jointClassName(pack.nodeTypes, source.node0, source.node1);
+            JointClassLoad& entry = byClass[name];
+            entry.name = name;
+            ++entry.bonds;
+            entry.peakCompression = std::max(entry.peakCompression, compression[bond]);
+            entry.peakTension = std::max(entry.peakTension, tension[bond]);
+            entry.peakShear = std::max(entry.peakShear, shear[bond]);
+            const float utilisation = std::max(
+                {limits.compressionElastic > 0.0f ? compression[bond] / limits.compressionElastic : 0.0f,
+                 limits.tensionElastic > 0.0f ? tension[bond] / limits.tensionElastic : 0.0f,
+                 limits.shearElastic > 0.0f ? shear[bond] / limits.shearElastic : 0.0f});
+            entry.peakUtilisation = std::max(entry.peakUtilisation, utilisation);
+            utilisationSum[name] += utilisation;
+        }
+    }
+
+    std::vector<JointClassLoad> result;
+    result.reserve(byClass.size());
+    for (auto& entry : byClass)
+    {
+        entry.second.meanUtilisation =
+            entry.second.bonds > 0 ? utilisationSum[entry.first] / entry.second.bonds : 0.0;
+        result.push_back(entry.second);
+    }
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const JointClassLoad& a, const JointClassLoad& b) {
+            return a.peakUtilisation > b.peakUtilisation;
+        });
+    return result;
+}
+
+/** Utilisation -> safety factor. 0 utilisation means "carries no load here". */
+double safetyFactor(float utilisation)
+{
+    return utilisation > 0.0f ? 1.0 / static_cast<double>(utilisation)
+                              : std::numeric_limits<double>::infinity();
+}
+
 DestructionMotion destructionMotion(
     const std::vector<DestructiblePtr>& destructibles,
     const std::vector<const ScenePack*>& packs,
@@ -1766,7 +1893,8 @@ void writeMetadata(
     double wallSeconds,
     std::uint32_t frameCount,
     const std::vector<std::uint32_t>& nodesPerBuilding,
-    const std::vector<std::uint32_t>& floorsPerBuilding)
+    const std::vector<std::uint32_t>& floorsPerBuilding,
+    const std::vector<JointClassLoad>& loadPath)
 {
     if (path.empty())
     {
@@ -1849,7 +1977,31 @@ void writeMetadata(
         << "    \"resimTickMilliseconds\": " << timings.resimTickMilliseconds << "\n"
         << "  },\n"
         << "  \"minimumAuthoredChunksRequired\": "
-        << options.requireMinimumAuthoredChunks << ",\n"
+        << options.requireMinimumAuthoredChunks << ",\n";
+
+    // Load path under self-weight only: what fraction of each joint class's
+    // capacity the structure's own weight consumes. safetyFactor = 1/utilisation;
+    // a class with a huge safety factor is not "strong", it is unloadable and
+    // therefore unbreakable — the signature of over-authored bond area.
+    output << "  \"gravityLoadPath\": [\n";
+    for (std::size_t entry = 0; entry < loadPath.size(); ++entry)
+    {
+        const JointClassLoad& load = loadPath[entry];
+        const double factor = safetyFactor(load.peakUtilisation);
+        output << "    {\"jointClass\": \"" << load.name << "\""
+             << ", \"bonds\": " << load.bonds
+             << ", \"peakUtilisation\": " << load.peakUtilisation
+             << ", \"meanUtilisation\": " << load.meanUtilisation
+             << ", \"safetyFactor\": "
+             << (std::isfinite(factor) ? std::to_string(factor) : std::string("null"))
+             << ", \"peakCompressionPa\": " << load.peakCompression
+             << ", \"peakTensionPa\": " << load.peakTension
+             << ", \"peakShearPa\": " << load.peakShear
+             << "}" << (entry + 1 < loadPath.size() ? "," : "") << "\n";
+    }
+    output << "  ],\n";
+
+    output
         << "  \"variedBuildingHeightsRequired\": "
         << (options.requireVariedBuildingHeights ? "true" : "false") << ",\n"
         << "  \"tuning\": {\n"
@@ -2290,9 +2442,66 @@ int run(const Options& options)
             physicsDt,
             PxVec3(0.0f, pack.gravity, 0.0f));
     }
+    // Capacity vs demand under self-weight only — the load path's resting state.
+    // Printed BEFORE the self-weight gate, because when a structure collapses
+    // under its own weight this report is the diagnosis: it names the joint
+    // class whose utilisation exceeded 1 instead of leaving the caller to guess.
+    const StressLimits scaledLimits{
+        pack.stressLimits.compressionElastic * options.stressLimitScale,
+        pack.stressLimits.compressionFatal * options.stressLimitScale,
+        pack.stressLimits.tensionElastic * options.stressLimitScale,
+        pack.stressLimits.tensionFatal * options.stressLimitScale,
+        pack.stressLimits.shearElastic * options.stressLimitScale,
+        pack.stressLimits.shearFatal * options.stressLimitScale};
+    const std::vector<JointClassLoad> loadPath =
+        sampleLoadPath(destructibles, buildingPacks, scaledLimits);
+    std::printf("gravity load path (utilisation = peak stress / elastic limit):\n");
+    for (const JointClassLoad& entry : loadPath)
+    {
+        std::printf(
+            "  %-22s bonds=%-6u peakUtil=%-10.4g safetyFactor=%-10.4g "
+            "peak(c/t/s)=%.3g/%.3g/%.3g Pa\n",
+            entry.name.c_str(),
+            entry.bonds,
+            static_cast<double>(entry.peakUtilisation),
+            safetyFactor(entry.peakUtilisation),
+            static_cast<double>(entry.peakCompression),
+            static_cast<double>(entry.peakTension),
+            static_cast<double>(entry.peakShear));
+    }
+
     if (aggregate(destructibles).splits != 0)
     {
         throw std::runtime_error("structures fractured under self-weight during warmup");
+    }
+
+    // Authoring gates. The lower bound catches a structure that cannot carry its
+    // own weight; the upper bound catches the opposite and far more insidious
+    // failure — bond areas inflated until the load path is unloadable, which
+    // makes the structure indestructible while every destruction gate still
+    // passes. Both are about the authored asset, not the run's tuning.
+    for (const JointClassLoad& entry : loadPath)
+    {
+        const double factor = safetyFactor(entry.peakUtilisation);
+        if (options.requireMinSafetyFactor > 0.0f
+            && factor < options.requireMinSafetyFactor)
+        {
+            throw std::runtime_error(
+                "joint class '" + entry.name + "' has safety factor "
+                + std::to_string(factor) + " under self-weight, below the required "
+                + std::to_string(options.requireMinSafetyFactor)
+                + " (authored bond area is too small to carry gravity)");
+        }
+        if (options.requireMaxSafetyFactor > 0.0f
+            && factor > options.requireMaxSafetyFactor)
+        {
+            throw std::runtime_error(
+                "joint class '" + entry.name + "' has safety factor "
+                + std::to_string(factor) + " under self-weight, above the allowed "
+                + std::to_string(options.requireMaxSafetyFactor)
+                + " (authored bond area is so large this joint carries no load "
+                  "and cannot break — destruction results would be vacuous)");
+        }
     }
 
     StateWriter writer;
@@ -2699,7 +2908,8 @@ int run(const Options& options)
         wallSeconds,
         writtenFrames,
         nodesPerBuilding,
-        floorsPerBuilding);
+        floorsPerBuilding,
+        loadPath);
     if (!options.telemetryPath.empty() && options.telemetryPath != options.metadataPath)
     {
         writeMetadata(
@@ -2716,7 +2926,8 @@ int run(const Options& options)
             wallSeconds,
             writtenFrames,
             nodesPerBuilding,
-            floorsPerBuilding);
+            floorsPerBuilding,
+            loadPath);
     }
 
     bool mappingsValid = true;

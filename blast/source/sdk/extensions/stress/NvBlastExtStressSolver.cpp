@@ -1531,6 +1531,27 @@ public:
 
     virtual bool                            getExcessForces(uint32_t actorIndex, const NvcVec3& com, NvcVec3& force, NvcVec3& torque) override;
 
+    virtual uint32_t                        getBondStresses(float* compression, float* tension, float* shear, uint32_t capacity) const override
+    {
+        const uint32_t count = std::min(capacity, m_assetBondCount);
+        for (uint32_t bondIndex = 0; bondIndex < count; ++bondIndex)
+        {
+            float bondCompression = 0.0f;
+            float bondTension = 0.0f;
+            float bondShear = 0.0f;
+            // Broken bonds keep whatever stress they carried on the tick they failed;
+            // report them as unloaded so utilisation reflects the live load path.
+            if (m_bondHealths[bondIndex] > 0.0f)
+            {
+                m_graphProcessor->getBondStress(bondIndex, bondCompression, bondTension, bondShear);
+            }
+            if (compression) compression[bondIndex] = bondCompression;
+            if (tension)     tension[bondIndex]     = bondTension;
+            if (shear)       shear[bondIndex]       = bondShear;
+        }
+        return count;
+    }
+
     virtual bool                            notifyActorCreated(const NvBlastActor& actor) override;
 
     virtual void                            notifyActorDestroyed(const NvBlastActor& actor) override;
@@ -1598,6 +1619,7 @@ private:
     const float*                                                        m_bondHealths;
     const float*                                                        m_cachedBondHealths;
     const NvBlastBond*                                                  m_bonds;
+    uint32_t                                                            m_assetBondCount;
     SupportGraphProcessor*                                              m_graphProcessor;
     float                                                               m_errorAngular;
     float                                                               m_errorLinear;
@@ -1630,6 +1652,8 @@ NV_INLINE T* ExtStressSolverImpl::getScratchArray(uint32_t size)
 
 ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtStressSolverSettings& settings)
     : m_family(family), m_settings(settings), m_isDirty(false), m_reset(false),
+    m_bondHealths(nullptr), m_cachedBondHealths(nullptr), m_bonds(nullptr), m_assetBondCount(0),
+    m_graphProcessor(nullptr),
     m_errorAngular(std::numeric_limits<float>::max()), m_errorLinear(std::numeric_limits<float>::max()),
     m_converged(false), m_islandAware(false), m_skipSettled(false), m_framesCount(0), m_valid(false)
 {
@@ -1645,6 +1669,7 @@ ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtS
 
     m_graph = NvBlastAssetGetSupportGraph(asset, logLL);
     const uint32_t bondCount = NvBlastAssetGetBondCount(asset, logLL);
+    m_assetBondCount = bondCount;
 
     m_bondFractureBuffer.reserve(bondCount);
 

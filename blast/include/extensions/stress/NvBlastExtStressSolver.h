@@ -399,6 +399,31 @@ public:
     */
     virtual bool                            getExcessForces(uint32_t actorIndex, const NvcVec3& com, NvcVec3& force, NvcVec3& torque) = 0;
 
+    /**
+    Read back the per-bond stress state from the last update(), indexed by ASSET bond index
+    (the same indexing as NvBlastAssetGetBonds), so callers can relate stress to authored
+    joint geometry.
+
+    Compression and tension are mutually exclusive (they measure stress along the bond normal
+    in opposite directions), so at most one of them is non-zero for a given bond. Shear is
+    independent and can co-exist with either. All values are pressures, directly comparable to
+    the ExtStressSolverSettings elastic/fatal limits — dividing by the matching limit gives the
+    utilisation of that joint, and its reciprocal is the safety factor.
+
+    Bonds that are broken, were reduced away by graph reduction, or are otherwise absent from
+    the solver graph are written as 0.
+
+    Any of the output pointers may be null to skip that component.
+
+    \param[out] compression     Array of at least `capacity` floats, or null.
+    \param[out] tension         Array of at least `capacity` floats, or null.
+    \param[out] shear           Array of at least `capacity` floats, or null.
+    \param[in]  capacity        Number of entries the output arrays can hold.
+
+    \return the number of entries written (min of capacity and the asset's bond count).
+    */
+    virtual uint32_t                        getBondStresses(float* compression, float* tension, float* shear, uint32_t capacity) const = 0;
+
 
     /**
     Debug Render Mode

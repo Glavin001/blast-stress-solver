@@ -710,6 +710,20 @@ public:
         return count;
     }
 
+    uint32_t getBondStresses(
+        float* compression,
+        float* tension,
+        float* shear,
+        uint32_t capacity) const override
+    {
+        if (!m_solver || capacity == 0)
+        {
+            return 0;
+        }
+        return ext_stress_solver_get_bond_stresses(
+            m_solver, compression, tension, shear, capacity);
+    }
+
     uint32_t captureResimulationSnapshot() override
     {
         if (m_tickPhase != TickPhase::Idle)

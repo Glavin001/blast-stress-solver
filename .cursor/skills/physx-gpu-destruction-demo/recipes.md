@@ -38,10 +38,11 @@ name=candidate-a
   --require-varied-building-heights \
   --require-partial-destruction \
   --scene "$SCENE_LOCAL" \
-  --projectile-mass-scale 2.6 \
-  --contact-force-scale 1.15 \
+  --require-min-safety-factor 2 --require-max-safety-factor 200 \
+  --projectile-radius-scale 2 --projectile-mass-scale 8 \
+  --contact-force-scale 1.0 \
   --stress-limit-scale 1.0 \
-  --excess-force-scale 0.018 \
+  --excess-force-scale 0.0 \
   --resim-passes 1 \
   --scoped-resim \
   --quiet-capture-skip \
@@ -50,9 +51,19 @@ name=candidate-a
   --output-state ''
 ```
 
+`--projectile-radius-scale R --projectile-mass-scale R³` keeps the ball at the pack's density (2763 kg/m³) while scaling energy. Measured 3×3, 12 s, resim on:
+
+| projectile | splits | i/p/h/s | 60 Hz misses | rate |
+|---|---|---|---|---|
+| 2.5 t, r=0.6 m (authored) | 21 | 2/7/0/0 | 0/810 | 11.8× |
+| 20 t, r=1.2 m | 172 | 0/9/0/0 | 0/810 | 4.8× |
+| 67.5 t, r=1.8 m | 935 | 0/1/7/1 | 292/810 | 0.95× |
+
+All three with `contact-force-scale 1.0`, `stress-limit-scale 1.0`, no excess-force kick.
+
 Omit `--max-bodies-per-structure` (default unlimited). Only pass it when someone explicitly asks for a hard body stop.
 
-Omit `--require-realtime` while searching; add it when locking a realtime recipe.
+Omit `--require-realtime` while searching; add it when locking a realtime recipe. Keep the two safety-factor gates on always — they are about the asset, not the run.
 
 Inspect:
 
@@ -60,15 +71,22 @@ Inspect:
 python3 - <<'PY'
 import json,sys
 m=json.load(open(sys.argv[1]))
-t=m['frameTelemetry']; mo=m['destructionMotion']; d=m['destructionDistribution']
+t=m['frameTelemetry']; mo=m['destructionMotion']; d=m['destructionDistribution']; tu=m['tuning']
 print('misses', t['budgetMissFrames'], 'maxMs', round(t['maxFrameHostMilliseconds'],2))
-print('mass', m['tuning']['projectileMass'], 'bodies', m['peakBodyCount'], 'splits', m['splits'])
+print('mass', tu['projectileMass'], 'bodies', m['peakBodyCount'], 'splits', m['splits'])
+dens = tu['projectileMass'] / (4/3*3.14159*tu['projectileRadius']**3)
+print(f"projectile density {dens:,.0f} kg/m3  (steel 7850, concrete ~2400, osmium 22590)")
+print('gain', 'contactForceScale', tu['contactForceScale'], 'stressLimitScale', tu['stressLimitScale'])
 print('moved/fall', mo['structuresWithMovedChunks'], mo['movedChunks'], mo['fallenChunks'])
 print('dyn/sup', mo['dynamicChunks'], mo['supportedRemainderChunks'])
 print('damage', d['partiallyFracturedStructures'], d['heavilyFracturedStructures'], d['shatteredStructures'])
+for j in m.get('gravityLoadPath', []):
+    print(f"  {j['jointClass']:22s} SF={j['safetyFactor']}")
 PY
 /tmp/highrise-tune/candidate-a.metadata.json
 ```
+
+Sanity: projectile density should land near a real material, `contactForceScale`/`stressLimitScale` should both be 1, and every joint-class safety factor should sit in the 2–40 band. If a safety factor is in the thousands, that joint carries no load and cannot break — fix the pack's bond areas rather than compensating with a heavier ball.
 
 ## Record: 25-building local-break (planted walls)
 
@@ -80,11 +98,14 @@ $CARGO run --release --locked -- record \
   --require-gpu --gpu-stress --require-partial-destruction --chase-projectile \
   --sim-arg=--scene --sim-arg=$SCENE_LOCAL \
   --sim-arg=--gpu-stress-min-bonds --sim-arg=3000 \
-  --sim-arg=--projectile-mass-scale --sim-arg=2.6 \
-  --sim-arg=--contact-force-scale --sim-arg=3.30 \
+  --sim-arg=--projectile-radius-scale --sim-arg=2 \
+  --sim-arg=--projectile-mass-scale --sim-arg=8 \
+  --sim-arg=--contact-force-scale --sim-arg=1.0 \
   --sim-arg=--min-stress-contact-impulse --sim-arg=5 \
-  --sim-arg=--stress-limit-scale --sim-arg=0.50 \
-  --sim-arg=--excess-force-scale --sim-arg=0.042 \
+  --sim-arg=--stress-limit-scale --sim-arg=1.0 \
+  --sim-arg=--excess-force-scale --sim-arg=0.0 \
+  --sim-arg=--require-min-safety-factor --sim-arg=2 \
+  --sim-arg=--require-max-safety-factor --sim-arg=200 \
   --sim-arg=--stress-workers --sim-arg=20 \
   --sim-arg=--tall-building-stride --sim-arg=12 \
   --sim-arg=--resim-passes --sim-arg=1 \
@@ -108,11 +129,14 @@ $CARGO run --release --locked -- record \
   --require-gpu --gpu-stress --require-partial-destruction --chase-projectile \
   --sim-arg=--scene --sim-arg=$SCENE_HR \
   --sim-arg=--gpu-stress-min-bonds --sim-arg=3000 \
-  --sim-arg=--projectile-mass-scale --sim-arg=2.6 \
-  --sim-arg=--contact-force-scale --sim-arg=1.05 \
+  --sim-arg=--projectile-radius-scale --sim-arg=2 \
+  --sim-arg=--projectile-mass-scale --sim-arg=8 \
+  --sim-arg=--contact-force-scale --sim-arg=1.0 \
   --sim-arg=--min-stress-contact-impulse --sim-arg=15 \
-  --sim-arg=--stress-limit-scale --sim-arg=1.17 \
-  --sim-arg=--excess-force-scale --sim-arg=0.015 \
+  --sim-arg=--stress-limit-scale --sim-arg=1.0 \
+  --sim-arg=--excess-force-scale --sim-arg=0.0 \
+  --sim-arg=--require-min-safety-factor --sim-arg=2 \
+  --sim-arg=--require-max-safety-factor --sim-arg=200 \
   --sim-arg=--stress-workers --sim-arg=20 \
   --sim-arg=--tall-building-stride --sim-arg=12 \
   --sim-arg=--require-realtime \
@@ -134,7 +158,9 @@ Script pins `--resim-passes 0` for worst-frame headroom. For punch-through quali
 
 ## Aggressive break (realtime optional)
 
-When the user relaxes 60 Hz: omit `--require-realtime` / `--sim-arg=--require-realtime`, raise mass/contact/body caps, lower `--stress-limit-scale`, then **report** `frameTelemetry.budgetMissFrames` and max ms. Example output stem: `…-heavy-blast.mp4`.
+When the user relaxes 60 Hz: omit `--require-realtime` / `--sim-arg=--require-realtime`, raise the projectile's **physical** energy (`--projectile-radius-scale R` with `--projectile-mass-scale R³`, and/or `--projectile-speed-scale`), then **report** `frameTelemetry.budgetMissFrames` and max ms. Example output stem: `…-heavy-blast.mp4`.
+
+Do *not* reach for `--contact-force-scale` or `--stress-limit-scale` here. They cancel each other and destroy the correspondence between the run and the pack's material model; a run tuned that way cannot be compared against any other run. `--projectile-radius-scale 3 --projectile-mass-scale 27` (67.5 t at concrete density) reaches heavy/shattered damage on the local pack at ~0.95× realtime with every gain at 1.0.
 
 ## Proof frames
 

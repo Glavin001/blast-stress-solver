@@ -780,6 +780,22 @@ ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* handlePtr
 }
 
 extern "C" uint32_t
+ext_stress_solver_get_bond_stresses(const ExtStressSolverHandle* handlePtr,
+                                    float* out_compression,
+                                    float* out_tension,
+                                    float* out_shear,
+                                    uint32_t capacity)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0U;
+    }
+    return handle->solver->getBondStresses(
+        out_compression, out_tension, out_shear, capacity);
+}
+
+extern "C" uint32_t
 ext_stress_solver_fill_debug_render(const ExtStressSolverHandle* handlePtr,
                                     uint32_t mode,
                                     float scale,

@@ -138,6 +138,17 @@ void ext_stress_solver_update(ExtStressSolverHandle* handle);
 
 uint32_t ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* handle);
 
+// Per-bond stress from the last update(), indexed by ASSET bond index (same order as the
+// bonds passed to ext_stress_solver_create). Compression and tension are mutually exclusive;
+// shear is independent. All values are pressures comparable to the settings' elastic/fatal
+// limits, so limit/stress is the joint's safety factor. Broken or graph-absent bonds read 0.
+// Any output pointer may be null. Returns the number of entries written.
+uint32_t ext_stress_solver_get_bond_stresses(const ExtStressSolverHandle* handle,
+                                             float* out_compression,
+                                             float* out_tension,
+                                             float* out_shear,
+                                             uint32_t capacity);
+
 uint32_t ext_stress_solver_fill_debug_render(const ExtStressSolverHandle* handle,
                                              uint32_t mode,
                                              float scale,

@@ -5,3 +5,6 @@ node_modules/
 .vercel/output/
 .codex
 *.towerstate
+# blast_stress_demo's default --metadata / --frame-telemetry output paths.
+blast-physx-mini-city.json
+blast-physx-mini-city*.csv
