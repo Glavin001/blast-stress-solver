@@ -277,6 +277,24 @@ add_executable(scene_pack_test
     scene_pack.cpp)
 target_include_directories(scene_pack_test PRIVATE "${PHYSX_ROOT}/include")
 target_compile_definitions(scene_pack_test PRIVATE PX_PHYSX_STATIC_LIB)
+add_executable(material_behavior_test
+    tests/material_behavior_test.cpp
+    physx_scene.cpp)
+target_include_directories(material_behavior_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${BLAST_ROOT}/include/extensions/stressphysx"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(material_behavior_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(material_behavior_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(material_behavior_test PRIVATE
+    NvBlastExtStressPhysX
+    ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_material_behavior COMMAND material_behavior_test)
+
 add_executable(scene_pack_conformance_test
     tests/scene_pack_conformance_test.cpp
     scene_pack.cpp)
