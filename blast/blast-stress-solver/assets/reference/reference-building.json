@@ -24,11 +24,11 @@
     {
      "name": "reinforced-concrete",
      "compressionElastic": 24000000,
-     "compressionFatal": 60000000,
+     "compressionFatal": 240000000,
      "tensionElastic": 3000000,
-     "tensionFatal": 8000000,
+     "tensionFatal": 30000000,
      "shearElastic": 4000000,
-     "shearFatal": 10000000
+     "shearFatal": 40000000
     },
     {
      "name": "concrete-slab",

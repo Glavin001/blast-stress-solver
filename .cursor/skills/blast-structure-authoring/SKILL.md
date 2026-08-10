@@ -178,9 +178,40 @@ Destruction quality, measured through `ExtStressPhysXFrameStepper` with
 |---|---|---|---|---|---|
 | gravity only | 0 | 1 | 64/64 | 100% | stands |
 | 500 kg @ 12 m/s | 0 | 1 | 64/64 | 100% | shrugs it off — **not glass** |
-| 1.5 t @ 16 m/s | 10 | 36 | 26/64 | 41% | **partial: a hole, and half the building still up in one piece** |
-| 4 t @ 20 m/s | 7 | 48 | 5/64 | 6% | frame comes down |
-| 40 t @ 45 m/s | 1 | 64 | 1/64 | 6% | everything breaks — **not rigid** |
+| 1.5 t @ 16 m/s | 9 | 34 | 31/64 | 48% | **partial: a hole, and half the building still up in one piece** |
+| 4 t @ 20 m/s | 5 | 40 | 23/64 | 41% | still partial — ductility holds the frame |
+| 40 t @ 45 m/s | 1 | 62 | 2/64 | 6% | everything breaks — **not rigid** |
+
+### Ductility is the single biggest quality lever
+
+The frame material ships at `fatal = elastic × 10` (`FRAME_BAND` in the
+generator). Elastic limits are untouched by that dial, so **gravity safety
+factors are bit-identical at any value** — it changes only *how* the frame
+fails, never whether it holds itself up. Measured on this building, standing
+fraction after one impact:
+
+| fatal/elastic | 1500 kg | 2500 | 4000 | 8000 | 20000 |
+|---|---|---|---|---|---|
+| 1.05 (brittle) | 0.06 | 0.06 | 0.06 | 0.06 | 0.06 |
+| 2.5 | 0.50 | 0.06 | 0.06 | 0.06 | 0.06 |
+| **10 (shipped)** | 0.50 | 0.50 | 0.41 | 0.06 | 0.06 |
+
+A brittle frame has **no partial state at any energy** — it is intact or it is
+a rubble field, which is the shattered-glass failure mode however carefully
+you tune strength. Widening the band buys a 4× energy range of partial
+results, and it does *not* make the structure unbreakable: 20 t still flattens
+every variant.
+
+Why it works, mechanically: damage per tick is
+`health × Σ(stress − elastic) / (fatal − elastic)`. A wide band means an
+overstressed bond loses a *fraction* of its health per tick, so load
+redistributes between ticks instead of the whole graph severing at once. It is
+the same stress path as everything else — no contact special-case exists.
+
+There is a performance bonus. Less collapse means fewer awake bodies, and the
+cost model pays for awake bodies, not chunks. At 2.5 t, the brittle build ends
+at 55 bodies / 0.60 ms per frame; the ductile build ends at 33 bodies /
+0.11 ms, fully settled.
 
 "Largest piece" is the biggest connected body left. It is the number that
 separates destruction from dust: at the interesting level 26 of 64 chunks are

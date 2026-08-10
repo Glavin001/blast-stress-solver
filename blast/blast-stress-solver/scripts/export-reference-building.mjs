@@ -58,12 +58,26 @@ const DRYWALL = 700;
 // Index 0 is the structure default: a bond with no `m` gets it.
 // Ductility is the fatal-elastic band: the frame yields over many frames, the
 // clip lets go quickly, which is what makes cladding shed cleanly.
+// Ductility of the structural frame: fatal = elastic * FRAME_BAND. Elastic
+// (strength) is untouched, so gravity safety factors are IDENTICAL for any
+// value here — this dial changes only HOW the frame fails, never whether it
+// holds itself up. Override to compare: FRAME_BAND=1.05 node scripts/...
+//
+// Measured on this building (standing fraction after a single impact):
+//   band 1.05 (brittle): 1.00 -> 0.06 with NO partial state at all
+//   band 2.5:            one partial step, ~1000-1400 kg wide
+//   band 10  (ductile):  partial state holds 1000-5000 kg, still fully
+//                        destructible at 20 t
+// See demos/blast-stress-demo/tests/material_behavior_test.cpp
+// (testBandWidthControlsBrittleVsDuctile) for the isolated mechanism.
+const FRAME_BAND = Number(process.env.FRAME_BAND ?? 10);
+
 const MATERIALS = [
   {
     name: 'reinforced-concrete',
-    compressionElastic: 24e6, compressionFatal: 60e6,
-    tensionElastic: 3.0e6, tensionFatal: 8.0e6,
-    shearElastic: 4.0e6, shearFatal: 10.0e6,
+    compressionElastic: 24e6, compressionFatal: 24e6 * FRAME_BAND,
+    tensionElastic: 3.0e6, tensionFatal: 3.0e6 * FRAME_BAND,
+    shearElastic: 4.0e6, shearFatal: 4.0e6 * FRAME_BAND,
   },
   {
     name: 'concrete-slab',

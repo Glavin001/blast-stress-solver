@@ -8,3 +8,6 @@ node_modules/
 # blast_stress_demo's default --metadata / --frame-telemetry output paths.
 blast-physx-mini-city.json
 blast-physx-mini-city*.csv
+
+# Agent worktrees (transient, created by isolated subagent sessions).
+.claude/worktrees/
