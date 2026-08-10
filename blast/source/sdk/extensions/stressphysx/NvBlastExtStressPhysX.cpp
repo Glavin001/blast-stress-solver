@@ -418,7 +418,9 @@ public:
         }
 
         TelemetryClock::time_point phaseStart = TelemetryClock::now();
+        const bool hadContacts = !m_contacts.empty();
         consumeContacts(dt);
+        m_hadForcesLastTick = hadContacts;
         m_telemetry.contactProcessingMilliseconds += elapsedMilliseconds(phaseStart);
 
         phaseStart = TelemetryClock::now();
@@ -468,6 +470,7 @@ public:
         if (m_telemetry.overstressedBondCount > 0)
         {
             const TelemetryClock::time_point phaseStart = TelemetryClock::now();
+            m_resimSeeds.clear();
             const bool fractured = fracture(m_tickDt);
             m_telemetry.fractureTopologyMilliseconds += elapsedMilliseconds(phaseStart);
             if (!fractured)
@@ -475,6 +478,19 @@ public:
                 m_tickPhase = TickPhase::Idle;
                 return false;
             }
+            if (!m_resimSeeds.empty())
+            {
+                m_framesSinceFracture = 0;
+            }
+            else
+            {
+                ++m_framesSinceFracture;
+            }
+        }
+        else
+        {
+            m_resimSeeds.clear();
+            ++m_framesSinceFracture;
         }
 
         m_telemetry.bodyCount = static_cast<uint32_t>(m_actorBodies.size());
