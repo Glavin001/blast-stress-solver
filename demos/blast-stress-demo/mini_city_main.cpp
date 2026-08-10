@@ -8,16 +8,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -42,6 +47,7 @@ struct Options
     bool requireVariedBuildingHeights{false};
     bool selfTest{false};
     std::uint32_t grid{3};
+    std::uint32_t stressWorkers{0};
     bool variedBuildingHeights{true};
     float durationSeconds{12.0f};
     float settleSeconds{1.5f};
@@ -87,6 +93,194 @@ struct DestructibleDeleter
 };
 
 using DestructiblePtr = std::unique_ptr<ExtStressPhysXDestructible, DestructibleDeleter>;
+
+std::uint32_t resolveStressWorkerCount(std::uint32_t requested)
+{
+    if (requested > 0)
+    {
+        return requested;
+    }
+    return std::min<std::uint32_t>(
+        8,
+        std::max<std::uint32_t>(1, std::thread::hardware_concurrency()));
+}
+
+class StressExecutor
+{
+public:
+    explicit StressExecutor(std::uint32_t workerCount) : m_workerCount(workerCount)
+    {
+        if (workerCount <= 1)
+        {
+            return;
+        }
+        m_workers.reserve(workerCount);
+        for (std::uint32_t worker = 0; worker < workerCount; ++worker)
+        {
+            m_workers.emplace_back([this]() { workerLoop(); });
+        }
+    }
+
+    ~StressExecutor()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stopping = true;
+        }
+        m_workAvailable.notify_all();
+        for (std::thread& worker : m_workers)
+        {
+            worker.join();
+        }
+    }
+
+    std::uint32_t workerCount() const
+    {
+        return m_workerCount;
+    }
+
+    bool solve(std::vector<DestructiblePtr>& destructibles)
+    {
+        if (m_workers.empty())
+        {
+            for (const DestructiblePtr& destructible : destructibles)
+            {
+                if (!destructible->solveTick())
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        std::atomic<bool> succeeded{true};
+        run(destructibles.size(), [&](std::size_t index) {
+            if (!destructibles[index]->solveTick())
+            {
+                succeeded.store(false, std::memory_order_relaxed);
+            }
+        });
+        return succeeded.load(std::memory_order_relaxed);
+    }
+
+private:
+    void run(std::size_t count, std::function<void(std::size_t)> task)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_task = std::move(task);
+            m_taskCount = count;
+            m_nextTask.store(0, std::memory_order_relaxed);
+            m_finishedWorkers = 0;
+            m_exception = nullptr;
+            ++m_generation;
+        }
+        m_workAvailable.notify_all();
+
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_workFinished.wait(lock, [this]() {
+            return m_finishedWorkers == m_workers.size();
+        });
+        if (m_exception)
+        {
+            std::rethrow_exception(m_exception);
+        }
+        m_task = {};
+    }
+
+    void workerLoop()
+    {
+        std::uint64_t observedGeneration = 0;
+        while (true)
+        {
+            std::function<void(std::size_t)> task;
+            std::size_t taskCount = 0;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_workAvailable.wait(lock, [&]() {
+                    return m_stopping || m_generation != observedGeneration;
+                });
+                if (m_stopping)
+                {
+                    return;
+                }
+                observedGeneration = m_generation;
+                task = m_task;
+                taskCount = m_taskCount;
+            }
+
+            try
+            {
+                while (true)
+                {
+                    const std::size_t index =
+                        m_nextTask.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= taskCount)
+                    {
+                        break;
+                    }
+                    task(index);
+                }
+            }
+            catch (...)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_exception)
+                {
+                    m_exception = std::current_exception();
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_finishedWorkers;
+                if (m_finishedWorkers == m_workers.size())
+                {
+                    m_workFinished.notify_one();
+                }
+            }
+        }
+    }
+
+    std::uint32_t m_workerCount{1};
+    std::vector<std::thread> m_workers;
+    std::mutex m_mutex;
+    std::condition_variable m_workAvailable;
+    std::condition_variable m_workFinished;
+    std::function<void(std::size_t)> m_task;
+    std::size_t m_taskCount{0};
+    std::atomic<std::size_t> m_nextTask{0};
+    std::size_t m_finishedWorkers{0};
+    std::uint64_t m_generation{0};
+    std::exception_ptr m_exception;
+    bool m_stopping{false};
+};
+
+void tickDestructibles(
+    std::vector<DestructiblePtr>& destructibles,
+    StressExecutor& executor,
+    float dt,
+    const PxVec3& gravity)
+{
+    for (const DestructiblePtr& destructible : destructibles)
+    {
+        if (!destructible->beginTick(dt, gravity))
+        {
+            throw std::runtime_error("PhysX destruction adapter load phase failed");
+        }
+    }
+    if (!executor.solve(destructibles))
+    {
+        throw std::runtime_error("PhysX destruction adapter stress phase failed");
+    }
+    for (const DestructiblePtr& destructible : destructibles)
+    {
+        if (!destructible->endTick())
+        {
+            throw std::runtime_error("PhysX destruction adapter topology phase failed");
+        }
+    }
+}
 
 struct Projectile
 {
@@ -329,6 +523,7 @@ void usage(const char* executable)
         "  --require-varied-building-heights  Fail unless all three skyline heights are present\n"
         "  --scene PATH            ScenePack v1 JSON\n"
         "  --grid N                N by N city (default 3)\n"
+        "  --stress-workers N      Parallel per-building stress solves (default auto, max 64)\n"
         "  --uniform-building-heights  Disable the default 1/2/3-floor skyline\n"
         "  --duration SECONDS      Destruction duration (default 12)\n"
         "  --settle SECONDS        Initial settle time (default 1.5)\n"
@@ -430,6 +625,8 @@ Options parseOptions(int argc, char** argv)
         else if (option == "--self-test") options.selfTest = true;
         else if (option == "--scene") options.scenePath = argument();
         else if (option == "--grid") options.grid = parseU32(argument(), "--grid");
+        else if (option == "--stress-workers")
+            options.stressWorkers = parseU32(argument(), "--stress-workers");
         else if (option == "--uniform-building-heights")
             options.variedBuildingHeights = false;
         else if (option == "--duration") options.durationSeconds = parseFloat(argument(), "--duration");
@@ -457,9 +654,13 @@ Options parseOptions(int argc, char** argv)
         else if (option == "--pane-height") options.paneHeight = parseU32(argument(), "--pane-height");
         else throw std::runtime_error("unknown option: " + option);
     }
-    if (options.grid == 0 || options.grid > 12)
+    if (options.grid == 0 || options.grid > 20)
     {
-        throw std::runtime_error("--grid must be between 1 and 12");
+        throw std::runtime_error("--grid must be between 1 and 20");
+    }
+    if (options.stressWorkers > 64)
+    {
+        throw std::runtime_error("--stress-workers must be between 0 and 64");
     }
     if (options.durationSeconds <= 0.0f || options.settleSeconds < 0.0f)
     {
@@ -486,6 +687,7 @@ Options parseOptions(int argc, char** argv)
         options.requirePartialDestruction = false;
         options.requireVariedBuildingHeights = false;
         options.grid = 1;
+        options.stressWorkers = 1;
         options.variedBuildingHeights = false;
         options.durationSeconds = 0.5f;
         options.settleSeconds = 0.0f;
@@ -512,7 +714,7 @@ public:
         }
         for (const ExtStressPhysXShapeSnapshot& snapshot : snapshots)
         {
-            m_owners.emplace(snapshot.shape, &destructible);
+            snapshot.shape->userData = &destructible;
         }
     }
 
@@ -536,11 +738,12 @@ public:
                 continue;
             }
             const PxU32 count = pair.extractContacts(points.data(), static_cast<PxU32>(points.size()));
+            ExtStressPhysXDestructible* owner0 = owner(pair.shapes[0]);
+            ExtStressPhysXDestructible* owner1 = owner(pair.shapes[1]);
             const bool projectileImpact =
-                (pair.shapes[0]->userData == this
-                    && m_owners.count(pair.shapes[1]) != 0)
+                (pair.shapes[0]->userData == this && owner1 != nullptr)
                 || (pair.shapes[1]->userData == this
-                    && m_owners.count(pair.shapes[0]) != 0);
+                    && owner0 != nullptr);
             for (PxU32 i = 0; i < count; ++i)
             {
                 if (projectileImpact)
@@ -548,8 +751,8 @@ public:
                     ++m_projectileImpactContacts;
                     m_projectileImpactImpulse += points[i].impulse.magnitude();
                 }
-                queue(pair.shapes[0], points[i].position, points[i].impulse);
-                queue(pair.shapes[1], points[i].position, -points[i].impulse);
+                queue(owner0, pair.shapes[0], points[i].position, points[i].impulse);
+                queue(owner1, pair.shapes[1], points[i].position, -points[i].impulse);
             }
         }
         m_callbackMilliseconds +=
@@ -568,16 +771,25 @@ public:
     void onAdvance(const PxRigidBody* const*, const PxTransform*, const PxU32) override {}
 
 private:
-    void queue(const PxShape* shape, const PxVec3& position, const PxVec3& impulse)
+    ExtStressPhysXDestructible* owner(const PxShape* shape) const
     {
-        const auto found = m_owners.find(shape);
-        if (found != m_owners.end())
+        return shape && shape->userData && shape->userData != this
+            ? static_cast<ExtStressPhysXDestructible*>(shape->userData)
+            : nullptr;
+    }
+
+    void queue(
+        ExtStressPhysXDestructible* destructible,
+        const PxShape* shape,
+        const PxVec3& position,
+        const PxVec3& impulse)
+    {
+        if (destructible)
         {
-            found->second->queueContact(*shape, position, impulse * m_forceScale);
+            destructible->queueContact(*shape, position, impulse * m_forceScale);
         }
     }
 
-    std::unordered_map<const PxShape*, ExtStressPhysXDestructible*> m_owners;
     float m_forceScale{1.0f};
     double m_callbackMilliseconds{0.0};
     std::uint64_t m_projectileImpactContacts{0};
@@ -1592,6 +1804,7 @@ int run(const Options& options)
     {
         contacts.registerProjectile(*projectile.shape);
     }
+    StressExecutor stressExecutor(resolveStressWorkerCount(options.stressWorkers));
 
     // Warm lazy PhysX/CUDA allocations and solver scratch before the measured
     // fixed-step interval. The structures and projectiles are still kinematic,
@@ -1603,13 +1816,11 @@ int run(const Options& options)
         {
             throw std::runtime_error("PxScene::fetchResults failed during warmup");
         }
-        for (const DestructiblePtr& destructible : destructibles)
-        {
-            if (!destructible->tick(physicsDt, PxVec3(0.0f, pack.gravity, 0.0f)))
-            {
-                throw std::runtime_error("PhysX destruction adapter warmup failed");
-            }
-        }
+        tickDestructibles(
+            destructibles,
+            stressExecutor,
+            physicsDt,
+            PxVec3(0.0f, pack.gravity, 0.0f));
     }
     if (aggregate(destructibles).splits != 0)
     {
@@ -1742,13 +1953,11 @@ int run(const Options& options)
         }
 
         const auto adapterStart = std::chrono::steady_clock::now();
-        for (const DestructiblePtr& destructible : destructibles)
-        {
-            if (!destructible->tick(physicsDt, PxVec3(0.0f, pack.gravity, 0.0f)))
-            {
-                throw std::runtime_error("PhysX destruction adapter tick failed");
-            }
-        }
+        tickDestructibles(
+            destructibles,
+            stressExecutor,
+            physicsDt,
+            PxVec3(0.0f, pack.gravity, 0.0f));
         const double adapterTickMilliseconds =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - adapterStart).count();

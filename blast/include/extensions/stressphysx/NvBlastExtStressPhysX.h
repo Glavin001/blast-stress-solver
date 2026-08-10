@@ -307,6 +307,15 @@ public:
         const physx::PxShape& shape,
         const physx::PxVec3& worldPosition,
         const physx::PxVec3& worldImpulse) = 0;
+    /**
+     * Three-phase tick API for batching independent destructibles. beginTick()
+     * and endTick() access PhysX and must run serially after fetchResults().
+     * solveTick() only updates this destructible's stress solver and may run
+     * concurrently with solveTick() on other destructibles.
+     */
+    virtual bool beginTick(float dt, const physx::PxVec3& worldGravity) = 0;
+    virtual bool solveTick() = 0;
+    virtual bool endTick() = 0;
     virtual bool tick(float dt, const physx::PxVec3& worldGravity) = 0;
 
     virtual bool validateMappings() = 0;

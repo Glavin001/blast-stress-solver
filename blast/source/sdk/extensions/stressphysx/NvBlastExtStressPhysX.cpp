@@ -389,17 +389,24 @@ public:
         return queueContact(contact);
     }
 
-    bool tick(float dt, const PxVec3& worldGravity) override
+    bool beginTick(float dt, const PxVec3& worldGravity) override
     {
         ++m_telemetry.ticks;
         m_telemetry.awakeDynamicBodyCount = 0;
+        if (m_tickPhase != TickPhase::Idle)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "beginTick called before the previous tick completed.");
+        }
         if (!m_solver || !std::isfinite(dt) || dt <= 0.0f || !worldGravity.isFinite())
         {
             m_contacts.clear();
             return fail(
                 ExtStressPhysXError::InvalidDescriptor,
                 INVALID_INDEX,
-                "tick requires a finite positive dt and finite gravity.");
+                "beginTick requires a finite positive dt and finite gravity.");
         }
 
         TelemetryClock::time_point phaseStart = TelemetryClock::now();
@@ -409,8 +416,21 @@ public:
         phaseStart = TelemetryClock::now();
         addGravity(worldGravity);
         m_telemetry.gravityMilliseconds += elapsedMilliseconds(phaseStart);
+        m_tickDt = dt;
+        m_tickPhase = TickPhase::Prepared;
+        return true;
+    }
 
-        phaseStart = TelemetryClock::now();
+    bool solveTick() override
+    {
+        if (m_tickPhase != TickPhase::Prepared)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "solveTick requires a successful beginTick.");
+        }
+        const TelemetryClock::time_point phaseStart = TelemetryClock::now();
         ext_stress_solver_update(m_solver);
 
         m_telemetry.overstressedBondCount =
@@ -424,20 +444,39 @@ public:
         m_telemetry.gpuStressDeviceToHostBytes +=
             ext_stress_solver_gpu_device_to_host_bytes(m_solver);
         m_telemetry.stressSolveMilliseconds += elapsedMilliseconds(phaseStart);
+        m_tickPhase = TickPhase::Solved;
+        return true;
+    }
 
+    bool endTick() override
+    {
+        if (m_tickPhase != TickPhase::Solved)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "endTick requires a successful solveTick.");
+        }
         if (m_telemetry.overstressedBondCount > 0)
         {
-            phaseStart = TelemetryClock::now();
-            const bool fractured = fracture(dt);
+            const TelemetryClock::time_point phaseStart = TelemetryClock::now();
+            const bool fractured = fracture(m_tickDt);
             m_telemetry.fractureTopologyMilliseconds += elapsedMilliseconds(phaseStart);
             if (!fractured)
             {
+                m_tickPhase = TickPhase::Idle;
                 return false;
             }
         }
 
         m_telemetry.bodyCount = static_cast<uint32_t>(m_actorBodies.size());
+        m_tickPhase = TickPhase::Idle;
         return true;
+    }
+
+    bool tick(float dt, const PxVec3& worldGravity) override
+    {
+        return beginTick(dt, worldGravity) && solveTick() && endTick();
     }
 
     bool validateMappings() override
@@ -671,6 +710,13 @@ public:
     }
 
 private:
+    enum class TickPhase
+    {
+        Idle,
+        Prepared,
+        Solved
+    };
+
     struct BodyState;
 
     struct NodeState
@@ -1628,6 +1674,8 @@ private:
     ExtStressPhysXId m_nextBodyId{1};
     ExtStressPhysXId m_nextShapeId{1};
     uint64_t m_splitSequence{0};
+    TickPhase m_tickPhase{TickPhase::Idle};
+    float m_tickDt{0.0f};
     mutable uint64_t m_shapeSnapshotGeneration{0};
     uint64_t m_contactGeneration{0};
 };
