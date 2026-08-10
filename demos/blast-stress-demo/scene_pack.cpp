@@ -524,6 +524,28 @@ ScenePack loadScenePack(const std::string& path)
         pack.stressLimits.tensionFatal = number(limits->at("tensionFatal"), "tensionFatal");
         pack.stressLimits.shearElastic = number(limits->at("shearElastic"), "shearElastic");
         pack.stressLimits.shearFatal = number(limits->at("shearFatal"), "shearFatal");
+        pack.stressLimitsAuthored = true;
+    }
+    else
+    {
+        // A pack without solver.limits gets StressLimits{} — 1 MPa elastic /
+        // 2 MPa fatal. That is roughly a twelfth of concrete's compressive
+        // strength, so the structure is far weaker than the material it is
+        // presumably meant to represent, and the difference has to be absorbed
+        // somewhere else (a smaller projectile, a lower contact scale) for the
+        // scene to behave. Say so rather than letting an unstated material
+        // masquerade as an authored one.
+        std::fprintf(
+            stderr,
+            "[scene_pack] '%s' omits defaults.solver.limits; falling back to "
+            "%.3g/%.3g Pa compression and %.3g/%.3g Pa tension elastic/fatal. "
+            "These are placeholder values, not an authored material — add an "
+            "explicit limits block so the pack states what it is made of.\n",
+            path.c_str(),
+            static_cast<double>(pack.stressLimits.compressionElastic),
+            static_cast<double>(pack.stressLimits.compressionFatal),
+            static_cast<double>(pack.stressLimits.tensionElastic),
+            static_cast<double>(pack.stressLimits.tensionFatal));
     }
 
     const Json& physics = defaults.at("physics");

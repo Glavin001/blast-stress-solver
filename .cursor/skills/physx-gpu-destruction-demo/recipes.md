@@ -38,7 +38,7 @@ name=candidate-a
   --require-varied-building-heights \
   --require-partial-destruction \
   --scene "$SCENE_LOCAL" \
-  --require-min-safety-factor 2 --require-max-safety-factor 200 \
+  --require-min-safety-factor 2 --require-max-safety-factor 2000 \
   --projectile-radius-scale 2 --projectile-mass-scale 8 \
   --contact-force-scale 1.0 \
   --stress-limit-scale 1.0 \
@@ -105,7 +105,7 @@ $CARGO run --release --locked -- record \
   --sim-arg=--stress-limit-scale --sim-arg=1.0 \
   --sim-arg=--excess-force-scale --sim-arg=0.0 \
   --sim-arg=--require-min-safety-factor --sim-arg=2 \
-  --sim-arg=--require-max-safety-factor --sim-arg=200 \
+  --sim-arg=--require-max-safety-factor --sim-arg=2000 \
   --sim-arg=--stress-workers --sim-arg=20 \
   --sim-arg=--tall-building-stride --sim-arg=12 \
   --sim-arg=--resim-passes --sim-arg=1 \
@@ -136,7 +136,7 @@ $CARGO run --release --locked -- record \
   --sim-arg=--stress-limit-scale --sim-arg=1.0 \
   --sim-arg=--excess-force-scale --sim-arg=0.0 \
   --sim-arg=--require-min-safety-factor --sim-arg=2 \
-  --sim-arg=--require-max-safety-factor --sim-arg=200 \
+  --sim-arg=--require-max-safety-factor --sim-arg=2000 \
   --sim-arg=--stress-workers --sim-arg=20 \
   --sim-arg=--tall-building-stride --sim-arg=12 \
   --sim-arg=--require-realtime \

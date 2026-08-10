@@ -77,8 +77,8 @@ frame 1.5–2.0, facade 0.09–1.5), which yields safety factors of ~2.7 (facade
 | `--contact-force-scale` | Contact → stress injection. **1.0 is physically correct** (the adapter already divides impulse by dt); treat ≠1 as a sensitivity experiment, not tuning |
 | `--stress-limit-scale` | Material strength (<1 breaks easier). **1.0 = the concrete the pack claims to be made of** |
 | `--excess-force-scale` | Post-split kick (used when resim off) |
-| `--require-min-safety-factor` | Fail if any joint class can't carry self-weight with this margin |
-| `--require-max-safety-factor` | Fail if any joint class is so over-authored it carries no load and cannot break |
+| `--require-min-safety-factor` | Fail if any joint class's **worst** bond can't carry self-weight with this margin |
+| `--require-max-safety-factor` | Fail if any joint class's **mean** load is so low it cannot break (over-authored area) |
 | `--resim-passes` | `1` = fracture-frame rollback+re-step (default); `0` = excess-force path / realtime pin |
 | `--max-bodies-per-structure` | **Default 0 = unlimited.** Opt-in hard stop only; do not use as a perf budget (falsifies fracture/resim) |
 | `--max-fractures-per-actor-per-tick` | **Default 0 = unlimited.** Opt-in; artificial caps degrade quality |
@@ -152,7 +152,9 @@ and writes the same table to `metadata.gravityLoadPath`. Utilisation is how much
 - Safety factor **in the 2–40 band** → a real structure. Facade should be the weakest class, the frame stronger, the base anchor strongest.
 - Safety factor **in the thousands or more** → the joint carries no load and **cannot be broken by any impulse the sim can produce**. Destruction results are then vacuous: damage gates pass because the structure is indestructible, not because the load path works.
 
-Pin both ends on any run you trust: `--require-min-safety-factor 2 --require-max-safety-factor 200`.
+Pin both ends on any run you trust: `--require-min-safety-factor 2 --require-max-safety-factor 2000`.
+
+The two gates read different statistics on purpose. The lower bound uses the **peak** — the worst joint has to stand. The upper bound uses the **mean**, because over-authoring is a systematic property of a class, and a peak-based upper bound is defeated by geometry: a Voronoi-fractured pack has sliver bonds where two cells barely touch (down to 3e-4 m² in `fractured-tower.json`), and one of those pins peak utilisation near 1 while the class as a whole sits two orders of magnitude lower (peak 0.995, mean 0.0036). A well-authored pack tops out around mean SF 210; an over-authored one reads ~1e6.
 
 ## Acceptance videos (reference)
 

@@ -75,6 +75,9 @@ struct ScenePack
     // that has to be cancelled elsewhere.
     float contactForceScale{1.0f};
     StressLimits stressLimits;
+    // False when the pack omitted defaults.solver.limits and stressLimits holds
+    // placeholder values rather than an authored material.
+    bool stressLimitsAuthored{false};
 };
 
 ScenePack loadScenePack(const std::string& path);

@@ -288,12 +288,21 @@ indestructible. A safety factor in the thousands is a bug, not a strong
 building. Two gates pin both ends:
 
 - `--require-min-safety-factor X` — fails a structure that cannot carry its own
-  weight (it would fracture during warmup).
+  weight (it would fracture during warmup). Reads the class's **peak**
+  utilisation: the worst joint has to stand.
 - `--require-max-safety-factor X` — fails an over-authored asset whose joints
-  carry no load, naming the offending class.
+  carry no load, naming the offending class. Reads the class's **mean**
+  utilisation, because over-authoring is systematic and a peak-based bound is
+  defeated by sliver bonds — a Voronoi pack's near-zero-area contacts pin peak
+  utilisation near 1 while the class as a whole is two orders of magnitude
+  lower (`fractured-tower.json`: peak 0.995, mean 0.0036).
 
-`--require-min-safety-factor 2 --require-max-safety-factor 200` is the
-recommended pair for any run whose destruction numbers are meant to be trusted.
+`--require-min-safety-factor 2 --require-max-safety-factor 2000` is the
+recommended pair for any run whose destruction numbers are meant to be trusted
+(a well-authored pack peaks around mean SF 210; an over-authored one reads ~1e6).
+
+A pack that omits `defaults.solver.limits` gets placeholder 1 MPa/2 MPa values
+rather than an authored material, and the loader now says so on stderr.
 `blast_stress_load_path` (CTest) covers the underlying API: self-weight stress
 is measurable and decreases up a column, stress scales inversely with authored
 area, and readback survives a topology edit.

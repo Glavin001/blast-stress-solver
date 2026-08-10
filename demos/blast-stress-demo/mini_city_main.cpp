@@ -2482,22 +2482,32 @@ int run(const Options& options)
     // passes. Both are about the authored asset, not the run's tuning.
     for (const JointClassLoad& entry : loadPath)
     {
-        const double factor = safetyFactor(entry.peakUtilisation);
+        // Lower bound: the WORST joint must still stand, so this reads the peak.
+        const double peakFactor = safetyFactor(entry.peakUtilisation);
         if (options.requireMinSafetyFactor > 0.0f
-            && factor < options.requireMinSafetyFactor)
+            && peakFactor < options.requireMinSafetyFactor)
         {
             throw std::runtime_error(
-                "joint class '" + entry.name + "' has safety factor "
-                + std::to_string(factor) + " under self-weight, below the required "
+                "joint class '" + entry.name + "' has peak safety factor "
+                + std::to_string(peakFactor) + " under self-weight, below the required "
                 + std::to_string(options.requireMinSafetyFactor)
                 + " (authored bond area is too small to carry gravity)");
         }
+        // Upper bound: over-authoring is a systematic property of a joint class,
+        // so this reads the MEAN. Peak would be the wrong statistic here — a
+        // Voronoi-fractured pack has sliver bonds down to ~3e-4 m^2 where two
+        // cells barely touch, and one of those pins peak utilisation near 1
+        // while the class as a whole sits two orders of magnitude lower
+        // (measured on fractured-tower.json: peak 0.995, mean 0.0036). Judging
+        // "does this joint carry load" off the worst geometric artifact in the
+        // class would let a genuinely unloadable class pass.
+        const double meanFactor = safetyFactor(static_cast<float>(entry.meanUtilisation));
         if (options.requireMaxSafetyFactor > 0.0f
-            && factor > options.requireMaxSafetyFactor)
+            && meanFactor > options.requireMaxSafetyFactor)
         {
             throw std::runtime_error(
-                "joint class '" + entry.name + "' has safety factor "
-                + std::to_string(factor) + " under self-weight, above the allowed "
+                "joint class '" + entry.name + "' has mean safety factor "
+                + std::to_string(meanFactor) + " under self-weight, above the allowed "
                 + std::to_string(options.requireMaxSafetyFactor)
                 + " (authored bond area is so large this joint carries no load "
                   "and cannot break — destruction results would be vacuous)");
