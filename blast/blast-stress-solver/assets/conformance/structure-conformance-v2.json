@@ -1,0 +1,351 @@
+{
+  "version": 2,
+  "key": "structure-conformance-v2",
+  "title": "Cross-runtime conformance structure",
+  "defaults": {
+    "camera": {
+      "target": {
+        "x": 0,
+        "y": 2,
+        "z": 0
+      },
+      "distance": 14
+    },
+    "projectile": {
+      "radius": 0.4,
+      "mass": 800,
+      "speed": 20,
+      "ttlMs": 6000
+    },
+    "solver": {
+      "gravity": -9.81,
+      "materialScale": 1,
+      "materials": [
+        {
+          "name": "reinforced-concrete",
+          "compressionElastic": 24000000.0,
+          "compressionFatal": 60000000.0,
+          "tensionElastic": 3000000.0,
+          "tensionFatal": 8000000.0,
+          "shearElastic": 4000000.0,
+          "shearFatal": 10000000.0
+        },
+        {
+          "name": "concrete",
+          "compressionElastic": 12000000.0,
+          "compressionFatal": 30000000.0,
+          "tensionElastic": 1200000.0,
+          "tensionFatal": 3000000.0,
+          "shearElastic": 1600000.0,
+          "shearFatal": 4000000.0
+        },
+        {
+          "name": "drywall-track",
+          "compressionElastic": 1000000.0,
+          "compressionFatal": 2000000.0,
+          "tensionElastic": 100000.0,
+          "tensionFatal": 300000.0,
+          "shearElastic": 150000.0,
+          "shearFatal": 400000.0
+        }
+      ]
+    },
+    "physics": {
+      "debrisCollisionMode": "all",
+      "friction": 0.25,
+      "restitution": 0.0,
+      "contactForceScale": 1,
+      "skipSingleBodies": false
+    },
+    "optimization": {
+      "smallBodyDampingMode": "always",
+      "debrisCleanupMode": "always",
+      "debrisTtlMs": 10000,
+      "maxCollidersForDebris": 3
+    }
+  },
+  "scenario": {
+    "nodeTypes": [
+      "foundation",
+      "foundation",
+      "column",
+      "column",
+      "slab",
+      "infill",
+      "infill"
+    ],
+    "nodes": [
+      {
+        "centroid": {
+          "x": -2.0,
+          "y": 0.25,
+          "z": 0.0
+        },
+        "mass": 0.0,
+        "volume": 2.0
+      },
+      {
+        "centroid": {
+          "x": 2.0,
+          "y": 0.25,
+          "z": 0.0
+        },
+        "mass": 0.0,
+        "volume": 2.0
+      },
+      {
+        "centroid": {
+          "x": -2.0,
+          "y": 2.0,
+          "z": 0.0
+        },
+        "mass": 1200.0,
+        "volume": 2.0
+      },
+      {
+        "centroid": {
+          "x": 2.0,
+          "y": 2.0,
+          "z": 0.0
+        },
+        "mass": 1200.0,
+        "volume": 2.0
+      },
+      {
+        "centroid": {
+          "x": 0.0,
+          "y": 3.4,
+          "z": 0.0
+        },
+        "mass": 3000.0,
+        "volume": 5.0
+      },
+      {
+        "centroid": {
+          "x": -1.0,
+          "y": 2.0,
+          "z": -1.4
+        },
+        "mass": 300.0,
+        "volume": 1.5
+      },
+      {
+        "centroid": {
+          "x": 1.0,
+          "y": 2.0,
+          "z": -1.4
+        },
+        "mass": 300.0,
+        "volume": 1.5
+      }
+    ],
+    "bonds": [
+      {
+        "node0": 0,
+        "node1": 2,
+        "centroid": {
+          "x": -2.0,
+          "y": 1.125,
+          "z": 0.0
+        },
+        "normal": {
+          "x": 0.0,
+          "y": 1.0,
+          "z": 0.0
+        },
+        "area": 0.25
+      },
+      {
+        "node0": 1,
+        "node1": 3,
+        "centroid": {
+          "x": 2.0,
+          "y": 1.125,
+          "z": 0.0
+        },
+        "normal": {
+          "x": 0.0,
+          "y": 1.0,
+          "z": 0.0
+        },
+        "area": 0.25
+      },
+      {
+        "node0": 2,
+        "node1": 4,
+        "centroid": {
+          "x": -1.0,
+          "y": 2.7,
+          "z": 0.0
+        },
+        "normal": {
+          "x": 0.8192319205190405,
+          "y": 0.5734623443633283,
+          "z": 0.0
+        },
+        "area": 0.25,
+        "m": 1
+      },
+      {
+        "node0": 3,
+        "node1": 4,
+        "centroid": {
+          "x": 1.0,
+          "y": 2.7,
+          "z": 0.0
+        },
+        "normal": {
+          "x": -0.8192319205190405,
+          "y": 0.5734623443633283,
+          "z": 0.0
+        },
+        "area": 0.25,
+        "m": 1
+      },
+      {
+        "node0": 2,
+        "node1": 5,
+        "centroid": {
+          "x": -1.5,
+          "y": 2.0,
+          "z": -0.7
+        },
+        "normal": {
+          "x": 0.5812381937190965,
+          "y": 0.0,
+          "z": -0.8137334712067349
+        },
+        "area": 0.18,
+        "m": 2
+      },
+      {
+        "node0": 3,
+        "node1": 6,
+        "centroid": {
+          "x": 1.5,
+          "y": 2.0,
+          "z": -0.7
+        },
+        "normal": {
+          "x": -0.5812381937190965,
+          "y": 0.0,
+          "z": -0.8137334712067349
+        },
+        "area": 0.18,
+        "m": 2
+      },
+      {
+        "node0": 5,
+        "node1": 6,
+        "centroid": {
+          "x": 0.0,
+          "y": 2.0,
+          "z": -1.4
+        },
+        "normal": {
+          "x": 1.0,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "area": 0.1,
+        "m": 2
+      }
+    ],
+    "nodeSizes": [
+      {
+        "x": 1.0,
+        "y": 0.5,
+        "z": 1.0
+      },
+      {
+        "x": 1.0,
+        "y": 0.5,
+        "z": 1.0
+      },
+      {
+        "x": 0.5,
+        "y": 2.5,
+        "z": 0.5
+      },
+      {
+        "x": 0.5,
+        "y": 2.5,
+        "z": 0.5
+      },
+      {
+        "x": 4.5,
+        "y": 0.3,
+        "z": 3.0
+      },
+      {
+        "x": 1.8,
+        "y": 2.4,
+        "z": 0.12
+      },
+      {
+        "x": 1.8,
+        "y": 2.4,
+        "z": 0.12
+      }
+    ],
+    "nodeColliders": [
+      {
+        "kind": "cuboid",
+        "halfExtents": {
+          "x": 0.5,
+          "y": 0.25,
+          "z": 0.5
+        }
+      },
+      {
+        "kind": "cuboid",
+        "halfExtents": {
+          "x": 0.5,
+          "y": 0.25,
+          "z": 0.5
+        }
+      },
+      {
+        "kind": "cuboid",
+        "halfExtents": {
+          "x": 0.25,
+          "y": 1.25,
+          "z": 0.25
+        }
+      },
+      {
+        "kind": "cuboid",
+        "halfExtents": {
+          "x": 0.25,
+          "y": 1.25,
+          "z": 0.25
+        }
+      },
+      {
+        "kind": "cuboid",
+        "halfExtents": {
+          "x": 2.25,
+          "y": 0.15,
+          "z": 1.5
+        }
+      },
+      {
+        "kind": "cuboid",
+        "halfExtents": {
+          "x": 0.9,
+          "y": 1.2,
+          "z": 0.06
+        }
+      },
+      {
+        "kind": "cuboid",
+        "halfExtents": {
+          "x": 0.9,
+          "y": 1.2,
+          "z": 0.06
+        }
+      }
+    ]
+  },
+  "nodeMeshes": []
+}

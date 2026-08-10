@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "nodeCount": 7,
+  "bondCount": 7,
+  "materialCount": 3,
+  "materialNames": [
+    "reinforced-concrete",
+    "concrete",
+    "drywall-track"
+  ],
+  "supportNodeCount": 2,
+  "totalMassKg": 6000.0,
+  "totalBondAreaM2": 1.46,
+  "bondsPerMaterial": [
+    2,
+    2,
+    3
+  ],
+  "bondsPerJointClass": {
+    "column~foundation": 2,
+    "column~infill": 2,
+    "column~slab": 2,
+    "infill~infill": 1
+  },
+  "gravity": -9.81,
+  "contactForceScale": 1
+}

@@ -277,6 +277,19 @@ add_executable(scene_pack_test
     scene_pack.cpp)
 target_include_directories(scene_pack_test PRIVATE "${PHYSX_ROOT}/include")
 target_compile_definitions(scene_pack_test PRIVATE PX_PHYSX_STATIC_LIB)
+add_executable(scene_pack_conformance_test
+    tests/scene_pack_conformance_test.cpp
+    scene_pack.cpp)
+target_include_directories(scene_pack_conformance_test PRIVATE
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(scene_pack_conformance_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(scene_pack_conformance_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}")
+target_link_libraries(scene_pack_conformance_test PRIVATE ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_scene_pack_conformance
+    COMMAND scene_pack_conformance_test
+        "${REPO_ROOT}/blast/blast-stress-solver/assets/conformance/structure-conformance-v2.json")
+
 add_test(NAME blast_stress_scene_pack
     COMMAND scene_pack_test
         "${BLAST_ROOT}/blast-stress-demo-rs/assets/scenes/fractured-tower.json")
