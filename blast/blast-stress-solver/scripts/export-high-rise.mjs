@@ -24,7 +24,26 @@ const floorCount = Number.parseInt(process.env.HIGH_RISE_FLOORS ?? '9', 10);
 if (!Number.isInteger(floorCount) || floorCount < 1 || floorCount > 40) {
   throw new Error('HIGH_RISE_FLOORS must be an integer between 1 and 40');
 }
-const outputStem = floorCount === 9 ? 'high-rise' : `high-rise-${floorCount}f`;
+// Local-damage profile: weaken wall/infill attachments and harden foundation
+// anchors so projectiles tear facade panels instead of shoving the whole tower.
+const localDamage = process.env.HIGH_RISE_LOCAL_DAMAGE === '1';
+const outputStem =
+  floorCount === 9 && !localDamage
+    ? 'high-rise'
+    : `high-rise-${floorCount}f${localDamage ? '-local' : ''}`;
+const LOCAL_DAMAGE_MULTIPLIERS = {
+  // Footing joints are few (12) and take the whole tower reaction, so they need
+  // essentially unbreakable area or the intact box tips as one body. Facade
+  // attachments stay paper-thin so impacts spend energy on local wall blowout.
+  foundationColumn: 50000.0,
+  foundationSkeleton: 25000.0,
+  columnColumn: 48.0,
+  columnSlab: 40.0,
+  slabSlab: 18.0,
+  infillInfill: 0.0012,
+  slabInfill: 0.0006,
+  frameInfill: 0.0004,
+};
 
 // Canonical output for the Rust/Bevy demo + Rust headless tests, plus a copy in the
 // library's own dist/ so the web demo can fetch it via the /vendor/blast-stress-solver
@@ -160,8 +179,24 @@ function summarize(scenario) {
 }
 
 async function main() {
-  const scenario = buildHighRiseScenario({ floorCount });
+  const scenario = buildHighRiseScenario({
+    floorCount,
+    ...(localDamage ? { multipliers: LOCAL_DAMAGE_MULTIPLIERS } : {}),
+  });
   const pack = serializeScenePack(scenario);
+
+  if (localDamage) {
+    // Pin the concrete frame (foundation + columns) as kinematic supports so the
+    // tower cannot tip as one body. Facade/infill keeps real mass and can peel
+    // off through weak bonds (adapter allows support↔light-node fractures).
+    const types = pack.scenario.nodeTypes ?? [];
+    for (let i = 0; i < pack.scenario.nodes.length; ++i) {
+      const type = types[i];
+      if (type === 'foundation' || type === 'column') {
+        pack.scenario.nodes[i].mass = 0;
+      }
+    }
+  }
 
   // Compact JSON: this is a generated, git-ignored artifact, so favor small size
   // and fast (re)generation over human-readable diffs.

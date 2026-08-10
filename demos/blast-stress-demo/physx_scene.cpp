@@ -214,7 +214,7 @@ PhysXScene::PhysXScene(
         throw std::runtime_error("PhysX scene creation failed");
     }
 
-    m_material = m_physics->createMaterial(0.6f, 0.6f, 0.05f);
+    m_material = m_physics->createMaterial(0.6f, 0.6f, 0.0f);
     if (!m_material)
     {
         throw std::runtime_error("PhysX material creation failed");

@@ -130,6 +130,13 @@ struct ExtStressPhysXSettings
     float excessForceScale;
     uint32_t maximumBodies;
     uint32_t maximumFracturesPerActorPerTick;
+    // When true, bonds that touch a mass==0 support node are never fractured
+    // unless the other node is light enough to peel (mass < supportPeelMaxMass).
+    // That keeps the planted skeleton fixed while facade panels can still tear off.
+    bool protectSupportBonds;
+    // Upper mass for peelable non-support nodes bonded to supports (e.g. drywall).
+    // Structural partners at/above this mass stay locked to the support graph.
+    float supportPeelMaxMass;
     float maximumLinearVelocity;
     float maximumAngularVelocity;
     float minimumSeparationVelocity;
@@ -153,6 +160,8 @@ struct ExtStressPhysXSettings
         , excessForceScale(1.0f)
         , maximumBodies(0)
         , maximumFracturesPerActorPerTick(0)
+        , protectSupportBonds(true)
+        , supportPeelMaxMass(1000.0f)
         , maximumLinearVelocity(0.0f)
         , maximumAngularVelocity(0.0f)
         , minimumSeparationVelocity(0.0f)

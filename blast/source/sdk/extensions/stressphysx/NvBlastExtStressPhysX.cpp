@@ -1205,6 +1205,66 @@ private:
             return true;
         }
 
+        if (m_settings.protectSupportBonds)
+        {
+            // Compact out footing/support joints so impacts tear non-support
+            // material instead of releasing the whole planted structure.
+            for (uint32_t commandIndex = 0; commandIndex < commandCount; ++commandIndex)
+            {
+                ExtStressFractureCommands& command = commands[commandIndex];
+                if (command.bondFractures == nullptr || command.bondFractureCount == 0)
+                {
+                    continue;
+                }
+                uint32_t kept = 0;
+                for (uint32_t fractureIndex = 0; fractureIndex < command.bondFractureCount;
+                     ++fractureIndex)
+                {
+                    const ExtStressBondFracture& fracture =
+                        command.bondFractures[fractureIndex];
+                    if (fracture.nodeIndex0 >= m_nodes.size()
+                        || fracture.nodeIndex1 >= m_nodes.size())
+                    {
+                        continue;
+                    }
+                    const float mass0 = m_nodes[fracture.nodeIndex0].mass;
+                    const float mass1 = m_nodes[fracture.nodeIndex1].mass;
+                    const bool support0 = mass0 == 0.0f;
+                    const bool support1 = mass1 == 0.0f;
+                    if (support0 || support1)
+                    {
+                        const float otherMass = support0 ? mass1 : mass0;
+                        // Keep footing/frame joints. Allow light facade peel-off.
+                        if (otherMass == 0.0f
+                            || otherMass >= m_settings.supportPeelMaxMass)
+                        {
+                            continue;
+                        }
+                    }
+                    if (kept != fractureIndex)
+                    {
+                        command.bondFractures[kept] = fracture;
+                    }
+                    ++kept;
+                }
+                command.bondFractureCount = kept;
+            }
+            commands.erase(
+                std::remove_if(
+                    commands.begin(),
+                    commands.end(),
+                    [](const ExtStressFractureCommands& command) {
+                        return command.bondFractureCount == 0
+                            || command.bondFractures == nullptr;
+                    }),
+                commands.end());
+            commandCount = static_cast<uint32_t>(commands.size());
+            if (commandCount == 0)
+            {
+                return true;
+            }
+        }
+
         commands.resize(commandCount);
         std::sort(commands.begin(), commands.end(), [](const ExtStressFractureCommands& a,
                                                         const ExtStressFractureCommands& b) {
