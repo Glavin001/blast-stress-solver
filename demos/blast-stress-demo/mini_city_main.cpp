@@ -39,8 +39,10 @@ struct Options
     bool requirePartialDestruction{false};
     bool requireRealtime{false};
     std::uint32_t requireMinimumAuthoredChunks{0};
+    bool requireVariedBuildingHeights{false};
     bool selfTest{false};
     std::uint32_t grid{3};
+    bool variedBuildingHeights{true};
     float durationSeconds{12.0f};
     float settleSeconds{1.5f};
     float projectileMassScale{1.5f};
@@ -58,6 +60,22 @@ struct Options
     std::string metadataPath{"blast-physx-mini-city.json"};
     std::string telemetryPath;
     std::string frameTelemetryPath;
+};
+
+struct BuildingVariant
+{
+    ScenePack pack;
+    std::vector<ExtStressPhysXNodeDesc> nodes;
+    std::vector<ExtStressPhysXBondDesc> bonds;
+    std::uint32_t floors{0};
+    float height{0.0f};
+};
+
+struct BuildingInstance
+{
+    std::size_t variantIndex{0};
+    PxVec3 offset{0.0f};
+    std::uint32_t visualBase{0};
 };
 
 struct DestructibleDeleter
@@ -308,8 +326,10 @@ void usage(const char* executable)
         "  --require-dynamic-destruction  Alias for --require-partial-destruction\n"
         "  --require-realtime      Fail if any post-settle frame exceeds 16.67 ms\n"
         "  --require-min-authored-chunks N  Fail unless the latent scene has at least N chunks\n"
+        "  --require-varied-building-heights  Fail unless all three skyline heights are present\n"
         "  --scene PATH            ScenePack v1 JSON\n"
         "  --grid N                N by N city (default 3)\n"
+        "  --uniform-building-heights  Disable the default 1/2/3-floor skyline\n"
         "  --duration SECONDS      Destruction duration (default 12)\n"
         "  --settle SECONDS        Initial settle time (default 1.5)\n"
         "  --projectile-mass-scale X    Multiply ScenePack projectile mass (default 1.5)\n"
@@ -405,9 +425,13 @@ Options parseOptions(int argc, char** argv)
         else if (option == "--require-min-authored-chunks")
             options.requireMinimumAuthoredChunks =
                 parseU32(argument(), "--require-min-authored-chunks");
+        else if (option == "--require-varied-building-heights")
+            options.requireVariedBuildingHeights = true;
         else if (option == "--self-test") options.selfTest = true;
         else if (option == "--scene") options.scenePath = argument();
         else if (option == "--grid") options.grid = parseU32(argument(), "--grid");
+        else if (option == "--uniform-building-heights")
+            options.variedBuildingHeights = false;
         else if (option == "--duration") options.durationSeconds = parseFloat(argument(), "--duration");
         else if (option == "--settle") options.settleSeconds = parseFloat(argument(), "--settle");
         else if (option == "--projectile-mass-scale")
@@ -460,7 +484,9 @@ Options parseOptions(int argc, char** argv)
         options.physics = PhysicsMode::Cpu;
         options.requireGpu = false;
         options.requirePartialDestruction = false;
+        options.requireVariedBuildingHeights = false;
         options.grid = 1;
+        options.variedBuildingHeights = false;
         options.durationSeconds = 0.5f;
         options.settleSeconds = 0.0f;
         options.statePath.clear();
@@ -611,6 +637,90 @@ std::vector<ExtStressPhysXBondDesc> makeBondDescs(const ScenePack& pack)
     return result;
 }
 
+ScenePack truncateToFloors(
+    const ScenePack& source,
+    std::uint32_t floors,
+    std::uint32_t maximumFloors)
+{
+    if (floors == 0 || floors > maximumFloors || source.nodes.empty())
+    {
+        throw std::runtime_error("invalid building floor count");
+    }
+    ScenePack result = source;
+    result.title = source.title + " " + std::to_string(floors) + "-floor";
+    result.nodes.clear();
+    result.bonds.clear();
+
+    float minimumY = source.nodes.front().centroid.y;
+    float maximumY = minimumY;
+    for (const SceneNode& node : source.nodes)
+    {
+        minimumY = std::min(minimumY, node.centroid.y);
+        maximumY = std::max(maximumY, node.centroid.y);
+    }
+    const float cutoff =
+        floors == maximumFloors
+        ? maximumY + 1.0f
+        : minimumY + (maximumY - minimumY) * static_cast<float>(floors)
+            / static_cast<float>(maximumFloors);
+    std::vector<std::uint32_t> remap(source.nodes.size(), UINT32_MAX);
+    for (std::uint32_t nodeIndex = 0; nodeIndex < source.nodes.size(); ++nodeIndex)
+    {
+        if (source.nodes[nodeIndex].centroid.y <= cutoff)
+        {
+            remap[nodeIndex] = static_cast<std::uint32_t>(result.nodes.size());
+            result.nodes.push_back(source.nodes[nodeIndex]);
+        }
+    }
+    for (const SceneBond& sourceBond : source.bonds)
+    {
+        if (sourceBond.node0 >= remap.size() || sourceBond.node1 >= remap.size()
+            || remap[sourceBond.node0] == UINT32_MAX
+            || remap[sourceBond.node1] == UINT32_MAX)
+        {
+            continue;
+        }
+        SceneBond bond = sourceBond;
+        bond.node0 = remap[sourceBond.node0];
+        bond.node1 = remap[sourceBond.node1];
+        result.bonds.push_back(bond);
+    }
+    if (result.nodes.empty() || result.bonds.empty()
+        || std::none_of(
+            result.nodes.begin(),
+            result.nodes.end(),
+            [](const SceneNode& node) { return node.mass == 0.0f; }))
+    {
+        throw std::runtime_error("floor truncation produced an invalid supported structure");
+    }
+    return result;
+}
+
+std::vector<BuildingVariant> makeBuildingVariants(
+    const ScenePack& source,
+    bool variedBuildingHeights)
+{
+    constexpr std::uint32_t maximumFloors = 3;
+    const std::uint32_t firstFloor = variedBuildingHeights ? 1 : maximumFloors;
+    std::vector<BuildingVariant> result;
+    for (std::uint32_t floors = firstFloor; floors <= maximumFloors; ++floors)
+    {
+        BuildingVariant variant;
+        variant.pack = truncateToFloors(source, floors, maximumFloors);
+        variant.nodes = makeNodeDescs(variant.pack);
+        variant.bonds = makeBondDescs(variant.pack);
+        variant.floors = floors;
+        for (const SceneNode& node : variant.pack.nodes)
+        {
+            variant.height = std::max(
+                variant.height,
+                node.centroid.y + node.visualHalfExtents.y);
+        }
+        result.push_back(std::move(variant));
+    }
+    return result;
+}
+
 std::array<Camera, 4> makeCameras(std::uint32_t grid, float pitch)
 {
     const float radius = std::max(28.0f, grid * pitch * 0.85f);
@@ -651,16 +761,38 @@ std::vector<Projectile> createProjectiles(
     const ScenePack& pack,
     const Options& options,
     const std::vector<PxVec3>& offsets,
+    const std::vector<float>& buildingHeights,
     std::uint32_t firstVisualId,
     float settleSeconds)
 {
+    const std::size_t projectileCount =
+        offsets.size() + (offsets.size() + 7) / 8;
+    const float projectileLifetime =
+        pack.projectileTtlSeconds * options.projectileTtlScale;
+    const float launchWindow =
+        options.durationSeconds - projectileLifetime - 1.0f;
+    if (projectileCount > 1 && launchWindow <= 0.0f)
+    {
+        throw std::runtime_error(
+            "destruction duration must exceed projectile lifetime by at least one second");
+    }
+    const float launchSpacing = projectileCount > 1
+        ? std::min(0.15f, launchWindow / static_cast<float>(projectileCount - 1))
+        : 0.0f;
     std::vector<Projectile> projectiles;
-    projectiles.reserve(offsets.size() * 2);
+    projectiles.reserve(projectileCount);
     for (std::size_t round = 0; round < 2; ++round)
     {
         for (std::size_t i = 0; i < offsets.size(); ++i)
         {
-            const PxVec3 target = offsets[i] + PxVec3(0.0f, round == 0 ? 7.0f : 4.5f, 0.0f);
+            if (round == 1 && i % 8 != 0)
+            {
+                continue;
+            }
+            const float targetHeight = std::max(
+                1.5f,
+                buildingHeights[i] * (round == 0 ? 0.58f : 0.34f));
+            const PxVec3 target = offsets[i] + PxVec3(0.0f, targetHeight, 0.0f);
             PxVec3 start;
             const float side = -1.0f;
             if (round == 0)
@@ -708,26 +840,13 @@ std::vector<Projectile> createProjectiles(
             projectile.body = body;
             projectile.shape = shape;
             projectile.visualId = firstVisualId + static_cast<std::uint32_t>(projectiles.size());
-            // Keep both opposing waves inside the recording window so the
-            // city shows citywide tear-through rather than one sparse pass.
-            const float launchSpacing = std::min(
-                0.28f,
-                12.0f / std::max<std::size_t>(1, offsets.size()));
+            // Strike every building once, then every eighth building from the
+            // opposite side. Spread the work over the available destruction
+            // window so this remains a useful frame-budget stress test.
             projectile.launchAt =
-                settleSeconds + static_cast<float>(round) * 9.0f
-                + static_cast<float>(i) * launchSpacing;
-            const float projectileLifetime =
-                pack.projectileTtlSeconds * options.projectileTtlScale;
+                settleSeconds
+                + static_cast<float>(projectiles.size()) * launchSpacing;
             projectile.retireAt = projectile.launchAt + projectileLifetime;
-            const float simulationEnd = settleSeconds + options.durationSeconds;
-            if (projectile.retireAt > simulationEnd)
-            {
-                // Clamp late projectiles so debris still has time to fall
-                // before the recording ends, instead of dropping the wave.
-                projectile.launchAt =
-                    std::max(settleSeconds, simulationEnd - projectileLifetime - 0.5f);
-                projectile.retireAt = projectile.launchAt + projectileLifetime;
-            }
             projectile.launchPosition = start;
             projectile.launchVelocity = velocity;
             projectiles.push_back(projectile);
@@ -817,7 +936,7 @@ AggregateTelemetry aggregate(const std::vector<DestructiblePtr>& destructibles)
 
 DestructionDistribution destructionDistribution(
     const std::vector<DestructiblePtr>& destructibles,
-    std::uint32_t chunksPerStructure)
+    const std::vector<std::uint32_t>& chunksPerStructure)
 {
     DestructionDistribution result;
     if (destructibles.empty())
@@ -826,13 +945,15 @@ DestructionDistribution destructionDistribution(
     }
     result.minimumBodiesPerStructure = UINT32_MAX;
     std::uint64_t totalBodies = 0;
-    const std::uint32_t heavyThreshold =
-        std::max<std::uint32_t>(2, (chunksPerStructure + 1) / 2);
-    const std::uint32_t shatteredThreshold =
-        std::max<std::uint32_t>(2, static_cast<std::uint32_t>(
-            std::ceil(chunksPerStructure * 0.75)));
-    for (const DestructiblePtr& destructible : destructibles)
+    for (std::size_t structure = 0; structure < destructibles.size(); ++structure)
     {
+        const DestructiblePtr& destructible = destructibles[structure];
+        const std::uint32_t chunks = chunksPerStructure[structure];
+        const std::uint32_t heavyThreshold =
+            std::max<std::uint32_t>(2, (chunks + 1) / 2);
+        const std::uint32_t shatteredThreshold =
+            std::max<std::uint32_t>(2, static_cast<std::uint32_t>(
+                std::ceil(chunks * 0.75)));
         const std::uint32_t bodies = destructible->getTelemetry().bodyCount;
         totalBodies += bodies;
         result.minimumBodiesPerStructure =
@@ -863,13 +984,14 @@ DestructionDistribution destructionDistribution(
 
 DestructionMotion destructionMotion(
     const std::vector<DestructiblePtr>& destructibles,
-    const ScenePack& pack,
+    const std::vector<const ScenePack*>& packs,
     const std::vector<PxVec3>& offsets)
 {
     DestructionMotion result;
     for (std::size_t structure = 0; structure < destructibles.size(); ++structure)
     {
         const DestructiblePtr& destructible = destructibles[structure];
+        const ScenePack& pack = *packs[structure];
         std::vector<ExtStressPhysXBodySnapshot> bodies(pack.nodes.size());
         const std::uint32_t bodyCount = destructible->getBodySnapshots(
             bodies.data(),
@@ -946,31 +1068,30 @@ DestructionMotion destructionMotion(
 std::vector<VisualPose> collectVisualPoses(
     const std::vector<DestructiblePtr>& destructibles,
     const std::vector<Projectile>& projectiles,
-    std::uint32_t nodesPerBuilding)
+    const std::vector<std::uint32_t>& nodesPerBuilding,
+    const std::vector<std::uint32_t>& visualBases,
+    bool fullSnapshot)
 {
     std::vector<VisualPose> result;
-    result.reserve(destructibles.size() * nodesPerBuilding + projectiles.size());
+    result.reserve(
+        (visualBases.empty() ? 0 : visualBases.back() + nodesPerBuilding.back())
+        + projectiles.size());
+    const std::uint32_t maximumNodes = nodesPerBuilding.empty()
+        ? 0
+        : *std::max_element(nodesPerBuilding.begin(), nodesPerBuilding.end());
+    std::vector<ExtStressPhysXShapeSnapshot> shapes(maximumNodes);
     for (std::size_t building = 0; building < destructibles.size(); ++building)
     {
-        std::vector<ExtStressPhysXShapeSnapshot> shapes(nodesPerBuilding);
-        std::vector<ExtStressPhysXBodySnapshot> bodies(nodesPerBuilding);
-        const std::uint32_t shapeCount =
-            destructibles[building]->getShapeSnapshots(shapes.data(), nodesPerBuilding);
-        const std::uint32_t bodyCount =
-            destructibles[building]->getBodySnapshots(bodies.data(), nodesPerBuilding);
-        std::unordered_map<ExtStressPhysXId, bool> sleeping;
-        for (std::uint32_t i = 0; i < bodyCount; ++i)
-        {
-            sleeping.emplace(bodies[i].bodyId, bodies[i].sleeping);
-        }
+        const std::uint32_t nodeCount = nodesPerBuilding[building];
+        const std::uint32_t shapeCount = fullSnapshot
+            ? destructibles[building]->getShapeSnapshots(shapes.data(), nodeCount)
+            : destructibles[building]->getActiveShapeSnapshots(shapes.data(), nodeCount);
         for (std::uint32_t i = 0; i < shapeCount; ++i)
         {
             VisualPose pose;
-            pose.actorId =
-                static_cast<std::uint32_t>(building) * nodesPerBuilding + shapes[i].nodeIndex;
+            pose.actorId = visualBases[building] + shapes[i].nodeIndex;
             pose.pose = shapes[i].worldPose;
-            const auto found = sleeping.find(shapes[i].bodyId);
-            pose.sleeping = found != sleeping.end() && found->second;
+            pose.sleeping = shapes[i].bodySleeping;
             result.push_back(pose);
         }
     }
@@ -1104,7 +1225,9 @@ void writeMetadata(
     std::uint64_t projectileImpactContacts,
     double projectileImpactImpulse,
     double wallSeconds,
-    std::uint32_t frameCount)
+    std::uint32_t frameCount,
+    const std::vector<std::uint32_t>& nodesPerBuilding,
+    const std::vector<std::uint32_t>& floorsPerBuilding)
 {
     if (path.empty())
     {
@@ -1117,6 +1240,25 @@ void writeMetadata(
     const PhaseStats adapterStats = summarizePhase(timings.adapterTickMilliseconds);
     const PhaseStats gpuStressStats = summarizePhase(timings.gpuStressSolveMilliseconds);
     const PhaseStats exportStats = summarizePhase(timings.stateExportMilliseconds);
+    std::uint64_t totalAuthoredChunks = 0;
+    std::uint32_t minimumNodesPerBuilding = UINT32_MAX;
+    std::uint32_t maximumNodesPerBuilding = 0;
+    std::array<std::uint32_t, 4> buildingFloorCounts{};
+    for (std::size_t building = 0; building < nodesPerBuilding.size(); ++building)
+    {
+        totalAuthoredChunks += nodesPerBuilding[building];
+        minimumNodesPerBuilding =
+            std::min(minimumNodesPerBuilding, nodesPerBuilding[building]);
+        maximumNodesPerBuilding =
+            std::max(maximumNodesPerBuilding, nodesPerBuilding[building]);
+        if (floorsPerBuilding[building] < buildingFloorCounts.size())
+        {
+            ++buildingFloorCounts[floorsPerBuilding[building]];
+        }
+    }
+    const double meanNodesPerBuilding =
+        static_cast<double>(totalAuthoredChunks)
+        / std::max<std::size_t>(1, nodesPerBuilding.size());
     std::ofstream output(path);
     if (!output)
     {
@@ -1133,6 +1275,8 @@ void writeMetadata(
         << "  \"realtimeRequired\": " << (options.requireRealtime ? "true" : "false") << ",\n"
         << "  \"minimumAuthoredChunksRequired\": "
         << options.requireMinimumAuthoredChunks << ",\n"
+        << "  \"variedBuildingHeightsRequired\": "
+        << (options.requireVariedBuildingHeights ? "true" : "false") << ",\n"
         << "  \"tuning\": {\n"
         << "    \"projectileMass\": " << pack.projectileMass * options.projectileMassScale << ",\n"
         << "    \"projectileSpeed\": " << pack.projectileSpeed * options.projectileSpeedScale << ",\n"
@@ -1146,7 +1290,15 @@ void writeMetadata(
         << "  },\n"
         << "  \"grid\": " << options.grid << ",\n"
         << "  \"buildingCount\": " << options.grid * options.grid << ",\n"
-        << "  \"nodesPerBuilding\": " << pack.nodes.size() << ",\n"
+        << "  \"variedBuildingHeights\": "
+        << (options.variedBuildingHeights ? "true" : "false") << ",\n"
+        << "  \"authoredChunkCount\": " << totalAuthoredChunks << ",\n"
+        << "  \"minimumNodesPerBuilding\": " << minimumNodesPerBuilding << ",\n"
+        << "  \"maximumNodesPerBuilding\": " << maximumNodesPerBuilding << ",\n"
+        << "  \"meanNodesPerBuilding\": " << meanNodesPerBuilding << ",\n"
+        << "  \"buildingFloorCounts\": {\"1\": " << buildingFloorCounts[1]
+        << ", \"2\": " << buildingFloorCounts[2]
+        << ", \"3\": " << buildingFloorCounts[3] << "},\n"
         << "  \"frames\": " << frameCount << ",\n"
         << "  \"fixedHz\": 60,\n"
         << "  \"wallSeconds\": " << wallSeconds << ",\n"
@@ -1247,13 +1399,117 @@ int run(const Options& options)
     constexpr float cityPitch = 18.0f;
 
     const ScenePack pack = loadScenePack(options.scenePath);
-    const std::vector<ExtStressPhysXNodeDesc> nodes = makeNodeDescs(pack);
-    const std::vector<ExtStressPhysXBondDesc> bonds = makeBondDescs(pack);
+    const std::vector<BuildingVariant> variants =
+        makeBuildingVariants(pack, options.variedBuildingHeights);
+    if (options.selfTest)
+    {
+        const std::vector<BuildingVariant> testVariants =
+            makeBuildingVariants(pack, true);
+        requireContract(testVariants.size() == 3, "skyline must expose three floor variants");
+        for (std::size_t i = 0; i < testVariants.size(); ++i)
+        {
+            constexpr std::array<std::size_t, 3> expectedNodes{83, 148, 204};
+            constexpr std::array<std::size_t, 3> expectedBonds{209, 373, 546};
+            requireContract(
+                testVariants[i].floors == i + 1,
+                "skyline floor metadata is not monotonic");
+            requireContract(
+                testVariants[i].pack.nodes.size() == expectedNodes[i],
+                "skyline variant authored-chunk count changed");
+            requireContract(
+                testVariants[i].pack.bonds.size() == expectedBonds[i],
+                "skyline variant bond count changed");
+            std::size_t supportCount = 0;
+            std::vector<std::vector<std::uint32_t>> adjacency(
+                testVariants[i].pack.nodes.size());
+            for (const SceneBond& bond : testVariants[i].pack.bonds)
+            {
+                requireContract(
+                    bond.node0 < testVariants[i].pack.nodes.size()
+                        && bond.node1 < testVariants[i].pack.nodes.size(),
+                    "truncated skyline bond remap is invalid");
+                adjacency[bond.node0].push_back(bond.node1);
+                adjacency[bond.node1].push_back(bond.node0);
+            }
+            for (std::size_t node = 0; node < testVariants[i].pack.nodes.size(); ++node)
+            {
+                supportCount += testVariants[i].pack.nodes[node].mass == 0.0f ? 1 : 0;
+                requireContract(
+                    testVariants[i].pack.nodes[node].mass == 0.0f
+                        || !adjacency[node].empty(),
+                    "truncated skyline contains an orphan dynamic chunk");
+            }
+            requireContract(supportCount == 36, "skyline support-node count changed");
+            std::vector<bool> visited(testVariants[i].pack.nodes.size(), false);
+            std::vector<std::uint32_t> pending{0};
+            visited[0] = true;
+            for (std::size_t cursor = 0; cursor < pending.size(); ++cursor)
+            {
+                for (std::uint32_t neighbor : adjacency[pending[cursor]])
+                {
+                    if (!visited[neighbor])
+                    {
+                        visited[neighbor] = true;
+                        pending.push_back(neighbor);
+                    }
+                }
+            }
+            requireContract(
+                std::all_of(visited.begin(), visited.end(), [](bool value) { return value; }),
+                "truncated skyline graph is disconnected");
+        }
+    }
     const std::vector<PxVec3> offsets = buildingOffsets(options.grid, cityPitch);
+    std::vector<BuildingInstance> buildings;
+    std::vector<const ScenePack*> buildingPacks;
+    std::vector<std::uint32_t> nodesPerBuilding;
+    std::vector<std::uint32_t> floorsPerBuilding;
+    std::vector<std::uint32_t> visualBases;
+    std::vector<float> buildingHeights;
+    buildings.reserve(offsets.size());
+    buildingPacks.reserve(offsets.size());
+    nodesPerBuilding.reserve(offsets.size());
+    floorsPerBuilding.reserve(offsets.size());
+    visualBases.reserve(offsets.size());
+    buildingHeights.reserve(offsets.size());
+    std::uint32_t totalAuthoredChunks = 0;
+    for (std::size_t buildingIndex = 0; buildingIndex < offsets.size(); ++buildingIndex)
+    {
+        const std::size_t variantIndex =
+            options.variedBuildingHeights ? 2 - buildingIndex % 3 : 0;
+        const BuildingVariant& variant = variants[variantIndex];
+        buildings.push_back({variantIndex, offsets[buildingIndex], totalAuthoredChunks});
+        buildingPacks.push_back(&variant.pack);
+        nodesPerBuilding.push_back(static_cast<std::uint32_t>(variant.pack.nodes.size()));
+        floorsPerBuilding.push_back(variant.floors);
+        visualBases.push_back(totalAuthoredChunks);
+        buildingHeights.push_back(variant.height);
+        totalAuthoredChunks += static_cast<std::uint32_t>(variant.pack.nodes.size());
+    }
+    if (options.requireVariedBuildingHeights)
+    {
+        std::array<std::uint32_t, 4> floorCounts{};
+        for (std::uint32_t floors : floorsPerBuilding)
+        {
+            if (floors < floorCounts.size())
+            {
+                ++floorCounts[floors];
+            }
+        }
+        if (!options.variedBuildingHeights
+            || variants.size() != 3
+            || floorCounts[1] == 0
+            || floorCounts[2] == 0
+            || floorCounts[3] == 0)
+        {
+            throw std::runtime_error(
+                "--require-varied-building-heights needs populated 1/2/3-floor variants");
+        }
+    }
 
     ContactRouter contacts(pack.contactForceScale * options.contactForceScale);
     SceneCapacity capacity;
-    capacity.maxBodies = static_cast<std::uint32_t>(pack.nodes.size() * offsets.size() * 2);
+    capacity.maxBodies = totalAuthoredChunks * 2;
     capacity.maxShapes = capacity.maxBodies + static_cast<std::uint32_t>(offsets.size() * 2);
     capacity.maxContactPairs = std::max<std::uint32_t>(65536, capacity.maxBodies * 64);
     PhysXScene context(options.physics, options.requireGpu, capacity, &contacts);
@@ -1261,17 +1517,18 @@ int run(const Options& options)
 
     std::vector<DestructiblePtr> destructibles;
     destructibles.reserve(offsets.size());
-    for (const PxVec3& offset : offsets)
+    for (const BuildingInstance& building : buildings)
     {
+        const BuildingVariant& variant = variants[building.variantIndex];
         ExtStressPhysXDesc desc;
         desc.physics = &context.physics();
         desc.scene = &context.scene();
         desc.material = &context.material();
-        desc.nodes = nodes.data();
-        desc.nodeCount = static_cast<std::uint32_t>(nodes.size());
-        desc.bonds = bonds.data();
-        desc.bondCount = static_cast<std::uint32_t>(bonds.size());
-        desc.worldTransform = PxTransform(offset);
+        desc.nodes = variant.nodes.data();
+        desc.nodeCount = static_cast<std::uint32_t>(variant.nodes.size());
+        desc.bonds = variant.bonds.data();
+        desc.bondCount = static_cast<std::uint32_t>(variant.bonds.size());
+        desc.worldTransform = PxTransform(building.offset);
         desc.settings.compressionElasticLimit =
             pack.stressLimits.compressionElastic * options.stressLimitScale;
         desc.settings.compressionFatalLimit =
@@ -1316,13 +1573,21 @@ int run(const Options& options)
         requireContract(destructibles.size() == 1, "self-test must create exactly one structure");
         contractBaseline = captureContractBaseline(
             *destructibles.front(),
-            static_cast<std::uint32_t>(pack.nodes.size()));
+            nodesPerBuilding.front());
     }
 
-    const std::uint32_t nodeVisualCount =
-        static_cast<std::uint32_t>(pack.nodes.size() * destructibles.size());
-    std::vector<Projectile> projectiles =
-        createProjectiles(context, pack, options, offsets, nodeVisualCount, options.settleSeconds);
+    std::vector<Projectile> projectiles;
+    if (!options.selfTest)
+    {
+        projectiles = createProjectiles(
+            context,
+            pack,
+            options,
+            offsets,
+            buildingHeights,
+            totalAuthoredChunks,
+            options.settleSeconds);
+    }
     for (const Projectile& projectile : projectiles)
     {
         contacts.registerProjectile(*projectile.shape);
@@ -1374,16 +1639,17 @@ int run(const Options& options)
         }
         for (std::size_t building = 0; building < destructibles.size(); ++building)
         {
-            for (std::size_t node = 0; node < pack.nodes.size(); ++node)
+            const ScenePack& buildingPack = *buildingPacks[building];
+            for (std::size_t node = 0; node < buildingPack.nodes.size(); ++node)
             {
                 VisualActor actor;
                 actor.shape = VisualActor::Shape::Box;
-                actor.part = pack.nodes[node].mass == 0.0f
+                actor.part = buildingPack.nodes[node].mass == 0.0f
                     ? 7
                     : static_cast<std::uint8_t>(building % 5);
-                actor.parameters = pack.nodes[node].visualHalfExtents;
+                actor.parameters = buildingPack.nodes[node].visualHalfExtents;
                 const std::uint32_t id =
-                    static_cast<std::uint32_t>(building * pack.nodes.size() + node);
+                    visualBases[building] + static_cast<std::uint32_t>(node);
                 if (!writer.defineActor(id, actor))
                 {
                     throw std::runtime_error(writer.error());
@@ -1408,7 +1674,9 @@ int run(const Options& options)
                 collectVisualPoses(
                     destructibles,
                     projectiles,
-                    static_cast<std::uint32_t>(pack.nodes.size()))))
+                    nodesPerBuilding,
+                    visualBases,
+                    true)))
         {
             throw std::runtime_error(writer.error());
         }
@@ -1448,15 +1716,17 @@ int run(const Options& options)
 
         if (options.selfTest && step == 0)
         {
-            for (const DestructiblePtr& destructible : destructibles)
+            for (std::size_t structure = 0; structure < destructibles.size(); ++structure)
             {
-                std::vector<ExtStressPhysXShapeSnapshot> shapes(pack.nodes.size());
+                const DestructiblePtr& destructible = destructibles[structure];
+                const ScenePack& buildingPack = *buildingPacks[structure];
+                std::vector<ExtStressPhysXShapeSnapshot> shapes(buildingPack.nodes.size());
                 destructible->getShapeSnapshots(
                     shapes.data(),
                     static_cast<std::uint32_t>(shapes.size()));
                 for (const ExtStressPhysXShapeSnapshot& shape : shapes)
                 {
-                    if (pack.nodes[shape.nodeIndex].mass > 0.0f)
+                    if (buildingPack.nodes[shape.nodeIndex].mass > 0.0f)
                     {
                         destructible->queueContact(
                             *shape.shape,
@@ -1523,7 +1793,9 @@ int run(const Options& options)
                     collectVisualPoses(
                         destructibles,
                         projectiles,
-                        static_cast<std::uint32_t>(pack.nodes.size()))))
+                        nodesPerBuilding,
+                        visualBases,
+                        false)))
             {
                 throw std::runtime_error(writer.error());
             }
@@ -1621,8 +1893,11 @@ int run(const Options& options)
     }
     const DestructionDistribution destruction = destructionDistribution(
         destructibles,
-        static_cast<std::uint32_t>(pack.nodes.size()));
-    const DestructionMotion motion = destructionMotion(destructibles, pack, offsets);
+        nodesPerBuilding);
+    const DestructionMotion motion = destructionMotion(
+        destructibles,
+        buildingPacks,
+        offsets);
     writeMetadata(
         options.metadataPath,
         options,
@@ -1635,7 +1910,9 @@ int run(const Options& options)
         contacts.projectileImpactContacts(),
         contacts.projectileImpactImpulse(),
         wallSeconds,
-        writtenFrames);
+        writtenFrames,
+        nodesPerBuilding,
+        floorsPerBuilding);
     if (!options.telemetryPath.empty() && options.telemetryPath != options.metadataPath)
     {
         writeMetadata(
@@ -1650,7 +1927,9 @@ int run(const Options& options)
             contacts.projectileImpactContacts(),
             contacts.projectileImpactImpulse(),
             wallSeconds,
-            writtenFrames);
+            writtenFrames,
+            nodesPerBuilding,
+            floorsPerBuilding);
     }
 
     bool mappingsValid = true;
@@ -1669,8 +1948,7 @@ int run(const Options& options)
     const std::uint32_t requiredFallingStructures = std::max<std::uint32_t>(
         1,
         static_cast<std::uint32_t>(std::ceil(destructibles.size() / 6.0)));
-    const std::uint32_t totalChunks =
-        static_cast<std::uint32_t>(destructibles.size() * pack.nodes.size());
+    const std::uint32_t totalChunks = totalAuthoredChunks;
     const bool partialDestructionValid =
         !options.requirePartialDestruction
         || (contacts.projectileImpactContacts() > 0
@@ -1704,7 +1982,7 @@ int run(const Options& options)
         context.mode() == PhysicsMode::Gpu ? "gpu" : "cpu",
         context.gpuActive() ? "active" : "inactive",
         destructibles.size(),
-        pack.nodes.size() * destructibles.size(),
+        static_cast<std::size_t>(totalAuthoredChunks),
         peaks.peakBodies,
         peaks.peakAwakeBodies,
         static_cast<unsigned long long>(peaks.splits),
@@ -1728,7 +2006,25 @@ int run(const Options& options)
 
     if (options.selfTest)
     {
-        validateContractResult(pack, *destructibles.front(), contractBaseline);
+        validateContractResult(
+            *buildingPacks.front(),
+            *destructibles.front(),
+            contractBaseline);
+        std::vector<ExtStressPhysXShapeSnapshot> activeShapes(
+            nodesPerBuilding.front());
+        const std::uint32_t activeShapeCount =
+            destructibles.front()->getActiveShapeSnapshots(
+                activeShapes.data(),
+                static_cast<std::uint32_t>(activeShapes.size()));
+        requireContract(
+            activeShapeCount > 0,
+            "active-shape delta export omitted moving fracture bodies");
+        for (std::uint32_t i = 0; i < activeShapeCount; ++i)
+        {
+            requireContract(
+                !activeShapes[i].bodyKinematic,
+                "active-shape delta export included a supported body");
+        }
     }
     releaseProjectiles(projectiles);
     if (!mappingsValid

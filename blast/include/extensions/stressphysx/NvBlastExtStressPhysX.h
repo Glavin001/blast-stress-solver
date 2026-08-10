@@ -220,6 +220,8 @@ struct ExtStressPhysXShapeSnapshot
     uint32_t nodeIndex;
     physx::PxShape* shape;
     physx::PxTransform worldPose;
+    bool bodyKinematic;
+    bool bodySleeping;
 };
 
 /**
@@ -314,6 +316,13 @@ public:
         ExtStressPhysXBodySnapshot* snapshots,
         uint32_t capacity) const = 0;
     virtual uint32_t getShapeSnapshots(
+        ExtStressPhysXShapeSnapshot* snapshots,
+        uint32_t capacity) const = 0;
+    /**
+     * Returns shapes owned by awake dynamic bodies plus one final snapshot
+     * when a body transitions to sleeping. Intended for delta state export.
+     */
+    virtual uint32_t getActiveShapeSnapshots(
         ExtStressPhysXShapeSnapshot* snapshots,
         uint32_t capacity) const = 0;
     virtual uint32_t getSplitContinuity(

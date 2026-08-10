@@ -258,9 +258,15 @@ public:
     {
         NVBLAST_ASSERT(node < m_velocities.size());
         AngLin6& v = m_velocities[node];
+        m_inputsChanged = m_inputsChanged
+            || v.ang.x != velocityAngular.x
+            || v.ang.y != velocityAngular.y
+            || v.ang.z != velocityAngular.z
+            || v.lin.x != velocityLinear.x
+            || v.lin.y != velocityLinear.y
+            || v.lin.z != velocityLinear.z;
         v.ang = { velocityAngular.x, velocityAngular.y, velocityAngular.z };
         v.lin = { velocityLinear.x, velocityLinear.y, velocityLinear.z };
-        m_inputsChanged = true;
     }
 
     uint32_t addBond(uint32_t node0, uint32_t node1, const NvVec3& bondCentroid)
@@ -312,6 +318,17 @@ public:
         m_gpuFrameSolveMilliseconds = 0.0f;
         m_gpuFrameHostToDeviceBytes = 0;
         m_gpuFrameDeviceToHostBytes = 0;
+#endif
+        if (skipSettled
+            && warmStart
+            && m_converged
+            && !m_forceColdStart
+            && !m_inputsChanged)
+        {
+            m_error_sq = {0.0f, 0.0f};
+            return;
+        }
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
         if (m_gpuSolver)
         {
             for (uint32_t i = 0; i < m_velocities.size(); ++i)
@@ -338,8 +355,12 @@ public:
             // The CPU path receives the configured iteration budget per
             // island. Give the global CUDA solve enough iterations to resolve
             // disconnected components before fracture thresholds are read.
-            gpuParams.maxIterations =
-                islandAware ? std::max(iterationCount, 56u) : iterationCount;
+            // Small crossover graphs use a tighter per-frame budget and rely
+            // on warm starts; larger graphs amortize a deeper global solve.
+            const uint32_t gpuIterationFloor = m_bonds.size() < 1024 ? 32u : 44u;
+            gpuParams.maxIterations = islandAware
+                ? std::max(iterationCount, gpuIterationFloor)
+                : iterationCount;
             gpuParams.tolerance = 0.001f;
             gpuParams.warmStart = warmStart && !m_forceColdStart;
             if (m_gpuSolver->solve(m_gpuVelocities.data(), gpuParams)

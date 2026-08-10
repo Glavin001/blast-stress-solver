@@ -571,6 +571,7 @@ public:
         }
         const uint32_t count =
             std::min(capacity, static_cast<uint32_t>(m_nodes.size()));
+        const uint64_t generation = ++m_shapeSnapshotGeneration;
         for (uint32_t i = 0; i < count; ++i)
         {
             const NodeState& source = m_nodes[i];
@@ -579,9 +580,66 @@ public:
             target.bodyId = source.body ? source.body->bodyId : 0;
             target.nodeIndex = i;
             target.shape = source.shape;
-            target.worldPose = source.body
-                ? source.body->body->getGlobalPose() * source.shape->getLocalPose()
-                : PxTransform(PxIdentity);
+            if (source.body)
+            {
+                target.bodyKinematic = isKinematic(*source.body);
+                target.bodySleeping =
+                    !target.bodyKinematic && source.body->body->isSleeping();
+                if (source.body->snapshotGeneration != generation)
+                {
+                    source.body->snapshotGlobalPose = source.body->body->getGlobalPose();
+                    source.body->snapshotGeneration = generation;
+                }
+                target.worldPose =
+                    source.body->snapshotGlobalPose * source.shape->getLocalPose();
+            }
+            else
+            {
+                target.worldPose = PxTransform(PxIdentity);
+                target.bodyKinematic = false;
+                target.bodySleeping = true;
+            }
+        }
+        return count;
+    }
+
+    uint32_t getActiveShapeSnapshots(
+        ExtStressPhysXShapeSnapshot* snapshots,
+        uint32_t capacity) const override
+    {
+        if (!snapshots || capacity == 0)
+        {
+            return 0;
+        }
+        uint32_t count = 0;
+        for (const auto& entry : m_actorBodies)
+        {
+            BodyState& body = *entry.second;
+            const bool kinematic = isKinematic(body);
+            const bool sleeping = !kinematic && body.body->isSleeping();
+            const bool active = !kinematic && !sleeping;
+            if (!active && !body.snapshotWasActive)
+            {
+                continue;
+            }
+            body.snapshotWasActive = active;
+            const PxTransform globalPose = body.body->getGlobalPose();
+            for (uint32_t nodeIndex : body.nodes)
+            {
+                if (count >= capacity)
+                {
+                    return count;
+                }
+                const NodeState& source = m_nodes[nodeIndex];
+                ExtStressPhysXShapeSnapshot& target = snapshots[count++];
+                target.shapeId = source.shapeId;
+                target.bodyId = body.bodyId;
+                target.nodeIndex = nodeIndex;
+                target.shape = source.shape;
+                target.worldPose = globalPose * source.shape->getLocalPose();
+                target.bodyKinematic = kinematic;
+                target.bodySleeping = sleeping;
+            }
         }
         return count;
     }
@@ -631,6 +689,11 @@ private:
         uint32_t actorIndex{INVALID_INDEX};
         PxRigidDynamic* body{nullptr};
         std::vector<uint32_t> nodes;
+        mutable uint64_t snapshotGeneration{0};
+        mutable PxTransform snapshotGlobalPose{PxIdentity};
+        mutable bool snapshotWasActive{false};
+        uint64_t contactGeneration{0};
+        PxTransform contactGlobalPose{PxIdentity};
 
         ~BodyState()
         {
@@ -892,6 +955,13 @@ private:
 
     void consumeContacts(float dt)
     {
+        m_contactNodeIndices.clear();
+        m_contactLocalPositions.clear();
+        m_contactLocalForces.clear();
+        m_contactNodeIndices.reserve(m_contacts.size());
+        m_contactLocalPositions.reserve(m_contacts.size() * 3);
+        m_contactLocalForces.reserve(m_contacts.size() * 3);
+        const uint64_t generation = ++m_contactGeneration;
         for (const QueuedContact& contact : m_contacts)
         {
             if (contact.nodeIndex >= m_nodes.size())
@@ -912,18 +982,31 @@ private:
                 body.body->wakeUp();
             }
 
-            const PxTransform pose = body.body->getGlobalPose();
+            if (body.contactGeneration != generation)
+            {
+                body.contactGlobalPose = body.body->getGlobalPose();
+                body.contactGeneration = generation;
+            }
+            const PxTransform& pose = body.contactGlobalPose;
             const PxVec3 localPosition = pose.transformInv(contact.position);
             const PxVec3 localForce = pose.q.rotateInv(contact.impulse / dt);
-            const StressVec3 bridgePosition = toStress(localPosition);
-            const StressVec3 bridgeForce = toStress(localForce);
-            ext_stress_solver_add_force(
+            m_contactNodeIndices.push_back(contact.nodeIndex);
+            m_contactLocalPositions.insert(
+                m_contactLocalPositions.end(),
+                {localPosition.x, localPosition.y, localPosition.z});
+            m_contactLocalForces.insert(
+                m_contactLocalForces.end(),
+                {localForce.x, localForce.y, localForce.z});
+        }
+        if (!m_contactNodeIndices.empty())
+        {
+            m_telemetry.contactsProcessed += ext_stress_solver_add_all_forces(
                 m_solver,
-                contact.nodeIndex,
-                &bridgePosition,
-                &bridgeForce,
+                m_contactNodeIndices.data(),
+                m_contactLocalPositions.data(),
+                m_contactLocalForces.data(),
+                static_cast<uint32_t>(m_contactNodeIndices.size()),
                 0);
-            ++m_telemetry.contactsProcessed;
         }
         m_contacts.clear();
     }
@@ -1537,11 +1620,16 @@ private:
     std::unordered_map<ExtStressPhysXId, uint32_t> m_shapeIdToNode;
     std::unordered_map<const PxRigidDynamic*, ExtStressPhysXId> m_bodyToId;
     std::vector<QueuedContact> m_contacts;
+    std::vector<uint32_t> m_contactNodeIndices;
+    std::vector<float> m_contactLocalPositions;
+    std::vector<float> m_contactLocalForces;
     std::vector<ExtStressPhysXSplitContinuity> m_continuity;
     ExtStressPhysXTelemetry m_telemetry;
     ExtStressPhysXId m_nextBodyId{1};
     ExtStressPhysXId m_nextShapeId{1};
     uint64_t m_splitSequence{0};
+    mutable uint64_t m_shapeSnapshotGeneration{0};
+    uint64_t m_contactGeneration{0};
 };
 
 ExtStressPhysXDestructible* ExtStressPhysXDestructible::create(

@@ -68,11 +68,11 @@ both the requested mode and `gpuActive`, so automation should check
 
 `--gpu-stress` enables the hybrid CUDA stress backend. Graphs at or above the
 measured 4,096-bond crossover use CUDA; smaller graphs stay on CPU. Each
-204-chunk tower has only 546 bonds, so the 8×8 acceptance run deliberately
-keeps those inexpensive graph solves on CPU while PhysX GPU handles the growing
-rigid-body, broadphase, and contact workload. Use
-`--gpu-stress-min-bonds 0` only to validate the CUDA stress path on tiny graphs;
-it is slower at city scale because it launches one small CUDA solve per tower.
+204-chunk tower has only 546 bonds, so the production default keeps those
+inexpensive graph solves on CPU while PhysX GPU handles the growing rigid-body,
+broadphase, and contact workload. The canonical benchmark deliberately sets
+`--gpu-stress-min-bonds 540` so intact three-floor towers exercise CUDA before
+fracture shrinks them onto the CPU path.
 
 The simulation is fixed at 60 Hz. `--snapshot-fps` must be a divisor of 60 and
 only controls exported render frames. Grid size is limited to 1–12. Run
@@ -93,18 +93,22 @@ Simulate, render, and encode without X11:
 ```sh
 cargo run --release --locked -- record \
   --sim-bin ../build/blast_stress_demo \
-  --grid 8 --duration 18 --settle 1.5 \
+  --grid 12 --duration 30 --settle 1.5 \
   --snapshot-fps 30 --require-gpu --gpu-stress \
   --require-partial-destruction --chase-projectile \
   --sim-arg=--gpu-stress-min-bonds --sim-arg=540 \
+  --sim-arg=--projectile-mass-scale --sim-arg=1.8 \
   --sim-arg=--contact-force-scale --sim-arg=3.1 \
   --sim-arg=--excess-force-scale --sim-arg=0.012 \
   --sim-arg=--require-realtime \
-  --sim-arg=--require-min-authored-chunks --sim-arg=10000 \
-  --output /root/recordings/blast-gpu-8x8-13k-gpu-stress-acceptance.mp4
+  --sim-arg=--require-min-authored-chunks --sim-arg=20000 \
+  --sim-arg=--require-varied-building-heights \
+  --output /root/recordings/blast-gpu-varied-12x12-20k-optimized-benchmark.mp4
 ```
 
 All project-generated videos should be written under `/root/recordings/`.
+The same canonical run is available as
+`bash demos/blast-stress-demo/record_stress_benchmark.sh [output.mp4]`.
 See [`recorder/README.md`](recorder/README.md) for rendering existing state
 files, telemetry sidecars, and the `TWSTATE1` layout.
 
@@ -142,18 +146,27 @@ fragments inherited the kinematic parent's zero velocity and remained lodged
 in the wall. Each tower is capped at 48 bodies so damage remains gradual and
 the latent-chunk hierarchy cannot degenerate into a 204-body shatter.
 
-The GPU-stress acceptance tuning is: 1,500 kg, 0.5 m projectiles at 25 m/s;
+The GPU-stress benchmark tuning is: 1,800 kg, 0.5 m projectiles at 25 m/s;
 contact-force scale 93; stress-limit scale 0.8; released-load scale 0.012; a
 4 m/s bounded separation impulse; 6 m/s linear and 8 rad/s angular fragment
-caps; and a 3.2 s projectile lifetime. Two opposing waves remain inside the
-recording window so the city shows citywide tear-through rather than one
-sparse pass.
+caps; and a 3.2 s projectile lifetime. Every building receives one oblique
+impact and every eighth building receives a lower opposing impact. Launches
+are distributed over the available destruction window to avoid artificial
+same-frame impact bursts while retaining citywide damage.
+
+By default the city deterministically alternates actual one-, two-, and
+three-floor support graphs. The shorter variants remove upper chunks and
+remap their bonds rather than merely scaling the same rigid body. Use
+`--uniform-building-heights` for the legacy all-three-floor layout.
 
 `--require-min-authored-chunks N` makes latent scene scale an executable
 contract. `--require-realtime` performs eight unmeasured warm-up steps to
 allocate lazy PhysX/solver resources, then fails if any recorded 60 Hz step
 exceeds 16.67 ms. Both the all-frame and destruction-only miss counts and the
 maximum destruction-frame time are written to metadata.
+`--require-varied-building-heights` additionally requires populated one-,
+two-, and three-floor cohorts, preventing a uniform skyline from satisfying
+the canonical benchmark by chunk count alone.
 
 ## Time-series diagnostics
 
@@ -182,46 +195,57 @@ while the other three remain stable references for spotting discontinuities or
 jitter.
 
 `TWSTATE1` frames are delta encoded: unchanged or sleeping visuals are omitted
-and retain their previous pose. On the 12×12 capture this reduced a seven-second
-state stream from 199 MB to 3.4 MB and cut mean export work from 2.92 ms to
-0.68 ms.
+and retain their previous pose. The adapter exposes an active-body delta query
+that evaluates one PhysX pose per emitting body rather than rescanning all
+20,880 shapes. Mean state-export work on the current 12×12 run is 0.28 ms.
 
 ## Current benchmark
 
-The current GPU-stress visual acceptance run is 8×8: 64 buildings, 13,056
-authored chunks, and 19.5 seconds of recorded time at a fixed 60 Hz:
+The benchmark baseline is now 12×12: 144 buildings, 20,880 authored chunks,
+and 31.5 seconds of 1080p/30 video from a fixed 60 Hz simulation. Its skyline
+contains 48 each of one-floor/83-chunk, two-floor/148-chunk, and
+three-floor/204-chunk graphs:
 
-- simulation: 7.67 s wall time (2.54× real time), 6.55 ms mean, 10.94 ms p95,
-  and 16.07 ms maximum host frame;
-- the hard real-time gate observed zero frames over 16.67 ms across all 1,170
-  measured steps;
-- PhysX GPU step: 1.92 ms mean / 3.16 ms p95 / 4.89 ms maximum; CUDA stress:
-  0.18 ms mean / 2.41 ms p95 / 6.04 ms maximum (hybrid 540-bond threshold);
-- 2,258 peak bodies and 1,068 awake bodies from 13,056 latent chunks, with
-  1,047 splits and 3,136 projectile impacts;
-- all 64 buildings partially fractured; 64 showed displaced pieces and 63
-  showed falling debris; 3,778 chunks moved at least 0.5 m, 2,926 fell, and
-  3,113 traveled at least 2 m;
-- 7,707 chunks remained in supported components, 5,349 became dynamic, and
-  zero buildings were heavily fractured or shattered;
-- maximum fragment displacement was 22.93 m, maximum fall was 12.43 m, and
-  split continuity drift stayed below `5e-5`;
-- 1080p/30 render and NVENC encoding completed in 5.23 s (over 3× real time).
+- simulation: 13.01 s wall time (2.42× real time), 6.87 ms mean, 10.21 ms p95,
+  and 16.09 ms maximum host frame;
+- the hard real-time gate observed zero frames over 16.67 ms across all 1,890
+  measured steps, including state export, with 0.57 ms worst-case headroom;
+- PhysX GPU step: 2.34 ms mean / 3.46 ms p95 / 6.80 ms maximum; CUDA stress:
+  0.06 ms mean / 0.49 ms p95 / 3.22 ms maximum (hybrid 540-bond threshold);
+- 4,590 peak bodies and 964 awake bodies from 20,880 latent chunks, with
+  1,760 splits and 7,001 projectile impacts;
+- all 144 buildings fractured without shattering; 116 showed displaced pieces
+  and 114 showed falling debris; 5,284 chunks moved at least 0.5 m, 4,617
+  fell, and 4,394 traveled at least 2 m;
+- 12,748 chunks remained in supported components, 8,132 became dynamic,
+  maximum displacement was 22.44 m, maximum fall was 12.03 m, and split
+  continuity drift stayed below `6.4e-5`;
+- 1080p/30 Vulkan rendering and NVENC encoding completed in 8.34 s, 3.78×
+  faster than video duration.
 
 The CUDA stress crossover benchmark uses a 12,769-node/25,312-bond graph with
-25 CGNR iterations. On the local RTX 4090 it measured 3.98 ms for the CPU
-reference versus 0.65 ms of CUDA work and 0.77 ms host-observed, a 5.20×
+25 CGNR iterations. On the local RTX 4090 it measured 4.52 ms for the CPU
+reference versus 0.68 ms of CUDA work and 0.75 ms host-observed, a 6.06×
 speedup. Inputs cost 306,456 B H2D; a quiet compact break readback is 4 B.
-High-rise graphs retain that measured crossover. The visual acceptance run
-uses a 540-bond hybrid threshold so each intact 546-bond tower starts on CUDA
-and falls back to CPU as fracture shrinks its graph. This recorded 3.68 seconds
-of CUDA stress work with nonzero H2D/D2H traffic while retaining the latent
-hierarchy and bounded active-body count.
+High-rise graphs retain that measured crossover. The visual benchmark uses a
+540-bond hybrid threshold, so each intact 546-bond three-floor tower starts on
+CUDA and falls back to CPU as fracture shrinks its graph; shorter graphs remain
+on CPU. The run recorded nonzero CUDA stress work and H2D/D2H traffic while
+retaining the latent hierarchy and bounded active-body count.
+
+CUDA inputs, status, and impulse output use persistent pinned staging buffers
+and asynchronous copies, collapsing upload/solve/status waits into one
+completion point. Island-aware solves use a size-tiered warm-start budget
+(32 iterations below 1,024 bonds, 44 above), and unchanged converged CPU inputs
+are skipped. Contact forces cross the bridge in batches, and body poses are
+cached once per snapshot/contact phase.
 
 The acceptance videos and synchronized sidecars are:
 
 - `/root/recordings/blast-gpu-8x8-13k-mass1050-closeup.mp4`
 - `/root/recordings/blast-gpu-8x8-13k-gpu-stress-acceptance.mp4`
+- `/root/recordings/blast-gpu-varied-10x10-14k-stress-benchmark.mp4`
+- `/root/recordings/blast-gpu-varied-12x12-20k-optimized-benchmark.mp4`
 
 GPU rigid-body execution and the high-rise stress crossover are both measured.
 Contact routing and PhysX actor/shape topology edits remain CPU-side by API

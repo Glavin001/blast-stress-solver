@@ -76,35 +76,41 @@ struct ImpactObserverCamera {
     camera: Option<Camera>,
 }
 
+#[derive(Clone, Copy)]
+struct SceneBounds {
+    minimum: Vec3,
+    maximum: Vec3,
+}
+
 struct OverviewOrbitCamera {
-    target: Vec3,
-    offset: Vec3,
+    bounds: SceneBounds,
+    direction: Vec3,
+    aspect: f32,
     fov_degrees: f32,
 }
 
 impl OverviewOrbitCamera {
-    fn new(camera: Camera) -> Self {
-        let direction = camera.direction.normalize_or_zero();
-        let distance_to_ground = if direction.y < -0.01 {
-            (-camera.eye.y / direction.y).max(10.0)
-        } else {
-            100.0
-        };
-        let target = camera.eye + direction * distance_to_ground;
+    fn new(camera: Camera, bounds: SceneBounds, aspect: f32) -> Self {
         Self {
-            target,
-            offset: camera.eye - target,
+            bounds,
+            direction: camera.direction.normalize(),
+            aspect,
             fov_degrees: camera.fov_degrees,
         }
     }
 
     fn at_time(&self, seconds: f32) -> Camera {
-        let eye = self.target + Quat::from_rotation_y(seconds * 0.08) * self.offset;
-        Camera {
-            eye,
-            direction: (self.target - eye).normalize(),
-            fov_degrees: self.fov_degrees,
-        }
+        let direction = Quat::from_rotation_y(seconds * 0.08) * self.direction;
+        fit_camera_to_bounds(
+            Camera {
+                eye: Vec3::ZERO,
+                direction,
+                fov_degrees: self.fov_degrees,
+            },
+            self.bounds,
+            self.aspect,
+            1.0,
+        )
     }
 }
 
@@ -166,6 +172,87 @@ impl ImpactObserverCamera {
         };
         self.camera = Some(camera);
         camera
+    }
+}
+
+fn scene_bounds(actors: &[Actor]) -> Option<SceneBounds> {
+    let mut minimum = Vec3::splat(f32::INFINITY);
+    let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+    let mut found = false;
+    for actor in actors {
+        if !actor.visible
+            || actor.part == PROJECTILE_PART
+            || actor.pose.position.y < -200.0
+            || actor.pose.position.abs().max_element() >= 5_000.0
+        {
+            continue;
+        }
+        let actor_matrix = transform_matrix(actor.pose);
+        for shape in &actor.shapes {
+            let (center, extents) = match shape {
+                Shape::Box {
+                    half_extents,
+                    local,
+                } => {
+                    let world = actor_matrix * transform_matrix(*local);
+                    let extents = world.transform_vector3(Vec3::X * half_extents.x).abs()
+                        + world.transform_vector3(Vec3::Y * half_extents.y).abs()
+                        + world.transform_vector3(Vec3::Z * half_extents.z).abs();
+                    (world.transform_point3(Vec3::ZERO), extents)
+                }
+                Shape::Sphere { radius, local } => {
+                    let world = actor_matrix * transform_matrix(*local);
+                    (world.transform_point3(Vec3::ZERO), Vec3::splat(*radius))
+                }
+            };
+            minimum = minimum.min(center - extents);
+            maximum = maximum.max(center + extents);
+            found = true;
+        }
+    }
+    found.then_some(SceneBounds { minimum, maximum })
+}
+
+fn fit_camera_to_bounds(
+    template: Camera,
+    bounds: SceneBounds,
+    aspect: f32,
+    padding: f32,
+) -> Camera {
+    let direction = template.direction.normalize_or_zero();
+    let direction = if direction.length_squared() > 0.0 {
+        direction
+    } else {
+        Vec3::NEG_Z
+    };
+    let reference_up = if direction.dot(Vec3::Y).abs() > 0.95 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let right = direction.cross(reference_up).normalize();
+    let up = right.cross(direction).normalize();
+    let center = (bounds.minimum + bounds.maximum) * 0.5;
+    let tangent_y = (template.fov_degrees.to_radians() * 0.5).tan();
+    let tangent_x = tangent_y * aspect;
+    let mut distance = 1.0_f32;
+    for x in [bounds.minimum.x, bounds.maximum.x] {
+        for y in [bounds.minimum.y, bounds.maximum.y] {
+            for z in [bounds.minimum.z, bounds.maximum.z] {
+                let relative = Vec3::new(x, y, z) - center;
+                let forward = relative.dot(direction);
+                distance = distance
+                    .max(relative.dot(right).abs() / tangent_x - forward)
+                    .max(relative.dot(up).abs() / tangent_y - forward)
+                    .max(1.0 - forward);
+            }
+        }
+    }
+    distance *= padding.max(0.8);
+    Camera {
+        eye: center - direction * distance,
+        direction,
+        fov_degrees: template.fov_degrees,
     }
 }
 
@@ -391,7 +478,7 @@ async fn render_recording_async(
         state.header.pane_width as f32 / state.header.pane_height as f32,
     );
     let mut impact_camera = chase_projectile.then(ImpactObserverCamera::default);
-    let orbit_camera = OverviewOrbitCamera::new(state.header.cameras[0]);
+    let mut orbit_camera = None;
     let camera_aspect = state.header.pane_width as f32 / state.header.pane_height as f32;
 
     let unpadded_bytes_per_row = width * 4;
@@ -499,7 +586,34 @@ async fn render_recording_async(
             let uniform = camera_uniform(camera, camera_aspect);
             queue.write_buffer(&camera_buffers[3], 0, bytemuck::bytes_of(&uniform));
         }
-        let orbit = orbit_camera.at_time(frame_index as f32 / fps as f32);
+        if orbit_camera.is_none() {
+            let bounds =
+                scene_bounds(&state.actors).context("initial frame has no visible scene bounds")?;
+            orbit_camera = Some(OverviewOrbitCamera::new(
+                state.header.cameras[0],
+                bounds,
+                camera_aspect,
+            ));
+            for camera_index in 1..=2 {
+                let padding = if camera_index == 1 { 0.88 } else { 1.02 };
+                let camera = fit_camera_to_bounds(
+                    state.header.cameras[camera_index],
+                    bounds,
+                    camera_aspect,
+                    padding,
+                );
+                let uniform = camera_uniform(camera, camera_aspect);
+                queue.write_buffer(
+                    &camera_buffers[camera_index],
+                    0,
+                    bytemuck::bytes_of(&uniform),
+                );
+            }
+        }
+        let orbit = orbit_camera
+            .as_ref()
+            .expect("overview camera initialized")
+            .at_time(frame_index as f32 / fps as f32);
         let orbit_uniform = camera_uniform(orbit, camera_aspect);
         queue.write_buffer(&camera_buffers[0], 0, bytemuck::bytes_of(&orbit_uniform));
         let (boxes, spheres) = collect_instances(&state.actors);

@@ -40,19 +40,26 @@ easy to distinguish from camera motion and avoids jumps between projectiles.
 ```sh
 cargo run --release --locked -- record \
   --sim-bin ../build/blast_stress_demo \
-  --grid 8 \
-  --duration 18 \
+  --grid 12 \
+  --duration 30 \
   --settle 1.5 \
   --snapshot-fps 30 \
   --require-gpu --gpu-stress \
   --require-partial-destruction --chase-projectile \
   --sim-arg=--gpu-stress-min-bonds --sim-arg=540 \
+  --sim-arg=--projectile-mass-scale --sim-arg=1.8 \
   --sim-arg=--contact-force-scale --sim-arg=3.1 \
   --sim-arg=--excess-force-scale --sim-arg=0.012 \
   --sim-arg=--require-realtime \
-  --sim-arg=--require-min-authored-chunks --sim-arg=10000 \
-  --output /root/recordings/blast-gpu-8x8-13k-gpu-stress-acceptance.mp4
+  --sim-arg=--require-min-authored-chunks --sim-arg=20000 \
+  --sim-arg=--require-varied-building-heights \
+  --output /root/recordings/blast-gpu-varied-12x12-20k-optimized-benchmark.mp4
 ```
+
+This benchmark uses the simulator's deterministic one-/two-/three-floor
+skyline: 144 structures and 20,880 authored chunks. Pass
+`--sim-arg=--uniform-building-heights` to restore identical full-height
+buildings.
 
 The default video is a timestamped
 `/root/recordings/blast-physx-gpu-mini-city-NxN-*.mp4`. With no `--state`, the

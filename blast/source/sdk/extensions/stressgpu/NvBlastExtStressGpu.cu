@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -539,9 +540,17 @@ public:
         {
             cudaGraphDestroy(m_graph);
         }
-        cudaEventDestroy(m_eventStart);
-        cudaEventDestroy(m_eventStop);
+        cudaEventDestroy(m_uploadStart);
+        cudaEventDestroy(m_uploadStop);
+        cudaEventDestroy(m_solveStart);
+        cudaEventDestroy(m_solveStop);
+        cudaEventDestroy(m_statusReady);
+        cudaEventDestroy(m_downloadStart);
+        cudaEventDestroy(m_downloadStop);
         cudaStreamDestroy(m_stream);
+        cudaFreeHost(m_hostStatus);
+        cudaFreeHost(m_hostImpulses);
+        cudaFreeHost(m_hostInput);
         cudaFree(m_reduceScratch);
         cudaFree(m_status);
         cudaFree(m_previousGradientSquared);
@@ -585,43 +594,52 @@ public:
         }
 
         m_telemetry = {};
-        checkCuda(cudaEventRecord(m_eventStart, m_stream), "record upload start");
+        std::memcpy(
+            m_hostInput,
+            nodeVelocities,
+            sizeof(ExtStressGpuImpulse) * m_nodeCount);
+        checkCuda(cudaEventRecord(m_uploadStart, m_stream), "record upload start");
         checkCuda(
-            cudaMemcpy(
+            cudaMemcpyAsync(
                 m_input,
-                nodeVelocities,
+                m_hostInput,
                 sizeof(ExtStressGpuImpulse) * m_nodeCount,
-                cudaMemcpyHostToDevice),
+                cudaMemcpyHostToDevice,
+                m_stream),
             "upload stress inputs");
-        checkCuda(cudaEventRecord(m_eventStop, m_stream), "record upload stop");
-        checkCuda(cudaEventSynchronize(m_eventStop), "wait for input upload");
-        checkCuda(
-            cudaEventElapsedTime(
-                &m_telemetry.uploadMilliseconds,
-                m_eventStart,
-                m_eventStop),
-            "measure input upload");
+        checkCuda(cudaEventRecord(m_uploadStop, m_stream), "record upload stop");
         m_telemetry.hostToDeviceBytes =
             sizeof(ExtStressGpuImpulse) * static_cast<std::uint64_t>(m_nodeCount);
 
-        checkCuda(cudaEventRecord(m_eventStart, m_stream), "record solve start");
+        checkCuda(cudaEventRecord(m_solveStart, m_stream), "record solve start");
         executeSolve(params);
-        checkCuda(cudaEventRecord(m_eventStop, m_stream), "record solve stop");
-        checkCuda(cudaEventSynchronize(m_eventStop), "wait for stress solve");
+        checkCuda(cudaEventRecord(m_solveStop, m_stream), "record solve stop");
+        checkCuda(
+            cudaMemcpyAsync(
+                m_hostStatus,
+                m_status,
+                sizeof(SolveStatus),
+                cudaMemcpyDeviceToHost,
+                m_stream),
+            "read stress status");
+        checkCuda(cudaEventRecord(m_statusReady, m_stream), "record status ready");
+        checkCuda(cudaEventSynchronize(m_statusReady), "wait for stress solve");
         checkCuda(cudaGetLastError(), "execute stress kernels");
         checkCuda(
             cudaEventElapsedTime(
+                &m_telemetry.uploadMilliseconds,
+                m_uploadStart,
+                m_uploadStop),
+            "measure input upload");
+        checkCuda(
+            cudaEventElapsedTime(
                 &m_telemetry.solveMilliseconds,
-                m_eventStart,
-                m_eventStop),
+                m_solveStart,
+                m_solveStop),
             "measure stress solve");
 
-        SolveStatus status{};
-        checkCuda(
-            cudaMemcpy(&status, m_status, sizeof(status), cudaMemcpyDeviceToHost),
-            "read stress status");
-        m_telemetry.iterations = status.iterations;
-        m_telemetry.converged = status.converged != 0;
+        m_telemetry.iterations = m_hostStatus->iterations;
+        m_telemetry.converged = m_hostStatus->converged != 0;
         m_hasWarmStart = true;
         return true;
     }
@@ -635,29 +653,35 @@ public:
         {
             return false;
         }
-        std::vector<AngLin> host(m_bondCount);
-        checkCuda(cudaEventRecord(m_eventStart, m_stream), "record readback start");
+        checkCuda(cudaEventRecord(m_downloadStart, m_stream), "record readback start");
         checkCuda(
-            cudaMemcpy(
-                host.data(),
+            cudaMemcpyAsync(
+                m_hostImpulses,
                 m_impulses,
                 sizeof(AngLin) * m_bondCount,
-                cudaMemcpyDeviceToHost),
+                cudaMemcpyDeviceToHost,
+                m_stream),
             "read stress impulses");
-        checkCuda(cudaEventRecord(m_eventStop, m_stream), "record readback stop");
-        checkCuda(cudaEventSynchronize(m_eventStop), "wait for impulse readback");
+        checkCuda(cudaEventRecord(m_downloadStop, m_stream), "record readback stop");
+        checkCuda(cudaEventSynchronize(m_downloadStop), "wait for impulse readback");
         checkCuda(
             cudaEventElapsedTime(
                 &m_telemetry.downloadMilliseconds,
-                m_eventStart,
-                m_eventStop),
+                m_downloadStart,
+                m_downloadStop),
             "measure impulse readback");
         for (std::uint32_t i = 0; i < m_bondCount; ++i)
         {
             bondImpulses[i].angular =
-                {host[i].angular.x, host[i].angular.y, host[i].angular.z};
+                {
+                    m_hostImpulses[i].angular.x,
+                    m_hostImpulses[i].angular.y,
+                    m_hostImpulses[i].angular.z};
             bondImpulses[i].linear =
-                {host[i].linear.x, host[i].linear.y, host[i].linear.z};
+                {
+                    m_hostImpulses[i].linear.x,
+                    m_hostImpulses[i].linear.y,
+                    m_hostImpulses[i].linear.z};
         }
         m_telemetry.deviceToHostBytes =
             sizeof(AngLin) * static_cast<std::uint64_t>(m_bondCount);
@@ -872,6 +896,12 @@ private:
         checkCuda(cudaMalloc(&pointer, sizeof(T) * count), name);
     }
 
+    template <typename T>
+    void allocateHost(T*& pointer, std::size_t count, const char* name)
+    {
+        checkCuda(cudaMallocHost(&pointer, sizeof(T) * count), name);
+    }
+
     void allocate()
     {
         allocateDevice(m_node0, m_bondCount, "allocate node0");
@@ -901,6 +931,9 @@ private:
         allocateDevice(m_deltaSquared, 1, "allocate tolerance");
         allocateDevice(m_previousGradientSquared, 1, "allocate previous gradient norm");
         allocateDevice(m_status, 1, "allocate solve status");
+        allocateHost(m_hostInput, m_nodeCount, "allocate pinned stress input");
+        allocateHost(m_hostImpulses, m_bondCount, "allocate pinned stress impulses");
+        allocateHost(m_hostStatus, 1, "allocate pinned stress status");
 
         const std::uint32_t reductionCount = std::max(m_nodeCount, m_bondCount);
         cub::DeviceReduce::Sum(
@@ -913,8 +946,13 @@ private:
         checkCuda(
             cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking),
             "create solver stream");
-        checkCuda(cudaEventCreate(&m_eventStart), "create start event");
-        checkCuda(cudaEventCreate(&m_eventStop), "create stop event");
+        checkCuda(cudaEventCreate(&m_uploadStart), "create upload start event");
+        checkCuda(cudaEventCreate(&m_uploadStop), "create upload stop event");
+        checkCuda(cudaEventCreate(&m_solveStart), "create solve start event");
+        checkCuda(cudaEventCreate(&m_solveStop), "create solve stop event");
+        checkCuda(cudaEventCreate(&m_statusReady), "create status-ready event");
+        checkCuda(cudaEventCreate(&m_downloadStart), "create download start event");
+        checkCuda(cudaEventCreate(&m_downloadStop), "create download stop event");
         checkCuda(cudaMemset(m_impulses, 0, sizeof(AngLin) * m_bondCount), "clear impulses");
         checkCuda(cudaMemset(m_brokenCount, 0, sizeof(std::uint32_t)), "clear broken count");
     }
@@ -1271,10 +1309,18 @@ private:
     float* m_deltaSquared{nullptr};
     float* m_previousGradientSquared{nullptr};
     SolveStatus* m_status{nullptr};
+    ExtStressGpuImpulse* m_hostInput{nullptr};
+    AngLin* m_hostImpulses{nullptr};
+    SolveStatus* m_hostStatus{nullptr};
     void* m_reduceScratch{nullptr};
     std::size_t m_reduceScratchBytes{0};
-    cudaEvent_t m_eventStart{};
-    cudaEvent_t m_eventStop{};
+    cudaEvent_t m_uploadStart{};
+    cudaEvent_t m_uploadStop{};
+    cudaEvent_t m_solveStart{};
+    cudaEvent_t m_solveStop{};
+    cudaEvent_t m_statusReady{};
+    cudaEvent_t m_downloadStart{};
+    cudaEvent_t m_downloadStop{};
     cudaStream_t m_stream{};
     cudaGraph_t m_graph{};
     cudaGraphExec_t m_graphExec{};
