@@ -200,6 +200,24 @@ target_link_libraries(resim_snapshot_test PRIVATE
     ${PHYSX_LINK_LIBS})
 add_test(NAME blast_stress_physx_resim_snapshot COMMAND resim_snapshot_test)
 
+add_executable(resim_punchthrough_test
+    tests/resim_punchthrough_test.cpp
+    physx_scene.cpp)
+target_include_directories(resim_punchthrough_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${BLAST_ROOT}/include/extensions/stressphysx"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(resim_punchthrough_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(resim_punchthrough_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(resim_punchthrough_test PRIVATE
+    NvBlastExtStressPhysX
+    ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_physx_resim_punchthrough COMMAND resim_punchthrough_test)
+
 add_executable(scene_pack_test
     tests/scene_pack_test.cpp
     scene_pack.cpp)

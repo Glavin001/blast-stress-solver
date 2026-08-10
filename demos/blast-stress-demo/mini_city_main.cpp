@@ -50,7 +50,7 @@ struct Options
     std::uint32_t grid{3};
     std::uint32_t stressWorkers{0};
     bool serializeGpuStress{false};
-    std::uint32_t maximumBodiesPerStructure{48};
+    std::uint32_t maximumBodiesPerStructure{0};
     std::uint32_t maximumFracturesPerActorPerTick{0};
     std::uint32_t tallBuildingStride{0};
     bool variedBuildingHeights{true};
@@ -60,6 +60,7 @@ struct Options
     float projectileSpeedScale{1.0f};
     float projectileRadiusScale{1.0f};
     float projectileTtlScale{0.4f};
+    std::uint32_t projectileWaves{4};
     float contactForceScale{1.5f};
     float minimumStressContactImpulse{0.0f};
     float stressLimitScale{0.8f};
@@ -424,8 +425,25 @@ struct FrameMetrics
     double stateExportMilliseconds{0.0};
     double frameHostMilliseconds{0.0};
     std::uint32_t resimPasses{0};
+    std::uint32_t resimBodiesCaptured{0};
+    std::uint32_t resimBodiesRestored{0};
     double resimCaptureMilliseconds{0.0};
+    double resimSceneCaptureMilliseconds{0.0};
+    double resimAdapterCaptureMilliseconds{0.0};
     double resimRestoreMilliseconds{0.0};
+    double resimSceneRestoreMilliseconds{0.0};
+    double resimAdapterRestoreMilliseconds{0.0};
+    double simulateSubmitMilliseconds{0.0};
+    double fetchResultsMilliseconds{0.0};
+    double beginTickMilliseconds{0.0};
+    double solveTickMilliseconds{0.0};
+    double endTickMilliseconds{0.0};
+    double baseSimulateSubmitMilliseconds{0.0};
+    double baseFetchResultsMilliseconds{0.0};
+    double baseTickMilliseconds{0.0};
+    double resimSimulateSubmitMilliseconds{0.0};
+    double resimFetchResultsMilliseconds{0.0};
+    double resimTickMilliseconds{0.0};
     AggregateTelemetry telemetry;
     std::uint64_t frameContacts{0};
     std::uint64_t frameSplits{0};
@@ -434,6 +452,9 @@ struct FrameMetrics
     std::uint64_t frameProjectileImpactContacts{0};
     double projectileImpactImpulse{0.0};
     double frameProjectileImpactImpulse{0.0};
+    float projectileMaxSpeed{0.0f};
+    float projectileMaxForwardSpeed{0.0f};
+    std::uint32_t projectilesActive{0};
 };
 
 struct RuntimeTimings
@@ -450,7 +471,24 @@ struct RuntimeTimings
     std::uint64_t resimPassesTotal{0};
     std::uint32_t resimFrames{0};
     double resimCaptureMilliseconds{0.0};
+    double resimSceneCaptureMilliseconds{0.0};
+    double resimAdapterCaptureMilliseconds{0.0};
     double resimRestoreMilliseconds{0.0};
+    double resimSceneRestoreMilliseconds{0.0};
+    double resimAdapterRestoreMilliseconds{0.0};
+    double simulateSubmitMilliseconds{0.0};
+    double fetchResultsMilliseconds{0.0};
+    double beginTickMilliseconds{0.0};
+    double solveTickMilliseconds{0.0};
+    double endTickMilliseconds{0.0};
+    double baseSimulateSubmitMilliseconds{0.0};
+    double baseFetchResultsMilliseconds{0.0};
+    double baseTickMilliseconds{0.0};
+    double resimSimulateSubmitMilliseconds{0.0};
+    double resimFetchResultsMilliseconds{0.0};
+    double resimTickMilliseconds{0.0};
+    std::uint64_t resimBodiesCapturedTotal{0};
+    std::uint64_t resimBodiesRestoredTotal{0};
 };
 
 struct DestructionDistribution
@@ -615,8 +653,10 @@ void usage(const char* executable)
         "  --grid N                N by N city (default 3)\n"
         "  --stress-workers N      Parallel per-building stress solves (default auto, max 64)\n"
         "  --serialize-gpu-stress  Serialize CUDA stress solves; CPU solves remain parallel\n"
-        "  --max-bodies-per-structure N  Fracture body budget per building (default 48)\n"
-        "  --max-fractures-per-actor-per-tick N  Spread bond breaks across steps (0 unlimited)\n"
+        "  --max-bodies-per-structure N  Opt-in hard stop once a building has N bodies\n"
+        "                          (default 0 = unlimited; do not use as a perf budget)\n"
+        "  --max-fractures-per-actor-per-tick N  Opt-in per-actor bond-break cap per tick\n"
+        "                          (default 0 = unlimited; degrades fracture quality)\n"
         "  --tall-building-stride N  Place one full-height tower every N buildings\n"
         "  --uniform-building-heights  Disable the default 1/2/3-floor skyline\n"
         "  --duration SECONDS      Destruction duration (default 12)\n"
@@ -625,6 +665,7 @@ void usage(const char* executable)
         "  --projectile-speed-scale X   Multiply ScenePack projectile speed\n"
         "  --projectile-radius-scale X  Multiply ScenePack projectile radius\n"
         "  --projectile-ttl-scale X     Multiply ScenePack projectile lifetime (default 0.4)\n"
+        "  --projectile-waves N         Launch waves per building (default 4; total balls = N*grid^2)\n"
         "  --contact-force-scale X      Multiply stress contact impulse transfer\n"
         "  --min-stress-contact-impulse X  Ignore weaker non-projectile stress feedback\n"
         "  --stress-limit-scale X       Multiply all elastic/fatal stress limits\n"
@@ -751,6 +792,8 @@ Options parseOptions(int argc, char** argv)
             options.projectileRadiusScale = parseFloat(argument(), "--projectile-radius-scale");
         else if (option == "--projectile-ttl-scale")
             options.projectileTtlScale = parseFloat(argument(), "--projectile-ttl-scale");
+        else if (option == "--projectile-waves")
+            options.projectileWaves = parseU32(argument(), "--projectile-waves");
         else if (option == "--contact-force-scale")
             options.contactForceScale = parseFloat(argument(), "--contact-force-scale");
         else if (option == "--min-stress-contact-impulse")
@@ -780,10 +823,9 @@ Options parseOptions(int argc, char** argv)
     {
         throw std::runtime_error("--stress-workers must be between 0 and 64");
     }
-    if (options.maximumBodiesPerStructure == 0
-        || options.maximumBodiesPerStructure > 1024)
+    if (options.maximumBodiesPerStructure > 100000)
     {
-        throw std::runtime_error("--max-bodies-per-structure must be between 1 and 1024");
+        throw std::runtime_error("--max-bodies-per-structure must be between 0 and 100000");
     }
     if (options.tallBuildingStride > 1024)
     {
@@ -792,6 +834,10 @@ Options parseOptions(int argc, char** argv)
     if (options.durationSeconds <= 0.0f || options.settleSeconds < 0.0f)
     {
         throw std::runtime_error("duration must be positive and settle must be non-negative");
+    }
+    if (options.projectileWaves == 0 || options.projectileWaves > 256)
+    {
+        throw std::runtime_error("--projectile-waves must be between 1 and 256");
     }
     if (options.projectileMassScale <= 0.0f
         || options.projectileSpeedScale <= 0.0f
@@ -1143,7 +1189,7 @@ std::vector<Projectile> createProjectiles(
     std::uint32_t firstVisualId,
     float settleSeconds)
 {
-    const std::size_t waveCount = 4;
+    const std::size_t waveCount = options.projectileWaves;
     const std::size_t projectileCount = offsets.size() * waveCount;
     const float projectileLifetime =
         pack.projectileTtlSeconds * options.projectileTtlScale;
@@ -1538,17 +1584,24 @@ public:
             throw std::runtime_error("could not write frame telemetry: " + path);
         }
         m_output
-            << "step,simulation_seconds,physics_step_ms,contact_callback_ms,"
+            << "step,simulation_seconds,physics_step_ms,simulate_submit_ms,fetch_results_ms,"
+               "contact_callback_ms,"
                "contact_processing_ms,gravity_ms,stress_solve_ms,gpu_stress_solve_ms,"
                "gpu_stress_h2d_bytes,gpu_stress_d2h_bytes,fracture_topology_ms,"
-               "adapter_tick_ms,mapping_validation_ms,state_export_ms,frame_host_ms,"
+               "adapter_tick_ms,begin_tick_ms,solve_tick_ms,end_tick_ms,"
+               "mapping_validation_ms,state_export_ms,frame_host_ms,"
                "realtime_factor,bodies,awake_bodies,solver_islands,solver_islands_skipped,"
                "overstressed_bonds,contacts_frame,contacts_total,contacts_dropped_total,"
                "projectile_impacts_frame,projectile_impacts_total,"
                "projectile_impulse_frame,projectile_impulse_total,"
                "splits_frame,splits_total,shapes_migrated_frame,shapes_migrated_total,"
                "sleeping_actors_skipped,max_position_drift,max_point_velocity_drift,"
-               "resim_passes,resim_capture_ms,resim_restore_ms\n";
+               "resim_passes,resim_bodies_captured,resim_bodies_restored,"
+               "resim_capture_ms,resim_scene_capture_ms,resim_adapter_capture_ms,"
+               "resim_restore_ms,resim_scene_restore_ms,resim_adapter_restore_ms,"
+               "base_simulate_submit_ms,base_fetch_results_ms,base_tick_ms,"
+               "resim_simulate_submit_ms,resim_fetch_results_ms,resim_tick_ms,"
+               "projectiles_active,projectile_max_speed,projectile_max_forward_speed\n";
     }
 
     void write(const FrameMetrics& frame)
@@ -1563,6 +1616,8 @@ public:
             << frame.step << ','
             << frame.simulationSeconds << ','
             << frame.physicsStepMilliseconds << ','
+            << frame.simulateSubmitMilliseconds << ','
+            << frame.fetchResultsMilliseconds << ','
             << frame.contactCallbackMilliseconds << ','
             << frame.contactProcessingMilliseconds << ','
             << frame.gravityMilliseconds << ','
@@ -1572,6 +1627,9 @@ public:
             << frame.gpuStressDeviceToHostBytes << ','
             << frame.fractureTopologyMilliseconds << ','
             << frame.adapterTickMilliseconds << ','
+            << frame.beginTickMilliseconds << ','
+            << frame.solveTickMilliseconds << ','
+            << frame.endTickMilliseconds << ','
             << frame.mappingValidationMilliseconds << ','
             << frame.stateExportMilliseconds << ','
             << frame.frameHostMilliseconds << ','
@@ -1596,8 +1654,23 @@ public:
             << frame.telemetry.maxPositionDrift << ','
             << frame.telemetry.maxVelocityDrift << ','
             << frame.resimPasses << ','
+            << frame.resimBodiesCaptured << ','
+            << frame.resimBodiesRestored << ','
             << frame.resimCaptureMilliseconds << ','
-            << frame.resimRestoreMilliseconds << '\n';
+            << frame.resimSceneCaptureMilliseconds << ','
+            << frame.resimAdapterCaptureMilliseconds << ','
+            << frame.resimRestoreMilliseconds << ','
+            << frame.resimSceneRestoreMilliseconds << ','
+            << frame.resimAdapterRestoreMilliseconds << ','
+            << frame.baseSimulateSubmitMilliseconds << ','
+            << frame.baseFetchResultsMilliseconds << ','
+            << frame.baseTickMilliseconds << ','
+            << frame.resimSimulateSubmitMilliseconds << ','
+            << frame.resimFetchResultsMilliseconds << ','
+            << frame.resimTickMilliseconds << ','
+            << frame.projectilesActive << ','
+            << frame.projectileMaxSpeed << ','
+            << frame.projectileMaxForwardSpeed << '\n';
     }
 
 private:
@@ -1699,8 +1772,35 @@ void writeMetadata(
         << "    \"maxPasses\": " << options.resimPasses << ",\n"
         << "    \"passesTotal\": " << timings.resimPassesTotal << ",\n"
         << "    \"framesWithResim\": " << timings.resimFrames << ",\n"
+        << "    \"bodiesCapturedTotal\": " << timings.resimBodiesCapturedTotal << ",\n"
+        << "    \"bodiesRestoredTotal\": " << timings.resimBodiesRestoredTotal << ",\n"
         << "    \"captureMilliseconds\": " << timings.resimCaptureMilliseconds << ",\n"
-        << "    \"restoreMilliseconds\": " << timings.resimRestoreMilliseconds << "\n"
+        << "    \"sceneCaptureMilliseconds\": "
+        << timings.resimSceneCaptureMilliseconds << ",\n"
+        << "    \"adapterCaptureMilliseconds\": "
+        << timings.resimAdapterCaptureMilliseconds << ",\n"
+        << "    \"restoreMilliseconds\": " << timings.resimRestoreMilliseconds << ",\n"
+        << "    \"sceneRestoreMilliseconds\": "
+        << timings.resimSceneRestoreMilliseconds << ",\n"
+        << "    \"adapterRestoreMilliseconds\": "
+        << timings.resimAdapterRestoreMilliseconds << ",\n"
+        << "    \"simulateSubmitMilliseconds\": "
+        << timings.simulateSubmitMilliseconds << ",\n"
+        << "    \"fetchResultsMilliseconds\": "
+        << timings.fetchResultsMilliseconds << ",\n"
+        << "    \"beginTickMilliseconds\": " << timings.beginTickMilliseconds << ",\n"
+        << "    \"solveTickMilliseconds\": " << timings.solveTickMilliseconds << ",\n"
+        << "    \"endTickMilliseconds\": " << timings.endTickMilliseconds << ",\n"
+        << "    \"baseSimulateSubmitMilliseconds\": "
+        << timings.baseSimulateSubmitMilliseconds << ",\n"
+        << "    \"baseFetchResultsMilliseconds\": "
+        << timings.baseFetchResultsMilliseconds << ",\n"
+        << "    \"baseTickMilliseconds\": " << timings.baseTickMilliseconds << ",\n"
+        << "    \"resimSimulateSubmitMilliseconds\": "
+        << timings.resimSimulateSubmitMilliseconds << ",\n"
+        << "    \"resimFetchResultsMilliseconds\": "
+        << timings.resimFetchResultsMilliseconds << ",\n"
+        << "    \"resimTickMilliseconds\": " << timings.resimTickMilliseconds << "\n"
         << "  },\n"
         << "  \"minimumAuthoredChunksRequired\": "
         << options.requireMinimumAuthoredChunks << ",\n"
@@ -1712,6 +1812,9 @@ void writeMetadata(
         << "    \"projectileRadius\": " << pack.projectileRadius * options.projectileRadiusScale << ",\n"
         << "    \"projectileLifetimeSeconds\": "
         << pack.projectileTtlSeconds * options.projectileTtlScale << ",\n"
+        << "    \"projectileWaves\": " << options.projectileWaves << ",\n"
+        << "    \"projectileCount\": "
+        << (options.grid * options.grid * options.projectileWaves) << ",\n"
         << "    \"contactForceScale\": "
         << pack.contactForceScale * options.contactForceScale << ",\n"
         << "    \"minimumStressContactImpulse\": "
@@ -1960,8 +2063,12 @@ int run(const Options& options)
         pack.contactForceScale * options.contactForceScale,
         options.minimumStressContactImpulse);
     SceneCapacity capacity;
-    capacity.maxBodies = totalAuthoredChunks * 2;
-    capacity.maxShapes = capacity.maxBodies + static_cast<std::uint32_t>(offsets.size() * 2);
+    capacity.maxBodies = totalAuthoredChunks * 2
+        + options.grid * options.grid * options.projectileWaves
+        + 1024;
+    capacity.maxShapes = capacity.maxBodies
+        + options.grid * options.grid * options.projectileWaves
+        + 1024;
     capacity.maxContactPairs = std::max<std::uint32_t>(65536, capacity.maxBodies * 64);
     PhysXScene context(options.physics, options.requireGpu, capacity, &contacts);
     context.scene().setGravity(PxVec3(0.0f, pack.gravity, 0.0f));
@@ -2256,6 +2363,10 @@ int run(const Options& options)
         }
         const double physicsStepMilliseconds = frameStats.simulateMilliseconds;
         const double adapterTickMilliseconds = frameStats.tickMilliseconds;
+        const double resimCaptureMilliseconds =
+            frameStats.sceneCaptureMilliseconds + frameStats.adapterCaptureMilliseconds;
+        const double resimRestoreMilliseconds =
+            frameStats.sceneRestoreMilliseconds + frameStats.adapterRestoreMilliseconds;
         const double contactCallbackMilliseconds =
             contacts.callbackMilliseconds() - previousContactCallbackMilliseconds;
         runtimeTimings.resimPassesTotal += frameStats.resimPasses;
@@ -2263,8 +2374,35 @@ int run(const Options& options)
         {
             ++runtimeTimings.resimFrames;
         }
-        runtimeTimings.resimCaptureMilliseconds += frameStats.sceneCaptureMilliseconds;
-        runtimeTimings.resimRestoreMilliseconds += frameStats.sceneRestoreMilliseconds;
+        runtimeTimings.resimCaptureMilliseconds += resimCaptureMilliseconds;
+        runtimeTimings.resimSceneCaptureMilliseconds +=
+            frameStats.sceneCaptureMilliseconds;
+        runtimeTimings.resimAdapterCaptureMilliseconds +=
+            frameStats.adapterCaptureMilliseconds;
+        runtimeTimings.resimRestoreMilliseconds += resimRestoreMilliseconds;
+        runtimeTimings.resimSceneRestoreMilliseconds +=
+            frameStats.sceneRestoreMilliseconds;
+        runtimeTimings.resimAdapterRestoreMilliseconds +=
+            frameStats.adapterRestoreMilliseconds;
+        runtimeTimings.simulateSubmitMilliseconds +=
+            frameStats.simulateSubmitMilliseconds;
+        runtimeTimings.fetchResultsMilliseconds +=
+            frameStats.fetchResultsMilliseconds;
+        runtimeTimings.beginTickMilliseconds += frameStats.beginTickMilliseconds;
+        runtimeTimings.solveTickMilliseconds += frameStats.solveTickMilliseconds;
+        runtimeTimings.endTickMilliseconds += frameStats.endTickMilliseconds;
+        runtimeTimings.baseSimulateSubmitMilliseconds +=
+            frameStats.baseSimulateSubmitMilliseconds;
+        runtimeTimings.baseFetchResultsMilliseconds +=
+            frameStats.baseFetchResultsMilliseconds;
+        runtimeTimings.baseTickMilliseconds += frameStats.baseTickMilliseconds;
+        runtimeTimings.resimSimulateSubmitMilliseconds +=
+            frameStats.resimSimulateSubmitMilliseconds;
+        runtimeTimings.resimFetchResultsMilliseconds +=
+            frameStats.resimFetchResultsMilliseconds;
+        runtimeTimings.resimTickMilliseconds += frameStats.resimTickMilliseconds;
+        runtimeTimings.resimBodiesCapturedTotal += frameStats.sceneBodiesCaptured;
+        runtimeTimings.resimBodiesRestoredTotal += frameStats.sceneBodiesRestored;
 
         // Fracture validates immediately inside the adapter. This periodic full
         // audit catches latent mapping drift without adding an O(nodes) scan to
@@ -2367,8 +2505,46 @@ int run(const Options& options)
         frame.frameProjectileImpactImpulse =
             frame.projectileImpactImpulse - previousProjectileImpactImpulse;
         frame.resimPasses = frameStats.resimPasses;
-        frame.resimCaptureMilliseconds = frameStats.sceneCaptureMilliseconds;
-        frame.resimRestoreMilliseconds = frameStats.sceneRestoreMilliseconds;
+        frame.resimBodiesCaptured = frameStats.sceneBodiesCaptured;
+        frame.resimBodiesRestored = frameStats.sceneBodiesRestored;
+        frame.resimCaptureMilliseconds = resimCaptureMilliseconds;
+        frame.resimSceneCaptureMilliseconds = frameStats.sceneCaptureMilliseconds;
+        frame.resimAdapterCaptureMilliseconds = frameStats.adapterCaptureMilliseconds;
+        frame.resimRestoreMilliseconds = resimRestoreMilliseconds;
+        frame.resimSceneRestoreMilliseconds = frameStats.sceneRestoreMilliseconds;
+        frame.resimAdapterRestoreMilliseconds = frameStats.adapterRestoreMilliseconds;
+        frame.simulateSubmitMilliseconds = frameStats.simulateSubmitMilliseconds;
+        frame.fetchResultsMilliseconds = frameStats.fetchResultsMilliseconds;
+        frame.beginTickMilliseconds = frameStats.beginTickMilliseconds;
+        frame.solveTickMilliseconds = frameStats.solveTickMilliseconds;
+        frame.endTickMilliseconds = frameStats.endTickMilliseconds;
+        frame.baseSimulateSubmitMilliseconds =
+            frameStats.baseSimulateSubmitMilliseconds;
+        frame.baseFetchResultsMilliseconds = frameStats.baseFetchResultsMilliseconds;
+        frame.baseTickMilliseconds = frameStats.baseTickMilliseconds;
+        frame.resimSimulateSubmitMilliseconds =
+            frameStats.resimSimulateSubmitMilliseconds;
+        frame.resimFetchResultsMilliseconds = frameStats.resimFetchResultsMilliseconds;
+        frame.resimTickMilliseconds = frameStats.resimTickMilliseconds;
+        for (const Projectile& projectile : projectiles)
+        {
+            if (!projectile.launched || projectile.retired || !projectile.body)
+            {
+                continue;
+            }
+            ++frame.projectilesActive;
+            const PxVec3 velocity = projectile.body->getLinearVelocity();
+            frame.projectileMaxSpeed =
+                std::max(frame.projectileMaxSpeed, velocity.magnitude());
+            const float launchSpeed = projectile.launchVelocity.magnitude();
+            if (launchSpeed > 1.0e-3f)
+            {
+                const PxVec3 forward = projectile.launchVelocity / launchSpeed;
+                frame.projectileMaxForwardSpeed = std::max(
+                    frame.projectileMaxForwardSpeed,
+                    velocity.dot(forward));
+            }
+        }
         frame.frameHostMilliseconds =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - frameStart).count();

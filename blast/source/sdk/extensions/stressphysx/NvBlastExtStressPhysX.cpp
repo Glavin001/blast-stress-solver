@@ -144,6 +144,7 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , resimulationCaptureMilliseconds(0.0)
     , resimulationRestoreMilliseconds(0.0)
     , resimulationMaxRederivedDriftMeters(0.0f)
+    , impactContactBondsFatalized(0)
     , lastError(ExtStressPhysXError::None)
     , lastErrorNode(INVALID_INDEX)
 {
@@ -1409,6 +1410,70 @@ private:
             return true;
         }
 
+        // Promote contact-adjacent overstress to fatal damage on this tick.
+        // m_contactNodeIndices still holds the nodes that received impulses in
+        // beginTick/consumeContacts; elastic-only micro-damage on those bonds
+        // would otherwise leave the projectile to rebound from a monolith.
+        if (m_settings.fatalizeImpactContactBonds && !m_contactNodeIndices.empty())
+        {
+            std::unordered_set<uint32_t> contactedNodes(
+                m_contactNodeIndices.begin(),
+                m_contactNodeIndices.end());
+            // Also include immediate bond neighbors of contacted nodes so a
+            // struck facade panel can detach as a piece instead of staying
+            // hinged on a single unbroken edge.
+            std::unordered_set<uint32_t> impactNodes = contactedNodes;
+            for (uint32_t commandIndex = 0; commandIndex < commandCount; ++commandIndex)
+            {
+                const ExtStressFractureCommands& command = commands[commandIndex];
+                if (command.bondFractures == nullptr)
+                {
+                    continue;
+                }
+                for (uint32_t fractureIndex = 0; fractureIndex < command.bondFractureCount;
+                     ++fractureIndex)
+                {
+                    const ExtStressBondFracture& fracture =
+                        command.bondFractures[fractureIndex];
+                    const bool touch0 = contactedNodes.count(fracture.nodeIndex0) != 0;
+                    const bool touch1 = contactedNodes.count(fracture.nodeIndex1) != 0;
+                    if (touch0)
+                    {
+                        impactNodes.insert(fracture.nodeIndex1);
+                    }
+                    if (touch1)
+                    {
+                        impactNodes.insert(fracture.nodeIndex0);
+                    }
+                }
+            }
+            for (uint32_t commandIndex = 0; commandIndex < commandCount; ++commandIndex)
+            {
+                ExtStressFractureCommands& command = commands[commandIndex];
+                if (command.bondFractures == nullptr)
+                {
+                    continue;
+                }
+                for (uint32_t fractureIndex = 0; fractureIndex < command.bondFractureCount;
+                     ++fractureIndex)
+                {
+                    ExtStressBondFracture& fracture = command.bondFractures[fractureIndex];
+                    if (impactNodes.count(fracture.nodeIndex0) == 0
+                        && impactNodes.count(fracture.nodeIndex1) == 0)
+                    {
+                        continue;
+                    }
+                    // Damage is subtracted from remaining bond health; a huge
+                    // value guarantees a full break regardless of authored area.
+                    if (fracture.health < 1.0e20f)
+                    {
+                        fracture.health = 1.0e20f;
+                        ++m_telemetry.impactContactBondsFatalized;
+                    }
+                }
+            }
+        }
+
         if (m_settings.protectSupportBonds)
         {
             // Compact out footing/support joints so impacts tear non-support
@@ -1474,35 +1539,32 @@ private:
                                                         const ExtStressFractureCommands& b) {
             return a.actorIndex < b.actorIndex;
         });
-        uint32_t remainingBodyBudget = std::numeric_limits<uint32_t>::max();
-        if (m_settings.maximumBodies > 0)
+        // maximumBodies / maximumFracturesPerActorPerTick are opt-in quality
+        // degradations (default 0 = unlimited). Never use the remaining body
+        // slot count to truncate how many bonds may break this tick: that
+        // applied an arbitrary prefix of the overstressed list and often left
+        // the impacted facade connected, so projectiles rebounded from a
+        // monolith and fracture-frame resimulation had no hole to push through.
+        if (m_settings.maximumBodies > 0
+            && static_cast<uint32_t>(m_actorBodies.size()) >= m_settings.maximumBodies)
         {
-            const uint32_t currentBodies = static_cast<uint32_t>(m_actorBodies.size());
-            if (currentBodies >= m_settings.maximumBodies)
-            {
-                return true;
-            }
-            remainingBodyBudget = m_settings.maximumBodies - currentBodies;
+            return true;
         }
         std::vector<ExtStressFractureCommands> limitedCommands;
         limitedCommands.reserve(commands.size());
         for (ExtStressFractureCommands command : commands)
         {
-            uint32_t allowed = command.bondFractureCount;
             if (m_settings.maximumFracturesPerActorPerTick > 0)
             {
-                allowed = std::min(
-                    allowed,
+                command.bondFractureCount = std::min(
+                    command.bondFractureCount,
                     m_settings.maximumFracturesPerActorPerTick);
             }
-            allowed = std::min(allowed, remainingBodyBudget);
-            if (allowed == 0)
+            if (command.bondFractureCount == 0)
             {
                 continue;
             }
-            command.bondFractureCount = allowed;
             limitedCommands.push_back(command);
-            remainingBodyBudget -= allowed;
         }
         commands.swap(limitedCommands);
         commandCount = static_cast<uint32_t>(commands.size());

@@ -42,12 +42,13 @@ name=candidate-a
   --contact-force-scale 1.15 \
   --stress-limit-scale 1.0 \
   --excess-force-scale 0.018 \
-  --max-bodies-per-structure 46 \
   --resim-passes 1 \
   --metadata /tmp/highrise-tune/$name.metadata.json \
   --frame-telemetry /tmp/highrise-tune/$name.frames.csv \
   --output-state ''
 ```
+
+Omit `--max-bodies-per-structure` (default unlimited). Only pass it when someone explicitly asks for a hard body stop.
 
 Omit `--require-realtime` while searching; add it when locking a realtime recipe.
 
@@ -84,7 +85,6 @@ $CARGO run --release --locked -- record \
   --sim-arg=--excess-force-scale --sim-arg=0.042 \
   --sim-arg=--stress-workers --sim-arg=20 \
   --sim-arg=--tall-building-stride --sim-arg=12 \
-  --sim-arg=--max-bodies-per-structure --sim-arg=95 \
   --sim-arg=--resim-passes --sim-arg=1 \
   --sim-arg=--require-realtime \
   --sim-arg=--require-min-authored-chunks --sim-arg=14000 \
@@ -94,7 +94,7 @@ $CARGO run --release --locked -- record \
   --output /root/recordings/blast-gpu-highrise-5x5-14k-10floor-local-break.mp4
 ```
 
-(Adjust scales if gates fail; prefer sim-only first.)
+(Adjust scales if gates fail; prefer sim-only first. Do **not** pin `--max-bodies-per-structure` unless explicitly requested — body/bond budgets falsify punch-through.)
 
 ## Record: heavier high-rise (non-local pack)
 
@@ -113,7 +113,6 @@ $CARGO run --release --locked -- record \
   --sim-arg=--excess-force-scale --sim-arg=0.015 \
   --sim-arg=--stress-workers --sim-arg=20 \
   --sim-arg=--tall-building-stride --sim-arg=12 \
-  --sim-arg=--max-bodies-per-structure --sim-arg=46 \
   --sim-arg=--require-realtime \
   --sim-arg=--require-min-authored-chunks --sim-arg=14000 \
   --sim-arg=--require-varied-building-heights \

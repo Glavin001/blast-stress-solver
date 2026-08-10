@@ -78,10 +78,31 @@ public:
 
         for (;;)
         {
+            // resimPasses counts completed restores; the upcoming simulate is
+            // the base step while it is still zero.
+            const bool resimPass = frame.resimPasses > 0;
+
             const StepperClock::time_point simulateStart = StepperClock::now();
             m_scene.simulate(dt);
+            const double submitMs = stepperElapsedMilliseconds(simulateStart);
+
+            const StepperClock::time_point fetchStart = StepperClock::now();
             const bool fetched = m_scene.fetchResults(true);
-            frame.simulateMilliseconds += stepperElapsedMilliseconds(simulateStart);
+            const double fetchMs = stepperElapsedMilliseconds(fetchStart);
+
+            frame.simulateSubmitMilliseconds += submitMs;
+            frame.fetchResultsMilliseconds += fetchMs;
+            frame.simulateMilliseconds += submitMs + fetchMs;
+            if (resimPass)
+            {
+                frame.resimSimulateSubmitMilliseconds += submitMs;
+                frame.resimFetchResultsMilliseconds += fetchMs;
+            }
+            else
+            {
+                frame.baseSimulateSubmitMilliseconds += submitMs;
+                frame.baseFetchResultsMilliseconds += fetchMs;
+            }
             if (!fetched)
             {
                 return false;
@@ -89,10 +110,32 @@ public:
             frameHooks.onPostFetchResults(frame.resimPasses);
 
             const uint64_t splitsBefore = sumSplits(destructibles, destructibleCount);
+            double beginMs = 0.0;
+            double solveMs = 0.0;
+            double endMs = 0.0;
             const StepperClock::time_point tickStart = StepperClock::now();
-            const bool ticked =
-                tickAll(dt, worldGravity, destructibles, destructibleCount, frameHooks);
-            frame.tickMilliseconds += stepperElapsedMilliseconds(tickStart);
+            const bool ticked = tickAll(
+                dt,
+                worldGravity,
+                destructibles,
+                destructibleCount,
+                frameHooks,
+                beginMs,
+                solveMs,
+                endMs);
+            const double tickMs = stepperElapsedMilliseconds(tickStart);
+            frame.tickMilliseconds += tickMs;
+            frame.beginTickMilliseconds += beginMs;
+            frame.solveTickMilliseconds += solveMs;
+            frame.endTickMilliseconds += endMs;
+            if (resimPass)
+            {
+                frame.resimTickMilliseconds += tickMs;
+            }
+            else
+            {
+                frame.baseTickMilliseconds += tickMs;
+            }
             if (!ticked)
             {
                 return false;
@@ -109,10 +152,15 @@ public:
 
             frameHooks.onRestore();
             restoreScene(frame);
+
+            const StepperClock::time_point adapterRestoreStart = StepperClock::now();
             for (uint32_t i = 0; i < destructibleCount; ++i)
             {
                 destructibles[i]->restoreResimulationSnapshot();
             }
+            frame.adapterRestoreMilliseconds +=
+                stepperElapsedMilliseconds(adapterRestoreStart);
+
             if (passesRemaining > 0)
             {
                 // Re-capture so the next rollback rewinds this pass's fracture
@@ -156,26 +204,40 @@ private:
         const PxVec3& worldGravity,
         ExtStressPhysXDestructible* const* destructibles,
         uint32_t destructibleCount,
-        ExtStressPhysXFrameHooks& hooks)
+        ExtStressPhysXFrameHooks& hooks,
+        double& beginMilliseconds,
+        double& solveMilliseconds,
+        double& endMilliseconds)
     {
+        const StepperClock::time_point beginStart = StepperClock::now();
         for (uint32_t i = 0; i < destructibleCount; ++i)
         {
             if (!destructibles[i]->beginTick(dt, worldGravity))
             {
+                beginMilliseconds = stepperElapsedMilliseconds(beginStart);
                 return false;
             }
         }
+        beginMilliseconds = stepperElapsedMilliseconds(beginStart);
+
+        const StepperClock::time_point solveStart = StepperClock::now();
         if (!hooks.solveAll(destructibles, destructibleCount))
         {
+            solveMilliseconds = stepperElapsedMilliseconds(solveStart);
             return false;
         }
+        solveMilliseconds = stepperElapsedMilliseconds(solveStart);
+
+        const StepperClock::time_point endStart = StepperClock::now();
         for (uint32_t i = 0; i < destructibleCount; ++i)
         {
             if (!destructibles[i]->endTick())
             {
+                endMilliseconds = stepperElapsedMilliseconds(endStart);
                 return false;
             }
         }
+        endMilliseconds = stepperElapsedMilliseconds(endStart);
         return true;
     }
 
@@ -185,7 +247,7 @@ private:
         ExtStressPhysXFrameHooks& hooks,
         ExtStressPhysXFrameStats& frame)
     {
-        const StepperClock::time_point captureStart = StepperClock::now();
+        const StepperClock::time_point sceneCaptureStart = StepperClock::now();
         {
             StepperSceneWriteLock lock(m_scene);
             const PxU32 actorCount =
@@ -219,21 +281,27 @@ private:
             }
         }
         frame.sceneBodiesCaptured = static_cast<uint32_t>(m_snapshot.size());
+        frame.sceneCaptureMilliseconds +=
+            stepperElapsedMilliseconds(sceneCaptureStart);
+
         // The adapter capture (re)starts each destructible's fracture-child
         // provenance window; its restore below re-derives those children after
         // the generic scene rewind.
+        const StepperClock::time_point adapterCaptureStart = StepperClock::now();
         for (uint32_t i = 0; i < destructibleCount; ++i)
         {
             destructibles[i]->captureResimulationSnapshot();
         }
         hooks.onCapture();
-        frame.sceneCaptureMilliseconds += stepperElapsedMilliseconds(captureStart);
+        frame.adapterCaptureMilliseconds +=
+            stepperElapsedMilliseconds(adapterCaptureStart);
     }
 
     void restoreScene(ExtStressPhysXFrameStats& frame)
     {
         const StepperClock::time_point restoreStart = StepperClock::now();
         StepperSceneWriteLock lock(m_scene);
+        uint32_t restored = 0;
         for (const SceneBodySnapshot& snapshot : m_snapshot)
         {
             PxRigidDynamic& body = *snapshot.body;
@@ -246,6 +314,7 @@ private:
             // writes are rejected on kinematic actors, so test the current flag.
             if (body.getRigidBodyFlags().isSet(PxRigidBodyFlag::eKINEMATIC))
             {
+                ++restored;
                 continue;
             }
             const PxVec3 restoredCenter =
@@ -271,7 +340,9 @@ private:
                 }
                 body.setWakeCounter(snapshot.wakeCounter);
             }
+            ++restored;
         }
+        frame.sceneBodiesRestored += restored;
         frame.sceneRestoreMilliseconds += stepperElapsedMilliseconds(restoreStart);
     }
 

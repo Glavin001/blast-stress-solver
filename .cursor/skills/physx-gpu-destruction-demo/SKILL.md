@@ -73,7 +73,8 @@ Local pack: weak infill bond areas, strong footings, `mass=0` on foundation+colu
 | `--stress-limit-scale` | Material strength (<1 breaks easier) |
 | `--excess-force-scale` | Post-split kick (used when resim off) |
 | `--resim-passes` | `1` = fracture-frame rollback+re-step (default); `0` = excess-force path / realtime pin |
-| `--max-bodies-per-structure` | Fracture budget per building |
+| `--max-bodies-per-structure` | **Default 0 = unlimited.** Opt-in hard stop only; do not use as a perf budget (falsifies fracture/resim) |
+| `--max-fractures-per-actor-per-tick` | **Default 0 = unlimited.** Opt-in; artificial caps degrade quality |
 | `--tall-building-stride` | Full-height every N buildings (skyline) |
 | `--gpu-stress-min-bonds` | CUDA stress crossover (3000 for high-rise graphs) |
 | `--min-stress-contact-impulse` | Ignore weak non-projectile contacts |
@@ -135,7 +136,7 @@ Sidecars share the stem: `.metadata.json`, `.frames.csv`, `.render.*`, `.simulat
 
 ## Hard realtime vs quality
 
-- User asks for **hard 60 Hz**: keep `--require-realtime`, pin body caps / resim / stress so `budgetMissFrames==0`.
+- User asks for **hard 60 Hz**: keep `--require-realtime`, tune stress/workers/scene size so `budgetMissFrames==0`. Do **not** invent body/bond fracture caps to buy headroom — those falsify destruction/resim.
 - User asks to **relax realtime** / maximize break: omit `--require-realtime`, report `budgetMissFrames` and max ms from metadata.
 
 ## More detail

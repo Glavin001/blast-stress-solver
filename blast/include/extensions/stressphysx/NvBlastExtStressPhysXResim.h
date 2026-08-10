@@ -37,20 +37,58 @@ struct ExtStressPhysXFrameStats
 {
     uint32_t resimPasses;
     uint32_t sceneBodiesCaptured;
+    uint32_t sceneBodiesRestored;
     uint64_t splits;
+
+    // Totals across the base step and every re-step. simulateMilliseconds is
+    // submit + fetchResults (matches the demo's physics_step_ms); the split
+    // fields isolate GPU work kickoff from the host sync wait.
     double simulateMilliseconds;
+    double simulateSubmitMilliseconds;
+    double fetchResultsMilliseconds;
     double tickMilliseconds;
+    double beginTickMilliseconds;
+    double solveTickMilliseconds;
+    double endTickMilliseconds;
+
+    // Capture/restore are split so GPU↔CPU sync cost (PhysX body get/set) can
+    // be separated from Blast adapter provenance bookkeeping.
     double sceneCaptureMilliseconds;
+    double adapterCaptureMilliseconds;
     double sceneRestoreMilliseconds;
+    double adapterRestoreMilliseconds;
+
+    // Base step (pass 0) vs all rollback re-steps combined. Quiet frames only
+    // fill the base_* fields; fracture frames fill both.
+    double baseSimulateSubmitMilliseconds;
+    double baseFetchResultsMilliseconds;
+    double baseTickMilliseconds;
+    double resimSimulateSubmitMilliseconds;
+    double resimFetchResultsMilliseconds;
+    double resimTickMilliseconds;
 
     ExtStressPhysXFrameStats()
         : resimPasses(0)
         , sceneBodiesCaptured(0)
+        , sceneBodiesRestored(0)
         , splits(0)
         , simulateMilliseconds(0.0)
+        , simulateSubmitMilliseconds(0.0)
+        , fetchResultsMilliseconds(0.0)
         , tickMilliseconds(0.0)
+        , beginTickMilliseconds(0.0)
+        , solveTickMilliseconds(0.0)
+        , endTickMilliseconds(0.0)
         , sceneCaptureMilliseconds(0.0)
+        , adapterCaptureMilliseconds(0.0)
         , sceneRestoreMilliseconds(0.0)
+        , adapterRestoreMilliseconds(0.0)
+        , baseSimulateSubmitMilliseconds(0.0)
+        , baseFetchResultsMilliseconds(0.0)
+        , baseTickMilliseconds(0.0)
+        , resimSimulateSubmitMilliseconds(0.0)
+        , resimFetchResultsMilliseconds(0.0)
+        , resimTickMilliseconds(0.0)
     {
     }
 };
