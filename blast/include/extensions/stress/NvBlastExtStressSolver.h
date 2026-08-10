@@ -301,6 +301,20 @@ public:
     virtual uint32_t                        getIslandsTotal() const = 0;
 
     /**
+    Enable the optional CUDA CGNR backend. Graph topology and warm-start state
+    remain resident on the GPU; the CPU implementation remains the fallback.
+
+    \return true when the requested backend is available and selected.
+    */
+    virtual bool                            setGpuAccelerated(bool enabled) = 0;
+    virtual void                            setGpuCudaContext(void* cudaContext) = 0;
+    virtual void                            setGpuMinimumBondCount(uint32_t bondCount) = 0;
+    virtual bool                            getGpuAccelerated() const = 0;
+    virtual float                           getGpuSolveMilliseconds() const = 0;
+    virtual uint64_t                        getGpuHostToDeviceBytes() const = 0;
+    virtual uint64_t                        getGpuDeviceToHostBytes() const = 0;
+
+    /**
     Generate fracture commands for particular actor.
 
     Calling this function if getOverstressedBondCount() == 0 or actor has no bond doesn't make sense, bondFractureCount will be '0'.

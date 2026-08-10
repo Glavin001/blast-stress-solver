@@ -1001,6 +1001,66 @@ ext_stress_solver_islands_total(const ExtStressSolverHandle* handlePtr)
     return (handle && handle->solver) ? handle->solver->getIslandsTotal() : 0U;
 }
 
+extern "C" uint8_t
+ext_stress_solver_set_gpu_accelerated(ExtStressSolverHandle* handlePtr, uint8_t enabled)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver
+            && handle->solver->setGpuAccelerated(enabled != 0))
+        ? 1U
+        : 0U;
+}
+
+extern "C" void
+ext_stress_solver_set_gpu_cuda_context(ExtStressSolverHandle* handlePtr, void* cudaContext)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setGpuCudaContext(cudaContext);
+    }
+}
+
+extern "C" void
+ext_stress_solver_set_gpu_minimum_bond_count(
+    ExtStressSolverHandle* handlePtr,
+    uint32_t bondCount)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setGpuMinimumBondCount(bondCount);
+    }
+}
+
+extern "C" uint8_t
+ext_stress_solver_get_gpu_accelerated(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver && handle->solver->getGpuAccelerated()) ? 1U : 0U;
+}
+
+extern "C" float
+ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuSolveMilliseconds() : 0.0f;
+}
+
+extern "C" uint64_t
+ext_stress_solver_gpu_host_to_device_bytes(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuHostToDeviceBytes() : 0U;
+}
+
+extern "C" uint64_t
+ext_stress_solver_gpu_device_to_host_bytes(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuDeviceToHostBytes() : 0U;
+}
+
 extern "C" uint32_t
 ext_stress_sizeof_ext_node_desc()
 {

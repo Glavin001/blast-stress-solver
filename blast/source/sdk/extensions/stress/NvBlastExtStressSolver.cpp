@@ -41,9 +41,13 @@
 #include "stress.h"
 #include "buffer.h"
 #include "simd/simd_device_query.h"
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+#include "NvBlastExtStressGpu.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #define USE_SCALAR_IMPL 0
 #define WARM_START 1
@@ -80,6 +84,16 @@ public:
         m_bonds.reserve(maxBondCount);
         m_impulses.reserve(maxBondCount);
         reset(nodeCount);
+    }
+
+    ~ConjugateGradientImpulseSolver()
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        if (m_gpuSolver)
+        {
+            m_gpuSolver->release();
+        }
+#endif
     }
 
     void getBondImpulses(uint32_t bond, NvVec3& impulseLinear, NvVec3& impulseAngular) const
@@ -124,6 +138,120 @@ public:
         params.centerBonds = true;
         params.equalizeMasses = true;
         m_stressProcessor.prepare(m_nodes.begin(), m_nodes.size(), m_bonds.begin(), m_bonds.size(), params);
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        if (m_gpuSolver)
+        {
+            m_gpuSolver->release();
+            m_gpuSolver = nullptr;
+        }
+        if (m_gpuRequested
+            && !m_nodes.empty()
+            && m_bonds.size() >= m_gpuMinimumBondCount)
+        {
+            m_gpuNodes.resize(m_nodes.size());
+            for (uint32_t i = 0; i < m_nodes.size(); ++i)
+            {
+                const SolverNodeS& node = m_nodes[i];
+                ExtStressGpuNode& gpu = m_gpuNodes[i];
+                gpu.position[0] = node.CoM.x;
+                gpu.position[1] = node.CoM.y;
+                gpu.position[2] = node.CoM.z;
+                gpu.mass = node.mass;
+                gpu.inertia = node.inertia;
+            }
+            m_gpuBonds.resize(m_bonds.size());
+            for (uint32_t i = 0; i < m_bonds.size(); ++i)
+            {
+                const SolverBond& bond = m_bonds[i];
+                ExtStressGpuBond& gpu = m_gpuBonds[i];
+                gpu.node0 = bond.nodes[0];
+                gpu.node1 = bond.nodes[1];
+                gpu.centroid[0] = bond.centroid.x;
+                gpu.centroid[1] = bond.centroid.y;
+                gpu.centroid[2] = bond.centroid.z;
+                gpu.normal[0] = gpu.normal[1] = gpu.normal[2] = 0.0f;
+                gpu.area = 1.0f;
+                gpu.health = 1.0f;
+            }
+            m_gpuSolver = ExtStressGpuSolver::create(
+                m_gpuNodes.data(),
+                static_cast<uint32_t>(m_gpuNodes.size()),
+                m_gpuBonds.data(),
+                static_cast<uint32_t>(m_gpuBonds.size()),
+                m_gpuCudaContext);
+            m_gpuVelocities.resize(m_nodes.size());
+            m_gpuImpulses.resize(m_bonds.size());
+            m_gpuLastVelocities.resize(m_nodes.size());
+            m_gpuLastInputValid = false;
+        }
+#endif
+    }
+
+    bool setGpuAccelerated(bool enabled)
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        m_gpuRequested = enabled;
+        m_forceColdStart = true;
+        return true;
+#else
+        return !enabled;
+#endif
+    }
+
+    void setGpuCudaContext(void* cudaContext)
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        m_gpuCudaContext = cudaContext;
+        m_forceColdStart = true;
+#else
+        NV_UNUSED(cudaContext);
+#endif
+    }
+
+    void setGpuMinimumBondCount(uint32_t bondCount)
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        m_gpuMinimumBondCount = bondCount;
+        m_forceColdStart = true;
+#else
+        NV_UNUSED(bondCount);
+#endif
+    }
+
+    bool getGpuAccelerated() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        return m_gpuRequested && m_gpuSolver != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    float getGpuSolveMilliseconds() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        return m_gpuFrameSolveMilliseconds;
+#else
+        return 0.0f;
+#endif
+    }
+
+    uint64_t getGpuHostToDeviceBytes() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        return m_gpuFrameHostToDeviceBytes;
+#else
+        return 0;
+#endif
+    }
+
+    uint64_t getGpuDeviceToHostBytes() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        return m_gpuFrameDeviceToHostBytes;
+#else
+        return 0;
+#endif
     }
 
     void setNodeVelocities(uint32_t node, const NvVec3& velocityLinear, const NvVec3& velocityAngular)
@@ -180,6 +308,74 @@ public:
 
     void solve(uint32_t iterationCount, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        m_gpuFrameSolveMilliseconds = 0.0f;
+        m_gpuFrameHostToDeviceBytes = 0;
+        m_gpuFrameDeviceToHostBytes = 0;
+        if (m_gpuSolver)
+        {
+            for (uint32_t i = 0; i < m_velocities.size(); ++i)
+            {
+                m_gpuVelocities[i].angular =
+                    {m_velocities[i].ang.x, m_velocities[i].ang.y, m_velocities[i].ang.z};
+                m_gpuVelocities[i].linear =
+                    {m_velocities[i].lin.x, m_velocities[i].lin.y, m_velocities[i].lin.z};
+            }
+            const bool unchanged =
+                skipSettled
+                && m_gpuLastInputValid
+                && std::memcmp(
+                    m_gpuVelocities.data(),
+                    m_gpuLastVelocities.data(),
+                    sizeof(ExtStressGpuImpulse) * m_gpuVelocities.size()) == 0;
+            if (unchanged)
+            {
+                m_error_sq = {0.0f, 0.0f};
+                m_inputsChanged = false;
+                return;
+            }
+            ExtStressGpuSolveParams gpuParams;
+            // The CPU path receives the configured iteration budget per
+            // island. Give the global CUDA solve enough iterations to resolve
+            // disconnected components before fracture thresholds are read.
+            gpuParams.maxIterations =
+                islandAware ? std::max(iterationCount, 56u) : iterationCount;
+            gpuParams.tolerance = 0.001f;
+            gpuParams.warmStart = warmStart && !m_forceColdStart;
+            if (m_gpuSolver->solve(m_gpuVelocities.data(), gpuParams)
+                && m_gpuSolver->readbackImpulses(
+                    m_gpuImpulses.data(),
+                    static_cast<uint32_t>(m_gpuImpulses.size())))
+            {
+                for (uint32_t i = 0; i < m_impulses.size(); ++i)
+                {
+                    m_impulses[i].ang = {
+                        m_gpuImpulses[i].angular.x,
+                        m_gpuImpulses[i].angular.y,
+                        m_gpuImpulses[i].angular.z};
+                    m_impulses[i].lin = {
+                        m_gpuImpulses[i].linear.x,
+                        m_gpuImpulses[i].linear.y,
+                        m_gpuImpulses[i].linear.z};
+                }
+                m_converged = m_gpuSolver->telemetry().converged;
+                m_gpuFrameSolveMilliseconds =
+                    m_gpuSolver->telemetry().solveMilliseconds;
+                m_gpuFrameHostToDeviceBytes =
+                    m_gpuSolver->telemetry().hostToDeviceBytes;
+                m_gpuFrameDeviceToHostBytes =
+                    m_gpuSolver->telemetry().deviceToHostBytes;
+                m_gpuLastVelocities = m_gpuVelocities;
+                m_gpuLastInputValid = true;
+                m_error_sq = m_converged
+                    ? AngLin6ErrorSq{0.0f, 0.0f}
+                    : AngLin6ErrorSq{FLT_MAX, FLT_MAX};
+                m_forceColdStart = false;
+                m_inputsChanged = false;
+                return;
+            }
+        }
+#endif
         StressProcessor::SolverParams params;
         params.maxIter = iterationCount;
         params.tolerance = 0.001f;
@@ -212,6 +408,21 @@ private:
     bool                        m_converged;
     bool                        m_forceColdStart;
     bool                        m_inputsChanged;
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+    bool                                m_gpuRequested{false};
+    void*                               m_gpuCudaContext{nullptr};
+    uint32_t                            m_gpuMinimumBondCount{4096};
+    ExtStressGpuSolver*                 m_gpuSolver{nullptr};
+    std::vector<ExtStressGpuNode>       m_gpuNodes;
+    std::vector<ExtStressGpuBond>       m_gpuBonds;
+    std::vector<ExtStressGpuImpulse>    m_gpuVelocities;
+    std::vector<ExtStressGpuImpulse>    m_gpuImpulses;
+    std::vector<ExtStressGpuImpulse>    m_gpuLastVelocities;
+    bool                                m_gpuLastInputValid{false};
+    float                               m_gpuFrameSolveMilliseconds{0.0f};
+    uint64_t                            m_gpuFrameHostToDeviceBytes{0};
+    uint64_t                            m_gpuFrameDeviceToHostBytes{0};
+#endif
 };
 
 
@@ -365,6 +576,33 @@ public:
         return m_solver.getIslandsTotal();
     }
 
+    bool setGpuAccelerated(bool enabled)
+    {
+        const bool available = m_solver.setGpuAccelerated(enabled);
+        if (available)
+        {
+            m_nodesDirty = true;
+        }
+        return available;
+    }
+
+    void setGpuCudaContext(void* cudaContext)
+    {
+        m_solver.setGpuCudaContext(cudaContext);
+        m_nodesDirty = true;
+    }
+
+    void setGpuMinimumBondCount(uint32_t bondCount)
+    {
+        m_solver.setGpuMinimumBondCount(bondCount);
+        m_nodesDirty = true;
+    }
+
+    bool getGpuAccelerated() const { return m_solver.getGpuAccelerated(); }
+    float getGpuSolveMilliseconds() const { return m_solver.getGpuSolveMilliseconds(); }
+    uint64_t getGpuHostToDeviceBytes() const { return m_solver.getGpuHostToDeviceBytes(); }
+    uint64_t getGpuDeviceToHostBytes() const { return m_solver.getGpuDeviceToHostBytes(); }
+
     void calcSolverBondStresses(
         uint32_t bondIdx, float bondArea, float nodeDist, const nvidia::NvVec3& bondNormal,
         float& stressNormal, float& stressShear) const
@@ -509,6 +747,14 @@ public:
             if (isBondInternal)
             {
                 // internal bond sadly requires graph resync (it never happens on reduction level '0')
+                m_nodesDirty = true;
+            }
+            else if (!m_nodesDirty && m_solver.getGpuAccelerated())
+            {
+                // CUDA topology and impulse ordering must exactly match the
+                // compacted host bond arrays. Defer to one full graph rebuild
+                // after this mutation batch instead of incrementally removing
+                // host-only bonds beneath a live GPU solver.
                 m_nodesDirty = true;
             }
             else if (!m_nodesDirty)
@@ -1176,6 +1422,41 @@ public:
         return m_graphProcessor->getIslandsTotal();
     }
 
+    virtual bool                            setGpuAccelerated(bool enabled) override
+    {
+        return m_graphProcessor->setGpuAccelerated(enabled);
+    }
+
+    virtual void                            setGpuCudaContext(void* cudaContext) override
+    {
+        m_graphProcessor->setGpuCudaContext(cudaContext);
+    }
+
+    virtual void                            setGpuMinimumBondCount(uint32_t bondCount) override
+    {
+        m_graphProcessor->setGpuMinimumBondCount(bondCount);
+    }
+
+    virtual bool                            getGpuAccelerated() const override
+    {
+        return m_graphProcessor->getGpuAccelerated();
+    }
+
+    virtual float                           getGpuSolveMilliseconds() const override
+    {
+        return m_graphProcessor->getGpuSolveMilliseconds();
+    }
+
+    virtual uint64_t                        getGpuHostToDeviceBytes() const override
+    {
+        return m_graphProcessor->getGpuHostToDeviceBytes();
+    }
+
+    virtual uint64_t                        getGpuDeviceToHostBytes() const override
+    {
+        return m_graphProcessor->getGpuDeviceToHostBytes();
+    }
+
     virtual void                            generateFractureCommands(const NvBlastActor& actor, NvBlastFractureBuffers& commands) override;
     virtual uint32_t                        generateFractureCommandsPerActor(const NvBlastActor** actorBuffer, NvBlastFractureBuffers* commandsBuffer, uint32_t bufferSize) override;
 
@@ -1514,7 +1795,9 @@ bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& co
             if (nvLinearPressure.magnitudeSquared() > FLT_EPSILON)
             {
                 const float* bondCenter = m_bonds[blastBondIndex].centroid;
-                const nvidia::NvVec3 forceOffset = nvidia::NvVec3(bondCenter[0], bondCenter[1], bondCenter[3]) - toNvShared(com);
+                const nvidia::NvVec3 forceOffset =
+                    nvidia::NvVec3(bondCenter[0], bondCenter[1], bondCenter[2])
+                    - toNvShared(com);
                 const nvidia::NvVec3 torqueFromForce = forceOffset.cross(nvLinearPressure);
                 nvAngularPressure += torqueFromForce;
             }

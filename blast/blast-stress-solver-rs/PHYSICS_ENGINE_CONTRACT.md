@@ -288,3 +288,68 @@ To bring up the pipeline on a new engine, provide an equivalent of
 Everything else — the stress solve, actor/island bookkeeping, fracture command
 generation, split planning (`split_migrator`), and the rigid-motion fit
 (`motion_fit`) — is already engine-independent and reused as-is.
+
+---
+
+## 6. PhysX 5 C++ implementation
+
+The repository now contains a native implementation of this contract:
+
+- public adapter:
+  `blast/include/extensions/stressphysx/NvBlastExtStressPhysX.h`
+- implementation:
+  `blast/source/sdk/extensions/stressphysx/NvBlastExtStressPhysX.cpp`
+- CPU/GPU host and benchmark:
+  `demos/blast-stress-demo`
+
+The implementation maps the contract to PhysX as follows:
+
+- Every Blast actor owns one `PxRigidDynamic`; support-containing actors use
+  `PxRigidBodyFlag::eKINEMATIC`, which can be toggled in place when a split
+  changes support membership.
+- Every node owns one stable `PxShape`. A split calls `detachShape(..., false)`,
+  computes the new parent-local pose from the captured world pose, and calls
+  `attachShape` on the assigned child body. The shape is not recooked or
+  recreated during migration.
+- Cuboids use `PxBoxGeometry`. Convexes are cooked with
+  `PxCookingParams::buildGPUData = true` and reject more than 64 input points;
+  the ScenePack loader performs deterministic point reduction before adapter
+  creation.
+- Child mass, COM, mass frame, and inertia are recomputed from node geometry
+  with `PxMassProperties::sum`, then written with `setMass`,
+  `setCMassLocalPose`, and `setMassSpaceInertiaTensor`.
+- Parent shape world poses and point velocities are captured before topology
+  edits. Child state is fitted from those samples, with explicit telemetry for
+  maximum world-position and point-velocity drift.
+- `PxSimulationEventCallback` contact points/impulses are routed back to the
+  owning adapter shape, queued, and injected into the stress graph before the
+  next solve.
+- Stable adapter-owned 64-bit body and shape IDs provide deterministic mapping
+  independent of PhysX pointer values. Snapshot APIs expose the resulting
+  bodies/shapes for rendering and validation.
+- GPU mode validates a `PxCudaContextManager`, enables
+  `PxSceneFlag::eENABLE_GPU_DYNAMICS`, selects `PxBroadPhaseType::eGPU`, cooks
+  GPU convex data, and sizes fixed GPU buffers from scene capacity.
+
+### Implementation status against the checklist
+
+Implemented: dynamic/kinematic body creation and removal, stable IDs, in-place
+support mutation, cuboid/convex shape creation, shape migration and local-pose
+updates, aggregate mass properties, pose/velocity/sleep access, contact impulse
+feedback, body wake-up, continuity checks, CPU contract tests, and strict GPU
+activation/capacity health checks.
+
+Deferred: complete body-state restore and fracture-frame resimulation, sibling
+contact grace, debris collision tiers/TTL cleanup, body pooling, and Direct GPU
+API state access. The current adapter intentionally uses regular PhysX object
+APIs between `fetchResults()` and the next `simulate()` because fractures change
+actor/shape topology. A future Direct GPU path must preserve that mutation
+window while adding GPU-index/buffer ownership and batched state reads/writes.
+
+The C++ snapshot API is currently read-only integration output; it does **not**
+satisfy §2.8 restore semantics. Until restore/resimulation is implemented,
+fragment motion continuity comes from pre-split point-velocity fitting and
+post-migration COM reconciliation.
+
+For reproducible commands, recorder details, measured GPU/CPU results, and
+known limits, see `demos/blast-stress-demo/README.md`.
