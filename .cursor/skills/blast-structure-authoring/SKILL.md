@@ -155,20 +155,24 @@ These are the knobs that look like tuning and are actually corruption:
 
 ## Worked example
 
-`blast/blast-stress-solver/assets/reference/reference-building.json` — 31
-nodes, 62 bonds, 4 materials, 3 floors of a 2×2 bay frame. Small enough to read
-end to end and re-measure in under a second.
+`blast/blast-stress-solver/assets/reference/reference-building.json` — 76
+nodes, 180 bonds, 4 materials, 3 floors of a 2×2 bay frame with a ring beam at
+every floor. Small enough to read end to end and re-measure in under a second.
 
 Calibrated result (pinned by CTest `blast_stress_reference_building_load_path`):
 
 | Joint class | Material | Safety factor |
 |---|---|---|
-| `column~infill` | facade-clip | 3.02 |
-| `infill~slab` | drywall-panel | 3.23 |
-| `column~column` | reinforced-concrete | 10.4 |
-| `column~slab` | reinforced-concrete | 10.4 |
-| `slab~slab` | concrete-slab | 14.2 |
-| `column~foundation` | reinforced-concrete | 32.0 |
+| `column~infill` | facade-clip | 3.04 |
+| `beam~infill` | drywall-panel | 3.20 |
+| `infill~infill` | drywall-panel | 3.29 |
+| `beam~column` | reinforced-concrete | 6.26 |
+| `column~slab` | concrete-slab | 7.71 |
+| `beam~beam` | reinforced-concrete | 8.95 |
+| `column~column` | reinforced-concrete | 12.5 |
+| `slab~slab` | concrete-slab | 13.8 |
+| `beam~slab` | concrete-slab | 14.0 |
+| `column~foundation` | reinforced-concrete | 32.5 |
 
 Destruction quality, measured through `ExtStressPhysXFrameStepper` with
 **resim = 1** and unity contact gain — pinned by CTest
@@ -176,16 +180,38 @@ Destruction quality, measured through `ExtStressPhysXFrameStepper` with
 
 | Impact | Splits | Bodies | Largest piece | Standing | Reading |
 |---|---|---|---|---|---|
-| gravity only | 0 | 1 | 64/64 | 100% | stands |
-| 500 kg @ 12 m/s | 0 | 1 | 64/64 | 100% | shrugs it off — **not glass** |
-| 1.5 t @ 16 m/s | 10 | 36 | 26/64 | 41% | **partial: a hole, and half the building still up in one piece** |
-| 4 t @ 20 m/s | 7 | 48 | 5/64 | 6% | frame comes down |
-| 40 t @ 45 m/s | 1 | 64 | 1/64 | 6% | everything breaks — **not rigid** |
+| gravity only | 0 | 1 | 76/76 | 100% | stands |
+| 400 kg @ 12 m/s | 0 | 1 | 76/76 | 100% | shrugs it off — **not glass** |
+| 1.5 t @ 16 m/s | 4 | 25 | 50/76 | 66% | facade shed, frame untouched |
+| 4 t @ 20 m/s | 13 | 63 | 5/76 | 5% | frame comes down |
+| 40 t @ 45 m/s | 2 | 74 | 2/76 | 5% | everything breaks — **not rigid** |
 
 "Largest piece" is the biggest connected body left. It is the number that
-separates destruction from dust: at the interesting level 26 of 64 chunks are
-still one object. Foundations never move at any energy — they are the only
-world-fixed nodes.
+separates destruction from dust. Foundations never move at any energy — they
+are the only world-fixed nodes.
+
+### Redundancy widens the band and flattens it — read both numbers
+
+This building was a **tree** before the ring beams: one column per slab
+quadrant, redundancy only through the slab diaphragm. Adding a beam ring is the
+textbook fix, and measured against the tree it looks like a clear win — the
+"standing 0.25–0.85" band goes from a 4.0× spread of impact energy to 5.2×, and
+the surviving piece grows from 12–32 chunks to 47–50.
+
+It is not a win, and the reason is a trap worth internalising: **standing
+fraction counts chunks, not structure.** 66% standing here is almost exactly
+"every frame chunk up, every facade panel shed". Across the whole widened band
+`moved(column)` is **0** — the frame is not damaged at all, it is just naked.
+The frame's own response went from graded (50% → 39% → 33% as energy rose) to a
+step: nothing, then total collapse, over a 300 kg interval.
+
+So when a change widens the partial band, check **which role moved**, not just
+how much is standing. `moved(...)` per role is in the sweep output for exactly
+this reason. A redundant structure resists damage — that is what redundancy
+*is* — so it buys a wider band of *cladding* results and a narrower, sharper
+transition in the frame. Whether that is what you want is a design decision,
+not a quality metric. The full experiment, including two failed attempts to
+recover the gradient, is in the header of `export-reference-building.mjs`.
 
 ## Two lessons this example paid for
 
@@ -207,3 +233,13 @@ Note the coupling in the other direction too — strengthening the facade to hit
 its gravity target moved the impact threshold up with it, so the "interesting"
 energy level moved from 500 kg to 1.5 t. Expect to re-locate the band after any
 material change.
+
+The ring beams paid this a third time, and harder. Adding them moved **eight**
+of ten joint classes out of band at once: the beams' own 13.4 t pushed the
+anchor under its floor (32.0 → 26), the slab bearing on a beam is a 0.66 m²
+patch so it read 35 on the frame material, and the facade — whose geometry only
+changed by getting shorter — dropped to 1.52 on a mode nothing had loaded
+before (the panel seam, in pure tension). Two of those needed a different
+*material assignment* rather than a different value: `column~slab` and
+`beam~slab` only sit in the frame band on the **slab** material. Budget a full
+re-measure, not a tweak, whenever the load path itself changes shape.

@@ -26,8 +26,17 @@
 // as impact energy rises: untouched -> cladding sheds with the frame standing
 // -> frame comes down -> total collapse.
 //
-// Fixture: assets/reference/reference-building.json (ScenePack v2, 64 nodes,
+// Fixture: assets/reference/reference-building.json (ScenePack v2, 76 nodes,
 // 4 materials, 3 floors). Runs on CPU in a couple of seconds.
+//
+// NOTE on what "partial" means for this fixture. The building now has a beam
+// ring, and its standing fraction plateaus at ~0.66 across a wide band of
+// energies. 0.66 is very close to "every frame chunk standing, every facade
+// panel shed" (52 frame chunks of 76), so a passing `moderate` here is mostly
+// a cladding result — `moved(column)` is the number that says whether the
+// FRAME took part, and it stays 0 until ~1.8 t. See the experiment notes in
+// export-reference-building.mjs; the band being wide is not the same as the
+// damage being graded.
 
 #include "../physx_scene.h"
 #include "../scene_pack.h"
@@ -384,12 +393,37 @@ int main(int argc, char** argv)
 
         // `--sweep` characterizes the response curve instead of asserting a
         // band — how the test levels below were chosen rather than guessed.
+        //
+        // An optional third argument replaces the default probes with a custom
+        // list, "mass@speed,mass@speed,..." (kg and m/s). The default eight are
+        // coarse — deliberately, they are the shape of the curve — so measuring
+        // how WIDE the partial band actually is needs a finer ramp than they
+        // provide. Passing probes beats editing and rebuilding this file, and
+        // keeps a characterization run out of the asserted path entirely.
         if (argc >= 3 && std::string(argv[2]) == "--sweep")
         {
-            for (const auto& probe : std::vector<std::pair<float, float>>{
-                     {0.0f, 0.0f}, {500.0f, 12.0f}, {1000.0f, 14.0f}, {1500.0f, 16.0f},
-                     {2500.0f, 18.0f}, {4000.0f, 20.0f}, {8000.0f, 25.0f},
-                     {40000.0f, 45.0f}})
+            std::vector<std::pair<float, float>> probes{
+                {0.0f, 0.0f}, {500.0f, 12.0f}, {1000.0f, 14.0f}, {1500.0f, 16.0f},
+                {2500.0f, 18.0f}, {4000.0f, 20.0f}, {8000.0f, 25.0f},
+                {40000.0f, 45.0f}};
+            if (argc >= 4)
+            {
+                probes.clear();
+                const std::string spec(argv[3]);
+                std::size_t at = 0;
+                while (at < spec.size())
+                {
+                    const std::size_t comma = std::min(spec.find(',', at), spec.size());
+                    const std::string item = spec.substr(at, comma - at);
+                    const std::size_t split = item.find('@');
+                    require(split != std::string::npos, "probe must be mass@speed: " + item);
+                    probes.emplace_back(
+                        std::stof(item.substr(0, split)), std::stof(item.substr(split + 1)));
+                    at = comma + 1;
+                }
+                require(!probes.empty(), "custom sweep needs at least one probe");
+            }
+            for (const auto& probe : probes)
             {
                 char label[64];
                 std::snprintf(label, sizeof(label), "%.0fkg @ %.0fm/s", probe.first, probe.second);
@@ -409,13 +443,21 @@ int main(int argc, char** argv)
 
         // ── Glancing hit: NOT made of glass ─────────────────────────────────
         // A structure that comes apart the moment anything touches it is the
-        // first failure mode. This impact carries real energy (10 kJ) and must
+        // first failure mode. This impact carries real energy (29 kJ) and must
         // still leave the building whole.
-        const Outcome glancing = run(pack, 500.0f, 12.0f);
-        report("glancing (500kg@12)", glancing);
+        //
+        // 400 kg, down from 500: the beam ring lowered the energy at which the
+        // cladding lets go, even though the facade is calibrated to the SAME
+        // gravity safety factor (3.03) as the beamless building. The ring ties
+        // all four faces into one stiff loop, so a hit on one face is carried
+        // round it and pops clips on faces the projectile never touched. The
+        // shed threshold is genuinely between 450 and 500 kg here, so this
+        // level is the honest one rather than the one that used to pass.
+        const Outcome glancing = run(pack, 400.0f, 12.0f);
+        report("glancing (400kg@12)", glancing);
         require(
             glancing.splits == 0,
-            "a 500 kg glancing hit must not break a 59 t concrete frame — a "
+            "a 400 kg glancing hit must not break a 72 t concrete frame — a "
             "structure that shatters on contact is the 'glass' failure mode");
 
         // ── Moderate hit: THE interesting band ──────────────────────────────
