@@ -171,16 +171,40 @@ public:
                 gpu.centroid[2] = bond.centroid.z;
                 // Normals are recomputed from node geometry in ExtStressGpuSolver.
                 gpu.normal[0] = gpu.normal[1] = gpu.normal[2] = 0.0f;
-                // Preserve authored contact area so stronger joints (frame) take
-                // less stress than weak facade joints for the same impulse.
+                // Area is geometry: the summed authored contact patch of the
+                // group's members. Health IS the damage pool and must seed from
+                // area, not 1.0 — a uniform seed is exactly the bug that once
+                // made authored strength meaningless on the CPU path. Caveat:
+                // bonds partially damaged before a topology rebuild re-seed at
+                // full area here; only the unwired on-device damage path reads
+                // this, and it must re-sync healths when it is wired.
                 gpu.area = bond.area > 0.0f ? bond.area : 1.0f;
-                gpu.health = 1.0f;
+                gpu.health = gpu.area;
+                gpu.material = bond.material;
+            }
+            // Convert the resolved material table for the device-side damage
+            // kernel; layouts match field-for-field.
+            m_gpuMaterials.resize(m_materialCount ? m_materialCount : 1);
+            for (uint32_t material = 0; material < m_gpuMaterials.size(); ++material)
+            {
+                const ExtStressMaterial source = (m_materials && material < m_materialCount)
+                    ? m_materials[material]
+                    : ExtStressMaterial();
+                ExtStressGpuMaterial& gpu = m_gpuMaterials[material];
+                gpu.compressionElasticLimit = source.compressionElasticLimit;
+                gpu.compressionFatalLimit = source.compressionFatalLimit;
+                gpu.tensionElasticLimit = source.tensionElasticLimit;
+                gpu.tensionFatalLimit = source.tensionFatalLimit;
+                gpu.shearElasticLimit = source.shearElasticLimit;
+                gpu.shearFatalLimit = source.shearFatalLimit;
             }
             m_gpuSolver = ExtStressGpuSolver::create(
                 m_gpuNodes.data(),
                 static_cast<uint32_t>(m_gpuNodes.size()),
                 m_gpuBonds.data(),
                 static_cast<uint32_t>(m_gpuBonds.size()),
+                m_gpuMaterials.data(),
+                static_cast<uint32_t>(m_gpuMaterials.size()),
                 m_gpuCudaContext);
             m_gpuVelocities.resize(m_nodes.size());
             m_gpuImpulses.resize(m_bonds.size());
@@ -272,13 +296,14 @@ public:
         v.lin = { velocityLinear.x, velocityLinear.y, velocityLinear.z };
     }
 
-    uint32_t addBond(uint32_t node0, uint32_t node1, const NvVec3& bondCentroid, float area = 1.0f)
+    uint32_t addBond(uint32_t node0, uint32_t node1, const NvVec3& bondCentroid, float area = 1.0f, uint32_t material = 0)
     {
         SolverBond b;
         b.nodes[0] = node0;
         b.nodes[1] = node1;
         b.centroid = { bondCentroid.x, bondCentroid.y, bondCentroid.z };
         b.area = area > 0.0f ? area : 1.0f;
+        b.material = material;
         m_bonds.pushBack(b);
         m_impulses.push_back({{0,0,0},{0,0,0}});
         m_forceColdStart = true;
@@ -293,6 +318,28 @@ public:
             m_bonds[bondIndex].area += area;
             m_forceColdStart = true;
         }
+    }
+
+    void setMaterialTable(const ExtStressMaterial* materials, uint32_t materialCount)
+    {
+        m_materials = materials;
+        m_materialCount = materialCount;
+        // The device-side table is uploaded at GPU-solver creation; force a
+        // rebuild so a changed table reaches the device. Tables change at
+        // authoring/sweep time, not per frame, so the cold start is cheap.
+        m_forceColdStart = true;
+    }
+
+    uint32_t getBondMaterial(uint32_t bondIndex) const
+    {
+        NVBLAST_ASSERT(bondIndex < m_bonds.size());
+        return m_bonds[bondIndex].material;
+    }
+
+    void setBondMaterial(uint32_t bondIndex, uint32_t material)
+    {
+        NVBLAST_ASSERT(bondIndex < m_bonds.size());
+        m_bonds[bondIndex].material = material;
     }
 
     void replaceWithLast(uint32_t bondIndex)
@@ -444,6 +491,10 @@ private:
     bool                        m_converged;
     bool                        m_forceColdStart;
     bool                        m_inputsChanged;
+    // Borrowed from the owning solver: resolved material table for the GPU
+    // damage-kernel seed. Not consumed by the CPU solve.
+    const ExtStressMaterial*    m_materials{nullptr};
+    uint32_t                    m_materialCount{0};
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
     bool                                m_gpuRequested{false};
     void*                               m_gpuCudaContext{nullptr};
@@ -451,6 +502,7 @@ private:
     ExtStressGpuSolver*                 m_gpuSolver{nullptr};
     std::vector<ExtStressGpuNode>       m_gpuNodes;
     std::vector<ExtStressGpuBond>       m_gpuBonds;
+    std::vector<ExtStressGpuMaterial>   m_gpuMaterials;
     std::vector<ExtStressGpuImpulse>    m_gpuVelocities;
     std::vector<ExtStressGpuImpulse>    m_gpuImpulses;
     std::vector<ExtStressGpuImpulse>    m_gpuLastVelocities;
@@ -686,9 +738,12 @@ public:
         }
     }
 
-    float getSolverBondStressPct(uint32_t bondIdx, const float* bondHealths, const ExtStressSolverSettings& settings, ExtStressSolver::DebugRenderMode mode) const
+    float getSolverBondStressPct(uint32_t bondIdx, const float* bondHealths, ExtStressSolver::DebugRenderMode mode) const
     {
-        // sum up the stress of all underlying bonds involved in this stress solver bond
+        // All member bonds share the group's stress values, but each maps to a
+        // percentage against its OWN material limits — so every intact member
+        // must be visited (no early break): a weak member can be near-fatal
+        // while a strong one in the same group is barely loaded.
         float compressionStress, tensionStress, shearStress;
         float stress = -1.0f;
         const auto& blastBondIndices = m_solverBondsData[bondIdx].blastBondIndices;
@@ -697,26 +752,24 @@ public:
             // only consider the stress values on bonds that are intact
             if (bondHealths[blastBondIndex] > 0.0f && getBondStress(blastBondIndex, compressionStress, tensionStress, shearStress))
             {
+                const ExtStressMaterial& material = materialForBlastBond(blastBondIndex);
                 if (mode == ExtStressSolver::STRESS_PCT_COMPRESSION || mode == ExtStressSolver::STRESS_PCT_MAX)
                 {
-                    compressionStress = mapStressToRange(compressionStress, settings.compressionElasticLimit, settings.compressionFatalLimit);
+                    compressionStress = mapStressToRange(compressionStress, material.compressionElasticLimit, material.compressionFatalLimit);
                     stress = std::max(compressionStress, stress);
                 }
 
                 if (mode == ExtStressSolver::STRESS_PCT_TENSION || mode == ExtStressSolver::STRESS_PCT_MAX)
                 {
-                    tensionStress = mapStressToRange(tensionStress, settings.tensionElasticLimit, settings.tensionFatalLimit);
+                    tensionStress = mapStressToRange(tensionStress, material.tensionElasticLimit, material.tensionFatalLimit);
                     stress = std::max(tensionStress, stress);
                 }
 
                 if (mode == ExtStressSolver::STRESS_PCT_SHEAR || mode == ExtStressSolver::STRESS_PCT_MAX)
                 {
-                    shearStress = mapStressToRange(shearStress, settings.shearElasticLimit, settings.shearFatalLimit);
+                    shearStress = mapStressToRange(shearStress, material.shearElasticLimit, material.shearFatalLimit);
                     stress = std::max(shearStress, stress);
                 }
-
-                // all bonds in the group share the same stress values, no need to keep iterating
-                break;
             }
         }
 
@@ -857,7 +910,7 @@ public:
 
         resetVelocities();
 
-        updateBondStress(settings, bondHealth, bonds);
+        updateBondStress(bondHealth, bonds);
     }
 
     bool calcError(float& linear, float& angular) const
@@ -911,7 +964,7 @@ private:
         }
     }
 
-    void updateBondStress(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds)
+    void updateBondStress(const float* bondHealth, const NvBlastBond* bonds)
     {
         m_overstressedBondCount = 0;
 
@@ -985,19 +1038,13 @@ private:
                 averageNodeDisp /= totalArea;
             }
 
-            // bonds are looked at as a whole group,
-            // so regardless of the current health of an individual one they are either all over stressed or none are
+            // The stress in a merged solver bond is shared by all member bonds
+            // (one constraint, one sigma over the summed area) — but each
+            // member fails against its OWN material limits, so overstress is
+            // counted per member rather than per group.
             float stressNormal, stressShear;
             calcSolverBondStresses(i, totalArea, averageNodeDisp.magnitude(), bondNormal, stressNormal, stressShear);
             NVBLAST_ASSERT(!std::isnan(stressNormal) && !std::isnan(stressShear));
-            if (
-                -stressNormal > settings.compressionElasticLimit ||
-                stressNormal > settings.tensionElasticLimit ||
-                stressShear > settings.shearElasticLimit
-            )
-            {
-                m_overstressedBondCount += blastBondIndices.size();
-            }
 
             // store the stress values for all the bonds involved
             for (auto blastBondIndex : blastBondIndices)
@@ -1005,6 +1052,13 @@ private:
                 const uint32_t bondIndex = m_blastBondIndexMap[blastBondIndex];
                 if (!isInvalidIndex(bondIndex) && bondHealth[blastBondIndex] > 0.0f)
                 {
+                    const ExtStressMaterial& material = materialForBlastBond(blastBondIndex);
+                    if (-stressNormal > material.compressionElasticLimit
+                        || stressNormal > material.tensionElasticLimit
+                        || stressShear > material.shearElasticLimit)
+                    {
+                        ++m_overstressedBondCount;
+                    }
                     BondData& bond = m_bondsData[bondIndex];
 
                     NVBLAST_ASSERT(getNodeData(bond.node0).solverNode != getNodeData(bond.node1).solverNode);
@@ -1272,7 +1326,10 @@ private:
                 data = &m_solverBondsData.back();
                 m_solverBondsMap[key] = m_solverBondsData.size() - 1;
 
-                m_solver.addBond(node0.solverNode, node1.solverNode, bond.centroid, bondArea);
+                const uint32_t bondMaterial =
+                    m_bondMaterials ? m_bondMaterials[bond.blastBondIndex] : 0;
+                m_solver.addBond(
+                    node0.solverNode, node1.solverNode, bond.centroid, bondArea, bondMaterial);
             }
             else
             {
@@ -1281,6 +1338,10 @@ private:
             }
             data->blastBondIndices.pushBack(bond.blastBondIndex);
         }
+        // Graph reduction can merge bonds of different materials into one
+        // solver bond; settle each group's representative to its weakest
+        // member (feeds only the GPU-side damage seed).
+        refreshGroupMaterials();
 
         m_bondsDirty = false;
     }
@@ -1376,6 +1437,69 @@ private:
 
     // Persistent scratch for updateBondStress() so it doesn't heap-allocate per solve.
     Array<uint32_t>::type               m_bondIndicesToRemove;
+
+    // Material table + per-asset-bond material indices, owned by
+    // ExtStressSolverImpl (stable storage; re-pointed whenever they change).
+    // Null until set: materialForBlastBond falls back to a default material so
+    // low-level use without a table keeps the historical 1.0/2.0 Pa behavior.
+    const ExtStressMaterial*            m_materials{nullptr};
+    uint32_t                            m_materialCount{0};
+    const uint32_t*                     m_bondMaterials{nullptr};
+
+public:
+    void setMaterialTables(
+        const ExtStressMaterial* materials,
+        uint32_t materialCount,
+        const uint32_t* bondMaterials)
+    {
+        m_materials = materials;
+        m_materialCount = materialCount;
+        m_bondMaterials = bondMaterials;
+        m_solver.setMaterialTable(materials, materialCount);
+    }
+
+    const ExtStressMaterial& materialForBlastBond(uint32_t blastBondIndex) const
+    {
+        static const ExtStressMaterial defaultMaterial = []() {
+            ExtStressMaterial resolved;
+            resolved.tensionElasticLimit = resolved.compressionElasticLimit;
+            resolved.tensionFatalLimit = resolved.compressionFatalLimit;
+            resolved.shearElasticLimit = resolved.compressionElasticLimit;
+            resolved.shearFatalLimit = resolved.compressionFatalLimit;
+            return resolved;
+        }();
+        if (!m_materials || m_materialCount == 0)
+        {
+            return defaultMaterial;
+        }
+        const uint32_t material =
+            m_bondMaterials ? m_bondMaterials[blastBondIndex] : 0;
+        return m_materials[material < m_materialCount ? material : 0];
+    }
+
+    // Re-derive each solver bond group's material as its WEAKEST member's
+    // (lowest resolved tension elastic limit). Consumed only by the GPU-side
+    // damage kernel seed; the CPU damage path reads each member's own material.
+    void refreshGroupMaterials()
+    {
+        for (uint32_t group = 0; group < m_solverBondsData.size(); ++group)
+        {
+            uint32_t weakest = 0;
+            float weakestLimit = FLT_MAX;
+            for (const uint32_t blastBondIndex : m_solverBondsData[group].blastBondIndices)
+            {
+                const uint32_t material =
+                    m_bondMaterials ? m_bondMaterials[blastBondIndex] : 0;
+                const ExtStressMaterial& resolved = materialForBlastBond(blastBondIndex);
+                if (resolved.tensionElasticLimit < weakestLimit)
+                {
+                    weakestLimit = resolved.tensionElasticLimit;
+                    weakest = material;
+                }
+            }
+            m_solver.setBondMaterial(group, weakest);
+        }
+    }
 };
 
 
@@ -1403,7 +1527,6 @@ public:
     virtual void                            setSettings(const ExtStressSolverSettings& settings) override
     {
         m_settings = settings;
-        inheritSettingsLimits();
     }
 
     virtual const ExtStressSolverSettings&  getSettings() const override
@@ -1552,6 +1675,90 @@ public:
         return count;
     }
 
+    virtual void                            setMaterials(const ExtStressMaterial* materials, uint32_t count) override
+    {
+        if (!materials || count == 0)
+        {
+            NVBLAST_LOG_ERROR("ExtStressSolver::setMaterials: at least one material is required");
+            return;
+        }
+        m_materials.resize(count);
+        for (uint32_t material = 0; material < count; ++material)
+        {
+            m_materials[material] = resolveMaterial(materials[material]);
+        }
+        // Storage may have reallocated; re-point the processor and refresh the
+        // solver-bond group materials (weakness ordering may have changed).
+        if (m_graphProcessor)
+        {
+            m_graphProcessor->setMaterialTables(
+                m_materials.data(),
+                static_cast<uint32_t>(m_materials.size()),
+                m_bondMaterials.data());
+            m_graphProcessor->refreshGroupMaterials();
+        }
+    }
+
+    virtual void                            setBondMaterials(const uint32_t* materialIndices, uint32_t bondCount) override
+    {
+        const uint32_t materialCount = static_cast<uint32_t>(m_materials.size());
+        const uint32_t count = std::min(bondCount, m_assetBondCount);
+        for (uint32_t bond = 0; bond < m_assetBondCount; ++bond)
+        {
+            const uint32_t material =
+                (materialIndices && bond < count) ? materialIndices[bond] : 0;
+            m_bondMaterials[bond] = material < materialCount ? material : 0;
+        }
+        if (m_graphProcessor)
+        {
+            m_graphProcessor->setMaterialTables(
+                m_materials.data(),
+                static_cast<uint32_t>(m_materials.size()),
+                m_bondMaterials.data());
+            m_graphProcessor->refreshGroupMaterials();
+        }
+    }
+
+    virtual uint32_t                        getBondUtilisations(float* utilisation, uint32_t capacity) const override
+    {
+        if (!utilisation)
+        {
+            return 0;
+        }
+        const uint32_t count = std::min(capacity, m_assetBondCount);
+        for (uint32_t bondIndex = 0; bondIndex < count; ++bondIndex)
+        {
+            float bondUtilisation = 0.0f;
+            float bondCompression, bondTension, bondShear;
+            if (m_bondHealths[bondIndex] > 0.0f
+                && m_graphProcessor->getBondStress(
+                    bondIndex, bondCompression, bondTension, bondShear))
+            {
+                // Divide by the BOND's own material limits: with mixed
+                // materials a global divisor would misreport every joint
+                // whose material differs from it.
+                const ExtStressMaterial& material = materialForBond(bondIndex);
+                if (material.compressionElasticLimit > 0.0f)
+                {
+                    bondUtilisation = std::max(
+                        bondUtilisation, bondCompression / material.compressionElasticLimit);
+                }
+                if (material.tensionElasticLimit > 0.0f)
+                {
+                    bondUtilisation = std::max(
+                        bondUtilisation, bondTension / material.tensionElasticLimit);
+                }
+                if (material.shearElasticLimit > 0.0f)
+                {
+                    bondUtilisation = std::max(
+                        bondUtilisation, bondShear / material.shearElasticLimit);
+                }
+            }
+            utilisation[bondIndex] = bondUtilisation;
+        }
+        return count;
+    }
+
     virtual bool                            notifyActorCreated(const NvBlastActor& actor) override;
 
     virtual void                            notifyActorDestroyed(const NvBlastActor& actor) override;
@@ -1583,28 +1790,37 @@ private:
     T*                                      getScratchArray(uint32_t size);
 
     bool                                    generateStressDamage(const NvBlastActor& actor, uint32_t bondIndex, uint32_t node0, uint32_t node1);
-    void                                    inheritSettingsLimits()
+
+    static ExtStressMaterial                resolveMaterial(const ExtStressMaterial& material)
     {
-        NVBLAST_ASSERT(m_settings.compressionElasticLimit >= 0.0f && m_settings.compressionFatalLimit >= 0.0f);
+        NVBLAST_ASSERT(material.compressionElasticLimit >= 0.0f && material.compressionFatalLimit >= 0.0f);
+        ExtStressMaterial resolved = material;
+        // Negative tension/shear limits inherit the compression values.
+        if (resolved.tensionElasticLimit < 0.0f)
+        {
+            resolved.tensionElasticLimit = resolved.compressionElasticLimit;
+        }
+        if (resolved.tensionFatalLimit < 0.0f)
+        {
+            resolved.tensionFatalLimit = resolved.compressionFatalLimit;
+        }
+        if (resolved.shearElasticLimit < 0.0f)
+        {
+            resolved.shearElasticLimit = resolved.compressionElasticLimit;
+        }
+        if (resolved.shearFatalLimit < 0.0f)
+        {
+            resolved.shearFatalLimit = resolved.compressionFatalLimit;
+        }
+        return resolved;
+    }
 
-        // check if any optional limits need to inherit from the compression values
-        if (m_settings.tensionElasticLimit < 0.0f)
-        {
-            m_settings.tensionElasticLimit = m_settings.compressionElasticLimit;
-        }
-        if (m_settings.tensionFatalLimit < 0.0f)
-        {
-            m_settings.tensionFatalLimit = m_settings.compressionFatalLimit;
-        }
-
-        if (m_settings.shearElasticLimit < 0.0f)
-        {
-            m_settings.shearElasticLimit = m_settings.compressionElasticLimit;
-        }
-        if (m_settings.shearFatalLimit < 0.0f)
-        {
-            m_settings.shearFatalLimit = m_settings.compressionFatalLimit;
-        }
+    const ExtStressMaterial&                materialForBond(uint32_t blastBondIndex) const
+    {
+        const uint32_t material = blastBondIndex < m_bondMaterials.size()
+            ? m_bondMaterials[blastBondIndex]
+            : 0;
+        return m_materials[material < m_materials.size() ? material : 0];
     }
 
 
@@ -1613,6 +1829,11 @@ private:
     const NvBlastFamily&                                                m_family;
     HashSet<const NvBlastActor*>::type                                  m_activeActors;
     ExtStressSolverSettings                                             m_settings;
+    // Resolved material table (>= 1 entry; index 0 = scene default) and the
+    // per-ASSET-bond material indices. Storage is stable between set calls so
+    // the graph processor can hold raw pointers into it.
+    std::vector<ExtStressMaterial>                                      m_materials;
+    std::vector<uint32_t>                                               m_bondMaterials;
     NvBlastSupportGraph                                                 m_graph;
     bool                                                                m_isDirty;
     bool                                                                m_reset;
@@ -1657,8 +1878,9 @@ ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtS
     m_errorAngular(std::numeric_limits<float>::max()), m_errorLinear(std::numeric_limits<float>::max()),
     m_converged(false), m_islandAware(false), m_skipSettled(false), m_framesCount(0), m_valid(false)
 {
-    // this needs to be called any time settings change, including when they are first set
-    inheritSettingsLimits();
+    // A solver always has a material table: the 1-entry default preserves the
+    // historical settings-defaults behavior for callers that never author one.
+    m_materials.push_back(resolveMaterial(ExtStressMaterial()));
 
     const NvBlastAsset* asset = NvBlastFamilyGetAsset(&m_family, logLL);
     if (!asset)
@@ -1670,6 +1892,7 @@ ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtS
     m_graph = NvBlastAssetGetSupportGraph(asset, logLL);
     const uint32_t bondCount = NvBlastAssetGetBondCount(asset, logLL);
     m_assetBondCount = bondCount;
+    m_bondMaterials.assign(bondCount, 0);
 
     m_bondFractureBuffer.reserve(bondCount);
 
@@ -1682,6 +1905,10 @@ ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtS
     }
 
     m_graphProcessor = NVBLAST_NEW(SupportGraphProcessor)(m_graph.nodeCount, bondCount);
+    m_graphProcessor->setMaterialTables(
+        m_materials.data(),
+        static_cast<uint32_t>(m_materials.size()),
+        m_bondMaterials.data());
 
     // traverse graph and fill bond info
     for (uint32_t node0 = 0; node0 < m_graph.nodeCount; ++node0)
@@ -1834,8 +2061,9 @@ bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& co
             nvidia::NvVec3 nvAngularPressure(0.0f);
 
             // deal with linear forces
-            const float excessCompression = bondData.stressNormal + m_settings.compressionFatalLimit;
-            const float excessTension = bondData.stressNormal - m_settings.tensionFatalLimit;
+            const ExtStressMaterial& bondMaterial = materialForBond(blastBondIndex);
+            const float excessCompression = bondData.stressNormal + bondMaterial.compressionFatalLimit;
+            const float excessTension = bondData.stressNormal - bondMaterial.tensionFatalLimit;
             if (excessCompression < 0.0f)
             {
                 nvLinearPressure += excessCompression * bondData.normal;
@@ -1846,7 +2074,7 @@ bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& co
                 nvLinearPressure += excessTension * bondData.normal;
             }
 
-            const float excessShear = bondData.stressShear - m_settings.shearFatalLimit;
+            const float excessShear = bondData.stressShear - bondMaterial.shearFatalLimit;
             if (excessShear > 0.0f)
             {
                 NvVec3 impulseLinear, impulseAngular;
@@ -2068,27 +2296,28 @@ bool ExtStressSolverImpl::generateStressDamage(const NvBlastActor& actor, uint32
     if (bondHealth > 0.0f && m_graphProcessor->getBondStress(bondIndex, stressCompression, stressTension, stressShear))
     {
         // compression and tension are mutually exclusive, only one can be positive at a time since they act in opposite directions
+        const ExtStressMaterial& material = materialForBond(bondIndex);
         float stressMultiplier = 0.0f;
-        if (stressCompression > m_settings.compressionElasticLimit)
+        if (stressCompression > material.compressionElasticLimit)
         {
-            const float excessStress = stressCompression - m_settings.compressionElasticLimit;
-            const float compressionDenom = m_settings.compressionFatalLimit - m_settings.compressionElasticLimit;
+            const float excessStress = stressCompression - material.compressionElasticLimit;
+            const float compressionDenom = material.compressionFatalLimit - material.compressionElasticLimit;
             const float compressionMultiplier = excessStress / (compressionDenom > 0.0f ? compressionDenom : 1.0f);
             stressMultiplier += compressionMultiplier;
         }
-        else if (stressTension > m_settings.tensionElasticLimit)
+        else if (stressTension > material.tensionElasticLimit)
         {
-            const float excessStress = stressTension - m_settings.tensionElasticLimit;
-            const float tensionDenom = m_settings.tensionFatalLimit - m_settings.tensionElasticLimit;
+            const float excessStress = stressTension - material.tensionElasticLimit;
+            const float tensionDenom = material.tensionFatalLimit - material.tensionElasticLimit;
             const float tensionMultiplier = excessStress / (tensionDenom > 0.0f ? tensionDenom : 1.0f);
             stressMultiplier += tensionMultiplier;
         }
 
         // shear can co-exist with either compression or tension so must be accounted for independently of them
-        if (stressShear > m_settings.shearElasticLimit)
+        if (stressShear > material.shearElasticLimit)
         {
-            const float excessStress = stressShear - m_settings.shearElasticLimit;
-            const float shearDenom = m_settings.shearFatalLimit - m_settings.shearElasticLimit;
+            const float excessStress = stressShear - material.shearElasticLimit;
+            const float shearDenom = material.shearFatalLimit - material.shearElasticLimit;
             const float shearMultiplier = excessStress / (shearDenom > 0.0f ? shearDenom : 1.0f);
             stressMultiplier += shearMultiplier;
         }
@@ -2262,7 +2491,7 @@ const ExtStressSolver::DebugBuffer ExtStressSolverImpl::fillDebugRender(const ui
             const NvcVec3 p1 = fromNvShared(solverNode1.mass > 0.0f ? solverNode1.localPos : bondData.centroid);
 
             // don't render lines for broken bonds
-            const float stressPct = m_graphProcessor->getSolverBondStressPct(i, m_bondHealths, m_settings, mode);
+            const float stressPct = m_graphProcessor->getSolverBondStressPct(i, m_bondHealths, mode);
             if (stressPct >= 0.0f)
             {
                 const uint32_t color = canTakeDamage(m_bondHealths[bondData.blastBondIndex]) ? bondHealthColor(stressPct) : BOND_UNBREAKABLE_COLOR;

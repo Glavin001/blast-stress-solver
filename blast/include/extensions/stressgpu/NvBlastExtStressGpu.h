@@ -22,8 +22,24 @@ struct ExtStressGpuBond
     std::uint32_t node1;
     float centroid[3];
     float normal[3];
+    // Geometry: the bond's contact patch (m^2). Strength lives in the material.
     float area{1.0f};
+    // Damage pool. Seed = area; a uniform seed makes authored strength
+    // meaningless (see the CPU-path history).
     float health{1.0f};
+    // Index into the material table handed to create().
+    std::uint32_t material{0};
+};
+
+/** Per-material stress limits (Pa), pre-resolved (no negative inheritance). */
+struct ExtStressGpuMaterial
+{
+    float compressionElasticLimit{1.0f};
+    float compressionFatalLimit{2.0f};
+    float tensionElasticLimit{1.0f};
+    float tensionFatalLimit{2.0f};
+    float shearElasticLimit{1.0f};
+    float shearFatalLimit{2.0f};
 };
 
 struct ExtStressGpuVec3
@@ -44,13 +60,9 @@ struct ExtStressGpuSolveParams
     std::uint32_t maxIterations{25};
     float tolerance{0.001f};
     bool warmStart{true};
+    // The damage kernel reads each bond's own material from the table given
+    // to create(); there are no global limits.
     bool applyDamage{false};
-    float compressionElasticLimit{1.0f};
-    float compressionFatalLimit{2.0f};
-    float tensionElasticLimit{1.0f};
-    float tensionFatalLimit{2.0f};
-    float shearElasticLimit{1.0f};
-    float shearFatalLimit{2.0f};
 };
 
 struct ExtStressGpuTelemetry
@@ -79,6 +91,8 @@ public:
         std::uint32_t nodeCount,
         const ExtStressGpuBond* bonds,
         std::uint32_t bondCount,
+        const ExtStressGpuMaterial* materials = nullptr,
+        std::uint32_t materialCount = 0,
         void* cudaContext = nullptr);
 
     virtual void release() = 0;

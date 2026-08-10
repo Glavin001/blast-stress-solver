@@ -19,20 +19,30 @@ typedef struct ExtStressNodeDesc {
 typedef struct ExtStressBondDesc {
     StressVec3 centroid;
     StressVec3 normal;
+    /* Geometry only: the bond's real contact patch in m^2. It is also the
+       damage pool. Strength is authored via `material`, never by scaling
+       area. */
     float area;
     uint32_t node0;
     uint32_t node1;
+    /* Index into the material table passed to ext_stress_solver_create. */
+    uint32_t material;
 } ExtStressBondDesc;
 
-typedef struct ExtStressSolverSettingsDesc {
-    uint32_t max_solver_iterations_per_frame;
-    uint32_t graph_reduction_level;
+/* Per-material stress limits (Pa). Negative tension/shear limits inherit the
+   corresponding compression limit (resolved inside the solver). */
+typedef struct ExtStressMaterialDesc {
     float compression_elastic_limit;
     float compression_fatal_limit;
     float tension_elastic_limit;
     float tension_fatal_limit;
     float shear_elastic_limit;
     float shear_fatal_limit;
+} ExtStressMaterialDesc;
+
+typedef struct ExtStressSolverSettingsDesc {
+    uint32_t max_solver_iterations_per_frame;
+    uint32_t graph_reduction_level;
 } ExtStressSolverSettingsDesc;
 
 typedef struct ExtStressDebugLine {
@@ -67,11 +77,32 @@ typedef struct ExtStressSplitEvent {
     uint32_t childCount;
 } ExtStressSplitEvent;
 
+/* materials may be null (with material_count 0) to get a single default
+   material — every bond must then use index 0. Any bond whose material index
+   is out of range of the effective table is an authoring error and creation
+   returns null. */
 ExtStressSolverHandle* ext_stress_solver_create(const ExtStressNodeDesc* nodes,
                                                 uint32_t node_count,
                                                 const ExtStressBondDesc* bonds,
                                                 uint32_t bond_count,
+                                                const ExtStressMaterialDesc* materials,
+                                                uint32_t material_count,
                                                 const ExtStressSolverSettingsDesc* settings);
+
+/* Replace the material table (e.g. sweep a global strength scale). Does not
+   rebuild the graph. Count must be >= 1 and must cover every bond's index. */
+uint8_t ext_stress_solver_set_materials(ExtStressSolverHandle* handle,
+                                        const ExtStressMaterialDesc* materials,
+                                        uint32_t material_count);
+
+/* Per-bond utilisation from the last update(), asset-bond-indexed: max over
+   modes of stress / that bond's OWN material elastic limit. 1/utilisation is
+   the joint's safety factor. Broken bonds read 0. Returns entries written. */
+uint32_t ext_stress_solver_get_bond_utilisations(const ExtStressSolverHandle* handle,
+                                                 float* out_utilisation,
+                                                 uint32_t capacity);
+
+uint32_t ext_stress_sizeof_material_desc(void);
 
 void ext_stress_solver_destroy(ExtStressSolverHandle* handle);
 

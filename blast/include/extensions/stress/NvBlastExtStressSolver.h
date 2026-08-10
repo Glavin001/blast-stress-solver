@@ -60,19 +60,36 @@ struct ExtStressSolverSettings
     uint32_t    maxSolverIterationsPerFrame;//!<    the maximum number of iterations to perform per frame
     uint32_t    graphReductionLevel;        //!<    graph reduction level
 
-    // stress pressure limits
-    float       compressionElasticLimit;    //!<    below this compression pressure no damage is done to bonds.  Also used as the default for shear and tension if they aren't provided.
-    float       compressionFatalLimit;      //!<    above this compression pressure the bond is immediately broken.  Also used as the default for shear and tension if they aren't provided.
-    float       tensionElasticLimit;        //!<    below this tension pressure no damage is done to bonds.  Use a negative value to fall back on compression limit.
-    float       tensionFatalLimit;          //!<    above this tension pressure the bond is immediately broken.  Use a negative value to fall back on compression limit.
-    float       shearElasticLimit;          //!<    below this shear pressure no damage is done to bonds.  Use a negative value to fall back on compression limit.
-    float       shearFatalLimit;            //!<    above this shear pressure the bond is immediately broken.  Use a negative value to fall back on compression limit.
-
     ExtStressSolverSettings() :
         maxSolverIterationsPerFrame(25),
-        graphReductionLevel(0),
+        graphReductionLevel(0)
+    {}
+};
 
-        // stress pressure limits
+/**
+A material for bonds: the stress limits (Pa) at which a joint made of this
+material yields and breaks. Strength lives here and ONLY here — bond area is
+geometry (the real contact patch, m^2) and doubles as the damage pool, so
+authoring strength through area corrupts both the stress readout and the
+effective toughness. Assign per-bond material indices instead.
+
+Ductility is the width of the (fatal - elastic) band: a wide band takes
+partial damage over many frames (concrete with rebar), a narrow band snaps
+(glass, drywall tape).
+
+Negative tension/shear limits inherit the corresponding compression limit,
+resolved when the table is set on the solver.
+*/
+struct ExtStressMaterial
+{
+    float compressionElasticLimit;  //!< below this compression pressure no damage occurs
+    float compressionFatalLimit;    //!< above this compression pressure the bond breaks outright
+    float tensionElasticLimit;      //!< < 0 inherits compression
+    float tensionFatalLimit;        //!< < 0 inherits compression
+    float shearElasticLimit;        //!< < 0 inherits compression
+    float shearFatalLimit;          //!< < 0 inherits compression
+
+    ExtStressMaterial() :
         compressionElasticLimit(1.0f),
         compressionFatalLimit(2.0f),
         tensionElasticLimit(-1.0f),
@@ -172,6 +189,43 @@ public:
     \return the pointer to stress solver settings currently set.
     */
     virtual const ExtStressSolverSettings&  getSettings() const = 0;
+
+    /**
+    Set the material table. Negative tension/shear limits are resolved to the
+    corresponding compression limit at set-time. A solver that never receives a
+    table behaves as if it had a 1-entry table of default ExtStressMaterial.
+
+    Replacing the table is cheap and can be done every frame (e.g. to sweep a
+    global strength scale); it does not rebuild the graph.
+
+    \param[in] materials    Array of materials. Index 0 is the scene default.
+    \param[in] count        Number of materials, >= 1.
+    */
+    virtual void                            setMaterials(const ExtStressMaterial* materials, uint32_t count) = 0;
+
+    /**
+    Assign each ASSET bond (indexed as in NvBlastAssetGetBonds) a material from
+    the table. Out-of-range indices clamp to 0. Passing null resets all bonds
+    to material 0.
+
+    \param[in] materialIndices  Array of at least `bondCount` indices, or null.
+    \param[in] bondCount        Number of entries provided.
+    */
+    virtual void                            setBondMaterials(const uint32_t* materialIndices, uint32_t bondCount) = 0;
+
+    /**
+    Read back per-bond utilisation from the last update(), indexed by ASSET
+    bond index: max over stress modes of (stress / that bond's own material
+    ELASTIC limit). 1/utilisation is the joint's safety factor. Using this
+    instead of dividing getBondStresses by hand guarantees the division uses
+    the bond's material rather than any global value. Broken bonds read 0.
+
+    \param[out] utilisation  Array of at least `capacity` floats.
+    \param[in]  capacity     Entries available.
+
+    \return entries written (min of capacity and the asset's bond count).
+    */
+    virtual uint32_t                        getBondUtilisations(float* utilisation, uint32_t capacity) const = 0;
 
     /**
     Notify stress solver on newly created actor.

@@ -423,16 +423,13 @@ __global__ void applyStressDamage(
     const Vec4* normals,
     const float* areas,
     const float* nodeDistances,
+    const std::uint32_t* bondMaterials,
+    const ExtStressGpuMaterial* materials,
+    std::uint32_t materialCount,
     float* health,
     std::uint32_t* brokenBonds,
     std::uint32_t* brokenCount,
-    std::uint32_t bondCount,
-    float compressionElastic,
-    float compressionFatal,
-    float tensionElastic,
-    float tensionFatal,
-    float shearElastic,
-    float shearFatal)
+    std::uint32_t bondCount)
 {
     const std::uint32_t bond = blockIdx.x * blockDim.x + threadIdx.x;
     if (bond >= bondCount || health[bond] <= 0.0f)
@@ -470,26 +467,32 @@ __global__ void applyStressDamage(
     stressShear += twist * 2.0f / distance;
     stressNormal += copysignf(bend * 2.0f / distance, stressNormal);
 
+    // Each bond fails against its OWN material. The table is tiny and
+    // L2-resident; a plain global read is sufficient.
+    const std::uint32_t materialIndex = bondMaterials[bond];
+    const ExtStressGpuMaterial material =
+        materials[materialIndex < materialCount ? materialIndex : 0];
+
     const float compression = fmaxf(0.0f, -stressNormal);
     const float tension = fmaxf(0.0f, stressNormal);
     float multiplier = 0.0f;
-    if (compression > compressionElastic)
+    if (compression > material.compressionElasticLimit)
     {
         multiplier +=
-            (compression - compressionElastic)
-            / fmaxf(compressionFatal - compressionElastic, 1.0f);
+            (compression - material.compressionElasticLimit)
+            / fmaxf(material.compressionFatalLimit - material.compressionElasticLimit, 1.0f);
     }
-    if (tension > tensionElastic)
+    if (tension > material.tensionElasticLimit)
     {
         multiplier +=
-            (tension - tensionElastic)
-            / fmaxf(tensionFatal - tensionElastic, 1.0f);
+            (tension - material.tensionElasticLimit)
+            / fmaxf(material.tensionFatalLimit - material.tensionElasticLimit, 1.0f);
     }
-    if (stressShear > shearElastic)
+    if (stressShear > material.shearElasticLimit)
     {
         multiplier +=
-            (stressShear - shearElastic)
-            / fmaxf(shearFatal - shearElastic, 1.0f);
+            (stressShear - material.shearElasticLimit)
+            / fmaxf(material.shearFatalLimit - material.shearElasticLimit, 1.0f);
     }
     if (multiplier <= 0.0f)
     {
@@ -517,11 +520,24 @@ public:
         std::uint32_t nodeCount,
         const ExtStressGpuBond* bonds,
         std::uint32_t bondCount,
+        const ExtStressGpuMaterial* materials,
+        std::uint32_t materialCount,
         CUcontext cudaContext)
         : m_nodeCount(nodeCount)
         , m_bondCount(bondCount)
         , m_cudaContext(cudaContext)
     {
+        // A solver always has a material table; default = one entry with the
+        // struct's defaults so limit-free callers keep historical behavior.
+        if (materials && materialCount > 0)
+        {
+            m_hostMaterials.assign(materials, materials + materialCount);
+        }
+        else
+        {
+            m_hostMaterials.assign(1, ExtStressGpuMaterial());
+        }
+        m_materialCount = static_cast<std::uint32_t>(m_hostMaterials.size());
         ContextGuard context(m_cudaContext);
         prepare(nodes, bonds);
         allocate();
@@ -569,6 +585,8 @@ public:
         cudaFree(m_brokenBonds);
         cudaFree(m_health);
         cudaFree(m_nodeDistances);
+        cudaFree(m_materials);
+        cudaFree(m_bondMaterials);
         cudaFree(m_areas);
         cudaFree(m_normals);
         cudaFree(m_inertia);
@@ -816,6 +834,7 @@ private:
         m_hostAreas.resize(m_bondCount);
         m_hostNodeDistances.resize(m_bondCount);
         m_hostHealth.resize(m_bondCount);
+        m_hostBondMaterials.resize(m_bondCount);
 
         double logMass = 0.0;
         std::uint32_t massCount = 0;
@@ -881,6 +900,8 @@ private:
             m_hostAreas[i] = bonds[i].area > 0.0f ? bonds[i].area : 1.0f;
             m_hostNodeDistances[i] = distance > 1.0e-6f ? distance : 1.0f;
             m_hostHealth[i] = std::max(0.0f, bonds[i].health);
+            m_hostBondMaterials[i] =
+                bonds[i].material < m_materialCount ? bonds[i].material : 0;
             Vec4 offset0{};
             Vec4 offset1{};
             if (first.mass <= 0.0f)
@@ -957,6 +978,8 @@ private:
         allocateDevice(m_inertia, m_nodeCount, "allocate inertia");
         allocateDevice(m_normals, m_bondCount, "allocate normals");
         allocateDevice(m_areas, m_bondCount, "allocate areas");
+        allocateDevice(m_bondMaterials, m_bondCount, "allocate bond materials");
+        allocateDevice(m_materials, m_materialCount, "allocate material table");
         allocateDevice(m_nodeDistances, m_bondCount, "allocate node distances");
         allocateDevice(m_health, m_bondCount, "allocate health");
         allocateDevice(m_brokenBonds, m_bondCount, "allocate broken bonds");
@@ -1068,6 +1091,20 @@ private:
                 sizeof(float) * m_bondCount,
                 cudaMemcpyHostToDevice),
             "upload health");
+        checkCuda(
+            cudaMemcpy(
+                m_bondMaterials,
+                m_hostBondMaterials.data(),
+                sizeof(std::uint32_t) * m_bondCount,
+                cudaMemcpyHostToDevice),
+            "upload bond materials");
+        checkCuda(
+            cudaMemcpy(
+                m_materials,
+                m_hostMaterials.data(),
+                sizeof(ExtStressGpuMaterial) * m_materialCount,
+                cudaMemcpyHostToDevice),
+            "upload material table");
     }
 
     void reduce(const AngLin* values, std::uint32_t count, float* result)
@@ -1254,16 +1291,13 @@ private:
                 m_normals,
                 m_areas,
                 m_nodeDistances,
+                m_bondMaterials,
+                m_materials,
+                m_materialCount,
                 m_health,
                 m_brokenBonds,
                 m_brokenCount,
-                m_bondCount,
-                params.compressionElasticLimit,
-                params.compressionFatalLimit,
-                params.tensionElasticLimit,
-                params.tensionFatalLimit,
-                params.shearElasticLimit,
-                params.shearFatalLimit);
+                m_bondCount);
         }
     }
 
@@ -1273,13 +1307,7 @@ private:
             && m_graphWarmStart == warmStart
             && m_graphParams.maxIterations == params.maxIterations
             && m_graphParams.tolerance == params.tolerance
-            && m_graphParams.applyDamage == params.applyDamage
-            && m_graphParams.compressionElasticLimit == params.compressionElasticLimit
-            && m_graphParams.compressionFatalLimit == params.compressionFatalLimit
-            && m_graphParams.tensionElasticLimit == params.tensionElasticLimit
-            && m_graphParams.tensionFatalLimit == params.tensionFatalLimit
-            && m_graphParams.shearElasticLimit == params.shearElasticLimit
-            && m_graphParams.shearFatalLimit == params.shearFatalLimit;
+            && m_graphParams.applyDamage == params.applyDamage;
     }
 
     void executeSolve(const ExtStressGpuSolveParams& params)
@@ -1330,6 +1358,8 @@ private:
     std::vector<float> m_hostAreas;
     std::vector<float> m_hostNodeDistances;
     std::vector<float> m_hostHealth;
+    std::vector<std::uint32_t> m_hostBondMaterials;
+    std::vector<ExtStressGpuMaterial> m_hostMaterials;
 
     std::uint32_t* m_node0{nullptr};
     std::uint32_t* m_node1{nullptr};
@@ -1340,6 +1370,9 @@ private:
     float* m_areas{nullptr};
     float* m_nodeDistances{nullptr};
     float* m_health{nullptr};
+    std::uint32_t* m_bondMaterials{nullptr};
+    ExtStressGpuMaterial* m_materials{nullptr};
+    std::uint32_t m_materialCount{0};
     std::uint32_t* m_brokenBonds{nullptr};
     std::uint32_t* m_brokenCount{nullptr};
     ExtStressGpuImpulse* m_input{nullptr};
@@ -1381,6 +1414,8 @@ ExtStressGpuSolver* ExtStressGpuSolver::create(
     std::uint32_t nodeCount,
     const ExtStressGpuBond* bonds,
     std::uint32_t bondCount,
+    const ExtStressGpuMaterial* materials,
+    std::uint32_t materialCount,
     void* cudaContext)
 {
     if (!nodes || !bonds || nodeCount == 0 || bondCount == 0)
@@ -1394,6 +1429,8 @@ ExtStressGpuSolver* ExtStressGpuSolver::create(
             nodeCount,
             bonds,
             bondCount,
+            materials,
+            materialCount,
             reinterpret_cast<CUcontext>(cudaContext));
     }
     catch (...)

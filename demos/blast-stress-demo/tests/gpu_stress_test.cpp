@@ -156,12 +156,25 @@ int main()
         static_cast<std::uint32_t>(cpuBonds.size()),
         dataParams);
 
+    // Damage limits are per-material now. This equivalence test uses one
+    // material so every bond fails at the same threshold; the second entry
+    // exists only to prove out-of-table indices are not silently accepted.
+    std::vector<Nv::Blast::ExtStressGpuMaterial> gpuMaterials(1);
+    gpuMaterials[0].compressionElasticLimit = 0.0f;
+    gpuMaterials[0].compressionFatalLimit = 0.001f;
+    gpuMaterials[0].tensionElasticLimit = 0.0f;
+    gpuMaterials[0].tensionFatalLimit = 0.001f;
+    gpuMaterials[0].shearElasticLimit = 0.0f;
+    gpuMaterials[0].shearFatalLimit = 0.001f;
+
     std::unique_ptr<ExtStressGpuSolver, SolverDeleter> gpu(
         ExtStressGpuSolver::create(
             gpuNodes.data(),
             static_cast<std::uint32_t>(gpuNodes.size()),
             gpuBonds.data(),
-            static_cast<std::uint32_t>(gpuBonds.size())));
+            static_cast<std::uint32_t>(gpuBonds.size()),
+            gpuMaterials.data(),
+            static_cast<std::uint32_t>(gpuMaterials.size())));
     if (!gpu)
     {
         std::cerr << "failed to create GPU stress solver\n";
@@ -239,12 +252,6 @@ int main()
 
     setLoads(25.0f);
     gpuParams.applyDamage = true;
-    gpuParams.compressionElasticLimit = 0.0f;
-    gpuParams.compressionFatalLimit = 0.001f;
-    gpuParams.tensionElasticLimit = 0.0f;
-    gpuParams.tensionFatalLimit = 0.001f;
-    gpuParams.shearElasticLimit = 0.0f;
-    gpuParams.shearFatalLimit = 0.001f;
     if (!gpu->solve(gpuVelocities.data(), gpuParams))
     {
         return 1;

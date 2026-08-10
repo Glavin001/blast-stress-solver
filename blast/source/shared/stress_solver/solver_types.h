@@ -70,6 +70,13 @@ struct SolverBond
     NvcVec3     centroid;
     uint32_t    nodes[2];   // Index into accompanying SolverNode<InertiaType> array.
     // Contact area used when converting solved impulses to stress (pressure).
-    // Authoring stronger joints (larger area) lowers stress for the same force.
+    // Area is GEOMETRY: the real contact patch. Strength is authored through
+    // the material, never by inflating area.
     float       area{1.0f};
+    // Material index into the solver's ExtStressMaterial table. When graph
+    // reduction merges bonds of different materials into one solver bond,
+    // this holds the WEAKEST member's material (conservative; only the
+    // unwired on-device damage path consumes it — the CPU damage path looks
+    // up each member bond's own material).
+    uint32_t    material{0};
 };

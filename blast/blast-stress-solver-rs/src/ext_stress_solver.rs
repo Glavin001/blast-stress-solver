@@ -38,10 +38,14 @@ impl ExtStressSolver {
                 area: b.area,
                 node0: b.node0,
                 node1: b.node1,
+                // This crate exposes a single global strength; every bond uses
+                // material 0 of the one-entry table built below.
+                material: 0,
             })
             .collect();
 
         let ffi_settings = to_ffi_settings(settings);
+        let ffi_materials = to_ffi_materials(settings);
 
         let handle = unsafe {
             ffi::ext_stress_solver_create(
@@ -49,6 +53,8 @@ impl ExtStressSolver {
                 ffi_nodes.len() as u32,
                 ffi_bonds.as_ptr(),
                 ffi_bonds.len() as u32,
+                ffi_materials.as_ptr(),
+                ffi_materials.len() as u32,
                 &ffi_settings,
             )
         };
@@ -485,11 +491,19 @@ fn to_ffi_settings(s: &SolverSettings) -> ffi::FfiExtStressSolverSettingsDesc {
     ffi::FfiExtStressSolverSettingsDesc {
         max_solver_iterations_per_frame: s.max_solver_iterations_per_frame,
         graph_reduction_level: s.graph_reduction_level,
+    }
+}
+
+/// Stress limits moved from settings to a per-bond material table. This crate
+/// still exposes one global strength, so it builds a single-entry table and
+/// leaves every bond on material 0 — identical behavior to before the split.
+fn to_ffi_materials(s: &SolverSettings) -> [ffi::FfiExtStressMaterialDesc; 1] {
+    [ffi::FfiExtStressMaterialDesc {
         compression_elastic_limit: s.compression_elastic_limit,
         compression_fatal_limit: s.compression_fatal_limit,
         tension_elastic_limit: s.tension_elastic_limit,
         tension_fatal_limit: s.tension_fatal_limit,
         shear_elastic_limit: s.shear_elastic_limit,
         shear_fatal_limit: s.shear_fatal_limit,
-    }
+    }]
 }

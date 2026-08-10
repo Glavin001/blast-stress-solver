@@ -97,9 +97,13 @@ struct ExtStressPhysXBondDesc
 {
     physx::PxVec3 centroid;
     physx::PxVec3 normal;
+    // Geometry only: the real contact patch (m^2), which is also the damage
+    // pool. Strength is authored through `material`, never by scaling area.
     float area;
     uint32_t node0;
     uint32_t node1;
+    // Index into ExtStressPhysXDesc::stressMaterials.
+    uint32_t material;
 
     ExtStressPhysXBondDesc()
         : centroid(0.0f)
@@ -107,6 +111,7 @@ struct ExtStressPhysXBondDesc
         , area(1.0f)
         , node0(0)
         , node1(0)
+        , material(0)
     {
     }
 };
@@ -115,12 +120,6 @@ struct ExtStressPhysXSettings
 {
     uint32_t maxSolverIterationsPerFrame;
     uint32_t graphReductionLevel;
-    float compressionElasticLimit;
-    float compressionFatalLimit;
-    float tensionElasticLimit;
-    float tensionFatalLimit;
-    float shearElasticLimit;
-    float shearFatalLimit;
     bool islandAware;
     bool skipSettledIslands;
     bool gpuStressSolver;
@@ -152,12 +151,6 @@ struct ExtStressPhysXSettings
     ExtStressPhysXSettings()
         : maxSolverIterationsPerFrame(25)
         , graphReductionLevel(0)
-        , compressionElasticLimit(1.0f)
-        , compressionFatalLimit(2.0f)
-        , tensionElasticLimit(-1.0f)
-        , tensionFatalLimit(-1.0f)
-        , shearElasticLimit(-1.0f)
-        , shearFatalLimit(-1.0f)
         , islandAware(true)
         , skipSettledIslands(true)
         , gpuStressSolver(false)
@@ -281,6 +274,32 @@ struct ExtStressPhysXSplitContinuity
 using ExtStressPhysXErrorCallback =
     void (*)(ExtStressPhysXError error, uint32_t nodeIndex, const char* message, void* userData);
 
+/**
+Per-material stress limits (Pa) for bonds. Negative tension/shear limits
+inherit the corresponding compression limit. Ductility is the width of the
+(fatal - elastic) band. Strength lives here and only here — see
+ExtStressPhysXBondDesc::area.
+*/
+struct ExtStressPhysXMaterial
+{
+    float compressionElasticLimit;
+    float compressionFatalLimit;
+    float tensionElasticLimit;
+    float tensionFatalLimit;
+    float shearElasticLimit;
+    float shearFatalLimit;
+
+    ExtStressPhysXMaterial()
+        : compressionElasticLimit(1.0f)
+        , compressionFatalLimit(2.0f)
+        , tensionElasticLimit(-1.0f)
+        , tensionFatalLimit(-1.0f)
+        , shearElasticLimit(-1.0f)
+        , shearFatalLimit(-1.0f)
+    {
+    }
+};
+
 struct ExtStressPhysXDesc
 {
     physx::PxPhysics* physics;
@@ -291,6 +310,10 @@ struct ExtStressPhysXDesc
     uint32_t nodeCount;
     const ExtStressPhysXBondDesc* bonds;
     uint32_t bondCount;
+    // Required, >= 1 entry; index 0 is the structure default. Every bond's
+    // material index must be inside this table (create fails otherwise).
+    const ExtStressPhysXMaterial* stressMaterials;
+    uint32_t stressMaterialCount;
     physx::PxTransform worldTransform;
     ExtStressPhysXSettings settings;
     ExtStressPhysXErrorCallback errorCallback;
@@ -305,6 +328,8 @@ struct ExtStressPhysXDesc
         , nodeCount(0)
         , bonds(nullptr)
         , bondCount(0)
+        , stressMaterials(nullptr)
+        , stressMaterialCount(0)
         , worldTransform(physx::PxIdentity)
         , errorCallback(nullptr)
         , errorUserData(nullptr)
@@ -380,6 +405,19 @@ public:
         float* compression,
         float* tension,
         float* shear,
+        uint32_t capacity) const = 0;
+
+    /**
+     * Per-bond utilisation from the last solve, authored-bond-indexed: the max
+     * over stress modes of stress divided by THAT bond's own material elastic
+     * limit. 1/utilisation is the joint's safety factor.
+     *
+     * Prefer this over dividing getBondStresses by hand — with a mixed-material
+     * structure there is no single correct divisor, and using one silently
+     * misreports every joint whose material differs from it.
+     */
+    virtual uint32_t getBondUtilisations(
+        float* utilisation,
         uint32_t capacity) const = 0;
 
     /**

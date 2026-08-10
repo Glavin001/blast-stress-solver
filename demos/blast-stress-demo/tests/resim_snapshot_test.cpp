@@ -113,8 +113,11 @@ ExtStressPhysXDestructible* createStack(
     desc.settings.minimumSeparationVelocity = 0.0f;
     // Far above the ~500 N self-weight load, far below the synthetic
     // fracture impulse: gravity settles, the queued contact splits.
-    desc.settings.compressionElasticLimit = 1.0e6f;
-    desc.settings.compressionFatalLimit = 2.0e6f;
+    ExtStressPhysXMaterial material;
+    material.compressionElasticLimit = 1.0e6f;
+    material.compressionFatalLimit = 2.0e6f;
+    desc.stressMaterials = &material;
+    desc.stressMaterialCount = 1;
     ExtStressPhysXTelemetry failure;
     ExtStressPhysXDestructible* destructible =
         ExtStressPhysXDestructible::create(desc, &failure);

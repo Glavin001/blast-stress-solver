@@ -96,6 +96,11 @@ ExtStressPhysXDestructible* createStack(
     desc.worldTransform = pose;
     desc.settings.applyExcessForces = false;
     desc.settings.minimumSeparationVelocity = 0.0f;
+    // Default material: 1/2 Pa limits, so self-weight alone is fatal — this
+    // test is about scoped-vs-full resim equivalence, not capacity.
+    static const ExtStressPhysXMaterial material;
+    desc.stressMaterials = &material;
+    desc.stressMaterialCount = 1;
     desc.settings.idleSkip = true;
     desc.settings.baseStepSleep = baseStepSleep;
     desc.settings.settledLinearSpeed = 0.15f;

@@ -144,9 +144,25 @@ pub(crate) struct FfiExtStressNodeDesc {
 pub(crate) struct FfiExtStressBondDesc {
     pub centroid: Vec3,
     pub normal: Vec3,
+    /// Geometry only: the real contact patch (m^2), which is also the damage
+    /// pool. Strength is authored via `material`, never by scaling area.
     pub area: f32,
     pub node0: u32,
     pub node1: u32,
+    /// Index into the material table passed to `ext_stress_solver_create`.
+    pub material: u32,
+}
+
+/// Per-material stress limits (Pa). Negative tension/shear inherit compression.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FfiExtStressMaterialDesc {
+    pub compression_elastic_limit: f32,
+    pub compression_fatal_limit: f32,
+    pub tension_elastic_limit: f32,
+    pub tension_fatal_limit: f32,
+    pub shear_elastic_limit: f32,
+    pub shear_fatal_limit: f32,
 }
 
 #[repr(C)]
@@ -154,12 +170,6 @@ pub(crate) struct FfiExtStressBondDesc {
 pub(crate) struct FfiExtStressSolverSettingsDesc {
     pub max_solver_iterations_per_frame: u32,
     pub graph_reduction_level: u32,
-    pub compression_elastic_limit: f32,
-    pub compression_fatal_limit: f32,
-    pub tension_elastic_limit: f32,
-    pub tension_fatal_limit: f32,
-    pub shear_elastic_limit: f32,
-    pub shear_fatal_limit: f32,
 }
 
 #[repr(C)]
@@ -201,8 +211,16 @@ extern "C" {
         node_count: u32,
         bonds: *const FfiExtStressBondDesc,
         bond_count: u32,
+        materials: *const FfiExtStressMaterialDesc,
+        material_count: u32,
         settings: *const FfiExtStressSolverSettingsDesc,
     ) -> *mut ExtStressSolverHandle;
+
+    pub(crate) fn ext_stress_solver_get_bond_utilisations(
+        handle: *const ExtStressSolverHandle,
+        out_utilisation: *mut f32,
+        capacity: u32,
+    ) -> u32;
 
     pub(crate) fn ext_stress_solver_destroy(handle: *mut ExtStressSolverHandle);
 

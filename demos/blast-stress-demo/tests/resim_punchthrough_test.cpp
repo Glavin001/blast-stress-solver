@@ -156,12 +156,15 @@ ExtStressPhysXDestructible* createFacade(
     desc.settings.applyExcessForces = false;
     desc.settings.minimumSeparationVelocity = 0.0f;
     desc.settings.maximumBodies = maximumBodies;
-    desc.settings.compressionElasticLimit = 5.0e5f;
-    desc.settings.compressionFatalLimit = 1.5e6f;
-    desc.settings.tensionElasticLimit = 5.0e5f;
-    desc.settings.tensionFatalLimit = 1.5e6f;
-    desc.settings.shearElasticLimit = 5.0e5f;
-    desc.settings.shearFatalLimit = 1.5e6f;
+    ExtStressPhysXMaterial material;
+    material.compressionElasticLimit = 5.0e5f;
+    material.compressionFatalLimit = 1.5e6f;
+    material.tensionElasticLimit = 5.0e5f;
+    material.tensionFatalLimit = 1.5e6f;
+    material.shearElasticLimit = 5.0e5f;
+    material.shearFatalLimit = 1.5e6f;
+    desc.stressMaterials = &material;
+    desc.stressMaterialCount = 1;
     ExtStressPhysXTelemetry failure;
     ExtStressPhysXDestructible* destructible =
         ExtStressPhysXDestructible::create(desc, &failure);

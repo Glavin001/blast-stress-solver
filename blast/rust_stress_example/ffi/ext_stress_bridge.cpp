@@ -171,13 +171,19 @@ inline ExtStressSolverSettings toSettings(const ExtStressSolverSettingsDesc* set
 
     settings.maxSolverIterationsPerFrame = settingsDesc->max_solver_iterations_per_frame;
     settings.graphReductionLevel = settingsDesc->graph_reduction_level;
-    settings.compressionElasticLimit = settingsDesc->compression_elastic_limit;
-    settings.compressionFatalLimit = settingsDesc->compression_fatal_limit;
-    settings.tensionElasticLimit = settingsDesc->tension_elastic_limit;
-    settings.tensionFatalLimit = settingsDesc->tension_fatal_limit;
-    settings.shearElasticLimit = settingsDesc->shear_elastic_limit;
-    settings.shearFatalLimit = settingsDesc->shear_fatal_limit;
     return settings;
+}
+
+inline ExtStressMaterial toMaterial(const ExtStressMaterialDesc& desc)
+{
+    ExtStressMaterial material;
+    material.compressionElasticLimit = desc.compression_elastic_limit;
+    material.compressionFatalLimit = desc.compression_fatal_limit;
+    material.tensionElasticLimit = desc.tension_elastic_limit;
+    material.tensionFatalLimit = desc.tension_fatal_limit;
+    material.shearElasticLimit = desc.shear_elastic_limit;
+    material.shearFatalLimit = desc.shear_fatal_limit;
+    return material;
 }
 
 extern "C" uint32_t ext_stress_sizeof_actor()
@@ -311,11 +317,30 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
                         uint32_t node_count,
                         const ExtStressBondDesc* bonds,
                         uint32_t bond_count,
+                        const ExtStressMaterialDesc* materials,
+                        uint32_t material_count,
                         const ExtStressSolverSettingsDesc* settingsDesc)
 {
     if (!nodes || node_count == 0U || !bonds || bond_count == 0U)
     {
         return nullptr;
+    }
+    // Every bond must reference a material inside the effective table (one
+    // default entry when no table is supplied). An out-of-range index is an
+    // authoring error, reported loudly rather than clamped into silence.
+    const uint32_t effectiveMaterialCount =
+        (materials && material_count > 0U) ? material_count : 1U;
+    for (uint32_t i = 0; i < bond_count; ++i)
+    {
+        if (bonds[i].material >= effectiveMaterialCount)
+        {
+            kLogFn(
+                NvBlastMessage::Error,
+                "ext_stress_solver_create: bond material index out of range",
+                __FILE__,
+                __LINE__);
+            return nullptr;
+        }
     }
 
     ExtStressSolverHandleImpl* handle = new (std::nothrow) ExtStressSolverHandleImpl();
@@ -413,10 +438,10 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
     }
 
     NvBlastActorDesc actorDesc{};
-    // Bond health is remaining contact area. Seed each bond from its authored
-    // area so strong frame joints (large area) take far more damage to break
-    // than facade clips. Uniform health=1 made every joint equally fragile and
-    // erased the civil load-path hierarchy under GPU and CPU stress alike.
+    // Bond health is remaining contact area — pure geometry. Strength is the
+    // per-bond material's limits; ductility is that material's elastic->fatal
+    // band. Uniform health=1 once made every joint equally fragile regardless
+    // of authored area; do not reintroduce it.
     std::vector<float> initialBondHealths(bond_count);
     for (uint32_t i = 0; i < bond_count; ++i)
     {
@@ -447,6 +472,24 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
     {
         releaseHandle(handle);
         return nullptr;
+    }
+
+    if (materials && material_count > 0U)
+    {
+        std::vector<ExtStressMaterial> table(material_count);
+        for (uint32_t i = 0; i < material_count; ++i)
+        {
+            table[i] = toMaterial(materials[i]);
+        }
+        handle->solver->setMaterials(table.data(), material_count);
+    }
+    {
+        std::vector<uint32_t> bondMaterials(bond_count);
+        for (uint32_t i = 0; i < bond_count; ++i)
+        {
+            bondMaterials[i] = bonds[i].material;
+        }
+        handle->solver->setBondMaterials(bondMaterials.data(), bond_count);
     }
 
     const NvBlastSupportGraph supportGraph = NvBlastAssetGetSupportGraph(handle->asset, kLogFn);
@@ -777,6 +820,43 @@ ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* handlePtr
 {
     const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
     return (handle && handle->solver) ? handle->solver->getOverstressedBondCount() : 0U;
+}
+
+extern "C" uint8_t
+ext_stress_solver_set_materials(ExtStressSolverHandle* handlePtr,
+                                const ExtStressMaterialDesc* materials,
+                                uint32_t material_count)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || !materials || material_count == 0U)
+    {
+        return 0;
+    }
+    std::vector<ExtStressMaterial> table(material_count);
+    for (uint32_t i = 0; i < material_count; ++i)
+    {
+        table[i] = toMaterial(materials[i]);
+    }
+    handle->solver->setMaterials(table.data(), material_count);
+    return 1;
+}
+
+extern "C" uint32_t
+ext_stress_solver_get_bond_utilisations(const ExtStressSolverHandle* handlePtr,
+                                        float* out_utilisation,
+                                        uint32_t capacity)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0U;
+    }
+    return handle->solver->getBondUtilisations(out_utilisation, capacity);
+}
+
+extern "C" uint32_t ext_stress_sizeof_material_desc(void)
+{
+    return static_cast<uint32_t>(sizeof(ExtStressMaterialDesc));
 }
 
 extern "C" uint32_t

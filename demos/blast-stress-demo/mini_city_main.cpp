@@ -99,9 +99,30 @@ struct BuildingVariant
     ScenePack pack;
     std::vector<ExtStressPhysXNodeDesc> nodes;
     std::vector<ExtStressPhysXBondDesc> bonds;
+    // Adapter material table for this structure. Until packs author their own
+    // tables (schema v2), this is a single material built from the pack's
+    // global stress limits scaled by --stress-limit-scale.
+    std::vector<Nv::Blast::ExtStressPhysXMaterial> materials;
     std::uint32_t floors{0};
     float height{0.0f};
 };
+
+std::vector<Nv::Blast::ExtStressPhysXMaterial> makeMaterialTable(
+    const ScenePack& pack,
+    float stressLimitScale)
+{
+    Nv::Blast::ExtStressPhysXMaterial material;
+    material.compressionElasticLimit =
+        pack.stressLimits.compressionElastic * stressLimitScale;
+    material.compressionFatalLimit =
+        pack.stressLimits.compressionFatal * stressLimitScale;
+    material.tensionElasticLimit =
+        pack.stressLimits.tensionElastic * stressLimitScale;
+    material.tensionFatalLimit = pack.stressLimits.tensionFatal * stressLimitScale;
+    material.shearElasticLimit = pack.stressLimits.shearElastic * stressLimitScale;
+    material.shearFatalLimit = pack.stressLimits.shearFatal * stressLimitScale;
+    return {material};
+}
 
 struct BuildingInstance
 {
@@ -1209,7 +1230,8 @@ ScenePack truncateToFloors(
 
 std::vector<BuildingVariant> makeBuildingVariants(
     const ScenePack& source,
-    bool variedBuildingHeights)
+    bool variedBuildingHeights,
+    float stressLimitScale)
 {
     constexpr std::uint32_t maximumFloors = 3;
     const std::uint32_t firstFloor = variedBuildingHeights ? 1 : maximumFloors;
@@ -1220,6 +1242,7 @@ std::vector<BuildingVariant> makeBuildingVariants(
         variant.pack = truncateToFloors(source, floors, maximumFloors);
         variant.nodes = makeNodeDescs(variant.pack);
         variant.bonds = makeBondDescs(variant.pack);
+        variant.materials = makeMaterialTable(variant.pack, stressLimitScale);
         variant.floors = floors;
         for (const SceneNode& node : variant.pack.nodes)
         {
@@ -2198,11 +2221,11 @@ int run(const Options& options)
 
     const ScenePack pack = loadScenePack(options.scenePath);
     const std::vector<BuildingVariant> variants =
-        makeBuildingVariants(pack, options.variedBuildingHeights);
+        makeBuildingVariants(pack, options.variedBuildingHeights, options.stressLimitScale);
     if (options.selfTest)
     {
         const std::vector<BuildingVariant> testVariants =
-            makeBuildingVariants(pack, true);
+            makeBuildingVariants(pack, true, options.stressLimitScale);
         requireContract(testVariants.size() == 3, "skyline must expose three floor variants");
         for (std::size_t i = 0; i < testVariants.size(); ++i)
         {
@@ -2351,18 +2374,9 @@ int run(const Options& options)
         desc.bonds = variant.bonds.data();
         desc.bondCount = static_cast<std::uint32_t>(variant.bonds.size());
         desc.worldTransform = PxTransform(building.offset);
-        desc.settings.compressionElasticLimit =
-            pack.stressLimits.compressionElastic * options.stressLimitScale;
-        desc.settings.compressionFatalLimit =
-            pack.stressLimits.compressionFatal * options.stressLimitScale;
-        desc.settings.tensionElasticLimit =
-            pack.stressLimits.tensionElastic * options.stressLimitScale;
-        desc.settings.tensionFatalLimit =
-            pack.stressLimits.tensionFatal * options.stressLimitScale;
-        desc.settings.shearElasticLimit =
-            pack.stressLimits.shearElastic * options.stressLimitScale;
-        desc.settings.shearFatalLimit =
-            pack.stressLimits.shearFatal * options.stressLimitScale;
+        desc.stressMaterials = variant.materials.data();
+        desc.stressMaterialCount =
+            static_cast<std::uint32_t>(variant.materials.size());
         desc.settings.islandAware = true;
         desc.settings.skipSettledIslands = true;
         desc.settings.gpuStressSolver = options.gpuStress;

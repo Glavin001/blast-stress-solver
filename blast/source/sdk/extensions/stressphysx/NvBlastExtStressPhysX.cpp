@@ -179,6 +179,41 @@ public:
                 "A destructible needs valid nodes, bonds, and a world transform.");
         }
 
+        // The material table is the ONLY strength authoring surface: bond area
+        // is geometry. Requiring the table forces every structure to state
+        // what it is made of instead of inheriting silent placeholder limits.
+        if (!desc.stressMaterials || desc.stressMaterialCount == 0)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "A destructible requires a stress material table (>= 1 entry).");
+        }
+        m_materialCount = desc.stressMaterialCount;
+        m_materialDescs.resize(desc.stressMaterialCount);
+        for (uint32_t i = 0; i < desc.stressMaterialCount; ++i)
+        {
+            const ExtStressPhysXMaterial& source = desc.stressMaterials[i];
+            if (!std::isfinite(source.compressionElasticLimit)
+                || !std::isfinite(source.compressionFatalLimit)
+                || source.compressionElasticLimit < 0.0f
+                || source.compressionFatalLimit < source.compressionElasticLimit)
+            {
+                return fail(
+                    ExtStressPhysXError::InvalidDescriptor,
+                    i,
+                    "Material compression limits must be finite, non-negative, "
+                    "and fatal >= elastic.");
+            }
+            ExtStressMaterialDesc& target = m_materialDescs[i];
+            target.compression_elastic_limit = source.compressionElasticLimit;
+            target.compression_fatal_limit = source.compressionFatalLimit;
+            target.tension_elastic_limit = source.tensionElasticLimit;
+            target.tension_fatal_limit = source.tensionFatalLimit;
+            target.shear_elastic_limit = source.shearElasticLimit;
+            target.shear_fatal_limit = source.shearFatalLimit;
+        }
+
         m_nodes.resize(desc.nodeCount);
         m_bonds.assign(desc.bonds, desc.bonds + desc.bondCount);
 
@@ -220,29 +255,33 @@ public:
                     INVALID_INDEX,
                     "Bond endpoints and geometry must be valid.");
             }
+            if (source.material >= m_materialCount)
+            {
+                return fail(
+                    ExtStressPhysXError::InvalidDescriptor,
+                    i,
+                    "Bond material index is outside the stress material table.");
+            }
             ExtStressBondDesc& bond = solverBonds[i];
             bond.centroid = toStress(source.centroid);
             bond.normal = toStress(source.normal);
             bond.area = source.area;
             bond.node0 = source.node0;
             bond.node1 = source.node1;
+            bond.material = source.material;
         }
 
         ExtStressSolverSettingsDesc solverSettings{};
         solverSettings.max_solver_iterations_per_frame = m_settings.maxSolverIterationsPerFrame;
         solverSettings.graph_reduction_level = m_settings.graphReductionLevel;
-        solverSettings.compression_elastic_limit = m_settings.compressionElasticLimit;
-        solverSettings.compression_fatal_limit = m_settings.compressionFatalLimit;
-        solverSettings.tension_elastic_limit = m_settings.tensionElasticLimit;
-        solverSettings.tension_fatal_limit = m_settings.tensionFatalLimit;
-        solverSettings.shear_elastic_limit = m_settings.shearElasticLimit;
-        solverSettings.shear_fatal_limit = m_settings.shearFatalLimit;
 
         m_solver = ext_stress_solver_create(
             solverNodes.data(),
             static_cast<uint32_t>(solverNodes.size()),
             solverBonds.data(),
             static_cast<uint32_t>(solverBonds.size()),
+            m_materialDescs.data(),
+            static_cast<uint32_t>(m_materialDescs.size()),
             &solverSettings);
         if (!m_solver)
         {
@@ -721,6 +760,17 @@ public:
         }
         return ext_stress_solver_get_bond_stresses(
             m_solver, compression, tension, shear, capacity);
+    }
+
+    uint32_t getBondUtilisations(
+        float* utilisation,
+        uint32_t capacity) const override
+    {
+        if (!m_solver || capacity == 0)
+        {
+            return 0;
+        }
+        return ext_stress_solver_get_bond_utilisations(m_solver, utilisation, capacity);
     }
 
     uint32_t captureResimulationSnapshot() override
@@ -1978,6 +2028,10 @@ private:
     bool m_resimSnapshotValid{false};
     bool m_hadForcesLastTick{false};
     uint32_t m_framesSinceFracture{1000};
+    // Converted material table forwarded to the bridge at create; kept for
+    // re-creation and validation of bond material indices.
+    std::vector<ExtStressMaterialDesc> m_materialDescs;
+    uint32_t m_materialCount{0};
     ExtStressPhysXTelemetry m_telemetry;
     ExtStressPhysXId m_nextBodyId{1};
     ExtStressPhysXId m_nextShapeId{1};
