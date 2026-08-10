@@ -528,6 +528,18 @@ struct DestructionDistribution
     double meanBodiesPerStructure{0.0};
 };
 
+// Per authored node role. Answers "did the structural frame actually fail, or
+// did we only strip cladding?" — which the aggregate chunk counts cannot,
+// because facade outnumbers frame roughly 2:1 and dominates every total.
+struct NodeTypeMotion
+{
+    std::uint32_t chunks{0};
+    std::uint32_t dynamicChunks{0};   // detached from a kinematic (supported) body
+    std::uint32_t movedChunks{0};     // displaced >= 0.5 m
+    std::uint32_t fallenChunks{0};    // dropped >= 0.5 m
+    float maximumDisplacement{0.0f};
+};
+
 struct DestructionMotion
 {
     std::uint32_t structuresWithMovedChunks{0};
@@ -540,6 +552,7 @@ struct DestructionMotion
     std::uint32_t supportedRemainderChunks{0};
     float maximumDisplacement{0.0f};
     float maximumDownwardDisplacement{0.0f};
+    std::map<std::string, NodeTypeMotion> byNodeType;
 };
 
 struct ContractBaseline
@@ -1141,6 +1154,9 @@ ScenePack truncateToFloors(
     result.title = source.title + " " + std::to_string(floors) + "-floor";
     result.nodes.clear();
     result.bonds.clear();
+    // nodeTypes is parallel to nodes, so it has to be rebuilt through the same
+    // remap below; carrying the source list over would misindex every role.
+    result.nodeTypes.clear();
 
     float minimumY = source.nodes.front().centroid.y;
     float maximumY = minimumY;
@@ -1161,6 +1177,10 @@ ScenePack truncateToFloors(
         {
             remap[nodeIndex] = static_cast<std::uint32_t>(result.nodes.size());
             result.nodes.push_back(source.nodes[nodeIndex]);
+            if (nodeIndex < source.nodeTypes.size())
+            {
+                result.nodeTypes.push_back(source.nodeTypes[nodeIndex]);
+            }
         }
     }
     for (const SceneBond& sourceBond : source.bonds)
@@ -1669,6 +1689,27 @@ DestructionMotion destructionMotion(
             result.maximumDisplacement = std::max(result.maximumDisplacement, displacement);
             result.maximumDownwardDisplacement =
                 std::max(result.maximumDownwardDisplacement, downwardDisplacement);
+
+            if (shape.nodeIndex < pack.nodeTypes.size())
+            {
+                NodeTypeMotion& byType = result.byNodeType[pack.nodeTypes[shape.nodeIndex]];
+                ++byType.chunks;
+                if (!shape.bodyKinematic)
+                {
+                    ++byType.dynamicChunks;
+                }
+                if (displacement >= 0.5f)
+                {
+                    ++byType.movedChunks;
+                }
+                if (downwardDisplacement >= 0.5f)
+                {
+                    ++byType.fallenChunks;
+                }
+                byType.maximumDisplacement =
+                    std::max(byType.maximumDisplacement, displacement);
+            }
+
             if (displacement >= 0.5f)
             {
                 ++result.movedChunks;
@@ -1998,6 +2039,26 @@ void writeMetadata(
              << ", \"peakTensionPa\": " << load.peakTension
              << ", \"peakShearPa\": " << load.peakShear
              << "}" << (entry + 1 < loadPath.size() ? "," : "") << "\n";
+    }
+    output << "  ],\n";
+
+    // Which authored roles actually failed. Facade outnumbers frame ~2:1, so the
+    // aggregate chunk counts cannot distinguish "stripped the cladding" from
+    // "brought down the structure".
+    output << "  \"motionByNodeType\": [\n";
+    {
+        std::size_t entry = 0;
+        for (const auto& item : motion.byNodeType)
+        {
+            const NodeTypeMotion& type = item.second;
+            output << "    {\"nodeType\": \"" << item.first << "\""
+                   << ", \"chunks\": " << type.chunks
+                   << ", \"dynamicChunks\": " << type.dynamicChunks
+                   << ", \"movedChunks\": " << type.movedChunks
+                   << ", \"fallenChunks\": " << type.fallenChunks
+                   << ", \"maximumDisplacement\": " << type.maximumDisplacement
+                   << "}" << (++entry < motion.byNodeType.size() ? "," : "") << "\n";
+        }
     }
     output << "  ],\n";
 
@@ -3019,6 +3080,23 @@ int run(const Options& options)
         static_cast<unsigned long long>(contacts.projectileImpactContacts()),
         wallSeconds,
         (options.durationSeconds + options.settleSeconds) / std::max(wallSeconds, 1.0e-9));
+
+    if (!motion.byNodeType.empty())
+    {
+        std::printf("destruction by authored role (chunks moved >= 0.5 m):\n");
+        for (const auto& item : motion.byNodeType)
+        {
+            const NodeTypeMotion& type = item.second;
+            std::printf(
+                "  %-12s chunks=%-6u detached=%-6u moved=%-6u fallen=%-6u maxDisp=%.2f m\n",
+                item.first.c_str(),
+                type.chunks,
+                type.dynamicChunks,
+                type.movedChunks,
+                type.fallenChunks,
+                static_cast<double>(type.maximumDisplacement));
+        }
+    }
 
     if (options.selfTest)
     {
