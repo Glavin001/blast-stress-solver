@@ -497,12 +497,16 @@ ScenePack loadScenePack(const std::string& path)
 {
     const Json root = JsonParser(readTextFile(path)).parse();
     requireKind(root, Json::Kind::Object, "root");
-    if (index(root.at("version"), "version") != 1)
+    const std::uint32_t version = index(root.at("version"), "version");
+    if (version != 1 && version != 2)
     {
-        throw std::runtime_error("only ScenePack version 1 is supported");
+        throw std::runtime_error(
+            "unsupported ScenePack version " + std::to_string(version)
+            + " (see SCENE_PACK_FORMAT.md)");
     }
 
     ScenePack pack;
+    pack.version = version;
     pack.title = string(root.at("title"), "title");
 
     const Json& defaults = root.at("defaults");
@@ -514,16 +518,68 @@ ScenePack loadScenePack(const std::string& path)
 
     const Json& solver = defaults.at("solver");
     pack.gravity = number(solver.at("gravity"), "gravity");
-    if (const Json* limits = solver.find("limits"))
+
+    // Parse one material entry. Negative tension/shear limits are left as-is;
+    // the solver resolves the inheritance when the table is installed.
+    const auto parseLimits = [](const Json& source) {
+        StressLimits limits;
+        limits.compressionElastic =
+            number(source.at("compressionElastic"), "compressionElastic");
+        limits.compressionFatal = number(source.at("compressionFatal"), "compressionFatal");
+        limits.tensionElastic = number(source.at("tensionElastic"), "tensionElastic");
+        limits.tensionFatal = number(source.at("tensionFatal"), "tensionFatal");
+        limits.shearElastic = number(source.at("shearElastic"), "shearElastic");
+        limits.shearFatal = number(source.at("shearFatal"), "shearFatal");
+        return limits;
+    };
+
+    if (version >= 2)
     {
-        pack.stressLimits.compressionElastic =
-            number(limits->at("compressionElastic"), "compressionElastic");
-        pack.stressLimits.compressionFatal =
-            number(limits->at("compressionFatal"), "compressionFatal");
-        pack.stressLimits.tensionElastic = number(limits->at("tensionElastic"), "tensionElastic");
-        pack.stressLimits.tensionFatal = number(limits->at("tensionFatal"), "tensionFatal");
-        pack.stressLimits.shearElastic = number(limits->at("shearElastic"), "shearElastic");
-        pack.stressLimits.shearFatal = number(limits->at("shearFatal"), "shearFatal");
+        // v2: materials are mandatory. A structure must state what it is made
+        // of rather than inheriting a placeholder — that silent inheritance is
+        // exactly how a pack ends up an order of magnitude off its own claimed
+        // material (SCENE_PACK_FORMAT.md, "v1 trap").
+        const Json* materials = solver.find("materials");
+        if (!materials || materials->kind != Json::Kind::Array
+            || materials->array.empty())
+        {
+            throw std::runtime_error(
+                "ScenePack v2 requires a non-empty defaults.solver.materials array");
+        }
+        pack.materials.reserve(materials->array.size());
+        for (std::size_t i = 0; i < materials->array.size(); ++i)
+        {
+            const Json& source = materials->array[i];
+            requireKind(source, Json::Kind::Object, "materials[]");
+            SceneMaterial material;
+            if (const Json* name = source.find("name"))
+            {
+                material.name =
+                    name->kind == Json::Kind::String ? name->string : std::string();
+            }
+            if (material.name.empty())
+            {
+                material.name = "material" + std::to_string(i);
+            }
+            material.limits = parseLimits(source);
+            if (!(material.limits.compressionElastic >= 0.0f)
+                || !(material.limits.compressionFatal >= material.limits.compressionElastic))
+            {
+                throw std::runtime_error(
+                    "material '" + material.name
+                    + "' needs compressionFatal >= compressionElastic >= 0");
+            }
+            pack.materials.push_back(std::move(material));
+        }
+        pack.stressLimits = pack.materials.front().limits;
+        pack.stressLimitsAuthored = true;
+    }
+    else if (const Json* limits = solver.find("limits"))
+    {
+        // v1 with explicit limits: synthesize the one-entry table so every
+        // downstream consumer sees the same shape regardless of pack version.
+        pack.stressLimits = parseLimits(*limits);
+        pack.materials.push_back(SceneMaterial{"pack-limits", pack.stressLimits});
         pack.stressLimitsAuthored = true;
     }
     else
@@ -546,6 +602,7 @@ ScenePack loadScenePack(const std::string& path)
             static_cast<double>(pack.stressLimits.compressionFatal),
             static_cast<double>(pack.stressLimits.tensionElastic),
             static_cast<double>(pack.stressLimits.tensionFatal));
+        pack.materials.push_back(SceneMaterial{"unstated", pack.stressLimits});
     }
 
     const Json& physics = defaults.at("physics");
@@ -605,6 +662,21 @@ ScenePack loadScenePack(const std::string& path)
         bond.centroid = vec3(source.at("centroid"), "centroid");
         bond.normal = vec3(source.at("normal"), "normal");
         bond.area = number(source.at("area"), "area");
+        // Material index; absent means 0. Out of range is an authoring error,
+        // not something to clamp — a silent clamp turns a typo into a
+        // mysteriously strong joint.
+        if (const Json* material = source.find("m"))
+        {
+            bond.material = index(*material, "m");
+            if (bond.material >= pack.materials.size())
+            {
+                throw std::runtime_error(
+                    "scene pack bond " + std::to_string(pack.bonds.size())
+                    + " references material " + std::to_string(bond.material)
+                    + " but the table has only " + std::to_string(pack.materials.size())
+                    + " entries");
+            }
+        }
         if (bond.node0 >= pack.nodes.size() || bond.node1 >= pack.nodes.size())
         {
             throw std::runtime_error("scene pack bond references an invalid node");

@@ -107,21 +107,30 @@ struct BuildingVariant
     float height{0.0f};
 };
 
+/**
+ * Convert the pack's authored material table for the adapter. --stress-limit-scale
+ * scales every material uniformly, so it sweeps global strength without
+ * disturbing the relative hierarchy the pack authored.
+ */
 std::vector<Nv::Blast::ExtStressPhysXMaterial> makeMaterialTable(
     const ScenePack& pack,
     float stressLimitScale)
 {
-    Nv::Blast::ExtStressPhysXMaterial material;
-    material.compressionElasticLimit =
-        pack.stressLimits.compressionElastic * stressLimitScale;
-    material.compressionFatalLimit =
-        pack.stressLimits.compressionFatal * stressLimitScale;
-    material.tensionElasticLimit =
-        pack.stressLimits.tensionElastic * stressLimitScale;
-    material.tensionFatalLimit = pack.stressLimits.tensionFatal * stressLimitScale;
-    material.shearElasticLimit = pack.stressLimits.shearElastic * stressLimitScale;
-    material.shearFatalLimit = pack.stressLimits.shearFatal * stressLimitScale;
-    return {material};
+    std::vector<Nv::Blast::ExtStressPhysXMaterial> table;
+    table.reserve(pack.materials.size());
+    for (const SceneMaterial& source : pack.materials)
+    {
+        Nv::Blast::ExtStressPhysXMaterial material;
+        material.compressionElasticLimit =
+            source.limits.compressionElastic * stressLimitScale;
+        material.compressionFatalLimit = source.limits.compressionFatal * stressLimitScale;
+        material.tensionElasticLimit = source.limits.tensionElastic * stressLimitScale;
+        material.tensionFatalLimit = source.limits.tensionFatal * stressLimitScale;
+        material.shearElasticLimit = source.limits.shearElastic * stressLimitScale;
+        material.shearFatalLimit = source.limits.shearFatal * stressLimitScale;
+        table.push_back(material);
+    }
+    return table;
 }
 
 struct BuildingInstance
@@ -1158,6 +1167,7 @@ std::vector<ExtStressPhysXBondDesc> makeBondDescs(const ScenePack& pack)
         target.centroid = source.centroid;
         target.normal = source.normal;
         target.area = source.area;
+        target.material = source.material;
     }
     return result;
 }
@@ -1569,6 +1579,9 @@ DestructionDistribution destructionDistribution(
 struct JointClassLoad
 {
     std::string name;
+    // Authored material of this class's bonds, or "(mixed)" when a joint class
+    // spans several — legitimate, but worth seeing in the report.
+    std::string material;
     std::uint32_t bonds{0};
     float peakCompression{0.0f};
     float peakTension{0.0f};
@@ -1593,13 +1606,13 @@ std::string jointClassName(
 
 std::vector<JointClassLoad> sampleLoadPath(
     const std::vector<DestructiblePtr>& destructibles,
-    const std::vector<const ScenePack*>& packs,
-    const StressLimits& limits)
+    const std::vector<const ScenePack*>& packs)
 {
     std::map<std::string, JointClassLoad> byClass;
     std::vector<float> compression;
     std::vector<float> tension;
     std::vector<float> shear;
+    std::vector<float> utilisation;
     std::map<std::string, double> utilisationSum;
 
     for (std::size_t structure = 0; structure < destructibles.size(); ++structure)
@@ -1609,8 +1622,14 @@ std::vector<JointClassLoad> sampleLoadPath(
         compression.assign(bondCount, 0.0f);
         tension.assign(bondCount, 0.0f);
         shear.assign(bondCount, 0.0f);
+        utilisation.assign(bondCount, 0.0f);
         const std::uint32_t written = destructibles[structure]->getBondStresses(
             compression.data(), tension.data(), shear.data(), bondCount);
+        // Utilisation comes from the solver, which divides each bond's stress
+        // by that bond's OWN material limits. With a heterogeneous structure
+        // there is no correct global divisor, so doing this division here
+        // would misreport every joint whose material is not the default.
+        destructibles[structure]->getBondUtilisations(utilisation.data(), bondCount);
 
         for (std::uint32_t bond = 0; bond < written; ++bond)
         {
@@ -1620,15 +1639,20 @@ std::vector<JointClassLoad> sampleLoadPath(
             JointClassLoad& entry = byClass[name];
             entry.name = name;
             ++entry.bonds;
+            if (entry.material.empty() && source.material < pack.materials.size())
+            {
+                entry.material = pack.materials[source.material].name;
+            }
+            else if (source.material < pack.materials.size()
+                && entry.material != pack.materials[source.material].name)
+            {
+                entry.material = "(mixed)";
+            }
             entry.peakCompression = std::max(entry.peakCompression, compression[bond]);
             entry.peakTension = std::max(entry.peakTension, tension[bond]);
             entry.peakShear = std::max(entry.peakShear, shear[bond]);
-            const float utilisation = std::max(
-                {limits.compressionElastic > 0.0f ? compression[bond] / limits.compressionElastic : 0.0f,
-                 limits.tensionElastic > 0.0f ? tension[bond] / limits.tensionElastic : 0.0f,
-                 limits.shearElastic > 0.0f ? shear[bond] / limits.shearElastic : 0.0f});
-            entry.peakUtilisation = std::max(entry.peakUtilisation, utilisation);
-            utilisationSum[name] += utilisation;
+            entry.peakUtilisation = std::max(entry.peakUtilisation, utilisation[bond]);
+            utilisationSum[name] += utilisation[bond];
         }
     }
 
@@ -2053,6 +2077,7 @@ void writeMetadata(
         const JointClassLoad& load = loadPath[entry];
         const double factor = safetyFactor(load.peakUtilisation);
         output << "    {\"jointClass\": \"" << load.name << "\""
+             << ", \"material\": \"" << load.material << "\""
              << ", \"bonds\": " << load.bonds
              << ", \"peakUtilisation\": " << load.peakUtilisation
              << ", \"meanUtilisation\": " << load.meanUtilisation
@@ -2512,22 +2537,18 @@ int run(const Options& options)
     // Printed BEFORE the self-weight gate, because when a structure collapses
     // under its own weight this report is the diagnosis: it names the joint
     // class whose utilisation exceeded 1 instead of leaving the caller to guess.
-    const StressLimits scaledLimits{
-        pack.stressLimits.compressionElastic * options.stressLimitScale,
-        pack.stressLimits.compressionFatal * options.stressLimitScale,
-        pack.stressLimits.tensionElastic * options.stressLimitScale,
-        pack.stressLimits.tensionFatal * options.stressLimitScale,
-        pack.stressLimits.shearElastic * options.stressLimitScale,
-        pack.stressLimits.shearFatal * options.stressLimitScale};
     const std::vector<JointClassLoad> loadPath =
-        sampleLoadPath(destructibles, buildingPacks, scaledLimits);
-    std::printf("gravity load path (utilisation = peak stress / elastic limit):\n");
+        sampleLoadPath(destructibles, buildingPacks);
+    std::printf(
+        "gravity load path (utilisation = peak stress / that bond's material "
+        "elastic limit):\n");
     for (const JointClassLoad& entry : loadPath)
     {
         std::printf(
-            "  %-22s bonds=%-6u peakUtil=%-10.4g safetyFactor=%-10.4g "
+            "  %-22s %-22s bonds=%-6u peakUtil=%-10.4g safetyFactor=%-10.4g "
             "peak(c/t/s)=%.3g/%.3g/%.3g Pa\n",
             entry.name.c_str(),
+            entry.material.c_str(),
             entry.bonds,
             static_cast<double>(entry.peakUtilisation),
             safetyFactor(entry.peakUtilisation),
