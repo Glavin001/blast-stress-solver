@@ -4,3 +4,4 @@ node_modules/
 /demos/blast-stress-demo/build-*/
 .vercel/output/
 .codex
+*.towerstate
