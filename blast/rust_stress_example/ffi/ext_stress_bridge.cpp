@@ -535,10 +535,11 @@ ext_stress_solver_reset(ExtStressSolverHandle* handlePtr)
 namespace
 {
 // Shared force-application path used by both the single-force and batched
-// entry points so their behaviour can never diverge. Mirrors the original
-// ext_stress_solver_add_force logic exactly: prefer the actor that owns the
-// input node (so the force lands in the right family after splits); otherwise
-// fall back to the graph-node index.
+// entry points so their behaviour can never diverge. Bond-graph nodes keep
+// stable graph indices after actor splits, so inject those in O(1) rather than
+// asking addForce(actor, position) to scan every graph node in the actor for
+// every contact. Subsupport chunks have no graph index and retain the actor
+// position lookup as their fallback.
 inline void applyForceToInputNode(ExtStressSolverHandleImpl& handle,
                                   uint32_t node_index,
                                   const NvcVec3& pos,
@@ -552,6 +553,12 @@ inline void applyForceToInputNode(ExtStressSolverHandleImpl& handle,
 
     const uint32_t graphIndex = handle.inputToGraph[node_index];
 
+    if (graphIndex != UINT32_MAX)
+    {
+        handle.solver->addForce(graphIndex, force, mode);
+        return;
+    }
+
     if (auto* entry = findActorOwningInputNode(handle, node_index))
     {
         if (entry->actor)
@@ -559,11 +566,6 @@ inline void applyForceToInputNode(ExtStressSolverHandleImpl& handle,
             handle.solver->addForce(*entry->actor, pos, force, mode);
             return;
         }
-    }
-
-    if (graphIndex != UINT32_MAX)
-    {
-        handle.solver->addForce(graphIndex, force, mode);
     }
 }
 } // namespace

@@ -20,15 +20,21 @@ import { buildHighRiseScenario } from '../dist/scenarios.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const floorCount = Number.parseInt(process.env.HIGH_RISE_FLOORS ?? '9', 10);
+if (!Number.isInteger(floorCount) || floorCount < 1 || floorCount > 40) {
+  throw new Error('HIGH_RISE_FLOORS must be an integer between 1 and 40');
+}
+const outputStem = floorCount === 9 ? 'high-rise' : `high-rise-${floorCount}f`;
+
 // Canonical output for the Rust/Bevy demo + Rust headless tests, plus a copy in the
 // library's own dist/ so the web demo can fetch it via the /vendor/blast-stress-solver
 // serve route. Both locations are git-ignored and regenerated from this script.
 const OUTPUT_PATHS = [
-  path.resolve(__dirname, '../../blast-stress-demo-rs/assets/scenes/high-rise.json'),
-  path.resolve(__dirname, '../dist/high-rise.json'),
+  path.resolve(__dirname, `../../blast-stress-demo-rs/assets/scenes/${outputStem}.json`),
+  path.resolve(__dirname, `../dist/${outputStem}.json`),
 ];
 
-const TITLE = 'High-Rise Apartment';
+const TITLE = `High-Rise Apartment ${floorCount}F`;
 
 // Scene defaults shared by both runtimes. `solver.limits` is the optional schema
 // extension carrying realistic, DECOUPLED concrete limits (Pa): strong in
@@ -154,7 +160,7 @@ function summarize(scenario) {
 }
 
 async function main() {
-  const scenario = buildHighRiseScenario();
+  const scenario = buildHighRiseScenario({ floorCount });
   const pack = serializeScenePack(scenario);
 
   // Compact JSON: this is a generated, git-ignored artifact, so favor small size

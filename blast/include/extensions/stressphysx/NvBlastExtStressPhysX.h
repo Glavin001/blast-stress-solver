@@ -320,6 +320,7 @@ public:
 
     virtual bool validateMappings() = 0;
     virtual const ExtStressPhysXTelemetry& getTelemetry() const = 0;
+    virtual bool usesGpuStressSolver() const = 0;
 
     virtual uint32_t getBodySnapshots(
         ExtStressPhysXBodySnapshot* snapshots,

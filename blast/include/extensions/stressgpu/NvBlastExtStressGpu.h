@@ -91,6 +91,16 @@ public:
         ExtStressGpuImpulse* bondImpulses,
         std::uint32_t capacity) = 0;
 
+    /**
+     * Executes a solve and reads its impulses with one host synchronization.
+     * Prefer this when the caller always consumes impulses immediately.
+     */
+    virtual bool solveAndReadbackImpulses(
+        const ExtStressGpuImpulse* nodeVelocities,
+        const ExtStressGpuSolveParams& params,
+        ExtStressGpuImpulse* bondImpulses,
+        std::uint32_t capacity) = 0;
+
     virtual bool readbackBrokenBonds(
         std::uint32_t* bondIndices,
         std::uint32_t capacity,

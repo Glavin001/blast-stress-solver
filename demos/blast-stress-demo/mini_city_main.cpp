@@ -48,6 +48,10 @@ struct Options
     bool selfTest{false};
     std::uint32_t grid{3};
     std::uint32_t stressWorkers{0};
+    bool serializeGpuStress{false};
+    std::uint32_t maximumBodiesPerStructure{48};
+    std::uint32_t maximumFracturesPerActorPerTick{0};
+    std::uint32_t tallBuildingStride{0};
     bool variedBuildingHeights{true};
     float durationSeconds{12.0f};
     float settleSeconds{1.5f};
@@ -56,6 +60,7 @@ struct Options
     float projectileRadiusScale{1.0f};
     float projectileTtlScale{0.4f};
     float contactForceScale{1.5f};
+    float minimumStressContactImpulse{0.0f};
     float stressLimitScale{0.8f};
     float excessForceScale{0.017f};
     std::uint32_t snapshotFps{30};
@@ -108,7 +113,9 @@ std::uint32_t resolveStressWorkerCount(std::uint32_t requested)
 class StressExecutor
 {
 public:
-    explicit StressExecutor(std::uint32_t workerCount) : m_workerCount(workerCount)
+    StressExecutor(std::uint32_t workerCount, bool serializeGpuStress)
+        : m_workerCount(workerCount)
+        , m_serializeGpuStress(serializeGpuStress)
     {
         if (workerCount <= 1)
         {
@@ -155,7 +162,17 @@ public:
 
         std::atomic<bool> succeeded{true};
         run(destructibles.size(), [&](std::size_t index) {
-            if (!destructibles[index]->solveTick())
+            bool solved = false;
+            if (m_serializeGpuStress && destructibles[index]->usesGpuStressSolver())
+            {
+                std::lock_guard<std::mutex> lock(m_gpuMutex);
+                solved = destructibles[index]->solveTick();
+            }
+            else
+            {
+                solved = destructibles[index]->solveTick();
+            }
+            if (!solved)
             {
                 succeeded.store(false, std::memory_order_relaxed);
             }
@@ -243,7 +260,9 @@ private:
     }
 
     std::uint32_t m_workerCount{1};
+    bool m_serializeGpuStress{false};
     std::vector<std::thread> m_workers;
+    std::mutex m_gpuMutex;
     std::mutex m_mutex;
     std::condition_variable m_workAvailable;
     std::condition_variable m_workFinished;
@@ -524,6 +543,10 @@ void usage(const char* executable)
         "  --scene PATH            ScenePack v1 JSON\n"
         "  --grid N                N by N city (default 3)\n"
         "  --stress-workers N      Parallel per-building stress solves (default auto, max 64)\n"
+        "  --serialize-gpu-stress  Serialize CUDA stress solves; CPU solves remain parallel\n"
+        "  --max-bodies-per-structure N  Fracture body budget per building (default 48)\n"
+        "  --max-fractures-per-actor-per-tick N  Spread bond breaks across steps (0 unlimited)\n"
+        "  --tall-building-stride N  Place one full-height tower every N buildings\n"
         "  --uniform-building-heights  Disable the default 1/2/3-floor skyline\n"
         "  --duration SECONDS      Destruction duration (default 12)\n"
         "  --settle SECONDS        Initial settle time (default 1.5)\n"
@@ -532,6 +555,7 @@ void usage(const char* executable)
         "  --projectile-radius-scale X  Multiply ScenePack projectile radius\n"
         "  --projectile-ttl-scale X     Multiply ScenePack projectile lifetime (default 0.4)\n"
         "  --contact-force-scale X      Multiply stress contact impulse transfer\n"
+        "  --min-stress-contact-impulse X  Ignore weaker non-projectile stress feedback\n"
         "  --stress-limit-scale X       Multiply all elastic/fatal stress limits\n"
         "  --excess-force-scale X       Scale released bond load applied to new debris\n"
         "  --impact-transfer-scale X    Alias for --excess-force-scale\n"
@@ -627,6 +651,17 @@ Options parseOptions(int argc, char** argv)
         else if (option == "--grid") options.grid = parseU32(argument(), "--grid");
         else if (option == "--stress-workers")
             options.stressWorkers = parseU32(argument(), "--stress-workers");
+        else if (option == "--serialize-gpu-stress")
+            options.serializeGpuStress = true;
+        else if (option == "--max-bodies-per-structure")
+            options.maximumBodiesPerStructure =
+                parseU32(argument(), "--max-bodies-per-structure");
+        else if (option == "--max-fractures-per-actor-per-tick")
+            options.maximumFracturesPerActorPerTick =
+                parseU32(argument(), "--max-fractures-per-actor-per-tick");
+        else if (option == "--tall-building-stride")
+            options.tallBuildingStride =
+                parseU32(argument(), "--tall-building-stride");
         else if (option == "--uniform-building-heights")
             options.variedBuildingHeights = false;
         else if (option == "--duration") options.durationSeconds = parseFloat(argument(), "--duration");
@@ -641,6 +676,9 @@ Options parseOptions(int argc, char** argv)
             options.projectileTtlScale = parseFloat(argument(), "--projectile-ttl-scale");
         else if (option == "--contact-force-scale")
             options.contactForceScale = parseFloat(argument(), "--contact-force-scale");
+        else if (option == "--min-stress-contact-impulse")
+            options.minimumStressContactImpulse =
+                parseFloat(argument(), "--min-stress-contact-impulse");
         else if (option == "--stress-limit-scale")
             options.stressLimitScale = parseFloat(argument(), "--stress-limit-scale");
         else if (option == "--excess-force-scale" || option == "--impact-transfer-scale")
@@ -662,6 +700,15 @@ Options parseOptions(int argc, char** argv)
     {
         throw std::runtime_error("--stress-workers must be between 0 and 64");
     }
+    if (options.maximumBodiesPerStructure == 0
+        || options.maximumBodiesPerStructure > 1024)
+    {
+        throw std::runtime_error("--max-bodies-per-structure must be between 1 and 1024");
+    }
+    if (options.tallBuildingStride > 1024)
+    {
+        throw std::runtime_error("--tall-building-stride must be between 0 and 1024");
+    }
     if (options.durationSeconds <= 0.0f || options.settleSeconds < 0.0f)
     {
         throw std::runtime_error("duration must be positive and settle must be non-negative");
@@ -671,6 +718,7 @@ Options parseOptions(int argc, char** argv)
         || options.projectileRadiusScale <= 0.0f
         || options.projectileTtlScale <= 0.0f
         || options.contactForceScale <= 0.0f
+        || options.minimumStressContactImpulse < 0.0f
         || options.stressLimitScale <= 0.0f
         || options.excessForceScale < 0.0f)
     {
@@ -702,7 +750,11 @@ Options parseOptions(int argc, char** argv)
 class ContactRouter final : public PxSimulationEventCallback
 {
 public:
-    explicit ContactRouter(float forceScale) : m_forceScale(forceScale) {}
+    ContactRouter(float forceScale, float minimumStressImpulse)
+        : m_forceScale(forceScale)
+        , m_minimumStressImpulse(minimumStressImpulse)
+    {
+    }
 
     void registerDestructible(ExtStressPhysXDestructible& destructible, std::uint32_t nodeCount)
     {
@@ -746,10 +798,15 @@ public:
                     && owner0 != nullptr);
             for (PxU32 i = 0; i < count; ++i)
             {
+                const float impulseMagnitude = points[i].impulse.magnitude();
                 if (projectileImpact)
                 {
                     ++m_projectileImpactContacts;
-                    m_projectileImpactImpulse += points[i].impulse.magnitude();
+                    m_projectileImpactImpulse += impulseMagnitude;
+                }
+                if (!projectileImpact && impulseMagnitude < m_minimumStressImpulse)
+                {
+                    continue;
                 }
                 queue(owner0, pair.shapes[0], points[i].position, points[i].impulse);
                 queue(owner1, pair.shapes[1], points[i].position, -points[i].impulse);
@@ -791,6 +848,7 @@ private:
     }
 
     float m_forceScale{1.0f};
+    float m_minimumStressImpulse{0.0f};
     double m_callbackMilliseconds{0.0};
     std::uint64_t m_projectileImpactContacts{0};
     double m_projectileImpactImpulse{0.0};
@@ -1484,6 +1542,8 @@ void writeMetadata(
         << "  \"gpuActive\": " << (context.gpuActive() ? "true" : "false") << ",\n"
         << "  \"gpuStressRequested\": " << (options.gpuStress ? "true" : "false") << ",\n"
         << "  \"gpuStressMinimumBondCount\": " << options.gpuStressMinimumBonds << ",\n"
+        << "  \"gpuStressSerialized\": "
+        << (options.serializeGpuStress ? "true" : "false") << ",\n"
         << "  \"realtimeRequired\": " << (options.requireRealtime ? "true" : "false") << ",\n"
         << "  \"minimumAuthoredChunksRequired\": "
         << options.requireMinimumAuthoredChunks << ",\n"
@@ -1497,8 +1557,15 @@ void writeMetadata(
         << pack.projectileTtlSeconds * options.projectileTtlScale << ",\n"
         << "    \"contactForceScale\": "
         << pack.contactForceScale * options.contactForceScale << ",\n"
+        << "    \"minimumStressContactImpulse\": "
+        << options.minimumStressContactImpulse << ",\n"
         << "    \"stressLimitScale\": " << options.stressLimitScale << ",\n"
-        << "    \"excessForceScale\": " << options.excessForceScale << "\n"
+        << "    \"excessForceScale\": " << options.excessForceScale << ",\n"
+        << "    \"maximumBodiesPerStructure\": "
+        << options.maximumBodiesPerStructure << ",\n"
+        << "    \"maximumFracturesPerActorPerTick\": "
+        << options.maximumFracturesPerActorPerTick << ",\n"
+        << "    \"tallBuildingStride\": " << options.tallBuildingStride << "\n"
         << "  },\n"
         << "  \"grid\": " << options.grid << ",\n"
         << "  \"buildingCount\": " << options.grid * options.grid << ",\n"
@@ -1687,8 +1754,21 @@ int run(const Options& options)
     std::uint32_t totalAuthoredChunks = 0;
     for (std::size_t buildingIndex = 0; buildingIndex < offsets.size(); ++buildingIndex)
     {
-        const std::size_t variantIndex =
-            options.variedBuildingHeights ? 2 - buildingIndex % 3 : 0;
+        std::size_t variantIndex = 0;
+        if (options.variedBuildingHeights)
+        {
+            if (options.tallBuildingStride > 0)
+            {
+                variantIndex =
+                    buildingIndex % options.tallBuildingStride == 0
+                    ? 2
+                    : buildingIndex % 2;
+            }
+            else
+            {
+                variantIndex = 2 - buildingIndex % 3;
+            }
+        }
         const BuildingVariant& variant = variants[variantIndex];
         buildings.push_back({variantIndex, offsets[buildingIndex], totalAuthoredChunks});
         buildingPacks.push_back(&variant.pack);
@@ -1719,7 +1799,9 @@ int run(const Options& options)
         }
     }
 
-    ContactRouter contacts(pack.contactForceScale * options.contactForceScale);
+    ContactRouter contacts(
+        pack.contactForceScale * options.contactForceScale,
+        options.minimumStressContactImpulse);
     SceneCapacity capacity;
     capacity.maxBodies = totalAuthoredChunks * 2;
     capacity.maxShapes = capacity.maxBodies + static_cast<std::uint32_t>(offsets.size() * 2);
@@ -1760,8 +1842,9 @@ int run(const Options& options)
         desc.settings.recordSplitContinuity = true;
         desc.settings.applyExcessForces = true;
         desc.settings.excessForceScale = options.excessForceScale;
-        desc.settings.maximumBodies = 48;
-        desc.settings.maximumFracturesPerActorPerTick = 0;
+        desc.settings.maximumBodies = options.maximumBodiesPerStructure;
+        desc.settings.maximumFracturesPerActorPerTick =
+            options.maximumFracturesPerActorPerTick;
         desc.settings.maximumLinearVelocity = 6.0f;
         desc.settings.maximumAngularVelocity = 8.0f;
         desc.settings.minimumSeparationVelocity = 4.0f;
@@ -1804,7 +1887,9 @@ int run(const Options& options)
     {
         contacts.registerProjectile(*projectile.shape);
     }
-    StressExecutor stressExecutor(resolveStressWorkerCount(options.stressWorkers));
+    StressExecutor stressExecutor(
+        resolveStressWorkerCount(options.stressWorkers),
+        options.serializeGpuStress);
 
     // Warm lazy PhysX/CUDA allocations and solver scratch before the measured
     // fixed-step interval. The structures and projectiles are still kinematic,

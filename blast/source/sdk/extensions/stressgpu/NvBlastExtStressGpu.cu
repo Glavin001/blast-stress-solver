@@ -588,59 +588,12 @@ public:
         const ExtStressGpuSolveParams& params) override
     {
         ContextGuard context(m_cudaContext);
-        if (!nodeVelocities || params.maxIterations == 0)
+        if (!enqueueSolve(nodeVelocities, params))
         {
             return false;
         }
-
-        m_telemetry = {};
-        std::memcpy(
-            m_hostInput,
-            nodeVelocities,
-            sizeof(ExtStressGpuImpulse) * m_nodeCount);
-        checkCuda(cudaEventRecord(m_uploadStart, m_stream), "record upload start");
-        checkCuda(
-            cudaMemcpyAsync(
-                m_input,
-                m_hostInput,
-                sizeof(ExtStressGpuImpulse) * m_nodeCount,
-                cudaMemcpyHostToDevice,
-                m_stream),
-            "upload stress inputs");
-        checkCuda(cudaEventRecord(m_uploadStop, m_stream), "record upload stop");
-        m_telemetry.hostToDeviceBytes =
-            sizeof(ExtStressGpuImpulse) * static_cast<std::uint64_t>(m_nodeCount);
-
-        checkCuda(cudaEventRecord(m_solveStart, m_stream), "record solve start");
-        executeSolve(params);
-        checkCuda(cudaEventRecord(m_solveStop, m_stream), "record solve stop");
-        checkCuda(
-            cudaMemcpyAsync(
-                m_hostStatus,
-                m_status,
-                sizeof(SolveStatus),
-                cudaMemcpyDeviceToHost,
-                m_stream),
-            "read stress status");
-        checkCuda(cudaEventRecord(m_statusReady, m_stream), "record status ready");
         checkCuda(cudaEventSynchronize(m_statusReady), "wait for stress solve");
-        checkCuda(cudaGetLastError(), "execute stress kernels");
-        checkCuda(
-            cudaEventElapsedTime(
-                &m_telemetry.uploadMilliseconds,
-                m_uploadStart,
-                m_uploadStop),
-            "measure input upload");
-        checkCuda(
-            cudaEventElapsedTime(
-                &m_telemetry.solveMilliseconds,
-                m_solveStart,
-                m_solveStop),
-            "measure stress solve");
-
-        m_telemetry.iterations = m_hostStatus->iterations;
-        m_telemetry.converged = m_hostStatus->converged != 0;
-        m_hasWarmStart = true;
+        finishSolve();
         return true;
     }
 
@@ -653,38 +606,30 @@ public:
         {
             return false;
         }
-        checkCuda(cudaEventRecord(m_downloadStart, m_stream), "record readback start");
-        checkCuda(
-            cudaMemcpyAsync(
-                m_hostImpulses,
-                m_impulses,
-                sizeof(AngLin) * m_bondCount,
-                cudaMemcpyDeviceToHost,
-                m_stream),
-            "read stress impulses");
-        checkCuda(cudaEventRecord(m_downloadStop, m_stream), "record readback stop");
+        enqueueImpulseReadback();
         checkCuda(cudaEventSynchronize(m_downloadStop), "wait for impulse readback");
-        checkCuda(
-            cudaEventElapsedTime(
-                &m_telemetry.downloadMilliseconds,
-                m_downloadStart,
-                m_downloadStop),
-            "measure impulse readback");
-        for (std::uint32_t i = 0; i < m_bondCount; ++i)
+        finishImpulseReadback(bondImpulses);
+        return true;
+    }
+
+    bool solveAndReadbackImpulses(
+        const ExtStressGpuImpulse* nodeVelocities,
+        const ExtStressGpuSolveParams& params,
+        ExtStressGpuImpulse* bondImpulses,
+        std::uint32_t capacity) override
+    {
+        ContextGuard context(m_cudaContext);
+        if (!bondImpulses || capacity < m_bondCount
+            || !enqueueSolve(nodeVelocities, params))
         {
-            bondImpulses[i].angular =
-                {
-                    m_hostImpulses[i].angular.x,
-                    m_hostImpulses[i].angular.y,
-                    m_hostImpulses[i].angular.z};
-            bondImpulses[i].linear =
-                {
-                    m_hostImpulses[i].linear.x,
-                    m_hostImpulses[i].linear.y,
-                    m_hostImpulses[i].linear.z};
+            return false;
         }
-        m_telemetry.deviceToHostBytes =
-            sizeof(AngLin) * static_cast<std::uint64_t>(m_bondCount);
+        // The status and impulse copies share one stream. Waiting for the
+        // latter completes the upload, solve, status, and impulse readback.
+        enqueueImpulseReadback();
+        checkCuda(cudaEventSynchronize(m_downloadStop), "wait for stress solve and readback");
+        finishSolve();
+        finishImpulseReadback(bondImpulses);
         return true;
     }
 
@@ -759,6 +704,107 @@ public:
     }
 
 private:
+    bool enqueueSolve(
+        const ExtStressGpuImpulse* nodeVelocities,
+        const ExtStressGpuSolveParams& params)
+    {
+        if (!nodeVelocities || params.maxIterations == 0)
+        {
+            return false;
+        }
+
+        m_telemetry = {};
+        std::memcpy(
+            m_hostInput,
+            nodeVelocities,
+            sizeof(ExtStressGpuImpulse) * m_nodeCount);
+        checkCuda(cudaEventRecord(m_uploadStart, m_stream), "record upload start");
+        checkCuda(
+            cudaMemcpyAsync(
+                m_input,
+                m_hostInput,
+                sizeof(ExtStressGpuImpulse) * m_nodeCount,
+                cudaMemcpyHostToDevice,
+                m_stream),
+            "upload stress inputs");
+        checkCuda(cudaEventRecord(m_uploadStop, m_stream), "record upload stop");
+        m_telemetry.hostToDeviceBytes =
+            sizeof(ExtStressGpuImpulse) * static_cast<std::uint64_t>(m_nodeCount);
+
+        checkCuda(cudaEventRecord(m_solveStart, m_stream), "record solve start");
+        executeSolve(params);
+        checkCuda(cudaEventRecord(m_solveStop, m_stream), "record solve stop");
+        checkCuda(
+            cudaMemcpyAsync(
+                m_hostStatus,
+                m_status,
+                sizeof(SolveStatus),
+                cudaMemcpyDeviceToHost,
+                m_stream),
+            "read stress status");
+        checkCuda(cudaEventRecord(m_statusReady, m_stream), "record status ready");
+        return true;
+    }
+
+    void finishSolve()
+    {
+        checkCuda(cudaGetLastError(), "execute stress kernels");
+        checkCuda(
+            cudaEventElapsedTime(
+                &m_telemetry.uploadMilliseconds,
+                m_uploadStart,
+                m_uploadStop),
+            "measure input upload");
+        checkCuda(
+            cudaEventElapsedTime(
+                &m_telemetry.solveMilliseconds,
+                m_solveStart,
+                m_solveStop),
+            "measure stress solve");
+        m_telemetry.iterations = m_hostStatus->iterations;
+        m_telemetry.converged = m_hostStatus->converged != 0;
+        m_hasWarmStart = true;
+    }
+
+    void enqueueImpulseReadback()
+    {
+        checkCuda(cudaEventRecord(m_downloadStart, m_stream), "record readback start");
+        checkCuda(
+            cudaMemcpyAsync(
+                m_hostImpulses,
+                m_impulses,
+                sizeof(AngLin) * m_bondCount,
+                cudaMemcpyDeviceToHost,
+                m_stream),
+            "read stress impulses");
+        checkCuda(cudaEventRecord(m_downloadStop, m_stream), "record readback stop");
+    }
+
+    void finishImpulseReadback(ExtStressGpuImpulse* bondImpulses)
+    {
+        checkCuda(
+            cudaEventElapsedTime(
+                &m_telemetry.downloadMilliseconds,
+                m_downloadStart,
+                m_downloadStop),
+            "measure impulse readback");
+        for (std::uint32_t i = 0; i < m_bondCount; ++i)
+        {
+            bondImpulses[i].angular =
+                {
+                    m_hostImpulses[i].angular.x,
+                    m_hostImpulses[i].angular.y,
+                    m_hostImpulses[i].angular.z};
+            bondImpulses[i].linear =
+                {
+                    m_hostImpulses[i].linear.x,
+                    m_hostImpulses[i].linear.y,
+                    m_hostImpulses[i].linear.z};
+        }
+        m_telemetry.deviceToHostBytes =
+            sizeof(AngLin) * static_cast<std::uint64_t>(m_bondCount);
+    }
+
     void prepare(const ExtStressGpuNode* nodes, const ExtStressGpuBond* bonds)
     {
         m_hostNode0.resize(m_bondCount);

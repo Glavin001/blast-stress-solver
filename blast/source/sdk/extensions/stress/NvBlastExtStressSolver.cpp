@@ -363,8 +363,9 @@ public:
                 : iterationCount;
             gpuParams.tolerance = 0.001f;
             gpuParams.warmStart = warmStart && !m_forceColdStart;
-            if (m_gpuSolver->solve(m_gpuVelocities.data(), gpuParams)
-                && m_gpuSolver->readbackImpulses(
+            if (m_gpuSolver->solveAndReadbackImpulses(
+                    m_gpuVelocities.data(),
+                    gpuParams,
                     m_gpuImpulses.data(),
                     static_cast<uint32_t>(m_gpuImpulses.size())))
             {

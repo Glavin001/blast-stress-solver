@@ -1,6 +1,7 @@
 /target/
 
-# Generated scene pack — produced from the TypeScript composer via
+# Generated scene packs — produced from the TypeScript composer via
 # `(cd ../blast-stress-solver && npm run build:ts && npm run generate:high-rise)`.
-# Not committed (large, regenerated); the demo/tests load it from disk at runtime.
-/assets/scenes/high-rise.json
+# HIGH_RISE_FLOORS emits additional `high-rise-<N>f.json` benchmark variants.
+# Not committed (large, regenerated); the demo/tests load them from disk at runtime.
+/assets/scenes/high-rise*.json

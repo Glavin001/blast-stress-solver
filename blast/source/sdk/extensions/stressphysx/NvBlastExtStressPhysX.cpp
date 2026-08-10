@@ -562,6 +562,11 @@ public:
         return m_telemetry;
     }
 
+    bool usesGpuStressSolver() const override
+    {
+        return m_solver && ext_stress_solver_get_gpu_accelerated(m_solver) != 0;
+    }
+
     uint32_t getBodySnapshots(
         ExtStressPhysXBodySnapshot* snapshots,
         uint32_t capacity) const override
