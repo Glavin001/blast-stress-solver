@@ -277,6 +277,17 @@ add_executable(scene_pack_test
     scene_pack.cpp)
 target_include_directories(scene_pack_test PRIVATE "${PHYSX_ROOT}/include")
 target_compile_definitions(scene_pack_test PRIVATE PX_PHYSX_STATIC_LIB)
+# The worked reference building must keep the calibration its documentation
+# claims: it stands under its own weight with every joint class inside the
+# target safety-factor bands (see the authoring skill). If a change to the
+# solver, the loader or the pack moves those numbers, this fails.
+add_test(NAME blast_stress_reference_building_load_path
+    COMMAND blast_stress_demo --physics cpu --grid 1 --duration 6 --settle 2
+        --scene "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building.json"
+        --projectile-mass-scale 0.0001 --projectile-speed-scale 0.0001
+        --require-min-safety-factor 2 --require-max-safety-factor 2000
+        --output-state "")
+
 add_executable(material_behavior_test
     tests/material_behavior_test.cpp
     physx_scene.cpp)
