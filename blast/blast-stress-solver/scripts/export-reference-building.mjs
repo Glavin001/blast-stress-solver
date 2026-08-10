@@ -47,8 +47,15 @@ const OUTPUT = path.resolve(__dirname, '../assets/reference/reference-building.j
 // ── Geometry ────────────────────────────────────────────────────────────────
 const BAY = 4.0; // m between column lines
 const FLOOR = 3.0; // m floor to floor
-const FLOORS = 3;
-const COL = 0.4; // column section, square
+// Size. Defaults reproduce the committed reference building byte-for-byte;
+// override to build towers:  BAYS=3 FLOORS=8 node scripts/export-reference-building.mjs
+const FLOORS = Number(process.env.FLOORS ?? 3);
+const BAYS = Number(process.env.BAYS ?? 1); // bays per axis => BAYS+1 column lines
+// Column section. Load per column scales with floor count, so a taller
+// building needs a bigger section — NOT stronger concrete. Sizing the section
+// to the load is the physical fix; scaling material limits to compensate for
+// an undersized column is the authoring error this project keeps relearning.
+const COL = Number(process.env.COL ?? 0.4); // column section, square
 const SLAB_T = 0.25;
 const PANEL_T = 0.12;
 const CONCRETE = 2400; // kg/m^3
@@ -71,19 +78,31 @@ const DRYWALL = 700;
 // See demos/blast-stress-demo/tests/material_behavior_test.cpp
 // (testBandWidthControlsBrittleVsDuctile) for the isolated mechanism.
 const FRAME_BAND = Number(process.env.FRAME_BAND ?? 10);
+// Material grade scales, for re-sizing a design to a different height. A
+// taller building genuinely uses a higher-grade slab and stronger cladding
+// fixings; these scale capacity, never geometry.
+const FRAME_SCALE = Number(process.env.FRAME_SCALE ?? 1);
+const SLAB_SCALE = Number(process.env.SLAB_SCALE ?? 1);
+const FACADE_SCALE = Number(process.env.FACADE_SCALE ?? 1);
+// Footing anchorage. Measured finding: for a TALL building the governing
+// failure is base overturning, not a vertical cascade — the superstructure
+// shears off its footings as a unit and there is no partial state at any
+// ductility. Anchorage is what buys local damage on a tall structure; a real
+// tower has heavily reinforced footing connections for exactly this reason.
+const ANCHOR_SCALE = Number(process.env.ANCHOR_SCALE ?? 1);
 
 const MATERIALS = [
   {
     name: 'reinforced-concrete',
-    compressionElastic: 24e6, compressionFatal: 24e6 * FRAME_BAND,
-    tensionElastic: 3.0e6, tensionFatal: 3.0e6 * FRAME_BAND,
-    shearElastic: 4.0e6, shearFatal: 4.0e6 * FRAME_BAND,
+    compressionElastic: 24e6 * FRAME_SCALE, compressionFatal: 24e6 * FRAME_SCALE * FRAME_BAND,
+    tensionElastic: 3.0e6 * FRAME_SCALE, tensionFatal: 3.0e6 * FRAME_SCALE * FRAME_BAND,
+    shearElastic: 4.0e6 * FRAME_SCALE, shearFatal: 4.0e6 * FRAME_SCALE * FRAME_BAND,
   },
   {
     name: 'concrete-slab',
-    compressionElastic: 12e6, compressionFatal: 30e6,
-    tensionElastic: 1.2e6, tensionFatal: 3.0e6,
-    shearElastic: 1.6e6, shearFatal: 4.0e6,
+    compressionElastic: 12e6 * SLAB_SCALE, compressionFatal: 30e6 * SLAB_SCALE,
+    tensionElastic: 1.2e6 * SLAB_SCALE, tensionFatal: 3.0e6 * SLAB_SCALE,
+    shearElastic: 1.6e6 * SLAB_SCALE, shearFatal: 4.0e6 * SLAB_SCALE,
   },
   {
     // Shear raised 3x when the panels were split in two: halving a panel
@@ -91,21 +110,28 @@ const MATERIALS = [
     // through it. Geometry changed, so the material had to follow — that is
     // the calibration loop, not tuning.
     name: 'drywall-panel',
-    compressionElastic: 0.8e6, compressionFatal: 2.0e6,
-    tensionElastic: 0.12e6, tensionFatal: 0.40e6,
-    shearElastic: 0.45e6, shearFatal: 1.2e6,
+    compressionElastic: 0.8e6 * FACADE_SCALE, compressionFatal: 2.0e6 * FACADE_SCALE,
+    tensionElastic: 0.12e6 * FACADE_SCALE, tensionFatal: 0.40e6 * FACADE_SCALE,
+    shearElastic: 0.45e6 * FACADE_SCALE, shearFatal: 1.2e6 * FACADE_SCALE,
   },
   {
     // Same story, and the second time this material's SHEAR was the binding
     // mode (the first pass had it at safety factor 1.06). Read peak(c/t/s) in
     // the load-path report and move only the mode that is actually loaded.
     name: 'facade-clip',
-    compressionElastic: 0.5e6, compressionFatal: 0.9e6,
-    tensionElastic: 0.09e6, tensionFatal: 0.22e6,
-    shearElastic: 0.60e6, shearFatal: 1.3e6,
+    compressionElastic: 0.5e6 * FACADE_SCALE, compressionFatal: 0.9e6 * FACADE_SCALE,
+    tensionElastic: 0.09e6 * FACADE_SCALE, tensionFatal: 0.22e6 * FACADE_SCALE,
+    shearElastic: 0.60e6 * FACADE_SCALE, shearFatal: 1.3e6 * FACADE_SCALE,
   },
 ];
+MATERIALS.push({
+  name: 'footing-anchor',
+  compressionElastic: 24e6 * ANCHOR_SCALE, compressionFatal: 24e6 * ANCHOR_SCALE * FRAME_BAND,
+  tensionElastic: 3.0e6 * ANCHOR_SCALE, tensionFatal: 3.0e6 * ANCHOR_SCALE * FRAME_BAND,
+  shearElastic: 4.0e6 * ANCHOR_SCALE, shearFatal: 4.0e6 * ANCHOR_SCALE * FRAME_BAND,
+});
 const [M_FRAME, M_SLAB, M_PANEL, M_CLIP] = [0, 1, 2, 3];
+const M_ANCHOR = 4;
 
 const round = (n) => Math.round(n * 1e5) / 1e5;
 const v = (x, y, z) => ({ x: round(x), y: round(y), z: round(z) });
@@ -131,6 +157,9 @@ function addNode(role, centre, half, density, fixed = false) {
   return nodes.length - 1;
 }
 
+const cellOf = (p) => Math.min(SLAB_CELLS - 1, Math.max(0,
+  Math.floor((p + FOOTPRINT / 2) / (FOOTPRINT / SLAB_CELLS))));
+
 const bonds = [];
 function addBond(a, b, area, material) {
   const ca = nodes[a].centroid;
@@ -148,8 +177,10 @@ function addBond(a, b, area, material) {
   bonds.push(bond);
 }
 
-const xs = [-BAY / 2, BAY / 2];
-const zs = [-BAY / 2, BAY / 2];
+// Column lines on a (BAYS+1) x (BAYS+1) grid.
+const lines = Array.from({ length: BAYS + 1 }, (_, i) => (i - BAYS / 2) * BAY);
+const xs = lines, zs = lines;
+const FOOTPRINT = BAYS * BAY + COL; // slab extent per axis
 
 // ── Fracture granularity ────────────────────────────────────────────────────
 // Each structural ELEMENT is built from several chunks, not one. This is what
@@ -178,7 +209,8 @@ for (const x of xs)
     foundation.set(key(x, z), addNode('foundation', [x, 0.3, z], [0.6, 0.3, 0.6], CONCRETE, true));
 
 const SEG_H = FLOOR / COL_SEGMENTS;
-const SLAB_HALF = (BAY / 2 + COL / 2) / SLAB_SPLIT;
+const SLAB_CELLS = BAYS * SLAB_SPLIT; // slab quadrants per axis
+const SLAB_HALF = FOOTPRINT / (2 * SLAB_CELLS);
 
 for (let f = 0; f < FLOORS; ++f) {
   const y0 = 0.6 + f * FLOOR;
@@ -189,36 +221,46 @@ for (let f = 0; f < FLOORS; ++f) {
           [x, y0 + SEG_H * (s + 0.5), z], [COL / 2, SEG_H / 2, COL / 2], CONCRETE));
 
   const slabY = y0 + FLOOR + SLAB_T / 2;
-  for (let i = 0; i < SLAB_SPLIT; ++i)
-    for (let j = 0; j < SLAB_SPLIT; ++j)
+  for (let i = 0; i < SLAB_CELLS; ++i)
+    for (let j = 0; j < SLAB_CELLS; ++j)
       slabs.set(key(f, i, j), addNode('slab',
-        [(i * 2 - 1) * SLAB_HALF, slabY, (j * 2 - 1) * SLAB_HALF],
+        [-FOOTPRINT / 2 + SLAB_HALF * (2 * i + 1), slabY,
+         -FOOTPRINT / 2 + SLAB_HALF * (2 * j + 1)],
         [SLAB_HALF, SLAB_T / 2, SLAB_HALF], CONCRETE));
 }
 
 for (let f = 0; f < FLOORS; ++f) {
   const y = 0.6 + f * FLOOR + FLOOR / 2;
-  const halfW = (BAY / 2 - COL / 2) / PANEL_SPLIT;
-  for (const z of zs)
-    for (let s = 0; s < PANEL_SPLIT; ++s)
-      panels.push([addNode('infill', [(s * 2 - 1) * halfW, y, z],
-        [halfW, FLOOR / 2 - 0.1, PANEL_T / 2], DRYWALL), f, 'z', z, s * 2 - 1]);
-  for (const x of xs)
-    for (let s = 0; s < PANEL_SPLIT; ++s)
-      panels.push([addNode('infill', [x, y, (s * 2 - 1) * halfW],
-        [PANEL_T / 2, FLOOR / 2 - 0.1, halfW], DRYWALL), f, 'x', x, s * 2 - 1]);
+  // Cladding fills each bay on the PERIMETER faces only (an interior bay has
+  // no exterior wall), split PANEL_SPLIT ways so a piece can break off.
+  const halfW = (BAY - COL) / (2 * PANEL_SPLIT);
+  const faces = [zs[0], zs[zs.length - 1]];
+  for (const z of faces)
+    for (let b = 0; b + 1 < xs.length; ++b) {
+      const mid = (xs[b] + xs[b + 1]) / 2;
+      for (let s = 0; s < PANEL_SPLIT; ++s)
+        panels.push([addNode('infill', [mid + (s * 2 - 1) * halfW, y, z],
+          [halfW, FLOOR / 2 - 0.1, PANEL_T / 2], DRYWALL), f, 'z', z, s * 2 - 1, b]);
+    }
+  for (const x of [xs[0], xs[xs.length - 1]])
+    for (let b = 0; b + 1 < zs.length; ++b) {
+      const mid = (zs[b] + zs[b + 1]) / 2;
+      for (let s = 0; s < PANEL_SPLIT; ++s)
+        panels.push([addNode('infill', [x, y, mid + (s * 2 - 1) * halfW],
+          [PANEL_T / 2, FLOOR / 2 - 0.1, halfW], DRYWALL), f, 'x', x, s * 2 - 1, b]);
+    }
 }
 
 // ── Bond areas: each one is a real contact patch, not a strength knob ───────
 const COL_AREA = COL * COL; // column cross-section
-const SLAB_CUT = 2 * SLAB_HALF * SLAB_T; // quadrant-to-quadrant cut face
+const SLAB_CUT = 2 * SLAB_HALF * SLAB_T; // one internal cut face // quadrant-to-quadrant cut face
 const PANEL_EDGE = 2 * ((BAY / 2 - COL / 2) / PANEL_SPLIT) * PANEL_T; // panel head into slab
 const PANEL_SEAM = (FLOOR - 0.2) * PANEL_T; // vertical seam between panel halves
 const CLIP_AREA = (FLOOR - 0.2) * PANEL_T; // panel edge against a column
 
 for (const x of xs)
   for (const z of zs)
-    addBond(foundation.get(key(x, z)), columns.get(key(x, z, 0, 0)), COL_AREA, M_FRAME);
+    addBond(foundation.get(key(x, z)), columns.get(key(x, z, 0, 0)), COL_AREA, M_ANCHOR);
 
 for (let f = 0; f < FLOORS; ++f) {
   for (const x of xs)
@@ -228,8 +270,8 @@ for (let f = 0; f < FLOORS; ++f) {
       for (let s = 0; s + 1 < COL_SEGMENTS; ++s)
         addBond(columns.get(key(x, z, f, s)), columns.get(key(x, z, f, s + 1)), COL_AREA, M_FRAME);
       const top = columns.get(key(x, z, f, COL_SEGMENTS - 1));
-      const qi = x < 0 ? 0 : 1;
-      const qj = z < 0 ? 0 : 1;
+      const qi = cellOf(x);
+      const qj = cellOf(z);
       addBond(top, slabs.get(key(f, qi, qj)), COL_AREA, M_FRAME);
       if (f + 1 < FLOORS)
         addBond(slabs.get(key(f, qi, qj)), columns.get(key(x, z, f + 1, 0)), COL_AREA, M_FRAME);
@@ -238,29 +280,34 @@ for (let f = 0; f < FLOORS; ++f) {
   // structure's only load-path redundancy: a quadrant whose column is gone is
   // still held by its neighbours, which is what produces a partial collapse
   // instead of an all-or-nothing one.
-  for (let i = 0; i < SLAB_SPLIT; ++i)
-    for (let j = 0; j < SLAB_SPLIT; ++j) {
-      if (i + 1 < SLAB_SPLIT)
+  for (let i = 0; i < SLAB_CELLS; ++i)
+    for (let j = 0; j < SLAB_CELLS; ++j) {
+      if (i + 1 < SLAB_CELLS)
         addBond(slabs.get(key(f, i, j)), slabs.get(key(f, i + 1, j)), SLAB_CUT, M_SLAB);
-      if (j + 1 < SLAB_SPLIT)
+      if (j + 1 < SLAB_CELLS)
         addBond(slabs.get(key(f, i, j)), slabs.get(key(f, i, j + 1)), SLAB_CUT, M_SLAB);
     }
 }
 
-for (const [panel, f, axis, coord, side] of panels) {
-  const qi = axis === 'z' ? (side < 0 ? 0 : 1) : (coord < 0 ? 0 : 1);
-  const qj = axis === 'z' ? (coord < 0 ? 0 : 1) : (side < 0 ? 0 : 1);
-  addBond(slabs.get(key(f, qi, qj)), panel, PANEL_EDGE, M_PANEL);
-  const cx = axis === 'z' ? (side < 0 ? xs[0] : xs[1]) : coord;
-  const cz = axis === 'z' ? coord : (side < 0 ? zs[0] : zs[1]);
+for (const [panel, f, axis, coord, side, bay] of panels) {
+  const c = nodes[panel].centroid;
+  addBond(slabs.get(key(f, cellOf(c.x), cellOf(c.z))), panel, PANEL_EDGE, M_PANEL);
+  // Clip onto the column line this half of the wall runs to.
+  const along = axis === 'z' ? xs : zs;
+  const lineCoord = side < 0 ? along[bay] : along[bay + 1];
+  const cx = axis === 'z' ? lineCoord : coord;
+  const cz = axis === 'z' ? coord : lineCoord;
   addBond(columns.get(key(cx, cz, f, 0)), panel, CLIP_AREA / 2, M_CLIP);
   addBond(columns.get(key(cx, cz, f, COL_SEGMENTS - 1)), panel, CLIP_AREA / 2, M_CLIP);
 }
 for (let f = 0; f < FLOORS; ++f) {
   for (const axis of ['z', 'x'])
     for (const coord of axis === 'z' ? zs : xs) {
-      const pair = panels.filter(([, pf, pa, pc]) => pf === f && pa === axis && pc === coord);
-      if (pair.length === 2) addBond(pair[0][0], pair[1][0], PANEL_SEAM, M_PANEL);
+      for (let bay = 0; bay + 1 < (axis === 'z' ? xs : zs).length; ++bay) {
+        const pair = panels.filter(
+          ([, pf, pa, pc, , pb]) => pf === f && pa === axis && pc === coord && pb === bay);
+        if (pair.length === 2) addBond(pair[0][0], pair[1][0], PANEL_SEAM, M_PANEL);
+      }
     }
 }
 

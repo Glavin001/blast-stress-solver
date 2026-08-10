@@ -56,6 +56,15 @@
      "tensionFatal": 220000,
      "shearElastic": 600000,
      "shearFatal": 1300000
+    },
+    {
+     "name": "footing-anchor",
+     "compressionElastic": 24000000,
+     "compressionFatal": 240000000,
+     "tensionElastic": 3000000,
+     "tensionFatal": 30000000,
+     "shearElastic": 4000000,
+     "shearFatal": 40000000
     }
    ]
   },
@@ -732,7 +741,8 @@
      "y": 1,
      "z": 0
     },
-    "area": 0.16
+    "area": 0.16,
+    "m": 4
    },
    {
     "node0": 1,
@@ -747,7 +757,8 @@
      "y": 1,
      "z": 0
     },
-    "area": 0.16
+    "area": 0.16,
+    "m": 4
    },
    {
     "node0": 2,
@@ -762,7 +773,8 @@
      "y": 1,
      "z": 0
     },
-    "area": 0.16
+    "area": 0.16,
+    "m": 4
    },
    {
     "node0": 3,
@@ -777,7 +789,8 @@
      "y": 1,
      "z": 0
     },
-    "area": 0.16
+    "area": 0.16,
+    "m": 4
    },
    {
     "node0": 4,
