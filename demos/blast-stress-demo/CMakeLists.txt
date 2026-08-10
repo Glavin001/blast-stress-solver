@@ -306,6 +306,27 @@ target_link_libraries(material_behavior_test PRIVATE
     ${PHYSX_LINK_LIBS})
 add_test(NAME blast_stress_material_behavior COMMAND material_behavior_test)
 
+add_executable(destruction_quality_test
+    tests/destruction_quality_test.cpp
+    physx_scene.cpp
+    scene_pack.cpp)
+target_include_directories(destruction_quality_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${BLAST_ROOT}/include/extensions/stressphysx"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(destruction_quality_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(destruction_quality_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(destruction_quality_test PRIVATE
+    NvBlastExtStressPhysX
+    ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_destruction_quality
+    COMMAND destruction_quality_test
+        "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building.json")
+
 add_executable(scene_pack_conformance_test
     tests/scene_pack_conformance_test.cpp
     scene_pack.cpp)

@@ -4,7 +4,7 @@
  *   node scripts/export-reference-building.mjs
  *   -> assets/reference/reference-building.json  (ScenePack v2)
  *
- * Small on purpose (31 nodes, 62 bonds, 3 floors of a 2x2 bay frame): big
+ * Small on purpose (64 nodes, 132 bonds, 3 floors of a 2x2 bay frame): big
  * enough to have a real load path — footings, columns, slab diaphragms and
  * non-structural cladding — and small enough to read end to end and to
  * re-measure in a fraction of a second while you iterate.
@@ -72,17 +72,23 @@ const MATERIALS = [
     shearElastic: 1.6e6, shearFatal: 4.0e6,
   },
   {
+    // Shear raised 3x when the panels were split in two: halving a panel
+    // halves its bonded edge, which doubles the stress the same weight puts
+    // through it. Geometry changed, so the material had to follow — that is
+    // the calibration loop, not tuning.
     name: 'drywall-panel',
     compressionElastic: 0.8e6, compressionFatal: 2.0e6,
     tensionElastic: 0.12e6, tensionFatal: 0.40e6,
-    shearElastic: 0.15e6, shearFatal: 0.5e6,
+    shearElastic: 0.45e6, shearFatal: 1.2e6,
   },
   {
-    // Raised from the first pass: shear was binding at safety factor 1.06.
+    // Same story, and the second time this material's SHEAR was the binding
+    // mode (the first pass had it at safety factor 1.06). Read peak(c/t/s) in
+    // the load-path report and move only the mode that is actually loaded.
     name: 'facade-clip',
     compressionElastic: 0.5e6, compressionFatal: 0.9e6,
     tensionElastic: 0.09e6, tensionFatal: 0.22e6,
-    shearElastic: 0.20e6, shearFatal: 0.45e6,
+    shearElastic: 0.60e6, shearFatal: 1.3e6,
   },
 ];
 const [M_FRAME, M_SLAB, M_PANEL, M_CLIP] = [0, 1, 2, 3];
@@ -130,63 +136,118 @@ function addBond(a, b, area, material) {
 
 const xs = [-BAY / 2, BAY / 2];
 const zs = [-BAY / 2, BAY / 2];
+
+// ── Fracture granularity ────────────────────────────────────────────────────
+// Each structural ELEMENT is built from several chunks, not one. This is what
+// makes breaks look like pieces instead of dust: an inter-element joint
+// failing releases a multi-chunk piece (half a column, a slab quadrant) that
+// holds together because its INTRA-element bonds are full-section monolithic
+// concrete.
+//
+// This is a measured lesson, not a style choice. The first version of this
+// file used one node per element; a moderate hit atomized the building into
+// 30 bodies out of 31 chunks — largest surviving piece: 2 chunks. Granularity
+// is what buys recognisable debris. See
+// demos/blast-stress-demo/tests/destruction_quality_test.cpp.
+const COL_SEGMENTS = 2; // per floor
+const SLAB_SPLIT = 2; // per axis -> 2x2 quadrants
+const PANEL_SPLIT = 2; // per wall face
+
 const foundation = new Map();
-const columns = new Map();
-const slabs = new Map();
-const panels = [];
+const columns = new Map(); // key(x,z,floor,segment)
+const slabs = new Map(); // key(floor,i,j)
+const panels = []; // [node, floor, axis, coord, side]
 const key = (...parts) => parts.join(':');
 
 for (const x of xs)
   for (const z of zs)
     foundation.set(key(x, z), addNode('foundation', [x, 0.3, z], [0.6, 0.3, 0.6], CONCRETE, true));
 
+const SEG_H = FLOOR / COL_SEGMENTS;
+const SLAB_HALF = (BAY / 2 + COL / 2) / SLAB_SPLIT;
+
 for (let f = 0; f < FLOORS; ++f) {
   const y0 = 0.6 + f * FLOOR;
   for (const x of xs)
     for (const z of zs)
-      columns.set(key(x, z, f),
-        addNode('column', [x, y0 + FLOOR / 2, z], [COL / 2, FLOOR / 2, COL / 2], CONCRETE));
-  slabs.set(f, addNode('slab', [0, y0 + FLOOR + SLAB_T / 2, 0],
-    [BAY / 2 + COL / 2, SLAB_T / 2, BAY / 2 + COL / 2], CONCRETE));
+      for (let s = 0; s < COL_SEGMENTS; ++s)
+        columns.set(key(x, z, f, s), addNode('column',
+          [x, y0 + SEG_H * (s + 0.5), z], [COL / 2, SEG_H / 2, COL / 2], CONCRETE));
+
+  const slabY = y0 + FLOOR + SLAB_T / 2;
+  for (let i = 0; i < SLAB_SPLIT; ++i)
+    for (let j = 0; j < SLAB_SPLIT; ++j)
+      slabs.set(key(f, i, j), addNode('slab',
+        [(i * 2 - 1) * SLAB_HALF, slabY, (j * 2 - 1) * SLAB_HALF],
+        [SLAB_HALF, SLAB_T / 2, SLAB_HALF], CONCRETE));
 }
 
 for (let f = 0; f < FLOORS; ++f) {
   const y = 0.6 + f * FLOOR + FLOOR / 2;
+  const halfW = (BAY / 2 - COL / 2) / PANEL_SPLIT;
   for (const z of zs)
-    panels.push([addNode('infill', [0, y, z],
-      [BAY / 2 - COL / 2, FLOOR / 2 - 0.1, PANEL_T / 2], DRYWALL), f, 'z', z]);
+    for (let s = 0; s < PANEL_SPLIT; ++s)
+      panels.push([addNode('infill', [(s * 2 - 1) * halfW, y, z],
+        [halfW, FLOOR / 2 - 0.1, PANEL_T / 2], DRYWALL), f, 'z', z, s * 2 - 1]);
   for (const x of xs)
-    panels.push([addNode('infill', [x, y, 0],
-      [PANEL_T / 2, FLOOR / 2 - 0.1, BAY / 2 - COL / 2], DRYWALL), f, 'x', x]);
+    for (let s = 0; s < PANEL_SPLIT; ++s)
+      panels.push([addNode('infill', [x, y, (s * 2 - 1) * halfW],
+        [PANEL_T / 2, FLOOR / 2 - 0.1, halfW], DRYWALL), f, 'x', x, s * 2 - 1]);
 }
 
 // ── Bond areas: each one is a real contact patch, not a strength knob ───────
 const COL_AREA = COL * COL; // column cross-section
-const SLAB_EDGE = (BAY + COL) * SLAB_T; // slab edge bearing on a column line
-const PANEL_EDGE = (BAY - COL) * PANEL_T; // panel head/base into the slab band
-const CLIP_AREA = (FLOOR - 0.2) * PANEL_T; // panel vertical edge against a column
+const SLAB_CUT = 2 * SLAB_HALF * SLAB_T; // quadrant-to-quadrant cut face
+const PANEL_EDGE = 2 * ((BAY / 2 - COL / 2) / PANEL_SPLIT) * PANEL_T; // panel head into slab
+const PANEL_SEAM = (FLOOR - 0.2) * PANEL_T; // vertical seam between panel halves
+const CLIP_AREA = (FLOOR - 0.2) * PANEL_T; // panel edge against a column
 
 for (const x of xs)
   for (const z of zs)
-    addBond(foundation.get(key(x, z)), columns.get(key(x, z, 0)), COL_AREA, M_FRAME);
+    addBond(foundation.get(key(x, z)), columns.get(key(x, z, 0, 0)), COL_AREA, M_FRAME);
 
 for (let f = 0; f < FLOORS; ++f) {
   for (const x of xs)
     for (const z of zs) {
-      addBond(columns.get(key(x, z, f)), slabs.get(f), COL_AREA, M_FRAME);
+      // INTRA-element: monolithic column, full section. Keeps a broken-off
+      // column piece in one lump instead of a pile of cubes.
+      for (let s = 0; s + 1 < COL_SEGMENTS; ++s)
+        addBond(columns.get(key(x, z, f, s)), columns.get(key(x, z, f, s + 1)), COL_AREA, M_FRAME);
+      const top = columns.get(key(x, z, f, COL_SEGMENTS - 1));
+      const qi = x < 0 ? 0 : 1;
+      const qj = z < 0 ? 0 : 1;
+      addBond(top, slabs.get(key(f, qi, qj)), COL_AREA, M_FRAME);
       if (f + 1 < FLOORS)
-        addBond(slabs.get(f), columns.get(key(x, z, f + 1)), COL_AREA, M_FRAME);
+        addBond(slabs.get(key(f, qi, qj)), columns.get(key(x, z, f + 1, 0)), COL_AREA, M_FRAME);
+    }
+  // INTRA-element: slab diaphragm continuity between quadrants. This is the
+  // structure's only load-path redundancy: a quadrant whose column is gone is
+  // still held by its neighbours, which is what produces a partial collapse
+  // instead of an all-or-nothing one.
+  for (let i = 0; i < SLAB_SPLIT; ++i)
+    for (let j = 0; j < SLAB_SPLIT; ++j) {
+      if (i + 1 < SLAB_SPLIT)
+        addBond(slabs.get(key(f, i, j)), slabs.get(key(f, i + 1, j)), SLAB_CUT, M_SLAB);
+      if (j + 1 < SLAB_SPLIT)
+        addBond(slabs.get(key(f, i, j)), slabs.get(key(f, i, j + 1)), SLAB_CUT, M_SLAB);
     }
 }
-for (let f = 0; f + 1 < FLOORS; ++f)
-  addBond(slabs.get(f), slabs.get(f + 1), SLAB_EDGE * 0.25, M_SLAB);
 
-for (const [panel, f, axis, coord] of panels) {
-  addBond(slabs.get(f), panel, PANEL_EDGE, M_PANEL);
-  for (const x of xs)
-    for (const z of zs)
-      if ((axis === 'z' && z === coord) || (axis === 'x' && x === coord))
-        addBond(columns.get(key(x, z, f)), panel, CLIP_AREA, M_CLIP);
+for (const [panel, f, axis, coord, side] of panels) {
+  const qi = axis === 'z' ? (side < 0 ? 0 : 1) : (coord < 0 ? 0 : 1);
+  const qj = axis === 'z' ? (coord < 0 ? 0 : 1) : (side < 0 ? 0 : 1);
+  addBond(slabs.get(key(f, qi, qj)), panel, PANEL_EDGE, M_PANEL);
+  const cx = axis === 'z' ? (side < 0 ? xs[0] : xs[1]) : coord;
+  const cz = axis === 'z' ? coord : (side < 0 ? zs[0] : zs[1]);
+  addBond(columns.get(key(cx, cz, f, 0)), panel, CLIP_AREA / 2, M_CLIP);
+  addBond(columns.get(key(cx, cz, f, COL_SEGMENTS - 1)), panel, CLIP_AREA / 2, M_CLIP);
+}
+for (let f = 0; f < FLOORS; ++f) {
+  for (const axis of ['z', 'x'])
+    for (const coord of axis === 'z' ? zs : xs) {
+      const pair = panels.filter(([, pf, pa, pc]) => pf === f && pa === axis && pc === coord);
+      if (pair.length === 2) addBond(pair[0][0], pair[1][0], PANEL_SEAM, M_PANEL);
+    }
 }
 
 const pack = {

@@ -21,6 +21,8 @@ a test, that test *is* the evidence — read it rather than trusting this file.
 
 - Format spec: [`SCENE_PACK_FORMAT.md`](../../../SCENE_PACK_FORMAT.md)
 - Behavior evidence: `demos/blast-stress-demo/tests/material_behavior_test.cpp`
+- End-to-end quality (multi-material pack + resim): `demos/blast-stress-demo/tests/destruction_quality_test.cpp`
+  (run it with `--sweep` to characterize a structure's response curve)
 - Worked example: `blast/blast-stress-solver/scripts/export-reference-building.mjs`
 
 ## The two axes
@@ -71,10 +73,10 @@ It prints, before any gate fires:
 
 ```
 gravity load path (utilisation = peak stress / that bond's material elastic limit):
-  infill~slab        drywall-panel        bonds=12  peakUtil=0.2942  safetyFactor=3.399  peak(c/t/s)=5.5e+04/1.47e+04/4.41e+04 Pa
-  column~infill      facade-clip          bonds=24  peakUtil=0.2837  safetyFactor=3.524  ...
-  column~slab        reinforced-concrete  bonds=20  peakUtil=0.05837 safetyFactor=17.13  ...
-  column~foundation  reinforced-concrete  bonds=4   peakUtil=0.02838 safetyFactor=35.24  ...
+  column~infill      facade-clip          bonds=48  peakUtil=0.3316  safetyFactor=3.015  peak(c/t/s)=1.66e+05/6.16e+03/1.79e+05 Pa
+  infill~slab        drywall-panel        bonds=24  peakUtil=0.3101  safetyFactor=3.225  ...
+  column~slab        reinforced-concrete  bonds=20  peakUtil=0.09665 safetyFactor=10.35  ...
+  column~foundation  reinforced-concrete  bonds=4   peakUtil=0.03126 safetyFactor=31.99  ...
 ```
 
 `safetyFactor = 1 / utilisation`. The same table lands in
@@ -112,11 +114,12 @@ a single sliver bond in a Voronoi-fractured pack).
    mode only**.
 5. Repeat. It converges in two or three passes.
 
-The worked example did exactly this: the first pass put the facade clip at
-safety factor 1.06 — the building stood, but its cladding was one gust from
-letting go. The binding mode was shear (5.67×10⁴ Pa against a 0.20×10⁶ limit),
-so only the clip's shear limits moved. Second pass: 3.52. See the comment block
-in `export-reference-building.mjs`.
+The worked example did exactly this, twice. The first pass put the facade clip
+at safety factor 1.06 — the building stood, but its cladding was one gust from
+letting go. Shear was the binding mode, so only the clip's shear limits moved.
+Later, splitting the panels in two halved their bonded edge and dropped the
+facade back to 1.08; again shear, again only shear moved. Final: 3.02/3.23. See
+the comment block in `export-reference-building.mjs`.
 
 ## Symptom table
 
@@ -160,21 +163,47 @@ Calibrated result (pinned by CTest `blast_stress_reference_building_load_path`):
 
 | Joint class | Material | Safety factor |
 |---|---|---|
-| `infill~slab` | drywall-panel | 3.40 |
-| `column~infill` | facade-clip | 3.52 |
-| `column~slab` | reinforced-concrete | 17.1 |
-| `slab~slab` | concrete-slab | 32.4 |
-| `column~foundation` | reinforced-concrete | 35.2 |
+| `column~infill` | facade-clip | 3.02 |
+| `infill~slab` | drywall-panel | 3.23 |
+| `column~column` | reinforced-concrete | 10.4 |
+| `column~slab` | reinforced-concrete | 10.4 |
+| `slab~slab` | concrete-slab | 14.2 |
+| `column~foundation` | reinforced-concrete | 32.0 |
 
-Impact response, measured (`--projectile-waves N`, default 3000 kg ball):
+Destruction quality, measured through `ExtStressPhysXFrameStepper` with
+**resim = 1** and unity contact gain — pinned by CTest
+`blast_stress_destruction_quality`:
 
-| Impulse (N·s) | Cladding moved | Frame moved | Reading |
-|---|---|---|---|
-| 6.6×10⁴ | 2/12 | 0/12 | local cladding damage |
-| 8.6×10⁴ | 4/12 | 0/12 | cladding sheds, frame intact |
-| 1.7×10⁵ | 11/12 | 11/12 | frame comes down |
-| 2.9×10⁵ | 12/12 | 12/12 | total collapse |
+| Impact | Splits | Bodies | Largest piece | Standing | Reading |
+|---|---|---|---|---|---|
+| gravity only | 0 | 1 | 64/64 | 100% | stands |
+| 500 kg @ 12 m/s | 0 | 1 | 64/64 | 100% | shrugs it off — **not glass** |
+| 1.5 t @ 16 m/s | 10 | 36 | 26/64 | 41% | **partial: a hole, and half the building still up in one piece** |
+| 4 t @ 20 m/s | 7 | 48 | 5/64 | 6% | frame comes down |
+| 40 t @ 45 m/s | 1 | 64 | 1/64 | 6% | everything breaks — **not rigid** |
 
-Cladding fails first and the frame only at ~2.5× that energy — the hierarchy
-the materials encode, showing up in behavior. Foundations never move at any
-energy: they are the only world-fixed nodes.
+"Largest piece" is the biggest connected body left. It is the number that
+separates destruction from dust: at the interesting level 26 of 64 chunks are
+still one object. Foundations never move at any energy — they are the only
+world-fixed nodes.
+
+## Two lessons this example paid for
+
+**Fracture granularity decides whether debris reads as pieces or dust.** The
+first version of this building used one node per structural element. A
+moderate hit atomized it: 30 bodies out of 31 chunks, largest surviving piece
+2 chunks. Elements are now built from several chunks bonded to each other with
+full-section monolithic material, so a joint failure releases a *piece* that
+holds together. Same materials, same energies — the difference is topology.
+
+**Changing geometry means re-running the calibration.** Splitting the panels in
+two halved each panel's bonded edge, which doubled the stress its own weight
+put through it, and dropped the facade from safety factor 3.5 to 1.08. The fix
+was raising that material's **shear** limits (the binding mode in the report),
+not its strength across the board. Geometry and material are independent axes,
+but they are not independent *decisions*: change one and re-measure.
+
+Note the coupling in the other direction too — strengthening the facade to hit
+its gravity target moved the impact threshold up with it, so the "interesting"
+energy level moved from 500 kg to 1.5 t. Expect to re-locate the band after any
+material change.
