@@ -135,27 +135,17 @@ struct ExtStressPhysXSettings
     // Opt-in per-actor bond-break cap for a single tick. Default 0 = unlimited.
     // Same warning as maximumBodies: artificial limits degrade simulation quality.
     uint32_t maximumFracturesPerActorPerTick;
-    // When true, bonds that touch a mass==0 support node are never fractured
-    // unless the other node is light enough to peel (mass < supportPeelMaxMass).
-    // That keeps the planted skeleton fixed while facade panels can still tear off.
-    bool protectSupportBonds;
-    // Upper mass for peelable non-support nodes bonded to supports (e.g. drywall).
-    // Structural partners at/above this mass stay locked to the support graph.
-    float supportPeelMaxMass;
-    // When true, overstressed bonds that touch a node which received a contact
-    // impulse this tick take fatal (full-health) damage instead of a single-frame
-    // elastic micro-damage. Projectile impacts against a still-monolithic body
-    // only load the stress graph for one solver step before the contact resolves
-    // and the projectile rebounds; without this, bonds can sit between elastic
-    // and fatal, take a few percent health damage, and never split on the hit
-    // frame — so fracture-frame resimulation never gets a hole to push through.
-    bool fatalizeImpactContactBonds;
+    // NOTE: this adapter never overrides a stress-solver fracture verdict and
+    // never applies persistent velocity caps to fracture bodies. Joint strength
+    // is authored (bond area = geometry, material limits = strength); anything
+    // the solver says breaks, breaks. Earlier revisions carried support-bond
+    // protection, impact-bond fatalization, and per-body velocity clamps as
+    // compensations for authoring the solver could not yet express — see
+    // PHYSICS_ENGINE_CONTRACT.md for the invariant that replaced them.
     bool idleSkip;
     bool baseStepSleep;
     float settledLinearSpeed;
     float settledAngularSpeed;
-    float maximumLinearVelocity;
-    float maximumAngularVelocity;
     float minimumSeparationVelocity;
     physx::PxShapeFlags shapeFlags;
 
@@ -177,15 +167,10 @@ struct ExtStressPhysXSettings
         , excessForceScale(1.0f)
         , maximumBodies(0)
         , maximumFracturesPerActorPerTick(0)
-        , protectSupportBonds(true)
-        , supportPeelMaxMass(1000.0f)
-        , fatalizeImpactContactBonds(true)
         , idleSkip(true)
         , baseStepSleep(false)
         , settledLinearSpeed(0.15f)
         , settledAngularSpeed(0.15f)
-        , maximumLinearVelocity(0.0f)
-        , maximumAngularVelocity(0.0f)
         , minimumSeparationVelocity(0.0f)
         , shapeFlags(physx::PxShapeFlag::eVISUALIZATION |
                      physx::PxShapeFlag::eSCENE_QUERY_SHAPE |
@@ -231,7 +216,6 @@ struct ExtStressPhysXTelemetry
     double resimulationCaptureMilliseconds;
     double resimulationRestoreMilliseconds;
     float resimulationMaxRederivedDriftMeters;
-    uint64_t impactContactBondsFatalized;
     ExtStressPhysXError lastError;
     uint32_t lastErrorNode;
 

@@ -96,9 +96,6 @@ ExtStressPhysXDestructible* createStack(
     desc.worldTransform = pose;
     desc.settings.applyExcessForces = false;
     desc.settings.minimumSeparationVelocity = 0.0f;
-    desc.settings.protectSupportBonds = true;
-    desc.settings.supportPeelMaxMass = 1000.0f;
-    desc.settings.fatalizeImpactContactBonds = true;
     desc.settings.idleSkip = true;
     desc.settings.baseStepSleep = baseStepSleep;
     desc.settings.settledLinearSpeed = 0.15f;

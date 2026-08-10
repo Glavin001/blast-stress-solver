@@ -144,7 +144,6 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , resimulationCaptureMilliseconds(0.0)
     , resimulationRestoreMilliseconds(0.0)
     , resimulationMaxRederivedDriftMeters(0.0f)
-    , impactContactBondsFatalized(0)
     , lastError(ExtStressPhysXError::None)
     , lastErrorNode(INVALID_INDEX)
 {
@@ -1167,14 +1166,6 @@ private:
                 "PhysX could not create a rigid dynamic.");
             return nullptr;
         }
-        if (m_settings.maximumLinearVelocity > 0.0f)
-        {
-            rigid->setMaxLinearVelocity(m_settings.maximumLinearVelocity);
-        }
-        if (m_settings.maximumAngularVelocity > 0.0f)
-        {
-            rigid->setMaxAngularVelocity(m_settings.maximumAngularVelocity);
-        }
 
         std::unique_ptr<BodyState> result(new (std::nothrow) BodyState());
         if (!result)
@@ -1517,129 +1508,6 @@ private:
             return true;
         }
 
-        // Promote contact-adjacent overstress to fatal damage on this tick.
-        // m_contactNodeIndices still holds the nodes that received impulses in
-        // beginTick/consumeContacts; elastic-only micro-damage on those bonds
-        // would otherwise leave the projectile to rebound from a monolith.
-        if (m_settings.fatalizeImpactContactBonds && !m_contactNodeIndices.empty())
-        {
-            std::unordered_set<uint32_t> contactedNodes(
-                m_contactNodeIndices.begin(),
-                m_contactNodeIndices.end());
-            // Also include immediate bond neighbors of contacted nodes so a
-            // struck facade panel can detach as a piece instead of staying
-            // hinged on a single unbroken edge.
-            std::unordered_set<uint32_t> impactNodes = contactedNodes;
-            for (uint32_t commandIndex = 0; commandIndex < commandCount; ++commandIndex)
-            {
-                const ExtStressFractureCommands& command = commands[commandIndex];
-                if (command.bondFractures == nullptr)
-                {
-                    continue;
-                }
-                for (uint32_t fractureIndex = 0; fractureIndex < command.bondFractureCount;
-                     ++fractureIndex)
-                {
-                    const ExtStressBondFracture& fracture =
-                        command.bondFractures[fractureIndex];
-                    const bool touch0 = contactedNodes.count(fracture.nodeIndex0) != 0;
-                    const bool touch1 = contactedNodes.count(fracture.nodeIndex1) != 0;
-                    if (touch0)
-                    {
-                        impactNodes.insert(fracture.nodeIndex1);
-                    }
-                    if (touch1)
-                    {
-                        impactNodes.insert(fracture.nodeIndex0);
-                    }
-                }
-            }
-            for (uint32_t commandIndex = 0; commandIndex < commandCount; ++commandIndex)
-            {
-                ExtStressFractureCommands& command = commands[commandIndex];
-                if (command.bondFractures == nullptr)
-                {
-                    continue;
-                }
-                for (uint32_t fractureIndex = 0; fractureIndex < command.bondFractureCount;
-                     ++fractureIndex)
-                {
-                    ExtStressBondFracture& fracture = command.bondFractures[fractureIndex];
-                    if (impactNodes.count(fracture.nodeIndex0) == 0
-                        && impactNodes.count(fracture.nodeIndex1) == 0)
-                    {
-                        continue;
-                    }
-                    // Damage is subtracted from remaining bond health; a huge
-                    // value guarantees a full break regardless of authored area.
-                    if (fracture.health < 1.0e20f)
-                    {
-                        fracture.health = 1.0e20f;
-                        ++m_telemetry.impactContactBondsFatalized;
-                    }
-                }
-            }
-        }
-
-        if (m_settings.protectSupportBonds)
-        {
-            // Compact out footing/support joints so impacts tear non-support
-            // material instead of releasing the whole planted structure.
-            for (uint32_t commandIndex = 0; commandIndex < commandCount; ++commandIndex)
-            {
-                ExtStressFractureCommands& command = commands[commandIndex];
-                if (command.bondFractures == nullptr || command.bondFractureCount == 0)
-                {
-                    continue;
-                }
-                uint32_t kept = 0;
-                for (uint32_t fractureIndex = 0; fractureIndex < command.bondFractureCount;
-                     ++fractureIndex)
-                {
-                    const ExtStressBondFracture& fracture =
-                        command.bondFractures[fractureIndex];
-                    if (fracture.nodeIndex0 >= m_nodes.size()
-                        || fracture.nodeIndex1 >= m_nodes.size())
-                    {
-                        continue;
-                    }
-                    const float mass0 = m_nodes[fracture.nodeIndex0].mass;
-                    const float mass1 = m_nodes[fracture.nodeIndex1].mass;
-                    const bool support0 = mass0 == 0.0f;
-                    const bool support1 = mass1 == 0.0f;
-                    if (support0 || support1)
-                    {
-                        const float otherMass = support0 ? mass1 : mass0;
-                        // Keep footing/frame joints. Allow light facade peel-off.
-                        if (otherMass == 0.0f
-                            || otherMass >= m_settings.supportPeelMaxMass)
-                        {
-                            continue;
-                        }
-                    }
-                    if (kept != fractureIndex)
-                    {
-                        command.bondFractures[kept] = fracture;
-                    }
-                    ++kept;
-                }
-                command.bondFractureCount = kept;
-            }
-            commands.erase(
-                std::remove_if(
-                    commands.begin(),
-                    commands.end(),
-                    [](const ExtStressFractureCommands& command) {
-                        return command.bondFractureCount == 0
-                            || command.bondFractures == nullptr;
-                    }),
-                commands.end());
-            commandCount = static_cast<uint32_t>(commands.size());
-            if (commandCount == 0)
-            {
-                return true;
-            }
-        }
 
         commands.resize(commandCount);
         std::sort(commands.begin(), commands.end(), [](const ExtStressFractureCommands& a,
@@ -2012,28 +1880,6 @@ private:
                         separationImpulse,
                         PxForceMode::eIMPULSE,
                         true);
-                }
-                if (m_settings.maximumLinearVelocity > 0.0f)
-                {
-                    const PxVec3 velocity = target.body->getLinearVelocity();
-                    const float maximum = m_settings.maximumLinearVelocity;
-                    if (velocity.magnitudeSquared() > maximum * maximum)
-                    {
-                        target.body->setLinearVelocity(
-                            velocity.getNormalized() * maximum,
-                            true);
-                    }
-                }
-                if (m_settings.maximumAngularVelocity > 0.0f)
-                {
-                    const PxVec3 velocity = target.body->getAngularVelocity();
-                    const float maximum = m_settings.maximumAngularVelocity;
-                    if (velocity.magnitudeSquared() > maximum * maximum)
-                    {
-                        target.body->setAngularVelocity(
-                            velocity.getNormalized() * maximum,
-                            true);
-                    }
                 }
             }
         }

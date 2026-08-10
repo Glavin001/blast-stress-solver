@@ -2371,27 +2371,18 @@ int run(const Options& options)
         // Resimulation re-solves the impact contact against the fractured
         // pieces, so it replaces the synthetic momentum paths: the excess-force
         // kick and the outward separation impulse would double-count with the
-        // re-solved contact. The velocity clamps stay — they are stability
-        // bounds, not momentum sources.
+        // re-solved contact.
         desc.settings.applyExcessForces = options.resimPasses == 0;
         desc.settings.excessForceScale = options.excessForceScale;
         desc.settings.maximumBodies = options.maximumBodiesPerStructure;
         desc.settings.maximumFracturesPerActorPerTick =
             options.maximumFracturesPerActorPerTick;
-        desc.settings.maximumLinearVelocity = 6.0f;
-        desc.settings.maximumAngularVelocity = 8.0f;
         desc.settings.minimumSeparationVelocity =
             options.resimPasses == 0 ? 4.0f : 0.0f;
         desc.settings.idleSkip = true;
         desc.settings.baseStepSleep = options.baseStepSleep;
         desc.settings.settledLinearSpeed = 0.15f;
         desc.settings.settledAngularSpeed = 0.15f;
-        // Only light non-structural chunks may peel off mass-0 foundations
-        // (infill ~300–370 kg). Columns (~1.8 t) and slabs (~4.4 t) stay
-        // locked to footings unless we intentionally raise this — otherwise
-        // balls10× shears the whole tower off its anchors and every building
-        // classifies as shattered soup.
-        desc.settings.supportPeelMaxMass = 1000.0f;
         desc.errorCallback = adapterError;
 
         ExtStressPhysXTelemetry failure;

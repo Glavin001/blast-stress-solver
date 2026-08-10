@@ -159,6 +159,19 @@ The reference colliders are created with
 `ActiveHooks::FILTER_CONTACT_PAIRS | FILTER_INTERSECTION_PAIR` (see
 `build_node_collider`).
 
+**Verdict-integrity invariant.** Contact feedback is *pure force injection*:
+the engine adapter converts solved impulses to forces (impulse ÷ dt, unity
+gain) and hands them to the stress solver — and then it accepts whatever the
+solver decides. An adapter must never edit, veto, or amplify fracture
+commands (e.g. dropping breaks on bonds that touch support nodes, or forcing
+full-health damage on contacted bonds), and must never install persistent
+per-body velocity caps on fracture bodies. Joint strength is authored: bond
+area is geometry, material limits are strength. If a structure breaks too
+easily or refuses to break, the fix is authoring — not a post-solve filter.
+Every such filter that existed in an earlier PhysX port revision turned out
+to be compensation for authoring the solver could not yet express, and each
+one silently invalidated the destruction results it was protecting.
+
 ### 2.6 Collision filtering — *optional (debris scaling & split cleanliness)*
 
 Two independent filtering mechanisms are used:
