@@ -34,6 +34,16 @@ pub enum Shape {
         radius: f32,
         local: Transform,
     },
+    /// A static triangle mesh (e.g. a Voronoi-fractured shard's real convex
+    /// hull) so a fragment renders as its actual shape, not its AABB.
+    /// Positions/normals are parallel per-vertex arrays in the actor's local
+    /// space; geometry never changes after the defining RECORD_ACTOR.
+    Mesh {
+        positions: Vec<Vec3>,
+        normals: Vec<Vec3>,
+        indices: Vec<u32>,
+        local: Transform,
+    },
 }
 
 #[derive(Debug)]
@@ -83,8 +93,11 @@ impl StateReader {
         }
 
         let version = read_u32(&mut reader)?;
-        if version != 1 {
-            bail!("unsupported TWSTATE state version {version}");
+        if version != 2 {
+            bail!(
+                "unsupported TWSTATE state version {version} (this reader expects 2, added \
+                 with Shape::Mesh support); re-run the writer to regenerate the recording"
+            );
         }
 
         let fps = read_u32(&mut reader)?;
@@ -170,6 +183,26 @@ impl StateReader {
                     radius: parameters.x,
                     local,
                 }),
+                3 => {
+                    let vertex_count = read_u32(&mut self.reader)? as usize;
+                    let mut positions = Vec::with_capacity(vertex_count);
+                    let mut normals = Vec::with_capacity(vertex_count);
+                    for _ in 0..vertex_count {
+                        positions.push(read_vec3(&mut self.reader)?);
+                        normals.push(read_vec3(&mut self.reader)?);
+                    }
+                    let index_count = read_u32(&mut self.reader)? as usize;
+                    let mut indices = Vec::with_capacity(index_count);
+                    for _ in 0..index_count {
+                        indices.push(read_u32(&mut self.reader)?);
+                    }
+                    shapes.push(Shape::Mesh {
+                        positions,
+                        normals,
+                        indices,
+                        local,
+                    });
+                }
                 _ => bail!("unknown shape kind {kind} on actor {id}"),
             }
         }

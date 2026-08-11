@@ -34,6 +34,26 @@ struct SceneNode
     SceneCollider collider;
 };
 
+/**
+ * Optional real render geometry for one node (`scenario.nodeMeshes[i]` in the
+ * pack JSON) — e.g. a Voronoi-fractured shard's actual irregular hull, so it
+ * draws as its true shape instead of its AABB box. Positions/normals are
+ * parallel per-vertex arrays, already centroid-relative (the same convention
+ * as `SceneCollider::points` and `SceneNode::visualHalfExtents`).
+ *
+ * `present` is false when this node has no mesh entry (absent, or `null` in
+ * the array) — the normal case for structural nodes (columns/slabs/
+ * foundation) that render as their box collider. A pack may mix meshed and
+ * box-only nodes freely.
+ */
+struct SceneMesh
+{
+    bool present{false};
+    std::vector<physx::PxVec3> positions;
+    std::vector<physx::PxVec3> normals;
+    std::vector<std::uint32_t> indices;
+};
+
 struct SceneBond
 {
     std::uint32_t node0{0};
@@ -80,6 +100,10 @@ struct ScenePack
     // parallel to `nodes`. Empty when the pack omits `scenario.nodeTypes`. Used to
     // label joint classes in the load-path safety-factor report.
     std::vector<std::string> nodeTypes;
+    // Optional real render geometry, parallel to `nodes` and always sized to
+    // match it (padded with `present=false` entries) once a pack is loaded, so
+    // callers can index nodeMeshes[i] unconditionally. See SceneMesh.
+    std::vector<SceneMesh> nodeMeshes;
     float gravity{-9.81f};
     float projectileRadius{0.6f};
     float projectileMass{1500.0f};

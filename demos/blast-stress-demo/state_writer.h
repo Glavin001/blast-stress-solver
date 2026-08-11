@@ -25,13 +25,25 @@ struct VisualActor
     enum class Shape : std::uint8_t
     {
         Box = 1,
-        Sphere = 2
+        Sphere = 2,
+        // Arbitrary static triangle mesh (e.g. a Voronoi-fractured shard's real
+        // convex hull), so a fragment renders as its actual shape instead of
+        // its AABB. Geometry is fixed at defineActor() time; only pose animates.
+        Mesh = 3
     };
 
     Shape shape{Shape::Box};
     std::uint8_t part{0};
     physx::PxVec3 parameters{0.5f};
     physx::PxTransform localPose{physx::PxIdentity};
+
+    // Only used when shape == Mesh. Positions/normals are parallel arrays
+    // (one entry per vertex), already in the actor's local space (the same
+    // convention as a box's halfExtents / a convex hull's collider points —
+    // see SCENE_PACK_FORMAT.md).
+    std::vector<physx::PxVec3> meshPositions;
+    std::vector<physx::PxVec3> meshNormals;
+    std::vector<std::uint32_t> meshIndices;
 };
 
 struct VisualPose

@@ -58,7 +58,7 @@ bool StateWriter::open(
     }
     const char magic[8] = {'T', 'W', 'S', 'T', 'A', 'T', 'E', '1'};
     if (!writeBytes(magic, sizeof(magic))
-        || !writeU32(1)
+        || !writeU32(2) // format version 2: adds VisualActor::Shape::Mesh
         || !writeU32(fps)
         || !writeU32(frameCount)
         || !writeU32(paneWidth)
@@ -100,6 +100,35 @@ bool StateWriter::defineActor(std::uint32_t id, const VisualActor& actor)
         || !writeTransform(actor.localPose))
     {
         return false;
+    }
+    if (actor.shape == VisualActor::Shape::Mesh)
+    {
+        if (actor.meshPositions.size() != actor.meshNormals.size())
+        {
+            return fail("mesh actor has mismatched position/normal counts");
+        }
+        if (!writeU32(static_cast<std::uint32_t>(actor.meshPositions.size())))
+        {
+            return false;
+        }
+        for (std::size_t i = 0; i < actor.meshPositions.size(); ++i)
+        {
+            if (!writeVec3(actor.meshPositions[i]) || !writeVec3(actor.meshNormals[i]))
+            {
+                return false;
+            }
+        }
+        if (!writeU32(static_cast<std::uint32_t>(actor.meshIndices.size())))
+        {
+            return false;
+        }
+        for (std::uint32_t index : actor.meshIndices)
+        {
+            if (!writeU32(index))
+            {
+                return false;
+            }
+        }
     }
     ++m_nextActorId;
     m_previousPoses.emplace_back();

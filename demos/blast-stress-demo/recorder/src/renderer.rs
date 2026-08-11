@@ -204,6 +204,23 @@ fn scene_bounds(actors: &[Actor]) -> Option<SceneBounds> {
                     let world = actor_matrix * transform_matrix(*local);
                     (world.transform_point3(Vec3::ZERO), Vec3::splat(*radius))
                 }
+                Shape::Mesh {
+                    positions, local, ..
+                } => {
+                    let world = actor_matrix * transform_matrix(*local);
+                    if positions.is_empty() {
+                        (world.transform_point3(Vec3::ZERO), Vec3::ZERO)
+                    } else {
+                        let mut mesh_min = Vec3::splat(f32::INFINITY);
+                        let mut mesh_max = Vec3::splat(f32::NEG_INFINITY);
+                        for position in positions {
+                            let world_position = world.transform_point3(*position);
+                            mesh_min = mesh_min.min(world_position);
+                            mesh_max = mesh_max.max(world_position);
+                        }
+                        ((mesh_min + mesh_max) * 0.5, (mesh_max - mesh_min) * 0.5)
+                    }
+                }
             };
             minimum = minimum.min(center - extents);
             maximum = maximum.max(center + extents);
@@ -552,6 +569,10 @@ async fn render_recording_async(
         "frame,cpu_submit_ms,readback_ms,overlay_ms,encode_pipe_ms,total_host_ms,boxes,spheres"
     )?;
 
+    // Built lazily on the first decoded frame: all RECORD_ACTOR entries
+    // precede any RECORD_FRAME in this format, so `state.actors` is complete
+    // by then (see StateReader::next_frame).
+    let mut mesh_actors: Vec<Option<MeshActor>> = Vec::new();
     let mut submitted_frames = 0_usize;
     let mut written_frames = 0_usize;
     let mut submit_info = Vec::with_capacity(state.header.frame_count as usize);
@@ -619,9 +640,13 @@ async fn render_recording_async(
             .at_time(frame_index as f32 / fps as f32);
         let orbit_uniform = camera_uniform(orbit, camera_aspect);
         queue.write_buffer(&camera_buffers[0], 0, bytemuck::bytes_of(&orbit_uniform));
+        if mesh_actors.is_empty() && !state.actors.is_empty() {
+            mesh_actors = build_mesh_actors(&device, &state.actors);
+        }
         let (boxes, spheres) = collect_instances(&state.actors, sleep_tint);
         box_buffer.upload(&device, &queue, "box-instances", &boxes);
         sphere_buffer.upload(&device, &queue, "sphere-instances", &spheres);
+        let visible_meshes = update_mesh_instances(&queue, &state.actors, &mesh_actors, sleep_tint);
 
         let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("blast-mini-city-frame"),
@@ -681,6 +706,12 @@ async fn render_recording_async(
                     &sphere_buffer.buffer,
                     spheres.len() as u32,
                 );
+                for &index in &visible_meshes {
+                    // Safe: `visible_meshes` only contains indices with a
+                    // `Some` entry (see update_mesh_instances).
+                    let mesh_actor = mesh_actors[index].as_ref().expect("visible mesh actor");
+                    draw_instances(&mut pass, &mesh_actor.mesh, &mesh_actor.instances, 1);
+                }
             }
         }
         commands.copy_texture_to_buffer(
@@ -823,10 +854,88 @@ fn collect_instances(
                         color,
                     });
                 }
+                // Mesh actors have unique per-actor geometry (a fractured
+                // shard's real hull), so they cannot share one instanced draw
+                // call the way every box/sphere does. Handled separately by
+                // `build_mesh_actors` + the per-frame mesh instance update.
+                Shape::Mesh { .. } => {}
             }
         }
     }
     (boxes, spheres)
+}
+
+/// Per-actor GPU resources for a `Shape::Mesh` actor: its own vertex/index
+/// buffers (geometry is static — defined once, like a fractured shard's real
+/// shape) plus a 1-element instance buffer rewritten each frame with its
+/// current pose. Unlike boxes/spheres, mesh actors are never batched into one
+/// shared instanced draw call because every fragment's geometry differs.
+struct MeshActor {
+    mesh: Mesh,
+    instances: wgpu::Buffer,
+}
+
+fn build_mesh_actors(device: &wgpu::Device, actors: &[Actor]) -> Vec<Option<MeshActor>> {
+    actors
+        .iter()
+        .map(|actor| match actor.shapes.first() {
+            Some(Shape::Mesh {
+                positions,
+                normals,
+                indices,
+                ..
+            }) => {
+                let vertices: Vec<Vertex> = positions
+                    .iter()
+                    .zip(normals.iter())
+                    .map(|(position, normal)| Vertex {
+                        position: position.to_array(),
+                        normal: normal.to_array(),
+                    })
+                    .collect();
+                let mesh = create_mesh(device, "fragment", &vertices, indices);
+                let instances = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fragment-instance"),
+                    size: std::mem::size_of::<InstanceRaw>() as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                Some(MeshActor { mesh, instances })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Refresh every visible mesh actor's 1-element instance buffer for this
+/// frame and return the actor indices to draw. Mirrors `collect_instances`
+/// but per-actor rather than batched, since mesh geometry is unique per actor.
+fn update_mesh_instances(
+    queue: &wgpu::Queue,
+    actors: &[Actor],
+    mesh_actors: &[Option<MeshActor>],
+    sleep_tint: bool,
+) -> Vec<usize> {
+    let mut visible = Vec::new();
+    for (index, actor) in actors.iter().enumerate() {
+        if !actor.visible {
+            continue;
+        }
+        let Some(mesh_actor) = mesh_actors.get(index).and_then(|entry| entry.as_ref()) else {
+            continue;
+        };
+        let Some(Shape::Mesh { local, .. }) = actor.shapes.first() else {
+            continue;
+        };
+        let model = transform_matrix(actor.pose) * transform_matrix(*local);
+        let raw = InstanceRaw {
+            model: model.to_cols_array_2d(),
+            color: part_color(actor.part, actor.sleeping && sleep_tint),
+        };
+        queue.write_buffer(&mesh_actor.instances, 0, bytemuck::bytes_of(&raw));
+        visible.push(index);
+    }
+    visible
 }
 
 fn transform_matrix(transform: Transform) -> Mat4 {

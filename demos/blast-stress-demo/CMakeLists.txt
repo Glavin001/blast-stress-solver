@@ -344,6 +344,20 @@ add_test(NAME blast_stress_scene_pack
     COMMAND scene_pack_test
         "${BLAST_ROOT}/blast-stress-demo-rs/assets/scenes/fractured-tower.json")
 
+add_executable(node_mesh_test
+    tests/node_mesh_test.cpp
+    scene_pack.cpp)
+target_include_directories(node_mesh_test PRIVATE
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(node_mesh_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(node_mesh_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}")
+target_link_libraries(node_mesh_test PRIVATE ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_node_mesh
+    COMMAND node_mesh_test
+        "${BLAST_ROOT}/blast-stress-demo-rs/assets/scenes/fractured-tower.json"
+        "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building.json")
+
 if(BLAST_ENABLE_CUDA_STRESS)
     add_executable(gpu_stress_test tests/gpu_stress_test.cpp)
     target_include_directories(gpu_stress_test PRIVATE

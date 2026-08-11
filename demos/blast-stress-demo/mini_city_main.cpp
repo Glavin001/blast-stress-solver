@@ -2628,11 +2628,28 @@ int run(const Options& options)
             for (std::size_t node = 0; node < buildingPack.nodes.size(); ++node)
             {
                 VisualActor actor;
-                actor.shape = VisualActor::Shape::Box;
                 actor.part = buildingPack.nodes[node].mass == 0.0f
                     ? 7
                     : static_cast<std::uint8_t>(building % 5);
-                actor.parameters = buildingPack.nodes[node].visualHalfExtents;
+                // A node with real fracture geometry (e.g. a Voronoi-fractured
+                // shard's true hull) renders as that shape; everything else
+                // (the common case — structural boxes) renders as its AABB,
+                // exactly as before this pack ever carried nodeMeshes.
+                const SceneMesh& mesh = node < buildingPack.nodeMeshes.size()
+                    ? buildingPack.nodeMeshes[node]
+                    : SceneMesh{};
+                if (mesh.present)
+                {
+                    actor.shape = VisualActor::Shape::Mesh;
+                    actor.meshPositions = mesh.positions;
+                    actor.meshNormals = mesh.normals;
+                    actor.meshIndices = mesh.indices;
+                }
+                else
+                {
+                    actor.shape = VisualActor::Shape::Box;
+                    actor.parameters = buildingPack.nodes[node].visualHalfExtents;
+                }
                 const std::uint32_t id =
                     visualBases[building] + static_cast<std::uint32_t>(node);
                 if (!writer.defineActor(id, actor))

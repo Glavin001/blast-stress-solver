@@ -639,6 +639,68 @@ ScenePack loadScenePack(const std::string& path)
         pack.nodes.push_back(std::move(node));
     }
 
+    // Optional real render geometry, one entry per node (root-level field,
+    // e.g. a Voronoi-fractured shard's actual hull). Absent, `[]`, or a
+    // length mismatch leaves every node at `present=false` (render as its box
+    // collider) rather than erroring — a pack that doesn't care about
+    // non-box visuals shouldn't need to know this field exists.
+    pack.nodeMeshes.assign(pack.nodes.size(), SceneMesh{});
+    if (const Json* meshes = root.find("nodeMeshes"))
+    {
+        if (meshes->kind == Json::Kind::Array && meshes->array.size() == pack.nodes.size())
+        {
+            const auto flatVec3Array = [](const Json& values, const char* field) {
+                requireKind(values, Json::Kind::Array, field);
+                if (values.array.size() % 3 != 0)
+                {
+                    throw std::runtime_error(
+                        std::string(field) + " must contain whole xyz triples");
+                }
+                std::vector<physx::PxVec3> result;
+                result.reserve(values.array.size() / 3);
+                for (std::size_t i = 0; i < values.array.size(); i += 3)
+                {
+                    result.emplace_back(
+                        number(values.array[i], field),
+                        number(values.array[i + 1], field),
+                        number(values.array[i + 2], field));
+                }
+                return result;
+            };
+            for (std::size_t i = 0; i < meshes->array.size(); ++i)
+            {
+                const Json& entry = meshes->array[i];
+                if (entry.kind != Json::Kind::Object)
+                {
+                    continue; // null / absent: this node has no mesh, use its box.
+                }
+                SceneMesh mesh;
+                mesh.positions = flatVec3Array(entry.at("positions"), "nodeMeshes[].positions");
+                mesh.normals = flatVec3Array(entry.at("normals"), "nodeMeshes[].normals");
+                if (mesh.positions.size() != mesh.normals.size())
+                {
+                    throw std::runtime_error(
+                        "nodeMeshes[" + std::to_string(i)
+                        + "]: positions/normals vertex count mismatch");
+                }
+                const Json& indices = entry.at("indices");
+                requireKind(indices, Json::Kind::Array, "nodeMeshes[].indices");
+                if (indices.array.size() % 3 != 0)
+                {
+                    throw std::runtime_error(
+                        "nodeMeshes[" + std::to_string(i) + "].indices must be whole triangles");
+                }
+                mesh.indices.reserve(indices.array.size());
+                for (const Json& value : indices.array)
+                {
+                    mesh.indices.push_back(index(value, "nodeMeshes[].indices"));
+                }
+                mesh.present = !mesh.positions.empty() && !mesh.indices.empty();
+                pack.nodeMeshes[i] = std::move(mesh);
+            }
+        }
+    }
+
     // Optional: authored node roles, used only for reporting joint classes.
     const Json* nodeTypes = scenario.find("nodeTypes");
     if (nodeTypes != nullptr
