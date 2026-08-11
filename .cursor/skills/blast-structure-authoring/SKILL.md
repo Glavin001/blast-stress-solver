@@ -25,6 +25,15 @@ a test, that test *is* the evidence — read it rather than trusting this file.
   (run it with `--sweep` to characterize a structure's response curve)
 - Worked example: `blast/blast-stress-solver/scripts/export-reference-building.mjs`
 
+**If a scene already exists and looks wrong on screen, start with
+[`blast-destruction-diagnostics`](../blast-destruction-diagnostics/SKILL.md)
+instead of this file.** Everything below assumes the geometry is sound. When a
+structure detonates, sprays debris, or does nothing and then collapses, the
+cause is usually geometric (interpenetration, wrong bond normals, a missing
+bearing surface, oversized fragments) and no material table will fix it — you
+will only move the failure elsewhere. That skill checks geometry first and
+scores runs from telemetry instead of from watching a video.
+
 ## The two axes
 
 > **Area is geometry. Material is strength. Never trade one for the other.**

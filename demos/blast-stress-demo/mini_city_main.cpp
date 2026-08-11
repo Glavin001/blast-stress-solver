@@ -1185,9 +1185,12 @@ ScenePack truncateToFloors(
     result.title = source.title + " " + std::to_string(floors) + "-floor";
     result.nodes.clear();
     result.bonds.clear();
-    // nodeTypes is parallel to nodes, so it has to be rebuilt through the same
-    // remap below; carrying the source list over would misindex every role.
+    // nodeTypes and nodeMeshes are parallel to nodes, so they have to be
+    // rebuilt through the same remap below; carrying the source lists over
+    // would misindex every role and attach shard geometry to the wrong node.
     result.nodeTypes.clear();
+    const bool hasMeshes = source.nodeMeshes.size() == source.nodes.size();
+    result.nodeMeshes.clear();
 
     float minimumY = source.nodes.front().centroid.y;
     float maximumY = minimumY;
@@ -1212,7 +1215,15 @@ ScenePack truncateToFloors(
             {
                 result.nodeTypes.push_back(source.nodeTypes[nodeIndex]);
             }
+            if (hasMeshes)
+            {
+                result.nodeMeshes.push_back(source.nodeMeshes[nodeIndex]);
+            }
         }
+    }
+    if (!hasMeshes)
+    {
+        result.nodeMeshes.assign(result.nodes.size(), SceneMesh{});
     }
     for (const SceneBond& sourceBond : source.bonds)
     {

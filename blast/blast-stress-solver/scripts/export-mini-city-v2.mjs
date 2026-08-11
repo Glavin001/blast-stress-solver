@@ -1,4 +1,17 @@
 /**
+ * SUPERSEDED by scripts/export-fractured-city.mjs — prefer that for new work.
+ *
+ * Packs from this script contain ~44 m^3 of real solid-solid interpenetration
+ * per city: the frame is deliberately embedded in the wall's thickness band so
+ * the proximity bonder finds contacts (see "Hybrid bonding" below). Bonded
+ * bodies that overlap are compressed springs — the contact solver ejects them
+ * when a bond breaks — which reads on screen as the structure detonating rather
+ * than collapsing. Measure any pack from here with
+ * demos/blast-stress-demo/tools/analyze_overlap.py before trusting it, and see
+ * .cursor/skills/blast-destruction-diagnostics/SKILL.md for the full diagnosis.
+ * export-fractured-city.mjs replaces the proximity bonder with exact contact
+ * areas and authors the wall skin flush outside the frame instead.
+ *
  * Mini-city — ScenePack v2, materials-based (NOT Rapier's multiplier-based area hack).
  *
  *   node scripts/export-mini-city-v2.mjs
@@ -28,9 +41,13 @@
  *   1. Author the frame (foundation/column/slab) as plain boxes with bonds
  *      computed from the exact cross-sections they represent — proven pattern,
  *      copied from export-reference-building.mjs.
- *   2. Fracture each of the 4 exterior faces (full building height, one
- *      fracture per face) into FRAGMENTS_PER_WALL Voronoi convex-hull shards
- *      via buildWallFragments() (wraps @dgreenheck/three-pinata).
+ *   2. Wrap each of the 4 exterior faces (full building height, one wall per
+ *      face) around a shard pattern drawn from a small pool of pre-fractured
+ *      UNIT wall templates (buildWallTemplates()/instantiateWall(), wraps
+ *      @dgreenheck/three-pinata) — the Voronoi fracture itself runs only
+ *      WALL_TEMPLATE_COUNT times for the whole city, not once per wall; every
+ *      actual wall reuses a template's shard pattern rescaled to its real
+ *      span/height. Offline/build-time only, no runtime fracturing.
  *   3. Wrap every frame node as a lightweight box FragmentInfo proxy, run
  *      computeBondsFromFragments() over [frame proxies + wall shards]
  *      TOGETHER, then keep only the bonds that touch a wall shard (wall~wall
@@ -60,7 +77,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as THREE from 'three';
 import * as pinata from '@dgreenheck/three-pinata';
-import { buildWallFragments, computeBondsFromFragments } from '../dist/three.js';
+import { fractureGeometry, computeBondsFromFragments } from '../dist/three.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUTPUT = path.resolve(__dirname, '../assets/mini-city/mini-city-v2.json');
@@ -98,7 +115,14 @@ const SLAB_SPLIT = 2; // per axis -> 2x2 quadrants per floor
 // Elastic (strength) is untouched by FRAME_BAND, so gravity safety factors are
 // IDENTICAL for any value here — it changes only HOW the frame fails.
 const FRAME_BAND = Number(process.env.FRAME_BAND ?? 10);
-const FRAME_SCALE = Number(process.env.FRAME_SCALE ?? 1);
+// The frame is deliberately a grade above the reference building's. Measured
+// at scale 1 these column joints sat at safety factor ~3.3 — below SKILL.md's
+// 5-20 frame band, and below the facade clips holding the cladding onto them.
+// That inversion is what made projectiles shear columns instead of peeling
+// facade: the sacrificial layer was stronger than the structure behind it.
+// At 2 the frame lands at ~6.5, inside its band and above the facade, so the
+// cladding is what gives way first.
+const FRAME_SCALE = Number(process.env.FRAME_SCALE ?? 2);
 const SLAB_SCALE = Number(process.env.SLAB_SCALE ?? 1);
 const FACADE_SCALE = Number(process.env.FACADE_SCALE ?? 1);
 const ANCHOR_SCALE = Number(process.env.ANCHOR_SCALE ?? 1);
@@ -108,7 +132,11 @@ const MATERIALS = [
     name: 'reinforced-concrete',
     compressionElastic: 24e6 * FRAME_SCALE, compressionFatal: 24e6 * FRAME_SCALE * FRAME_BAND,
     tensionElastic: 3.0e6 * FRAME_SCALE, tensionFatal: 3.0e6 * FRAME_SCALE * FRAME_BAND,
-    shearElastic: 4.0e6 * FRAME_SCALE, shearFatal: 4.0e6 * FRAME_SCALE * FRAME_BAND,
+    // Shear raised from the reference building's 4.0e6: this city's taller
+    // buildings (up to FLOORS_MAX floors on a fixed COL section) put more
+    // shear through column~slab/column~column than the 3-floor reference
+    // ever measured — see the calibration-loop note at the bottom of this file.
+    shearElastic: 5.8e6 * FRAME_SCALE, shearFatal: 5.8e6 * FRAME_SCALE * FRAME_BAND,
   },
   {
     name: 'concrete-slab',
@@ -119,27 +147,45 @@ const MATERIALS = [
   {
     // Shard-to-shard seams. Meant to shatter visibly, but must still hold
     // under gravity (target safety factor 2-4, same facade band as the
-    // reference building).
+    // reference building). Recalibrated after the walls were banded per floor:
+    // shards now stack within a band and hand weight down through their seams,
+    // so shear binds here (measured 4.44e5 Pa peak) where tension used to.
+    // The old 0.45 MPa shear limit sat 1% above that peak — a facade holding
+    // itself up with no margin, which is what let one impact unzip a whole
+    // building. 1.5 MPa is an ordinary grouted precast-panel seam and puts
+    // this class back in the 2-4 band. Strength moves on the material axis
+    // only; areas stay pure geometry (see the note at the bottom of this file).
     name: 'facade-panel',
-    compressionElastic: 0.8e6 * FACADE_SCALE, compressionFatal: 2.0e6 * FACADE_SCALE,
-    tensionElastic: 0.12e6 * FACADE_SCALE, tensionFatal: 0.40e6 * FACADE_SCALE,
-    shearElastic: 0.45e6 * FACADE_SCALE, shearFatal: 1.2e6 * FACADE_SCALE,
+    compressionElastic: 2.4e6 * FACADE_SCALE, compressionFatal: 6.0e6 * FACADE_SCALE,
+    tensionElastic: 1.5e6 * FACADE_SCALE, tensionFatal: 5.0e6 * FACADE_SCALE,
+    shearElastic: 1.5e6 * FACADE_SCALE, shearFatal: 4.0e6 * FACADE_SCALE,
   },
   {
-    // Shard-to-frame clips (wall~column, wall~slab). More brittle than the
-    // panel-panel seam is intentional — clips are the deliberate weak link.
+    // Shard-to-frame clips (wall~column, wall~slab, wall~foundation). More
+    // brittle than the panel-panel seam is intentional — clips are the
+    // deliberate weak link. Sized to the hardest-loaded pair sharing this
+    // material (column~wall, compression-binding at 5.15e5 Pa peak); the
+    // lighter-loaded slab~wall / foundation~wall pairs land above the 2-4
+    // facade band as a result (safety ~5-7) but nowhere near "vacuous"
+    // (thousands) — see the calibration-loop note at the bottom of this file.
     name: 'facade-clip',
-    compressionElastic: 0.5e6 * FACADE_SCALE, compressionFatal: 0.9e6 * FACADE_SCALE,
-    tensionElastic: 0.09e6 * FACADE_SCALE, tensionFatal: 0.22e6 * FACADE_SCALE,
-    shearElastic: 0.60e6 * FACADE_SCALE, shearFatal: 1.3e6 * FACADE_SCALE,
+    compressionElastic: 1.6e6 * FACADE_SCALE, compressionFatal: 2.9e6 * FACADE_SCALE,
+    tensionElastic: 2.7e5 * FACADE_SCALE, tensionFatal: 6.6e5 * FACADE_SCALE,
+    shearElastic: 9.0e5 * FACADE_SCALE, shearFatal: 2.0e6 * FACADE_SCALE,
   },
   {
     // Footing anchorage — a distinct design lever from the frame itself
     // (base overturn dominates over vertical cascade on taller buildings).
+    // Target band is 30-70 (SKILL.md: "never the failure point"). Sized well
+    // above plain reinforced-concrete because a real footing anchor is not
+    // just a concrete-to-concrete bearing joint — it is doweled/bolted rebar
+    // continuity into the pedestal, which is exactly the kind of capacity
+    // difference this material axis exists to express (never by inflating
+    // bond area — see the calibration-loop note at the bottom of this file).
     name: 'footing-anchor',
-    compressionElastic: 24e6 * ANCHOR_SCALE, compressionFatal: 24e6 * ANCHOR_SCALE * FRAME_BAND,
-    tensionElastic: 3.0e6 * ANCHOR_SCALE, tensionFatal: 3.0e6 * ANCHOR_SCALE * FRAME_BAND,
-    shearElastic: 4.0e6 * ANCHOR_SCALE, shearFatal: 4.0e6 * ANCHOR_SCALE * FRAME_BAND,
+    compressionElastic: 1.0e8 * ANCHOR_SCALE, compressionFatal: 1.0e8 * ANCHOR_SCALE * FRAME_BAND,
+    tensionElastic: 1.3e7 * ANCHOR_SCALE, tensionFatal: 1.3e7 * ANCHOR_SCALE * FRAME_BAND,
+    shearElastic: 5.0e7 * ANCHOR_SCALE, shearFatal: 5.0e7 * ANCHOR_SCALE * FRAME_BAND,
   },
 ];
 const [M_FRAME, M_SLAB, M_PANEL, M_CLIP, M_ANCHOR] = [0, 1, 2, 3, 4];
@@ -175,17 +221,83 @@ function exportGeometry(geometry) {
   };
 }
 
-function boxMesh(sizeX, sizeY, sizeZ) {
-  const g = new THREE.BoxGeometry(sizeX, sizeY, sizeZ);
-  const mesh = exportGeometry(g);
-  g.dispose();
-  return mesh;
+// Volume enclosed by a closed triangle mesh (divergence theorem). The shards
+// are convex hulls straight out of the fracture, so this is their true volume.
+function hullVolume(mesh) {
+  const p = mesh.positions, idx = mesh.indices;
+  let total = 0;
+  for (let i = 0; i < idx.length; i += 3) {
+    const a = idx[i] * 3, b = idx[i + 1] * 3, c = idx[i + 2] * 3;
+    total +=
+      p[a] * (p[b + 1] * p[c + 2] - p[b + 2] * p[c + 1]) -
+      p[a + 1] * (p[b] * p[c + 2] - p[b + 2] * p[c]) +
+      p[a + 2] * (p[b] * p[c + 1] - p[b + 1] * p[c]);
+  }
+  return Math.abs(total) / 6;
+}
+
+// ── Wall fracture templates ──────────────────────────────────────────────────
+// three-pinata's Voronoi fracture is (a) the slow step and (b) not fully
+// seed-controlled by SEED above (its internal cell-placement RNG drifts
+// between identical-input runs). Rather than re-fracturing a fresh box per
+// wall — GRID^2 * 4 calls — fracture a small pool of UNIT-width/height panels
+// ONCE and reuse each shard pattern for every actual wall by rescaling X
+// (span) and Y (height). Thickness (Z) is authored real (WALL_T) in the
+// template and never rescaled, so shard depth always matches the true wall
+// section. This is also offline/build-time only — the demo loads the frozen
+// JSON, there is no runtime fracturing.
+const WALL_TEMPLATE_COUNT = 3;
+
+function buildWallTemplates(fragmentCount, pinataModule) {
+  const templates = [];
+  for (let i = 0; i < WALL_TEMPLATE_COUNT; i++) {
+    const unit = new THREE.BoxGeometry(1, 1, WALL_T, 2, 3, 1);
+    templates.push(fractureGeometry(unit, { fragmentCount, pinata: pinataModule }));
+    unit.dispose();
+  }
+  return templates;
+}
+
+// Reposition/rescale a cached unit template into a real wall instance. Each
+// fragment's geometry is already recentered on its own centroid (that's what
+// fractureGeometry() returns), so scaling both the shard geometry and its
+// worldPosition by the same per-axis factor stretches shape and layout
+// consistently — the same trick buildWallFragments() already used for
+// rotation (applyMatrix4 handles the normal matrix for us).
+function instantiateWall(template, { span, height, centerX = 0, centerZ = 0, rotationY = 0, baseY = 0, minHalfExtent = 0.05 }) {
+  const cy = height * 0.5 + baseY;
+  const scaleMatrix = new THREE.Matrix4().makeScale(span, height, 1);
+  const rotMatrix = Math.abs(rotationY) > 0.001 ? new THREE.Matrix4().makeRotationY(rotationY) : null;
+
+  return template.map((f) => {
+    const geometry = f.geometry.clone();
+    geometry.applyMatrix4(scaleMatrix);
+    let position = new THREE.Vector3(f.worldPosition.x * span, f.worldPosition.y * height, f.worldPosition.z);
+    if (rotMatrix) {
+      geometry.applyMatrix4(rotMatrix);
+      position = position.applyMatrix4(rotMatrix);
+    }
+    geometry.computeBoundingBox();
+    const size = new THREE.Vector3();
+    geometry.boundingBox.getSize(size);
+    return {
+      worldPosition: { x: position.x + centerX, y: position.y + cy, z: position.z + centerZ },
+      halfExtents: {
+        x: Math.max(minHalfExtent, size.x * 0.5),
+        y: Math.max(minHalfExtent, size.y * 0.5),
+        z: Math.max(minHalfExtent, size.z * 0.5),
+      },
+      geometry,
+      isSupport: false,
+      fragmentType: 'wall',
+    };
+  });
 }
 
 // ── Per-building authoring ──────────────────────────────────────────────────
 // Builds one building's local nodes/bonds (node indices are LOCAL to the
 // building — 0-based — and offset by the caller when merging into the city).
-function buildBuilding({ width, floors, pinataModule, bondOptions }) {
+function buildBuilding({ width, floors, wallTemplates, bondOptions }) {
   const nodes = [];
   const nodeTypes = [];
   const nodeSizes = [];
@@ -199,7 +311,13 @@ function buildBuilding({ width, floors, pinataModule, bondOptions }) {
     nodeTypes.push(type);
     nodeSizes.push(v(half[0] * 2, half[1] * 2, half[2] * 2));
     nodeColliders.push({ kind: 'cuboid', halfExtents: v(...half) });
-    nodeMeshes.push(boxMesh(half[0] * 2, half[1] * 2, half[2] * 2));
+    // No nodeMesh for structural (box) nodes: the renderer instances all
+    // boxes in one shared draw call, and only fracture-shard geometry (real
+    // irregular hulls) needs its own per-actor mesh + draw call. Populating
+    // every node here regressed to ~3300 unique-mesh draw calls per camera
+    // pane instead of ~300 (one per wall shard) plus one instanced box call —
+    // see mini_city_main.cpp / recorder/src/renderer.rs.
+    nodeMeshes.push(null);
     return nodes.length - 1;
   }
 
@@ -281,28 +399,55 @@ function buildBuilding({ width, floors, pinataModule, bondOptions }) {
 
   const FRAME_COUNT = nodes.length; // everything below this index is frame
 
-  // ── Exterior walls: one Voronoi fracture per face, full building height ──
-  const totalHeight = floors * FLOOR_HEIGHT;
+  // ── Exterior walls: one Voronoi fracture per face PER FLOOR ─────────────
+  // Fracturing each face once over the full height produced 10-19 m shards
+  // (multi-tonne slabs on a 27 m building). Those are wrong three ways: a
+  // projectile cannot punch a local hole in one, losing a single shard strips
+  // a third of a facade at once (the "no damage, then the building explodes"
+  // cliff), and a full-height shard straddles any floor cutoff — the demo's
+  // height-truncated grid variants left half their shards cantilevered up to
+  // 7.6 m above the frame, which drove the column~wall clips past their
+  // elastic limit under gravity alone (safety factor 0.99 at rest).
+  // Banding the fracture per floor fixes all three: shards are floor-height
+  // panel pieces, and every band boundary lands exactly on a floor cutoff.
   const halfFootprint = FOOTPRINT / 2;
   const sideSpan = FOOTPRINT - WALL_T * 2; // side walls fit between front/back, no corner double-fill
-  const wallOpts = { fragmentCount: FRAGMENTS_PER_WALL, thickness: WALL_T, height: totalHeight, baseY: BASE_Y, pinata: pinataModule };
-  const wallFragments = [
-    ...buildWallFragments({ ...wallOpts, span: FOOTPRINT, centerX: 0, centerZ: -halfFootprint + WALL_T * 0.5, rotationY: 0 }),
-    ...buildWallFragments({ ...wallOpts, span: FOOTPRINT, centerX: 0, centerZ: halfFootprint - WALL_T * 0.5, rotationY: 0 }),
-    ...buildWallFragments({ ...wallOpts, span: sideSpan, centerX: -halfFootprint + WALL_T * 0.5, centerZ: 0, rotationY: Math.PI * 0.5 }),
-    ...buildWallFragments({ ...wallOpts, span: sideSpan, centerX: halfFootprint - WALL_T * 0.5, centerZ: 0, rotationY: Math.PI * 0.5 }),
+  const faces = [
+    { span: FOOTPRINT, centerX: 0, centerZ: -halfFootprint + WALL_T * 0.5, rotationY: 0 },
+    { span: FOOTPRINT, centerX: 0, centerZ: halfFootprint - WALL_T * 0.5, rotationY: 0 },
+    { span: sideSpan, centerX: -halfFootprint + WALL_T * 0.5, centerZ: 0, rotationY: Math.PI * 0.5 },
+    { span: sideSpan, centerX: halfFootprint - WALL_T * 0.5, centerZ: 0, rotationY: Math.PI * 0.5 },
   ];
+  const wallFragments = [];
+  for (let f = 0; f < floors; ++f) {
+    for (let face = 0; face < faces.length; ++face) {
+      // Rotate through the template pool by floor AND face so the facade does
+      // not visibly repeat one shard pattern up a column or around a corner.
+      const template = wallTemplates[(f + face) % wallTemplates.length];
+      wallFragments.push(...instantiateWall(template, {
+        ...faces[face],
+        height: FLOOR_HEIGHT,
+        baseY: BASE_Y + f * FLOOR_HEIGHT,
+      }));
+    }
+  }
 
   // Append wall shards as real nodes (convex-hull collider + real mesh), in
   // the SAME order as wallFragments so their node index (FRAME_COUNT + j)
   // matches their position in the `combined` array used for bonding below.
   for (const f of wallFragments) {
     const hx = f.halfExtents.x, hy = f.halfExtents.y, hz = f.halfExtents.z;
-    const volume = 8 * hx * hy * hz; // bbox volume — same convention buildScenarioFromFragments() uses
+    const mesh = exportGeometry(f.geometry);
+    // Mass comes from the shard's REAL hull volume, not its bounding box. A
+    // Voronoi shard is a slanted convex cell, so its AABB overstates it by
+    // ~2x on average (worst case ~4x here) — that was silently making the
+    // whole facade twice as heavy as the geometry it is drawn from, loading
+    // the clips that hold it on. halfExtents stay the AABB: that is what
+    // broadphase and the visual box path legitimately want.
+    const volume = hullVolume(mesh);
     nodes.push({ centroid: v(f.worldPosition.x, f.worldPosition.y, f.worldPosition.z), mass: round(volume * DRYWALL), volume: round(volume) });
     nodeTypes.push('wall');
     nodeSizes.push(v(hx * 2, hy * 2, hz * 2));
-    const mesh = exportGeometry(f.geometry);
     nodeMeshes.push(mesh);
     nodeColliders.push({ kind: 'convex_hull', points: mesh.positions });
   }
@@ -323,12 +468,47 @@ function buildBuilding({ width, floors, pinataModule, bondOptions }) {
   const combined = [...frameProxies, ...wallFragments.map((f) => ({ ...f, fragmentType: 'wall' }))];
   const detected = computeBondsFromFragments(combined, bondOptions);
 
+  // A full-height wall shard's bounding box geometrically overlaps every
+  // column segment / slab quadrant it happens to pass by along its height
+  // and length (by construction — columns are embedded in the wall's
+  // thickness band so contacts are real overlaps, not marginal touches), so
+  // an unpruned proximity pass produces many more "clip" bonds per shard
+  // than a real facade clip fixing would ever have. Keep only each wall
+  // shard's nearest few contacts per frame type (by centroid distance) —
+  // physically: a panel clips to the column(s)/slab(s) it actually sits
+  // against, not to every member whose footprint its bounding box crosses.
+  const CLIPS_PER_TYPE = 2;
+  const wallFrameCandidates = new Map(); // wallNodeIndex -> Map<frameType, [{bond,dist}]>
+  const wallWallBonds = [];
   for (const b of detected) {
     if (b.node0 < FRAME_COUNT && b.node1 < FRAME_COUNT) continue; // frame~frame: already authored exactly above
     const t0 = combined[b.node0].fragmentType;
     const t1 = combined[b.node1].fragmentType;
-    const material = t0 === 'wall' && t1 === 'wall' ? M_PANEL : M_CLIP;
+    if (t0 === 'wall' && t1 === 'wall') {
+      wallWallBonds.push(b);
+      continue;
+    }
+    const wallIdx = t0 === 'wall' ? b.node0 : b.node1;
+    const frameIdx = t0 === 'wall' ? b.node1 : b.node0;
+    const frameType = combined[frameIdx].fragmentType;
+    const wp = combined[wallIdx].worldPosition, fp = combined[frameIdx].worldPosition;
+    const dist = Math.hypot(wp.x - fp.x, wp.y - fp.y, wp.z - fp.z);
+    let byType = wallFrameCandidates.get(wallIdx);
+    if (!byType) { byType = new Map(); wallFrameCandidates.set(wallIdx, byType); }
+    let list = byType.get(frameType);
+    if (!list) { list = []; byType.set(frameType, list); }
+    list.push({ b, dist });
+  }
+
+  const pushDetected = (b, material) =>
     bonds.push({ node0: b.node0, node1: b.node1, centroid: v(b.centroid.x, b.centroid.y, b.centroid.z), normal: v(b.normal.x, b.normal.y, b.normal.z), area: round(b.area), m: material });
+
+  for (const b of wallWallBonds) pushDetected(b, M_PANEL);
+  for (const byType of wallFrameCandidates.values()) {
+    for (const list of byType.values()) {
+      list.sort((a, c) => a.dist - c.dist);
+      for (const { b } of list.slice(0, CLIPS_PER_TYPE)) pushDetected(b, M_CLIP);
+    }
   }
 
   for (const g of frameProxies) g.geometry.dispose();
@@ -343,6 +523,10 @@ async function main() {
   const cellPitch = WIDTH_MAX + STREET;
   const span = (GRID - 1) * cellPitch;
   const half = span / 2;
+
+  // Fracture the reusable wall-shard pool ONCE for the whole city (see
+  // buildWallTemplates() above) instead of per building/per wall.
+  const wallTemplates = buildWallTemplates(FRAGMENTS_PER_WALL, pinata);
 
   const cityNodes = [];
   const cityNodeTypes = [];
@@ -371,7 +555,7 @@ async function main() {
       const cx = -half + c * cellPitch;
       const cz = -half + r * cellPitch;
 
-      const b = buildBuilding({ width, floors, pinataModule: pinata, bondOptions });
+      const b = buildBuilding({ width, floors, wallTemplates, bondOptions });
 
       const base = cityNodes.length;
       for (const n of b.nodes) {
