@@ -37,10 +37,19 @@ PATH="/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH" \
 
 ## Workflow (tune → gate → record → proof)
 
+0. **Verify the pack before spending a render on it.** Rendering to find out
+   whether a scene is any good is the slow loop and it does not tell you *why*.
+   Run the geometry and telemetry checks in
+   [`blast-destruction-diagnostics`](../blast-destruction-diagnostics/SKILL.md)
+   first — interpenetration, bond cross-check, stability at rest, and a
+   progressive-vs-explosive score. A pack that fails those will look wrong on
+   video no matter which knobs you turn.
 1. **Sim-only tune** with absolute binary path (cwd may be `/root`). Write metadata/CSV under `/tmp/...`. Iterate knobs until gates and visuals match the ask.
 2. **Record MP4** via recorder `cargo run --release --locked -- record ...` with the same `--sim-arg=` knobs.
 3. **Compare** prior vs new `*.metadata.json` (destruction + frameTelemetry).
 4. **Proof frames**: `ffmpeg -ss N -i out.mp4 -frames:v 1 /tmp/proof.png` then Read the PNG.
+   Always do this yourself before showing the video to anyone — a run that
+   passes every gate can still look wrong, and it is cheap to check.
 
 Canonical 12×12 script: `bash demos/blast-stress-demo/record_stress_benchmark.sh`.  
 Detailed recipes: [recipes.md](recipes.md).
@@ -117,6 +126,62 @@ new=json.load(open('/root/recordings/NEW.metadata.json'))
 # print tuning, frameTelemetry misses/max, destructionMotion, peakBodyCount, splits
 PY
 ```
+
+## CLI constraints that abort the run
+
+These are validated up front and exit before simulating. Each one costs a
+wasted round trip if you learn it from the error:
+
+- **`--duration` must exceed the projectile lifetime by ≥ 1 s.** Lifetime is
+  pack `ttlMs` × `--projectile-ttl-scale`, so a short `--duration` fails even
+  though nothing about it looks wrong. Either raise duration or lower the ttl
+  scale.
+- **`--projectile-waves` must be 1–256.** There is no 0.
+- **All `*-scale` knobs must be > 0.** Also no 0.
+- **To run gravity-only** (load-path reading, stability check), you therefore
+  cannot disable projectiles. Use `--projectile-mass-scale 0.0001
+  --projectile-speed-scale 0.0001`, which leaves them present but inert.
+
+Unrelated but equally repetitive: the shell's cwd persists between commands and
+a `cd` into the recorder breaks later relative paths — use absolute paths for
+the binary and the pack. And `ffmpeg -vf select=eq(n\,N)` needs `-update 1` to
+write a single PNG, otherwise it warns about a missing sequence pattern.
+
+## `--grid N` is one template tiled, not a city
+
+`--grid N` does **not** load N² distinct buildings. It takes the single
+`--scene` pack and tiles copies across an N×N grid, deriving height variety by
+calling `truncateToFloors` to cut each copy to 1/3, 2/3 and full height. So:
+
+- `buildings=1` in the summary when `--grid 1`, whatever the pack contains.
+- Projectile targets come from `buildingOffsets(grid, pitch)` — one per grid
+  cell. A pre-merged pack containing several already-positioned buildings gets
+  a single target, not one each. Author **one** building and let `--grid` tile
+  it.
+- Truncation keeps nodes whose **centroid** is below the cutoff and rebuilds
+  every parallel array through the same remap. Anything spanning a cutoff is
+  the authoring problem: a wall fractured over the full height leaves shards
+  cantilevered above the truncated frame. Band fracture per storey so every
+  boundary lands on a cutoff.
+- Any array parallel to `nodes` (`nodeTypes`, `nodeMeshes`) must be remapped
+  too, or it misindexes on truncated variants.
+
+## What `--require-partial-destruction` actually checks
+
+It rejects both "nothing happened" and "everything turned to soup". All must
+hold, or it prints `REJECT runaway destruction` with the failing counts:
+
+- projectile impacts > 0, splits > 0, and **no splits before first impact**
+- ≥ 60% of structures damaged, and **`shattered == 0`**
+- ≥ 1/4 of structures with moved chunks, ≥ 1/6 with fallen chunks
+- a standing remainder: supported chunks ≥ **totalChunks / 4**
+- max displacement ≥ 2 m and ≤ max(20, duration × 5)
+
+`shattered == 0` is the strict one: a tall frame that genuinely progressively
+collapses fails this gate even when the run is correct. Treat a reject as
+information, not a verdict — read the counts, and cross-check with
+`analyze_destruction.py` (see `blast-destruction-diagnostics`), which scores
+*how* damage was distributed in time rather than how much of it there was.
 
 ## Projectiles (behavior)
 
