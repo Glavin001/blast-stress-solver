@@ -413,15 +413,19 @@ public:
                 return;
             }
             ExtStressGpuSolveParams gpuParams;
-            // The CPU path receives the configured iteration budget per
-            // island. Give the global CUDA solve enough iterations to resolve
-            // disconnected components before fracture thresholds are read.
-            // Small crossover graphs use a tighter per-frame budget and rely
-            // on warm starts; larger graphs amortize a deeper global solve.
-            const uint32_t gpuIterationFloor = m_bonds.size() < 1024 ? 32u : 44u;
-            gpuParams.maxIterations = islandAware
-                ? std::max(iterationCount, gpuIterationFloor)
-                : iterationCount;
+            // The GPU solver is island-aware: each disconnected component gets
+            // its own conjugate-gradient scalars and its own convergence test,
+            // matching the CPU sub-solves. It therefore takes the same
+            // iteration budget as the CPU path, and the same budget means the
+            // same answer -- which is what makes a scene portable between the
+            // two backends instead of needing per-backend tuning.
+            //
+            // This used to inflate the budget to a 32/44 floor, because the
+            // solve was global: one shared residual could sit under tolerance
+            // while a small component was still badly resolved, and extra
+            // iterations were the only lever. Per-island convergence removes
+            // the need, and removing it restores CPU/GPU agreement.
+            gpuParams.maxIterations = iterationCount;
             gpuParams.tolerance = 0.001f;
             gpuParams.warmStart = warmStart && !m_forceColdStart;
             if (m_gpuSolver->solveAndReadbackImpulses(

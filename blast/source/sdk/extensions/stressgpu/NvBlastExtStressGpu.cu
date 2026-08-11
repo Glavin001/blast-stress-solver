@@ -51,6 +51,10 @@ struct SolveStatus
     std::uint32_t converged;
 };
 
+/// Bonds/nodes that belong to no solvable island (static-static bonds, and
+/// static nodes, which are fixed boundaries carrying no coupling).
+static constexpr std::uint32_t kNoIsland = 0xFFFFFFFFu;
+
 void checkCuda(cudaError_t result, const char* operation)
 {
     if (result != cudaSuccess)
@@ -298,6 +302,23 @@ __global__ void setTolerance(float* deltaSquared, const float* rhsSquared, float
     }
 }
 
+/// Seed each island's squared residual target and mark it active.
+__global__ void setTolerancePerIsland(
+    float* deltaSquared,
+    std::uint32_t* islandActive,
+    const float* rhsSquared,
+    float tolerance,
+    std::uint32_t islandCount)
+{
+    const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= islandCount)
+    {
+        return;
+    }
+    deltaSquared[id] = rhsSquared[id] * tolerance * tolerance;
+    islandActive[id] = 1;
+}
+
 __global__ void initializeStatus(SolveStatus* status, std::uint32_t maxIterations)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0)
@@ -305,6 +326,82 @@ __global__ void initializeStatus(SolveStatus* status, std::uint32_t maxIteration
         status->active = 1;
         status->iterations = maxIterations;
         status->converged = 0;
+    }
+}
+
+/// Per-island sum of squared magnitudes.
+///
+/// Islands are disconnected components, so their conjugate-gradient scalars
+/// must be independent: a shared alpha/beta compromises every island toward
+/// the average, and a shared convergence test lets a large well-conditioned
+/// island hide a small badly-solved one. atomicAdd rather than a segmented
+/// library reduce because bonds and nodes are not stored island-contiguous.
+__global__ void accumulateSquaredByIsland(
+    const AngLin* values,
+    const std::uint32_t* island,
+    float* perIsland,
+    std::uint32_t count)
+{
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count)
+    {
+        return;
+    }
+    const std::uint32_t id = island[index];
+    if (id == kNoIsland)
+    {
+        return;
+    }
+    const AngLin& value = values[index];
+    const float squared =
+        value.angular.x * value.angular.x + value.angular.y * value.angular.y +
+        value.angular.z * value.angular.z + value.linear.x * value.linear.x +
+        value.linear.y * value.linear.y + value.linear.z * value.linear.z;
+    atomicAdd(&perIsland[id], squared);
+}
+
+/// One thread per island: retire islands that have reached tolerance. An
+/// island that stops here stops costing iterations, which is what makes
+/// solving to a residual tolerance affordable instead of running a fixed
+/// budget for the whole graph.
+__global__ void checkConvergencePerIsland(
+    std::uint32_t* islandActive,
+    const float* residualSquared,
+    const float* deltaSquared,
+    std::uint32_t islandCount)
+{
+    const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= islandCount || !islandActive[id])
+    {
+        return;
+    }
+    if (residualSquared[id] <= deltaSquared[id])
+    {
+        islandActive[id] = 0;
+    }
+}
+
+/// Roll the per-island flags up into the single status the host reads.
+__global__ void summarizeIslands(
+    SolveStatus* status,
+    const std::uint32_t* islandActive,
+    std::uint32_t islandCount,
+    std::uint32_t iteration)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+    {
+        return;
+    }
+    std::uint32_t active = 0;
+    for (std::uint32_t i = 0; i < islandCount; ++i)
+    {
+        active += islandActive[i] ? 1u : 0u;
+    }
+    status->active = active;
+    if (active == 0 && !status->converged)
+    {
+        status->converged = 1;
+        status->iterations = iteration;
     }
 }
 
@@ -324,17 +421,23 @@ __global__ void checkConvergence(
     }
 }
 
-__global__ void updateDirection(
+__global__ void updateDirectionPerIsland(
     AngLin* direction,
     const AngLin* gradient,
     const float* gradientSquared,
     const float* previousGradientSquared,
-    const SolveStatus* status,
+    const std::uint32_t* bondIsland,
+    const std::uint32_t* islandActive,
     std::uint32_t count,
     std::uint32_t iteration)
 {
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (!status->active || index >= count)
+    if (index >= count)
+    {
+        return;
+    }
+    const std::uint32_t id = bondIsland[index];
+    if (id == kNoIsland || !islandActive[id])
     {
         return;
     }
@@ -343,64 +446,93 @@ __global__ void updateDirection(
         direction[index] = gradient[index];
         return;
     }
-    const float denominator = *previousGradientSquared;
-    const float beta = denominator > 0.0f ? *gradientSquared / denominator : 0.0f;
+    const float denominator = previousGradientSquared[id];
+    const float beta = denominator > 0.0f ? gradientSquared[id] / denominator : 0.0f;
     direction[index].angular =
         add(gradient[index].angular, mul(direction[index].angular, beta));
     direction[index].linear =
         add(gradient[index].linear, mul(direction[index].linear, beta));
 }
 
-__global__ void saveGradientSquared(
+__global__ void saveGradientSquaredPerIsland(
     float* previousGradientSquared,
     const float* gradientSquared,
-    const SolveStatus* status)
+    const std::uint32_t* islandActive,
+    std::uint32_t islandCount)
 {
-    if (threadIdx.x == 0 && blockIdx.x == 0 && status->active)
+    const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id < islandCount && islandActive[id])
     {
-        *previousGradientSquared = *gradientSquared;
+        previousGradientSquared[id] = gradientSquared[id];
     }
 }
 
-__global__ void updateSolutionAndResidual(
+/// Each island advances by its own step size. A degenerate island (zero or
+/// non-finite denominator) retires itself without disturbing the others.
+__global__ void updateSolutionAndResidualPerIsland(
     AngLin* solution,
     AngLin* residual,
     const AngLin* direction,
     const AngLin* projectedDirection,
     const float* gradientSquared,
     const float* projectedDirectionSquared,
-    SolveStatus* status,
+    std::uint32_t* islandActive,
+    const std::uint32_t* bondIsland,
+    const std::uint32_t* nodeIsland,
     std::uint32_t bondCount,
     std::uint32_t nodeCount)
 {
-    if (!status->active)
-    {
-        return;
-    }
-    const float denominator = *projectedDirectionSquared;
-    if (!(denominator > 0.0f) || !isfinite(denominator))
-    {
-        if (threadIdx.x == 0 && blockIdx.x == 0)
-        {
-            status->active = 0;
-        }
-        return;
-    }
-    const float step = *gradientSquared / denominator;
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < bondCount)
     {
-        solution[index].angular =
-            add(solution[index].angular, mul(direction[index].angular, step));
-        solution[index].linear =
-            add(solution[index].linear, mul(direction[index].linear, step));
+        const std::uint32_t id = bondIsland[index];
+        if (id != kNoIsland && islandActive[id])
+        {
+            const float denominator = projectedDirectionSquared[id];
+            if (denominator > 0.0f && isfinite(denominator))
+            {
+                const float step = gradientSquared[id] / denominator;
+                solution[index].angular =
+                    add(solution[index].angular, mul(direction[index].angular, step));
+                solution[index].linear =
+                    add(solution[index].linear, mul(direction[index].linear, step));
+            }
+        }
     }
     if (index < nodeCount)
     {
-        residual[index].angular =
-            sub(residual[index].angular, mul(projectedDirection[index].angular, step));
-        residual[index].linear =
-            sub(residual[index].linear, mul(projectedDirection[index].linear, step));
+        const std::uint32_t id = nodeIsland[index];
+        if (id != kNoIsland && islandActive[id])
+        {
+            const float denominator = projectedDirectionSquared[id];
+            if (denominator > 0.0f && isfinite(denominator))
+            {
+                const float step = gradientSquared[id] / denominator;
+                residual[index].angular =
+                    sub(residual[index].angular, mul(projectedDirection[index].angular, step));
+                residual[index].linear =
+                    sub(residual[index].linear, mul(projectedDirection[index].linear, step));
+            }
+        }
+    }
+}
+
+/// Retire islands whose step is degenerate. Separate pass so the update above
+/// stays branch-simple and every island sees a consistent active flag.
+__global__ void retireDegenerateIslands(
+    std::uint32_t* islandActive,
+    const float* projectedDirectionSquared,
+    std::uint32_t islandCount)
+{
+    const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= islandCount || !islandActive[id])
+    {
+        return;
+    }
+    const float denominator = projectedDirectionSquared[id];
+    if (!(denominator > 0.0f) || !isfinite(denominator))
+    {
+        islandActive[id] = 0;
     }
 }
 
@@ -540,8 +672,10 @@ public:
         m_materialCount = static_cast<std::uint32_t>(m_hostMaterials.size());
         ContextGuard context(m_cudaContext);
         prepare(nodes, bonds);
+        computeIslands(nodes, bonds);
         allocate();
         uploadTopology();
+        uploadIslands();
     }
 
     ~ExtStressGpuSolverImpl() override
@@ -571,6 +705,9 @@ public:
         cudaFree(m_status);
         cudaFree(m_previousGradientSquared);
         cudaFree(m_deltaSquared);
+        cudaFree(m_islandActive);
+        cudaFree(m_bondIsland);
+        cudaFree(m_nodeIsland);
         cudaFree(m_projectedDirectionSquared);
         cudaFree(m_gradientSquared);
         cudaFree(m_reductionInput);
@@ -995,10 +1132,17 @@ private:
             m_reductionInput,
             std::max(m_nodeCount, m_bondCount),
             "allocate reduction input");
-        allocateDevice(m_gradientSquared, 1, "allocate gradient norm");
-        allocateDevice(m_projectedDirectionSquared, 1, "allocate projected norm");
-        allocateDevice(m_deltaSquared, 1, "allocate tolerance");
-        allocateDevice(m_previousGradientSquared, 1, "allocate previous gradient norm");
+        // Per-island conjugate-gradient scalars. One set per disconnected
+        // component, so islands converge and step independently.
+        allocateDevice(m_gradientSquared, m_islandCount, "allocate gradient norm");
+        allocateDevice(
+            m_projectedDirectionSquared, m_islandCount, "allocate projected norm");
+        allocateDevice(m_deltaSquared, m_islandCount, "allocate tolerance");
+        allocateDevice(
+            m_previousGradientSquared, m_islandCount, "allocate previous gradient norm");
+        allocateDevice(m_islandActive, m_islandCount, "allocate island active flags");
+        allocateDevice(m_bondIsland, m_bondCount, "allocate bond island ids");
+        allocateDevice(m_nodeIsland, m_nodeCount, "allocate node island ids");
         allocateDevice(m_status, 1, "allocate solve status");
         allocateHost(m_hostInput, m_nodeCount, "allocate pinned stress input");
         allocateHost(m_hostImpulses, m_bondCount, "allocate pinned stress impulses");
@@ -1024,6 +1168,115 @@ private:
         checkCuda(cudaEventCreate(&m_downloadStop), "create download stop event");
         checkCuda(cudaMemset(m_impulses, 0, sizeof(AngLin) * m_bondCount), "clear impulses");
         checkCuda(cudaMemset(m_brokenCount, 0, sizeof(std::uint32_t)), "clear broken count");
+    }
+
+    /// Partition the graph into islands, matching the CPU solver's rule
+    /// exactly (stress.cpp solveIslandAware): union only across bonds whose
+    /// endpoints are both dynamic, because a static (zero-mass) node is a fixed
+    /// boundary that transmits no coupling and therefore cuts the graph. The
+    /// partitions must agree for CPU and GPU results to agree.
+    void computeIslands(const ExtStressGpuNode* nodes, const ExtStressGpuBond* bonds)
+    {
+        m_hostParent.resize(m_nodeCount);
+        for (std::uint32_t i = 0; i < m_nodeCount; ++i)
+        {
+            m_hostParent[i] = i;
+        }
+        const auto isStatic = [&](std::uint32_t node) {
+            return !(nodes[node].mass > 0.0f);
+        };
+        for (std::uint32_t b = 0; b < m_bondCount; ++b)
+        {
+            const std::uint32_t n0 = bonds[b].node0;
+            const std::uint32_t n1 = bonds[b].node1;
+            if (n0 >= m_nodeCount || n1 >= m_nodeCount)
+            {
+                continue;
+            }
+            if (isStatic(n0) || isStatic(n1))
+            {
+                continue; // cut at static nodes
+            }
+            unite(n0, n1);
+        }
+
+        m_hostRootIsland.assign(m_nodeCount, kNoIsland);
+        m_hostBondIsland.assign(m_bondCount, kNoIsland);
+        m_islandCount = 0;
+        for (std::uint32_t b = 0; b < m_bondCount; ++b)
+        {
+            const std::uint32_t n0 = bonds[b].node0;
+            const std::uint32_t n1 = bonds[b].node1;
+            if (n0 >= m_nodeCount || n1 >= m_nodeCount)
+            {
+                continue;
+            }
+            const bool s0 = isStatic(n0);
+            const bool s1 = isStatic(n1);
+            if (s0 && s1)
+            {
+                continue; // degenerate static-static bond: no coupling
+            }
+            const std::uint32_t rep = findRoot(s0 ? n1 : n0);
+            if (m_hostRootIsland[rep] == kNoIsland)
+            {
+                m_hostRootIsland[rep] = m_islandCount++;
+            }
+            m_hostBondIsland[b] = m_hostRootIsland[rep];
+        }
+
+        // Static nodes stay unassigned: they are boundaries, excluded from the
+        // per-island residual just as they are from the CPU sub-systems.
+        m_hostNodeIsland.assign(m_nodeCount, kNoIsland);
+        for (std::uint32_t i = 0; i < m_nodeCount; ++i)
+        {
+            if (!isStatic(i))
+            {
+                m_hostNodeIsland[i] = m_hostRootIsland[findRoot(i)];
+            }
+        }
+        if (m_islandCount == 0)
+        {
+            m_islandCount = 1; // keep buffers valid on a graph with no coupling
+        }
+    }
+
+    std::uint32_t findRoot(std::uint32_t node)
+    {
+        while (m_hostParent[node] != node)
+        {
+            m_hostParent[node] = m_hostParent[m_hostParent[node]];
+            node = m_hostParent[node];
+        }
+        return node;
+    }
+
+    void unite(std::uint32_t a, std::uint32_t b)
+    {
+        const std::uint32_t ra = findRoot(a);
+        const std::uint32_t rb = findRoot(b);
+        if (ra != rb)
+        {
+            m_hostParent[rb] = ra;
+        }
+    }
+
+    void uploadIslands()
+    {
+        checkCuda(
+            cudaMemcpy(
+                m_bondIsland,
+                m_hostBondIsland.data(),
+                sizeof(std::uint32_t) * m_bondCount,
+                cudaMemcpyHostToDevice),
+            "upload bond island ids");
+        checkCuda(
+            cudaMemcpy(
+                m_nodeIsland,
+                m_hostNodeIsland.data(),
+                sizeof(std::uint32_t) * m_nodeCount,
+                cudaMemcpyHostToDevice),
+            "upload node island ids");
     }
 
     void uploadTopology()
@@ -1107,23 +1360,28 @@ private:
             "upload material table");
     }
 
-    void reduce(const AngLin* values, std::uint32_t count, float* result)
+    /// Per-island reduction. Replaces the whole-graph cub::DeviceReduce, which
+    /// imposed a grid-wide barrier every iteration and produced a single
+    /// residual that could not distinguish a converged island from a starved
+    /// one.
+    void reduceByIsland(
+        const AngLin* values,
+        const std::uint32_t* island,
+        std::uint32_t count,
+        float* result)
     {
-        squaredMagnitude<<<
+        checkCuda(
+            cudaMemsetAsync(result, 0, sizeof(float) * m_islandCount, m_stream),
+            "clear per-island reduction");
+        accumulateSquaredByIsland<<<
             (count + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
             m_stream>>>(
             values,
-            m_reductionInput,
-            count);
-        cub::DeviceReduce::Sum(
-            m_reduceScratch,
-            m_reduceScratchBytes,
-            m_reductionInput,
+            island,
             result,
-            count,
-            m_stream);
+            count);
     }
 
     void rightMultiply(const AngLin* bonds, AngLin* nodes)
@@ -1195,11 +1453,20 @@ private:
                 m_stream>>>(m_residual, m_projectedDirection, m_nodeCount);
         }
 
-        reduce(m_rhs, m_nodeCount, m_gradientSquared);
-        setTolerance<<<1, 1, 0, m_stream>>>(
+        // Tolerance is relative to each island's own load, not the whole
+        // graph's: a small island next to a heavily loaded one would otherwise
+        // inherit a threshold it can never meaningfully meet.
+        reduceByIsland(m_rhs, m_nodeIsland, m_nodeCount, m_gradientSquared);
+        setTolerancePerIsland<<<
+            (m_islandCount + kBlockSize - 1) / kBlockSize,
+            kBlockSize,
+            0,
+            m_stream>>>(
             m_deltaSquared,
+            m_islandActive,
             m_gradientSquared,
-            params.tolerance);
+            params.tolerance,
+            m_islandCount);
         initializeStatus<<<1, 1, 0, m_stream>>>(m_status, params.maxIterations);
 
         for (std::uint32_t iteration = 0; iteration < params.maxIterations; ++iteration)
@@ -1218,13 +1485,20 @@ private:
                 m_offset1,
                 m_health,
                 m_bondCount);
-            reduce(m_gradient, m_bondCount, m_gradientSquared);
-            checkConvergence<<<1, 1, 0, m_stream>>>(
-                m_status,
+            const std::uint32_t islandBlocks =
+                (m_islandCount + kBlockSize - 1) / kBlockSize;
+            reduceByIsland(m_gradient, m_bondIsland, m_bondCount, m_gradientSquared);
+            checkConvergencePerIsland<<<islandBlocks, kBlockSize, 0, m_stream>>>(
+                m_islandActive,
                 m_gradientSquared,
                 m_deltaSquared,
+                m_islandCount);
+            summarizeIslands<<<1, 1, 0, m_stream>>>(
+                m_status,
+                m_islandActive,
+                m_islandCount,
                 iteration);
-            updateDirection<<<
+            updateDirectionPerIsland<<<
                 (m_bondCount + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
                 0,
@@ -1233,20 +1507,27 @@ private:
                 m_gradient,
                 m_gradientSquared,
                 m_previousGradientSquared,
-                m_status,
+                m_bondIsland,
+                m_islandActive,
                 m_bondCount,
                 iteration);
-            saveGradientSquared<<<1, 1, 0, m_stream>>>(
+            saveGradientSquaredPerIsland<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_previousGradientSquared,
                 m_gradientSquared,
-                m_status);
+                m_islandActive,
+                m_islandCount);
 
             rightMultiply(m_direction, m_projectedDirection);
-            reduce(
+            reduceByIsland(
                 m_projectedDirection,
+                m_nodeIsland,
                 m_nodeCount,
                 m_projectedDirectionSquared);
-            updateSolutionAndResidual<<<
+            retireDegenerateIslands<<<islandBlocks, kBlockSize, 0, m_stream>>>(
+                m_islandActive,
+                m_projectedDirectionSquared,
+                m_islandCount);
+            updateSolutionAndResidualPerIsland<<<
                 (maxCount + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
                 0,
@@ -1257,7 +1538,9 @@ private:
                 m_projectedDirection,
                 m_gradientSquared,
                 m_projectedDirectionSquared,
-                m_status,
+                m_islandActive,
+                m_bondIsland,
+                m_nodeIsland,
                 m_bondCount,
                 m_nodeCount);
         }
@@ -1384,6 +1667,17 @@ private:
     AngLin* m_projectedDirection{nullptr};
     float* m_reductionInput{nullptr};
     float* m_gradientSquared{nullptr};
+    /// Per-island conjugate-gradient state. Islands are disconnected
+    /// components: they must converge and step independently, matching the CPU
+    /// solver's per-island sub-solves.
+    std::uint32_t* m_islandActive{nullptr};
+    std::uint32_t* m_bondIsland{nullptr};
+    std::uint32_t* m_nodeIsland{nullptr};
+    std::uint32_t m_islandCount{1};
+    std::vector<std::uint32_t> m_hostParent;
+    std::vector<std::uint32_t> m_hostRootIsland;
+    std::vector<std::uint32_t> m_hostBondIsland;
+    std::vector<std::uint32_t> m_hostNodeIsland;
     float* m_projectedDirectionSquared{nullptr};
     float* m_deltaSquared{nullptr};
     float* m_previousGradientSquared{nullptr};
