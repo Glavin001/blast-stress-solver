@@ -351,7 +351,12 @@ function buildBuilding({ width, floors, rng }) {
   ];
 
   for (const x of lines) for (const z of lines) {
-    foundation.set(key(x, z), addBox('foundation', [x, FOUND_HALF, z], [FOUND_HALF, FOUND_HALF, FOUND_HALF], CONCRETE, true));
+    // Sit the footing so its TOP is exactly BASE_Y. Centring it at FOUND_HALF
+    // left its top at 2*FOUND_HALF while columns started at BASE_Y =
+    // 0.001 + 2*FOUND_HALF, i.e. every column was bonded to its footing across
+    // a 1 mm gap with no contact surface at all. NvBlast's own contact-based
+    // bond generator finds zero column~foundation contacts in that layout.
+    foundation.set(key(x, z), addBox('foundation', [x, BASE_Y - FOUND_HALF, z], [FOUND_HALF, FOUND_HALF, FOUND_HALF], CONCRETE, true));
   }
   // Columns stop at the slab soffit, not at the floor line: the slab occupies
   // the top SLAB_T of each storey. Running them the full storey height buried
@@ -392,10 +397,18 @@ function buildBuilding({ width, floors, rng }) {
         addBond(columns.get(key(f, x, z, s)), columns.get(key(f, x, z, s + 1)), COL_AREA, M_FRAME, UP);
       }
       const top = columns.get(key(f, x, z, COL_SEGMENTS - 1));
-      const i = Math.min(SLAB_CELLS - 1, Math.max(0, Math.floor((x + half) / (FOOTPRINT / SLAB_CELLS))));
-      const j = Math.min(SLAB_CELLS - 1, Math.max(0, Math.floor((z + half) / (FOOTPRINT / SLAB_CELLS))));
-      addBond(top, slabs.get(key(f, i, j)), COL_AREA, M_FRAME, UP);
-      if (f + 1 < floors) addBond(slabs.get(key(f, i, j)), columns.get(key(f + 1, x, z, 0)), COL_AREA, M_FRAME, UP);
+      // A column on a bay line straddles two or four slab cells, so bonding
+      // only the cell containing its centre both omitted load paths and gave
+      // that one cell the column's whole section area. Split the contact by
+      // the real overlap of the column footprint with each cell.
+      for (let i = 0; i < SLAB_CELLS; i++) for (let j = 0; j < SLAB_CELLS; j++) {
+        const [cx0, cx1] = slabRange(i), [cz0, cz1] = slabRange(j);
+        const ox = Math.min(x + COL / 2, cx1) - Math.max(x - COL / 2, cx0);
+        const oz = Math.min(z + COL / 2, cz1) - Math.max(z - COL / 2, cz0);
+        if (ox <= 0 || oz <= 0) continue;
+        addBond(top, slabs.get(key(f, i, j)), ox * oz, M_FRAME, UP);
+        if (f + 1 < floors) addBond(slabs.get(key(f, i, j)), columns.get(key(f + 1, x, z, 0)), ox * oz, M_FRAME, UP);
+      }
     }
     for (let i = 0; i < SLAB_CELLS; i++) for (let j = 0; j < SLAB_CELLS; j++) {
       // Cut area is the real shared face: the neighbour's extent along the

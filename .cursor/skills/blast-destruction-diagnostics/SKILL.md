@@ -164,7 +164,7 @@ Proximity bonding needs tolerance fudge factors and tempts you into
 interpenetrating geometry so it finds contacts. Options, best first:
 
 1. NvBlast's own contact-based generator (`createBondsFromTriangles`, mode
-   `exact`) via `generateAutoBondsFromChunks` — needs the WASM runtime built.
+   `exact`) via `generateAutoBondsFromChunks`.
 2. Closed-form contact when you author the geometry: for a Voronoi panel built
    by half-plane clipping, shard~shard area is the shared edge length ×
    thickness and shard~frame area is an exact polygon-rectangle intersection.
@@ -174,6 +174,63 @@ interpenetrating geometry so it finds contacts. Options, best first:
 
 Verify tiling numerically: total shard volume must equal the analytic panel
 volume. If it does, there are no gaps and no overlaps by construction.
+
+### Cross-check closed-form bonds against the library's generator
+
+Closed-form contact is fast and deterministic, but the arithmetic is only
+trustworthy once something independent agrees with it:
+
+```sh
+node blast/blast-stress-solver/scripts/verify-bonds-against-autobonding.mjs pack.json
+```
+
+It runs NvBlast's triangle-based generator over the same geometry and diffs the
+bond sets. Read the columns as:
+
+- **GAPPED** — the pack bonds two bodies that are actually apart. Always a bug.
+- **MISSING** — a contact the pack does not bond. A real omitted load path
+  unless it is below the pack's `MIN_BOND_AREA` floor.
+- **AREA** — both find the contact, areas disagree.
+- **TOUCHING** — extra bonds whose bodies are flush. **Not a defect.** EXACT
+  mode looks for *common surface* and does not reliably report
+  exactly-coplanar faces between independently triangulated meshes, e.g. a
+  panel bearing on a slab ledge. Do not "fix" these by deleting bonds; the tool
+  re-measures the gap so you can tell them apart. AVERAGE mode is not the
+  answer either — measured on one pack it covered 45% of authored bonds versus
+  EXACT's 82%.
+
+On the pack this skill came from, that diff caught two real bugs closed-form
+math had hidden: every column bonded to its footing across a **1 mm gap**
+(`BASE_Y = clearance + 2*FOUND_HALF` put the column base above the footing
+top), and columns bonded to only **one** of the several slab cells they
+straddle, giving that cell the column's whole section area (36% area error, 429
+missing contacts). Both were invisible to the stress gates and to the eye.
+
+### Building the WASM runtime
+
+The generator lives in the Emscripten build:
+
+```sh
+git clone --depth 1 https://github.com/emscripten-core/emsdk /root/emsdk
+cd /root/emsdk && ./emsdk install latest && ./emsdk activate latest
+source /root/emsdk/emsdk_env.sh
+cd blast/js_stress_example && node scripts/build.js
+cd ../blast-stress-solver && node scripts/copy-dist.js
+```
+
+Emscripten ≥ 4 needs two flags the older build predates, both already in
+`scripts/build.js`: `-sDEFAULT_TO_CXX=1` (the driver is `emcc` over C++ sources,
+so the link otherwise fails on `operator new` / `__cxa_throw`) and
+`-sINCOMING_MODULE_JS_API=[locateFile,wasmBinary,...]` (the loader supplies
+those and newer Emscripten aborts on undeclared Module properties).
+
+Smoke-test with geometry whose answer you know — two unit boxes sharing a face
+plus one isolated box should give exactly one bond of area 1.0 with normal
+(1,0,0):
+
+```js
+const bonds = await generateAutoBondsFromChunks([mk(0), mk(1), mk(8)], { mode: 'exact' });
+```
 
 ## Determinism
 
@@ -192,10 +249,11 @@ seeded RNG drives every choice.
 ## Acceptance checklist before recording
 
 1. `analyze_overlap.py --require-clean` → 0 m³
-2. Shard volume equals analytic panel volume
-3. Gravity-only run, long settle → `splits=0`, drift ≈ 0
-4. `analyze_destruction.py --require-progressive` → `PROGRESSIVE`
-5. Damage monotonic across an energy sweep, with no shattered outliers
-6. Same seed twice → identical checksum
+2. `verify-bonds-against-autobonding.mjs` → 0 GAPPED, 0 MISSING
+3. Shard volume equals analytic panel volume
+4. Gravity-only run, long settle → `splits=0`, drift ≈ 0
+5. `analyze_destruction.py --require-progressive` → `PROGRESSIVE`
+6. Damage monotonic across an energy sweep, with no shattered outliers
+7. Same seed twice → identical checksum
 
 Only then render, and inspect extracted frames yourself before showing anyone.
