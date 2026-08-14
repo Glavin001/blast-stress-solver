@@ -146,6 +146,23 @@ struct ExtStressPhysXSettings
     float settledLinearSpeed;
     float settledAngularSpeed;
     float minimumSeparationVelocity;
+    // Damping applied to every body this adapter creates.
+    //
+    // PhysX defaults (linear 0, angular 0.05) suit gameplay objects that
+    // should coast. Fracture debris is not that: with no linear damping a
+    // rubble pile trades micro-contacts indefinitely, never falling below the
+    // sleep threshold, and PhysX sleeps per contact island -- so one jittering
+    // body holds every body it transitively touches awake. Measured on a
+    // demolished city, that left ~93% of 20k bodies awake permanently.
+    //
+    // This is not a velocity cap and does not contradict the no-clamp
+    // invariant below: damping is a continuous force opposing motion, the
+    // physical stand-in for the air drag and micro-friction a real rubble
+    // field has, and it never overrides a fracture verdict or bounds a
+    // trajectory. The sibling Rapier implementation carries the same feature
+    // as `smallBodyDamping`, and the shipped scene packs already request it.
+    float linearDamping;
+    float angularDamping;
     physx::PxShapeFlags shapeFlags;
 
     ExtStressPhysXSettings()
@@ -165,6 +182,8 @@ struct ExtStressPhysXSettings
         , settledLinearSpeed(0.15f)
         , settledAngularSpeed(0.15f)
         , minimumSeparationVelocity(0.0f)
+        , linearDamping(0.0f)
+        , angularDamping(0.05f)
         , shapeFlags(physx::PxShapeFlag::eVISUALIZATION |
                      physx::PxShapeFlag::eSCENE_QUERY_SHAPE |
                      physx::PxShapeFlag::eSIMULATION_SHAPE)
@@ -251,12 +270,20 @@ struct ExtStressPhysXContact
     const physx::PxShape* shape;
     physx::PxVec3 worldPosition;
     physx::PxVec3 worldImpulse;
+    // Whether this contact may wake a sleeping body. New impacts should;
+    // PERSISTING resting contacts must not -- in a rubble pile every body has
+    // one, and waking for them re-opens the whole contact island every tick,
+    // which is indistinguishable from sleeping being broken. The load is fed
+    // to the solver either way; if it overstresses a bond, the fracture
+    // itself wakes the body.
+    bool wake;
 
     ExtStressPhysXContact()
         : shapeId(0)
         , shape(nullptr)
         , worldPosition(0.0f)
         , worldImpulse(0.0f)
+        , wake(true)
     {
     }
 };
@@ -362,6 +389,37 @@ public:
      * concurrently with solveTick() on other destructibles.
      */
     virtual bool beginTick(float dt, const physx::PxVec3& worldGravity) = 0;
+
+    /**
+     * beginTick() driven entirely by a caller-supplied body snapshot.
+     *
+     * Identical solver inputs to beginTick(), with one difference: it makes no
+     * PhysX calls at all, so it may run concurrently across destructibles.
+     * beginTick() reads isSleeping() and getGlobalPose() for every body, which
+     * is both a per-tick cost proportional to body count and unsynchronised
+     * PxScene access if called off the main thread -- the latter races PhysX's
+     * deferred shape/bounds sync and crashes inside SqBoundsManagerEx.
+     *
+     * Hosts that already read body state each tick (via getBodySnapshots)
+     * therefore pay for those reads twice. Pass that snapshot here instead.
+     *
+     * Contacts on a sleeping body cannot be woken from here, since wakeUp() is
+     * a scene write. Their ids are appended to `outWakeBodies` and the caller
+     * must wake them before the next simulate(). If `wakeCapacity` is too
+     * small the call still succeeds and `outWakeCount` reports the number that
+     * would have been written, so the caller can detect truncation.
+     *
+     * `bodies` must cover every body of this destructible; entries for other
+     * destructibles are ignored (matched by bodyId).
+     */
+    virtual bool beginTickFromSnapshot(
+        float dt,
+        const physx::PxVec3& worldGravity,
+        const ExtStressPhysXBodySnapshot* bodies,
+        uint32_t bodyCount,
+        ExtStressPhysXId* outWakeBodies,
+        uint32_t wakeCapacity,
+        uint32_t* outWakeCount) = 0;
     virtual bool solveTick() = 0;
     virtual bool endTick() = 0;
     virtual bool tick(float dt, const physx::PxVec3& worldGravity) = 0;

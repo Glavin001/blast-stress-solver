@@ -47,6 +47,11 @@ struct ExtStressSolverHandleImpl
     // (rebuildActorTable / apply_fracture_commands / reset). Replaces the former
     // O(total nodes) linear scan that ran once per injected force.
     std::vector<uint32_t> inputNodeToActorSlot;
+    // O(1) actorIndex -> slot lookup, rebuilt alongside inputNodeToActorSlot.
+    // Gravity injection asks for one actor per body every tick, so a linear
+    // scan here is quadratic in the body count of a collapsing structure --
+    // which is exactly the case that has to stay real time.
+    std::vector<uint32_t> actorIndexToSlot;
     bool actorIndexDirty{true};
     std::vector<uint8_t> splitScratch;
     std::vector<NvBlastActor*> splitActors;
@@ -242,13 +247,17 @@ void rebuildActorTable(ExtStressSolverHandleImpl& handle)
     handle.actorIndexDirty = true;
 }
 
+void ensureActorIndex(ExtStressSolverHandleImpl& handle);
+
 ExtStressSolverHandleImpl::ActorEntry* findActorByIndex(ExtStressSolverHandleImpl& handle, uint32_t actorIndex)
 {
-    for (auto& entry : handle.actors)
+    ensureActorIndex(handle);
+    if (actorIndex < handle.actorIndexToSlot.size())
     {
-        if (entry.actorIndex == actorIndex)
+        const uint32_t slot = handle.actorIndexToSlot[actorIndex];
+        if (slot < handle.actors.size())
         {
-            return &entry;
+            return &handle.actors[slot];
         }
     }
     return nullptr;
@@ -279,8 +288,21 @@ void ensureActorIndex(ExtStressSolverHandleImpl& handle)
     }
 
     handle.inputNodeToActorSlot.assign(handle.inputToGraph.size(), UINT32_MAX);
+    uint32_t maxActorIndex = 0;
+    for (const auto& entry : handle.actors)
+    {
+        maxActorIndex = std::max(maxActorIndex, entry.actorIndex);
+    }
+    handle.actorIndexToSlot.assign(
+        handle.actors.empty() ? 0 : static_cast<size_t>(maxActorIndex) + 1, UINT32_MAX);
     for (uint32_t slot = 0; slot < handle.actors.size(); ++slot)
     {
+        const uint32_t actorIndex = handle.actors[slot].actorIndex;
+        if (actorIndex < handle.actorIndexToSlot.size()
+            && handle.actorIndexToSlot[actorIndex] == UINT32_MAX)
+        {
+            handle.actorIndexToSlot[actorIndex] = slot;
+        }
         for (uint32_t inputNode : handle.actors[slot].inputNodes)
         {
             // First writer wins, matching the prior loop's first-match semantics

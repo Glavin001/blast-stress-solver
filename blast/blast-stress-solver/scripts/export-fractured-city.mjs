@@ -65,7 +65,7 @@ const SEED = Number(process.env.SEED ?? 7);
 const SHARDS_PER_PANEL = Number(process.env.SHARDS_PER_PANEL ?? 10);
 
 const BAY = 4.0;
-const FLOOR_HEIGHT = 3.0;
+export const FLOOR_HEIGHT = 3.0;
 const COL = Number(process.env.COL ?? 0.4);
 const SLAB_T = 0.25;
 const WALL_T = 0.15;
@@ -94,7 +94,7 @@ const SLAB_SCALE = Number(process.env.SLAB_SCALE ?? 1);
 const FACADE_SCALE = Number(process.env.FACADE_SCALE ?? 1);
 const ANCHOR_SCALE = Number(process.env.ANCHOR_SCALE ?? 1);
 
-const MATERIALS = [
+export const MATERIALS = [
   {
     name: 'reinforced-concrete',
     compressionElastic: 24e6 * FRAME_SCALE, compressionFatal: 24e6 * FRAME_SCALE * FRAME_BAND,
@@ -144,7 +144,7 @@ const MATERIALS = [
 const [M_FRAME, M_SLAB, M_PANEL, M_CLIP, M_ANCHOR] = [0, 1, 2, 3, 4];
 
 // ── Utilities ───────────────────────────────────────────────────────────────
-function mulberry32(a) {
+export function mulberry32(a) {
   return function () {
     a |= 0; a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -152,8 +152,8 @@ function mulberry32(a) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const round = (n) => Math.round(n * 1e5) / 1e5;
-const v = (x, y, z) => ({ x: round(x), y: round(y), z: round(z) });
+export const round = (n) => Math.round(n * 1e5) / 1e5;
+export const v = (x, y, z) => ({ x: round(x), y: round(y), z: round(z) });
 
 // ── 2D convex geometry ──────────────────────────────────────────────────────
 const EPS = 1e-9;
@@ -286,7 +286,7 @@ function prismMesh(poly, thickness, toWorld, centroid) {
 }
 
 // ── Per-building authoring ──────────────────────────────────────────────────
-function buildBuilding({ width, floors, rng }) {
+export function buildBuilding({ width, floors, rng }) {
   const nodes = [], nodeTypes = [], nodeSizes = [], nodeColliders = [], nodeMeshes = [], bonds = [];
 
   function addBox(type, centre, half, density, fixed = false) {
@@ -652,4 +652,8 @@ async function main() {
   process.stderr.write(`buildings=${GRID * GRID} nodes=${cityNodes.length} bonds=${cityBonds.length} shards=${totalWall} mass=${Math.round(totalMass)}kg\n`);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// Only run the city export when invoked directly; the building generator and
+// its helpers are imported by sibling exporters.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}

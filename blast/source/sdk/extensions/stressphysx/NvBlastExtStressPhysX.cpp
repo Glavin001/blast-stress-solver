@@ -418,6 +418,7 @@ public:
         queued.nodeIndex = nodeIndex;
         queued.position = contact.worldPosition;
         queued.impulse = contact.worldImpulse;
+        queued.wake = contact.wake;
         m_contacts.push_back(queued);
         ++m_telemetry.contactsQueued;
         return true;
@@ -433,6 +434,204 @@ public:
         contact.worldPosition = worldPosition;
         contact.worldImpulse = worldImpulse;
         return queueContact(contact);
+    }
+
+    /// Gravity injection from a caller-supplied snapshot. No PhysX calls.
+    void addGravityFromSnapshot(
+        const PxVec3& worldGravity,
+        const ExtStressPhysXBodySnapshot* bodies,
+        uint32_t bodyCount)
+    {
+        for (uint32_t i = 0; i < bodyCount; ++i)
+        {
+            const ExtStressPhysXBodySnapshot& snapshot = bodies[i];
+            // Keyed by actorIndex: m_actorBodies is a map<actorIndex, BodyState>,
+            // NOT by bodyId. Looking up by bodyId silently missed nearly every
+            // body, so most of the structure got no gravity and it fractured
+            // about half as much -- caught by the severed-tower bond count.
+            const auto found = m_actorBodies.find(snapshot.actorIndex);
+            if (found == m_actorBodies.end())
+            {
+                continue;  // belongs to another destructible
+            }
+            BodyState& body = *found->second;
+            if (body.bodyId != snapshot.bodyId)
+            {
+                continue;  // stale snapshot row for a recycled actor slot
+            }
+            if (!snapshot.kinematic)
+            {
+                if (snapshot.sleeping)
+                {
+                    ++m_telemetry.sleepingActorsSkipped;
+                    continue;
+                }
+                ++m_telemetry.awakeDynamicBodyCount;
+            }
+            const PxVec3 localGravity = snapshot.globalPose.q.rotateInv(worldGravity);
+            const StressVec3 bridgeGravity = toStress(localGravity);
+            ext_stress_solver_add_actor_gravity(
+                m_solver,
+                body.actorIndex,
+                &bridgeGravity);
+        }
+    }
+
+    /// consumeContacts() against snapshot poses, deferring wakeUp() to the
+    /// caller because it is a scene write.
+    void consumeContactsFromSnapshot(
+        float dt,
+        const ExtStressPhysXBodySnapshot* bodies,
+        uint32_t bodyCount,
+        ExtStressPhysXId* outWakeBodies,
+        uint32_t wakeCapacity,
+        uint32_t* outWakeCount)
+    {
+        uint32_t wakeCount = 0;
+        if (m_contacts.empty())
+        {
+            // Nothing to look anything up for. Building the index anyway cost
+            // a hash insert per body per tick -- ten thousand of them on a
+            // collapsing city -- to answer zero queries.
+            m_contactNodeIndices.clear();
+            m_contactLocalPositions.clear();
+            m_contactLocalForces.clear();
+            if (outWakeCount != nullptr)
+            {
+                *outWakeCount = 0;
+            }
+            return;
+        }
+
+        m_snapshotByBodyId.clear();
+        for (uint32_t i = 0; i < bodyCount; ++i)
+        {
+            m_snapshotByBodyId[bodies[i].bodyId] = &bodies[i];
+        }
+
+        m_contactNodeIndices.clear();
+        m_contactLocalPositions.clear();
+        m_contactLocalForces.clear();
+        m_contactNodeIndices.reserve(m_contacts.size());
+        m_contactLocalPositions.reserve(m_contacts.size() * 3);
+        m_contactLocalForces.reserve(m_contacts.size() * 3);
+        const uint64_t generation = ++m_contactGeneration;
+        for (const QueuedContact& contact : m_contacts)
+        {
+            if (contact.nodeIndex >= m_nodes.size())
+            {
+                ++m_telemetry.contactsDropped;
+                continue;
+            }
+            NodeState& node = m_nodes[contact.nodeIndex];
+            if (!node.body || !node.body->body)
+            {
+                ++m_telemetry.contactsDropped;
+                continue;
+            }
+            BodyState& body = *node.body;
+            const auto found = m_snapshotByBodyId.find(body.bodyId);
+            if (found == m_snapshotByBodyId.end())
+            {
+                // Counted, not silent: a contact whose body has no snapshot row
+                // would be lost damage, and contactsDropped is how that shows up.
+                ++m_telemetry.contactsDropped;
+                continue;
+            }
+            const ExtStressPhysXBodySnapshot& snapshot = *found->second;
+
+            if (contact.wake && !snapshot.kinematic && snapshot.sleeping)
+            {
+                if (wakeCount < wakeCapacity && outWakeBodies != nullptr)
+                {
+                    outWakeBodies[wakeCount] = body.bodyId;
+                }
+                ++wakeCount;
+            }
+
+            if (body.contactGeneration != generation)
+            {
+                body.contactGlobalPose = snapshot.globalPose;
+                body.contactGeneration = generation;
+            }
+            const PxTransform& pose = body.contactGlobalPose;
+            const PxVec3 localPosition = pose.transformInv(contact.position);
+            const PxVec3 localForce = pose.q.rotateInv(contact.impulse / dt);
+            m_contactNodeIndices.push_back(contact.nodeIndex);
+            m_contactLocalPositions.insert(
+                m_contactLocalPositions.end(),
+                {localPosition.x, localPosition.y, localPosition.z});
+            m_contactLocalForces.insert(
+                m_contactLocalForces.end(),
+                {localForce.x, localForce.y, localForce.z});
+        }
+        if (!m_contactNodeIndices.empty())
+        {
+            m_telemetry.contactsProcessed += ext_stress_solver_add_all_forces(
+                m_solver,
+                m_contactNodeIndices.data(),
+                m_contactLocalPositions.data(),
+                m_contactLocalForces.data(),
+                static_cast<uint32_t>(m_contactNodeIndices.size()),
+                0);
+        }
+        m_contacts.clear();
+        if (outWakeCount != nullptr)
+        {
+            *outWakeCount = wakeCount;
+        }
+    }
+
+    bool beginTickFromSnapshot(
+        float dt,
+        const PxVec3& worldGravity,
+        const ExtStressPhysXBodySnapshot* bodies,
+        uint32_t bodyCount,
+        ExtStressPhysXId* outWakeBodies,
+        uint32_t wakeCapacity,
+        uint32_t* outWakeCount) override
+    {
+        ++m_telemetry.ticks;
+        m_telemetry.awakeDynamicBodyCount = 0;
+        if (outWakeCount != nullptr)
+        {
+            *outWakeCount = 0;
+        }
+        if (m_tickPhase != TickPhase::Idle)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "beginTickFromSnapshot called before the previous tick completed.");
+        }
+        if (!m_solver || !std::isfinite(dt) || dt <= 0.0f || !worldGravity.isFinite())
+        {
+            m_contacts.clear();
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "beginTickFromSnapshot requires a finite positive dt and finite gravity.");
+        }
+        if (bodies == nullptr && bodyCount > 0)
+        {
+            m_contacts.clear();
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "beginTickFromSnapshot requires a body snapshot.");
+        }
+
+        TelemetryClock::time_point phaseStart = TelemetryClock::now();
+        consumeContactsFromSnapshot(
+            dt, bodies, bodyCount, outWakeBodies, wakeCapacity, outWakeCount);
+        m_telemetry.contactProcessingMilliseconds += elapsedMilliseconds(phaseStart);
+
+        phaseStart = TelemetryClock::now();
+        addGravityFromSnapshot(worldGravity, bodies, bodyCount);
+        m_telemetry.gravityMilliseconds += elapsedMilliseconds(phaseStart);
+        m_tickDt = dt;
+        m_tickPhase = TickPhase::Prepared;
+        return true;
     }
 
     bool beginTick(float dt, const PxVec3& worldGravity) override
@@ -547,6 +746,12 @@ public:
                 ++nodeOwners[nodeIndex];
                 valid = valid && m_nodes[nodeIndex].body == &body &&
                         m_nodes[nodeIndex].shape != nullptr;
+                // NOTE: a physical-attachment check (shape->getActor() ==
+                // body.body) was tried here and reverted: it fails during
+                // creation, where validateMappings runs before every shape's
+                // final attachment, and a validation failure aborts create().
+                // If reintroduced it must be a separate post-attachment
+                // check, never part of the create-time gate.
             }
         }
 
@@ -1057,6 +1262,7 @@ private:
         uint32_t nodeIndex{INVALID_INDEX};
         PxVec3 position{0.0f};
         PxVec3 impulse{0.0f};
+        bool wake{true};
     };
 
     // Motion state of one body at capture time, keyed by the stable bodyId
@@ -1127,13 +1333,18 @@ private:
                     nodeIndex,
                     "A convex node needs at least four points.");
             }
-            if (desc.geometry.convexPointCount > MAX_GPU_CONVEX_POINTS)
+            // Assets are expected to author hulls within the GPU vertex cap;
+            // an oversized cloud is clamped by the cooker's own vertex limit
+            // below, which computes the best bounded hull rather than
+            // discarding points arbitrarily. The sanity bound only guards
+            // cooking cost against a degenerate asset.
+            if (desc.geometry.convexPointCount > 2048)
             {
                 ++m_telemetry.convexPointLimitRejections;
                 return fail(
                     ExtStressPhysXError::ConvexPointLimitExceeded,
                     nodeIndex,
-                    "GPU-compatible convex hulls are limited to 64 input points.");
+                    "Convex node point cloud is unreasonably large (> 2048 points).");
             }
             for (uint32_t i = 0; i < desc.geometry.convexPointCount; ++i)
             {
@@ -1151,6 +1362,11 @@ private:
             convexDesc.points.stride = sizeof(PxVec3);
             convexDesc.points.data = desc.geometry.convexPoints;
             convexDesc.flags = PxConvexFlag::eCOMPUTE_CONVEX;
+            // GPU rigid bodies require hulls of at most 64 vertices. Asking
+            // the cooker to honour that directly produces the optimal bounded
+            // hull; anything upstream that pre-thins the cloud can only do
+            // worse.
+            convexDesc.vertexLimit = static_cast<PxU16>(MAX_GPU_CONVEX_POINTS);
 
             PxCookingParams cookingParams(m_physics.getTolerancesScale());
             cookingParams.buildGPUData = true;
@@ -1227,6 +1443,8 @@ private:
                 "Could not allocate an adapter body record.");
             return nullptr;
         }
+        rigid->setLinearDamping(m_settings.linearDamping);
+        rigid->setAngularDamping(m_settings.angularDamping);
         result->bodyId = m_nextBodyId++;
         result->actorIndex = actorIndex;
         result->body = rigid;
@@ -1337,15 +1555,54 @@ private:
             properties.data(),
             transforms.data(),
             static_cast<PxU32>(properties.size()));
+
+        // The centre of mass is declared on the shared convention -- the
+        // mass-weighted mean of the nodes' authored centroids (each shape's
+        // local pose) -- NOT the volume centroid PxMassProperties computes
+        // from the hull geometry.
+        //
+        // Every layer that reconstructs a chunk from a streamed body pose
+        // (server ledger, bootstrap, client topology) subtracts the
+        // centroid-convention COM from the rest position. For boxes the two
+        // definitions coincide, which is how the volume-centroid COM shipped
+        // unnoticed; for authored convex hulls they can differ by tens of
+        // centimetres, and every reconstructing layer then draws each chunk
+        // displaced by exactly that difference the instant a body splits.
+        //
+        // A well-authored asset states its centroid AT the volume centroid,
+        // making this physically exact as well as consistent. For assets that
+        // do not, consistency wins: the declared COM is the contract the rest
+        // of the pipeline reconstructs against, and the inertia tensor is
+        // translated to remain correct about the declared point.
+        PxVec3 conventionCom(0.0f);
+        float conventionMass = 0.0f;
+        for (uint32_t nodeIndex : body.nodes)
+        {
+            const NodeState& node = m_nodes[nodeIndex];
+            if (node.mass <= 0.0f)
+            {
+                continue;
+            }
+            conventionCom += node.shape->getLocalPose().p * node.mass;
+            conventionMass += node.mass;
+        }
+        const PxVec3 centerOfMass = conventionMass > 0.0f
+            ? conventionCom * (1.0f / conventionMass)
+            : combined.centerOfMass;
+        const PxMat33 aboutConvention = PxMassProperties::translateInertia(
+            combined.inertiaTensor,
+            combined.mass,
+            centerOfMass - combined.centerOfMass);
+
         PxQuat massFrame(PxIdentity);
         PxVec3 diagonal =
-            PxMassProperties::getMassSpaceInertia(combined.inertiaTensor, massFrame);
+            PxMassProperties::getMassSpaceInertia(aboutConvention, massFrame);
         diagonal.x = std::max(diagonal.x, MIN_MASS);
         diagonal.y = std::max(diagonal.y, MIN_MASS);
         diagonal.z = std::max(diagonal.z, MIN_MASS);
 
         body.body->setMass(std::max(combined.mass, MIN_MASS));
-        body.body->setCMassLocalPose(PxTransform(combined.centerOfMass, massFrame));
+        body.body->setCMassLocalPose(PxTransform(centerOfMass, massFrame));
         body.body->setMassSpaceInertiaTensor(diagonal);
     }
 
@@ -2017,6 +2274,10 @@ private:
     std::unordered_map<ExtStressPhysXId, uint32_t> m_shapeIdToNode;
     std::unordered_map<const PxRigidDynamic*, ExtStressPhysXId> m_bodyToId;
     std::vector<QueuedContact> m_contacts;
+    /// bodyId -> snapshot, rebuilt per tick by the snapshot-fed begin phase.
+    /// A member so that phase allocates nothing while running concurrently.
+    std::unordered_map<ExtStressPhysXId, const ExtStressPhysXBodySnapshot*>
+        m_snapshotByBodyId;
     std::vector<uint32_t> m_contactNodeIndices;
     std::vector<float> m_contactLocalPositions;
     std::vector<float> m_contactLocalForces;
