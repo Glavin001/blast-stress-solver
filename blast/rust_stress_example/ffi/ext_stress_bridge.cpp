@@ -1484,6 +1484,15 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
         if (entryIndex < handle->actors.size())
         {
             handle->actors.erase(handle->actors.begin() + static_cast<std::ptrdiff_t>(entryIndex));
+            // Erasing shifts every later entry left. The actorIndex -> slot
+            // table must be invalidated HERE, not just on push_back: a second
+            // fracture command in this same call would otherwise resolve its
+            // actor through stale slots and read a DIFFERENT actor's node
+            // list -- which is exactly how promotions ended up pairing chunks
+            // from buildings seventy metres apart. The old linear scan was
+            // immune because it read the live vector; the indexed lookup is
+            // only correct if every mutation marks it dirty.
+            handle->actorIndexDirty = true;
         }
 
         ExtStressSplitEvent* evt = nullptr;
@@ -1564,6 +1573,7 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
             }
 
             handle->actors.push_back(std::move(entry));
+            handle->actorIndexDirty = true;
         }
 
         if (evt)
