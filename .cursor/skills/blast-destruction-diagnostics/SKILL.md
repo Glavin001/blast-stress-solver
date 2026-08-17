@@ -121,6 +121,20 @@ The usual cause is bonding an entire continuous interface (e.g. a shard glued up
 the whole column face) where the real connection is discrete anchors. A long
 stiff bonded interface concentrates enormous stress at its ends.
 
+### "The whole layer is heavier than the geometry it is drawn from"
+
+Fragment mass is usually `volume × density`, and it is tempting to take volume
+from the fragment's bounding box because that is already computed for
+broadphase. Don't: a Voronoi shard is a slanted convex cell whose AABB
+overstates it by **~2× on average, up to ~4×** for elongated slivers. Measured
+on one facade, that authored 362,187 kg of cladding for geometry whose true
+volume is 184,275 kg — every clip holding it then carries double its real load,
+and no amount of material tuning makes that stand cleanly.
+
+Compute the real hull volume (divergence theorem over the closed triangle mesh)
+for mass, and keep the AABB only for `nodeSizes`, which is what broadphase and
+the box render path legitimately want.
+
 ### "Safety factor is set by one absurd bond"
 
 Check the bond-area distribution per class. Contact patches below ~10 cm² are
@@ -245,6 +259,21 @@ SEED=7 node scripts/export-....mjs && md5sum out.json   # must match
 
 If it drifts, either freeze a verified artifact or own the fracture so one
 seeded RNG drives every choice.
+
+## Near the collapse threshold, expect chaos — tune for a regime, not a number
+
+Progressive collapse is genuinely sensitive to initial conditions: once a frame
+loses enough columns it comes down, and whether a given impact tips it is not a
+smooth function of energy. Measured on one pack, projectile mass-scale 2.5
+collapsed 3 of 9 buildings while 2.75 collapsed none — non-monotonic across a
+10% change.
+
+This is real physics, not a bug, but it has a practical consequence: **do not
+tune toward an exact damage count**, and do not treat a single run as
+characterizing a setting. Sweep energies, confirm the *trend* is monotonic
+(e.g. 248 → 365 → 705 splits over mass 8 → 20 → 50), and pick an energy band
+whose outcomes you are happy with across the spread. A gate that demands an
+exact outcome near the transition will flap.
 
 ## Acceptance checklist before recording
 

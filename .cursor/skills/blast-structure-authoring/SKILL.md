@@ -211,6 +211,20 @@ you tune strength. Widening the band buys a 4× energy range of partial
 results, and it does *not* make the structure unbreakable: 20 t still flattens
 every variant.
 
+> **This result is about the FRAME. Do not generalize it to cladding.**
+> Non-structural skin wants the opposite: a **brittle** band (≈1.2), so a
+> struck panel lets go at once, at the impact site. Making the facade ductile
+> too produced the worst failure measured on this project — cladding joints sat
+> overstressed for ~6 s of simulated time silently draining their damage pool
+> with nothing visibly moving, then the pools emptied and the released load
+> cascaded in one burst (63% of impacts landed before anything broke; 41% of
+> all damage in one 0.5 s window). Ductility belongs in the structure that must
+> stay standing, brittleness in the layer meant to come off.
+> `export-fractured-city.mjs` ships `FRAME_BAND=10` with `FACADE_BAND=1.2` for
+> exactly this reason; see
+> [`blast-destruction-diagnostics`](../blast-destruction-diagnostics/SKILL.md)
+> § "Nothing happens, then it detonates".
+
 Why it works, mechanically: damage per tick is
 `health × Σ(stress − elastic) / (fatal − elastic)`. A wide band means an
 overstressed bond loses a *fraction* of its health per tick, so load
