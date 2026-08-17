@@ -127,6 +127,15 @@ struct ExtStressPhysXSettings
     bool recordSplitContinuity;
     bool applyExcessForces;
     float excessForceScale;
+    /**
+    Feed each spinning body's omega-squared-r load to the solver.
+
+    A free island receives gravity as a uniform per-node acceleration, which is
+    a rigid translation and therefore produces no bond stress at all. Its spin
+    is the one self-generated load it does have, so without this a tumbling
+    slab is stress-free no matter how fast it turns.
+    */
+    bool applyCentrifugal;
     // Opt-in hard stop only: when >0 and the structure already has this many
     // bodies, skip further fracture. Default 0 = unlimited. Do not use this as
     // a perf "budget" — capping fracture falsifies impact/resim behavior.
@@ -175,6 +184,7 @@ struct ExtStressPhysXSettings
         , recordSplitContinuity(true)
         , applyExcessForces(true)
         , excessForceScale(1.0f)
+        , applyCentrifugal(true)
         , maximumBodies(0)
         , maximumFracturesPerActorPerTick(0)
         , idleSkip(true)

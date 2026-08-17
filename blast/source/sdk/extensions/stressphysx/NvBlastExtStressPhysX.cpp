@@ -463,10 +463,22 @@ public:
             {
                 if (snapshot.sleeping)
                 {
-                    ++m_telemetry.sleepingActorsSkipped;
-                    continue;
+                    // A sleeping body that took contact load this tick still
+                    // needs its weight: consumeContactsFromSnapshot has
+                    // already pushed the support reaction into the solver, and
+                    // gravity is the other half of that pair. Skipping it here
+                    // would leave a resting pile loaded upward only.
+                    if (m_contactedActors.find(body.actorIndex) ==
+                        m_contactedActors.end())
+                    {
+                        ++m_telemetry.sleepingActorsSkipped;
+                        continue;
+                    }
                 }
-                ++m_telemetry.awakeDynamicBodyCount;
+                else
+                {
+                    ++m_telemetry.awakeDynamicBodyCount;
+                }
             }
             const PxVec3 localGravity = snapshot.globalPose.q.rotateInv(worldGravity);
             const StressVec3 bridgeGravity = toStress(localGravity);
@@ -474,6 +486,10 @@ public:
                 m_solver,
                 body.actorIndex,
                 &bridgeGravity);
+            if (!snapshot.kinematic)
+            {
+                addCentrifugal(body, snapshot.globalPose, snapshot.angularVelocity);
+            }
         }
     }
 
@@ -496,12 +512,14 @@ public:
             m_contactNodeIndices.clear();
             m_contactLocalPositions.clear();
             m_contactLocalForces.clear();
+            m_contactedActors.clear();
             if (outWakeCount != nullptr)
             {
                 *outWakeCount = 0;
             }
             return;
         }
+        m_contactedActors.clear();
 
         m_snapshotByBodyId.clear();
         for (uint32_t i = 0; i < bodyCount; ++i)
@@ -530,6 +548,12 @@ public:
                 continue;
             }
             BodyState& body = *node.body;
+            // A body carrying contact load must also carry its weight this
+            // tick, even if PhysX has it asleep: the contact pushes its
+            // support nodes up, and without the matching gravity pulling the
+            // rest down the solver sees a net upward load and reports
+            // wrong-signed stress. addGravityFromSnapshot consults this.
+            m_contactedActors.insert(body.actorIndex);
             const auto found = m_snapshotByBodyId.find(body.bodyId);
             if (found == m_snapshotByBodyId.end())
             {
@@ -1242,6 +1266,17 @@ private:
         uint32_t actorIndex{INVALID_INDEX};
         PxRigidDynamic* body{nullptr};
         std::vector<uint32_t> nodes;
+        /**
+        Mass-weighted mean of the member nodes' centroids, in STRUCTURE space.
+
+        That is the frame the solver states node positions in, so it is the
+        frame addCentrifugalAcceleration expects. Deliberately NOT the PhysX
+        body centre of mass, which is body-local: passing that would offset
+        every centrifugal radius by the body origin. Cached because it only
+        moves when membership does; invalidated wherever `nodes` is assigned.
+        */
+        mutable PxVec3 localCentreOfMass{0.0f};
+        mutable bool localComValid{false};
         mutable uint64_t snapshotGeneration{0};
         mutable PxTransform snapshotGlobalPose{PxIdentity};
         mutable bool snapshotWasActive{false};
@@ -1256,6 +1291,75 @@ private:
             }
         }
     };
+
+    /**
+    Structure-space centre of mass of a body's member nodes.
+
+    The solver states node positions in structure space, so the centrifugal
+    radius must be measured from a centre in that same frame.
+    */
+    const PxVec3& bodyLocalCentreOfMass(const BodyState& body) const
+    {
+        if (!body.localComValid)
+        {
+            PxVec3 weighted(0.0f);
+            float totalMass = 0.0f;
+            for (uint32_t nodeIndex : body.nodes)
+            {
+                if (nodeIndex >= m_nodes.size())
+                {
+                    continue;
+                }
+                const NodeState& node = m_nodes[nodeIndex];
+                // Support nodes carry mass 0; weight them uniformly so an
+                // all-support body still resolves to its geometric centre
+                // rather than dividing by zero.
+                const float mass = node.mass > 0.0f ? node.mass : 1.0f;
+                weighted += node.centroid * mass;
+                totalMass += mass;
+            }
+            body.localCentreOfMass =
+                totalMass > 0.0f ? weighted / totalMass : PxVec3(0.0f);
+            body.localComValid = true;
+        }
+        return body.localCentreOfMass;
+    }
+
+    /**
+    Feed the spin of a tumbling body to the solver as centrifugal load.
+
+    Without this a free island carries no internal load at all: gravity enters
+    as a uniform per-node acceleration, which for an unanchored body is a rigid
+    translation and so produces zero relative velocity across every bond. A
+    spinning slab genuinely is under omega-squared-r tension, and this is the
+    only term that expresses it.
+    */
+    void addCentrifugal(
+        const BodyState& body,
+        const PxTransform& globalPose,
+        const PxVec3& worldAngularVelocity)
+    {
+        if (!m_settings.applyCentrifugal)
+        {
+            return;
+        }
+        // Below this the term is numerically irrelevant and only costs a call.
+        constexpr float kMinAngularSpeed = 1.0e-3f;
+        if (worldAngularVelocity.magnitudeSquared() <=
+            kMinAngularSpeed * kMinAngularSpeed)
+        {
+            return;
+        }
+        // Same frame convention as gravity above.
+        const PxVec3 localAngular = globalPose.q.rotateInv(worldAngularVelocity);
+        const StressVec3 bridgeCom = toStress(bodyLocalCentreOfMass(body));
+        const StressVec3 bridgeAngular = toStress(localAngular);
+        ext_stress_solver_add_centrifugal_acceleration(
+            m_solver,
+            body.actorIndex,
+            &bridgeCom,
+            &bridgeAngular);
+    }
 
     struct QueuedContact
     {
@@ -1686,13 +1790,17 @@ private:
                 }
                 ++m_telemetry.awakeDynamicBodyCount;
             }
-            const PxVec3 localGravity =
-                body.body->getGlobalPose().q.rotateInv(worldGravity);
+            const PxTransform globalPose = body.body->getGlobalPose();
+            const PxVec3 localGravity = globalPose.q.rotateInv(worldGravity);
             const StressVec3 bridgeGravity = toStress(localGravity);
             ext_stress_solver_add_actor_gravity(
                 m_solver,
                 body.actorIndex,
                 &bridgeGravity);
+            if (!isKinematic(body))
+            {
+                addCentrifugal(body, globalPose, body.body->getAngularVelocity());
+            }
         }
     }
 
@@ -2030,6 +2138,7 @@ private:
                 }
             }
             child.body->nodes = plan.nodes;
+            child.body->localComValid = false;  // membership changed
             assigned.push_back(std::move(child));
         }
 
@@ -2281,6 +2390,10 @@ private:
     std::vector<uint32_t> m_contactNodeIndices;
     std::vector<float> m_contactLocalPositions;
     std::vector<float> m_contactLocalForces;
+    /// Actors that received contact load this tick, so the gravity phase can
+    /// pair their weight even while PhysX has them asleep. Member (not local)
+    /// so the begin phase allocates nothing while running concurrently.
+    std::unordered_set<uint32_t> m_contactedActors;
     std::vector<ExtStressPhysXSplitContinuity> m_continuity;
     std::vector<ResimBodySnapshot> m_resimSnapshot;
     std::unordered_map<ExtStressPhysXId, uint32_t> m_resimIndexByBodyId;
