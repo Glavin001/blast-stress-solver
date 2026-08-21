@@ -381,6 +381,25 @@ add_test(NAME blast_stress_reference_building_crush_hard_impact
 # stepper still holds it in its pre-simulate capture. That combination segfaulted
 # and is only reachable with several buildings and a resim pass, so it gets its
 # own gate.
+# The punch-through wall, both ways. Crush ON must take a bite out of the
+# impact zone; the SAME impact with crush OFF must comminute nothing. This is
+# the flagship demonstration scenario, so its behaviour is pinned.
+add_test(NAME blast_stress_crush_wall_bite
+    COMMAND blast_stress_demo
+        --physics cpu --grid 1 --duration 8 --settle 2
+        --projectile-waves 1 --resim-passes 2
+        --scene "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/crush-wall.json"
+        --require-crush-fraction-min 0.02 --require-crush-fraction-max 0.2
+        --output-state "")
+
+add_test(NAME blast_stress_crush_wall_bond_only
+    COMMAND blast_stress_demo
+        --physics cpu --grid 1 --duration 8 --settle 2
+        --projectile-waves 1 --resim-passes 2 --no-crush
+        --scene "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/crush-wall.json"
+        --require-crush-fraction-max 0
+        --output-state "")
+
 add_test(NAME blast_stress_crush_multi_structure_resim
     COMMAND blast_stress_demo
         --physics cpu --grid 3 --duration 12 --settle 2
