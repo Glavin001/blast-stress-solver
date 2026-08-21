@@ -306,6 +306,89 @@ target_link_libraries(material_behavior_test PRIVATE
     ${PHYSX_LINK_LIBS})
 add_test(NAME blast_stress_material_behavior COMMAND material_behavior_test)
 
+add_executable(chunk_crush_test
+    tests/chunk_crush_test.cpp
+    physx_scene.cpp)
+target_include_directories(chunk_crush_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${BLAST_ROOT}/include/extensions/stressphysx"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(chunk_crush_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(chunk_crush_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(chunk_crush_test PRIVATE
+    NvBlastExtStressPhysX
+    ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_chunk_crush COMMAND chunk_crush_test)
+
+add_executable(scene_pack_v3_test
+    tests/scene_pack_v3_test.cpp
+    scene_pack.cpp)
+target_include_directories(scene_pack_v3_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(scene_pack_v3_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(scene_pack_v3_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(scene_pack_v3_test PRIVATE ${PHYSX_LINK_LIBS})
+add_test(NAME blast_stress_scene_pack_v3
+    COMMAND scene_pack_v3_test
+        "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building-crush.json")
+
+# The crush-enabled reference building, end to end. Two runs on the SAME pack:
+# gravity alone must comminute nothing, and an impact must comminute a small
+# localized fraction. The upper bound is the load-bearing half -- a crush model
+# that grinds up the whole structure has reproduced the over-fragmentation this
+# project already treats as failure.
+add_test(NAME blast_stress_reference_building_crush_gravity
+    COMMAND blast_stress_demo
+        --physics cpu --grid 1 --duration 10 --settle 2
+        --scene "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building-crush.json"
+        --projectile-mass-scale 0.0001 --projectile-speed-scale 0.0001
+        --require-crush-fraction-max 0
+        --output-state "")
+
+# An ORDINARY impact must comminute nothing: the wall comes apart at its joints
+# and every chunk survives. Crushing is reserved for violence, and this is the
+# test that says so.
+add_test(NAME blast_stress_reference_building_crush_ordinary_impact
+    COMMAND blast_stress_demo
+        --physics cpu --grid 1 --duration 10 --settle 2
+        --scene "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building-crush.json"
+        --require-crush-fraction-max 0
+        --output-state "")
+
+# A HARD impact must comminute a small, localized fraction -- and only that.
+# The upper bound is the load-bearing half: a crush model that grinds up the
+# whole structure has reproduced the over-fragmentation this project already
+# treats as failure.
+add_test(NAME blast_stress_reference_building_crush_hard_impact
+    COMMAND blast_stress_demo
+        --physics cpu --grid 1 --duration 10 --settle 2
+        --projectile-mass-scale 8
+        --scene "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building-crush.json"
+        --require-crush-fraction-min 0.01 --require-crush-fraction-max 0.25
+        --output-state "")
+
+# Crushing across MANY structures with resimulation on. This is the shape the
+# single-building tests cannot cover: retiring a body mid-frame while the frame
+# stepper still holds it in its pre-simulate capture. That combination segfaulted
+# and is only reachable with several buildings and a resim pass, so it gets its
+# own gate.
+add_test(NAME blast_stress_crush_multi_structure_resim
+    COMMAND blast_stress_demo
+        --physics cpu --grid 3 --duration 12 --settle 2
+        --projectile-mass-scale 8 --resim-passes 2
+        --scene "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building-crush.json"
+        --require-crush-fraction-min 0.01 --require-crush-fraction-max 0.25
+        --output-state "")
+
 add_executable(destruction_quality_test
     tests/destruction_quality_test.cpp
     physx_scene.cpp
