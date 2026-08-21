@@ -46,6 +46,12 @@ pub struct SimulationFrame {
     pub max_position_drift: f64,
     pub max_point_velocity_drift: f64,
     pub budget_miss_frames: u64,
+    /// Chunk-crushing counters. None when the CSV predates crushing, so old
+    /// recordings render without a crush line rather than with a false zero.
+    pub chunks_crushed_total: Option<u64>,
+    pub chunks_crushed_frame: u64,
+    pub crushed_mass_total: f64,
+    pub nodes_at_crush_yield: u64,
 }
 
 pub struct SimulationTelemetry {
@@ -148,6 +154,14 @@ impl SimulationTelemetry {
                 max_position_drift: parse_f64("max_position_drift")?,
                 max_point_velocity_drift: parse_f64("max_point_velocity_drift")?,
                 budget_miss_frames: budget_misses,
+                chunks_crushed_total: if columns.contains_key("chunks_crushed_total") {
+                    Some(parse_f64("chunks_crushed_total")? as u64)
+                } else {
+                    None
+                },
+                chunks_crushed_frame: parse_optional_f64("chunks_crushed_frame")? as u64,
+                crushed_mass_total: parse_optional_f64("crushed_mass_total")?,
+                nodes_at_crush_yield: parse_optional_f64("nodes_at_crush_yield")? as u64,
             });
         }
         if frames.is_empty() {
@@ -167,7 +181,7 @@ impl SimulationTelemetry {
 
 pub fn simulation_overlay(frame: &SimulationFrame) -> Vec<String> {
     let simulated_fps = 1000.0 / frame.frame_host_ms.max(1.0e-6);
-    vec![
+    let mut lines = vec![
         format!(
             "PHYSX GPU  t={:6.2}s  step={}  host={:5.2}ms ({:5.1} fps, {:4.2}x realtime)",
             frame.simulation_seconds,
@@ -227,7 +241,17 @@ pub fn simulation_overlay(frame: &SimulationFrame) -> Vec<String> {
             "60Hz budget misses={}",
             frame.budget_miss_frames,
         ),
-    ]
+    ];
+    // Only when the telemetry knows about crushing at all: a pre-crush CSV
+    // gets no line, a crush-capable run shows the counter even at zero -- so
+    // "crushed=0" in an A/B comparison is a statement, not an omission.
+    if let Some(total) = frame.chunks_crushed_total {
+        lines.push(format!(
+            "crush: pulverized={} (+{})  mass-lost={:.0} kg  chunks-at-yield={}",
+            total, frame.chunks_crushed_frame, frame.crushed_mass_total, frame.nodes_at_crush_yield
+        ));
+    }
+    lines
 }
 
 pub fn draw_overlay(frame: &mut [u8], width: u32, height: u32, lines: &[String], scale: u32) {

@@ -966,6 +966,10 @@ fn part_color(part: u8, apply_sleep_tint: bool) -> [f32; 4] {
         3 => [0.45, 0.45, 0.43],
         4 => [0.62, 0.40, 0.20],
         5 => [0.15, 0.85, 0.35],
+        // Dust motes from pulverized (crushed) chunks: warm sand, deliberately
+        // unlike every structural grey, so "vanished into dust" and "detached
+        // and tumbled" are distinguishable at a glance.
+        6 => [0.95, 0.80, 0.45],
         7 => [0.42, 0.42, 0.40],
         _ => [0.70, 0.70, 0.70],
     };
