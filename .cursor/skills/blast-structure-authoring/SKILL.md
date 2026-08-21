@@ -68,6 +68,68 @@ Ductility is the band width, **independent of strength**. Two materials with an
 identical elastic limit and a 1.05× vs 500× band behave completely differently:
 one snaps, the other survives 400 steps of the same load.
 
+## The fourth knob: chunk crushing (ScenePack v3, opt-in)
+
+The three knobs above decide when a **joint** fails. Crushing decides when a
+**chunk itself** is comminuted and leaves the simulation as dust. Both happen in
+one impact: a wall separates along its joints, and the small region under the
+hit is ground up.
+
+Off unless a material authors a `crush` block, and off is byte-identical to
+before it existed — verified by running the crush-enabled reference building
+with `--no-crush` against the plain v2 pack (`testDisabledByDefault`).
+
+| Knob | Controls | Evidence |
+|---|---|---|
+| **`capPressure` + `cohesion` + `frictionSlope`** | *Whether* a chunk comminutes: the Drucker–Prager yield surface | `testOverstressedChunkCrushes` |
+| **`crushEnergy`** (J/m³) | *How much* is lost: the specific comminution energy | `testCrushEnergyControlsHowMuchIsLost` |
+| **`crushViscosity`** (Pa·s) | *How fast*, once past yield | `testFlowIsQuadraticInOverstress` |
+| **`debrisMassFraction`** | How much mass comes back as rigid fragments instead of dust | `testDebrisFractionRespawnsMass` |
+
+Don't dial the cone — derive it. Under an unconfined squeeze at a material's own
+compressive strength `fc`, the state is `p = fc/3, q = fc`, so
+
+```
+cohesion = fc * (1 - frictionSlope/3)     frictionSlope ~ 1.2 for concrete
+capPressure = 2.5 * fc                    confined pore collapse
+```
+
+makes a chunk yield at exactly the `fc` its bonds already use. One fewer number
+to invent.
+
+### Measure it the same way you measure joints
+
+```
+crush utilisation = max( q / (cohesion + frictionSlope*p),  p / capPressure )
+crush safety factor = 1 / crush utilisation
+```
+
+`getNodeCrushUtilisation` is valid on an intact, motionless structure, so the
+crush margin is checkable without exceeding it — exactly like reading joint
+safety factors under gravity alone (`testUtilisationIsReadableBeforeYield`). The
+demo prints `peakUtil` and `crushSafetyFactor` on every run.
+
+Target: **crush safety factor above ~5 under gravity**. The reference building
+sits at 8.4. Below 1 and the structure comminutes standing still.
+
+### What crushing will and will not do
+
+- **Nothing accumulates below yield.** A structure standing under its own weight
+  never grinds itself to dust however long it stands
+  (`testSettledStructureNeverCrushes`).
+- **Flow is quadratic in overstress**, so one material covers both "survives
+  ordinary abuse" and "pulverizes under a real hit" with no second threshold.
+  Measured on the reference building: ordinary impact → 0 chunks; 2× projectile
+  mass → 4.7%; 8× → 6.3%; 16× → 10.9%.
+- **No contact needed.** A chunk buried in a collapse, loaded only through its
+  bonds, comminutes exactly as a struck one does (`testBondLoadedChunkCrushes`).
+- **Tension never crushes.** A chunk in net tension cracks — which is the bond
+  model's job — rather than turning to powder. This is also what keeps
+  free-floating debris tumbling instead of crumbling (`testConfinementDiscriminates`).
+- **Requires `graphReductionLevel = 0`.** Reduction merges chunks into aggregate
+  solver nodes, so a per-chunk stress tensor would describe the aggregate.
+  Creation fails rather than reporting a plausible wrong number.
+
 ## The measurement
 
 Run any scene with a negligible projectile to get gravity-only loads:
@@ -144,6 +206,10 @@ the comment block in `export-reference-building.mjs`.
 | Holds its weight but explodes on contact | Tension/shear far below compression | Intended for concrete — but if it is too fragile, raise tension/shear specifically (`testTensionAndCompressionAreIndependent`). |
 | No progressive collapse — damage stays local | Survivors have too much margin | Redistribution is emergent, never scripted. Cutting one of two legs raised the survivor 0.022 → 0.121 (`testLoadRedistributesOntoSurvivors`). If survivors sit at safety factor 30, they will absorb it. Lower frame margin toward 5–10. |
 | Utilisation never changes after damage | Settled-island skip is serving cached values | A **fully supported** structure that fractures does not re-solve until something moves. Real scenes self-correct (detached pieces move). To measure, set `skipSettledIslands = false` and `idleSkip = false`. |
+| Chunks vanish where you wanted them to break apart | Crush too easy for the load | Read `peakUtil`. Above ~10 the chunks are far past yield: raise `crushEnergy` (toughness) before touching the yield surface. |
+| Crushing never fires however hard you hit | Chunks are in tension, not compression | Tension never comminutes by design. If the region should be crushed, it needs confinement — check `getNodeStressInvariants`; a negative `p` means it is being torn off, not squeezed. |
+| Crushing fires under gravity alone | Crush safety factor below 1 | Read `crushSafetyFactor` on a gravity-only run. Target above ~5; the reference building sits at 8.4. |
+| Foundations turn to dust | A support node points at a crushable material | Give footings a material with no `crush` block. A vaporizing footing is never the story (`scene_pack_v3_test`). |
 | Numbers differ between Rapier and PhysX | Expected for trajectories, **not** for structure | Asset interpretation is pinned by the conformance digest. If node/bond/material counts differ, that is a loader bug — see `SCENE_PACK_FORMAT.md`. |
 
 ## Non-negotiables
