@@ -123,6 +123,14 @@ sits at 8.4. Below 1 and the structure comminutes standing still.
   mass → 4.7%; 8× → 6.3%; 16× → 10.9%.
 - **No contact needed.** A chunk buried in a collapse, loaded only through its
   bonds, comminutes exactly as a struck one does (`testBondLoadedChunkCrushes`).
+- **Comminution costs the crusher.** With `applyCrushResistance` (default on),
+  each damage increment charges `dD * crushEnergy * volume` against the
+  impactor's kinetic energy, levied on the resim pass where the removed
+  material would otherwise refund its stopping impulse. Measured on the
+  punch-through wall at 1.4x: the crushable wall ABSORBS 5.2 MJ and stops the
+  ball at 2.7 m/s, while the bond-only wall lets a plug through at 36.5 m/s
+  (`testCrushResistanceChargesTheCrusher`). A crushable material is an energy
+  sink, not a weakness.
 - **Tension never crushes.** A chunk in net tension cracks — which is the bond
   model's job — rather than turning to powder. This is also what keeps
   free-floating debris tumbling instead of crumbling (`testConfinementDiscriminates`).
@@ -207,6 +215,7 @@ the comment block in `export-reference-building.mjs`.
 | No progressive collapse — damage stays local | Survivors have too much margin | Redistribution is emergent, never scripted. Cutting one of two legs raised the survivor 0.022 → 0.121 (`testLoadRedistributesOntoSurvivors`). If survivors sit at safety factor 30, they will absorb it. Lower frame margin toward 5–10. |
 | Utilisation never changes after damage | Settled-island skip is serving cached values | A **fully supported** structure that fractures does not re-solve until something moves. Real scenes self-correct (detached pieces move). To measure, set `skipSettledIslands = false` and `idleSkip = false`. |
 | Chunks vanish where you wanted them to break apart | Crush too easy for the load | Read `peakUtil`. Above ~10 the chunks are far past yield: raise `crushEnergy` (toughness) before touching the yield surface. |
+| Ball sails through a crushable wall unslowed | Comminution bill not being charged | Check `resistance=` in the crush summary. Zero with chunks crushing means the host is not passing `otherActor` on contacts, or `--no-crush-resistance` is set. |
 | Crushing never fires however hard you hit | Chunks are in tension, not compression | Tension never comminutes by design. If the region should be crushed, it needs confinement — check `getNodeStressInvariants`; a negative `p` means it is being torn off, not squeezed. |
 | Crushing fires under gravity alone | Crush safety factor below 1 | Read `crushSafetyFactor` on a gravity-only run. Target above ~5; the reference building sits at 8.4. |
 | Foundations turn to dust | A support node points at a crushable material | Give footings a material with no `crush` block. A vaporizing footing is never the story (`scene_pack_v3_test`). |

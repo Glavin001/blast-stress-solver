@@ -321,6 +321,19 @@ unconfined, and demand progressively more under confinement. That is one fewer
 number to invent — the cone is pinned to the same `fc` the bonds already use.
 `blast/blast-stress-solver/scripts/export-reference-building.mjs` does this.
 
+### The energy bill
+
+`crushEnergy` is charged, not just referenced: the PhysX adapter (setting
+`applyCrushResistance`, default on) extracts each damage increment's
+`dD * crushEnergy * volume` from the impacting body's kinetic energy as a
+resistive impulse, levied on the resimulation pass -- the pass where the
+removed material would otherwise refund its stopping impulse and hand the
+penetrator a free hole. The same authored number therefore sets both how fast
+a material comminutes and how much stopping power comminuting it has, which is
+what the physical quantity means. Bond-borne crushes deep inside a structure
+charge nobody: their load path is the structure itself and the reaction is
+already inside the solve.
+
 ### Authoring against it
 
 Crushing has the same shape of measurement as joint strength:
