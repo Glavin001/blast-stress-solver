@@ -1958,6 +1958,125 @@ DestructionMotion destructionMotion(
  */
 constexpr float kRetiredVisualDepth = -10000.0f;
 
+/**
+ * Momentum-matched dust bursts for pulverized chunks -- the visual grammar that
+ * separates the two destruction fates: a stress-FRACTURED chunk detaches whole
+ * and tumbles away; a CRUSHED chunk vanishes into a burst of dust motes carrying
+ * its velocity.
+ *
+ * The particles are VISUAL ONLY: a fixed pool of small box actors declared at
+ * frame 0 (TWSTATE1 cannot spawn actors later) and parked below the world.
+ * A burst teleports a handful to the chunk's position with the chunk's velocity
+ * plus a deterministic radial spread, integrates them ballistically on the
+ * host, and re-parks them when they expire or reach the ground. No PhysX
+ * bodies, no RNG, no effect on the simulation -- a resim pass replays contacts,
+ * not this, and identical runs produce identical dust.
+ *
+ * This is also the reference implementation of the ExtStressPhysXChunkDestroyed
+ * consumer pattern: everything the burst needs (position, velocity, volume) is
+ * on the event, which is exactly why the event carries it.
+ */
+class DustPool
+{
+public:
+    static constexpr std::uint32_t kCapacity = 256;
+    static constexpr std::uint32_t kPerBurst = 16;
+    static constexpr std::uint8_t kDustPart = 6;
+
+    DustPool(std::uint32_t firstVisualId, float gravity)
+        : m_firstVisualId(firstVisualId), m_gravity(gravity)
+    {
+        m_particles.resize(kCapacity);
+    }
+
+    std::uint32_t firstVisualId() const { return m_firstVisualId; }
+
+    /// Half extent for pool slot i. Varied by index so a burst has texture.
+    static float halfExtent(std::uint32_t i)
+    {
+        return 0.05f + 0.03f * static_cast<float>(i % 4);
+    }
+
+    void burst(const PxVec3& position, const PxVec3& velocity, float volume)
+    {
+        // Deterministic spherical spread: golden-angle lattice indexed by a
+        // running counter. Reads as a burst, replays identically.
+        const float chunkRadius = 0.35f * std::cbrt(std::max(volume, 1.0e-3f));
+        for (std::uint32_t i = 0; i < kPerBurst; ++i)
+        {
+            Particle& particle = m_particles[m_next % kCapacity];
+            const std::uint32_t n = m_emitted++;
+            ++m_next;
+
+            const float golden = 2.399963f; // radians
+            const float z = 1.0f - 2.0f * (static_cast<float>(n % 32) + 0.5f) / 32.0f;
+            const float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+            const float phi = golden * static_cast<float>(n);
+            const PxVec3 direction(r * std::cos(phi), z, r * std::sin(phi));
+
+            const float speed = 2.0f + 0.9f * static_cast<float>(n % 4);
+            particle.active = true;
+            particle.secondsRemaining = 1.4f;
+            particle.position = position + direction * chunkRadius;
+            particle.velocity = velocity + direction * speed;
+        }
+    }
+
+    void integrate(float dt)
+    {
+        for (Particle& particle : m_particles)
+        {
+            if (!particle.active)
+            {
+                continue;
+            }
+            particle.secondsRemaining -= dt;
+            // Ground or timeout ends a mote; dust settles, it does not bounce.
+            if (particle.secondsRemaining <= 0.0f || particle.position.y < 0.05f)
+            {
+                particle.active = false;
+                particle.position = PxVec3(0.0f, kRetiredVisualDepth, 0.0f);
+                continue;
+            }
+            particle.velocity.y += m_gravity * dt;
+            // Air drag: real dust decelerates fast, which is what makes a
+            // burst read as powder rather than shrapnel.
+            particle.velocity *= std::max(0.0f, 1.0f - 1.2f * dt);
+            particle.position += particle.velocity * dt;
+        }
+    }
+
+    /// Append every particle's pose. Parked particles repeat an identical pose
+    /// and the state writer's delta encoding drops them, so the steady-state
+    /// cost of an idle pool is zero bytes.
+    void appendPoses(std::vector<VisualPose>& poses) const
+    {
+        for (std::uint32_t i = 0; i < kCapacity; ++i)
+        {
+            VisualPose pose;
+            pose.actorId = m_firstVisualId + i;
+            pose.pose = PxTransform(m_particles[i].position);
+            pose.sleeping = !m_particles[i].active;
+            poses.push_back(pose);
+        }
+    }
+
+private:
+    struct Particle
+    {
+        PxVec3 position{0.0f, kRetiredVisualDepth, 0.0f};
+        PxVec3 velocity{0.0f};
+        float secondsRemaining{0.0f};
+        bool active{false};
+    };
+
+    std::uint32_t m_firstVisualId{0};
+    float m_gravity{-9.81f};
+    std::uint64_t m_emitted{0};
+    std::uint32_t m_next{0};
+    std::vector<Particle> m_particles;
+};
+
 std::vector<VisualPose> collectVisualPoses(
     const std::vector<DestructiblePtr>& destructibles,
     const std::vector<Projectile>& projectiles,
@@ -2750,6 +2869,10 @@ int run(const Options& options)
     // collectVisualPoses. Not rewound on a resim rollback, matching the events:
     // restore rewinds motion only, so a crushed chunk stays crushed.
     std::vector<std::uint32_t> retiredVisuals;
+    // Constructed only when a state stream is being written AND crushing is
+    // live -- its actor ids come after the projectiles', so it cannot exist
+    // until both are known. Null means no dust.
+    std::unique_ptr<DustPool> dustPool;
     hooks.chunkDestroyed = [&](std::size_t building,
                                const ExtStressPhysXChunkDestroyed* events,
                                std::uint32_t count) {
@@ -2778,6 +2901,10 @@ int run(const Options& options)
 
             // Its visual has to be told to leave too; see kRetiredVisualDepth.
             retiredVisuals.push_back(visualBases[building] + event.nodeIndex);
+            if (dustPool)
+            {
+                dustPool->burst(event.worldPose.p, event.linearVelocity, event.volume);
+            }
         }
     };
 
@@ -2946,14 +3073,36 @@ int run(const Options& options)
                 throw std::runtime_error(writer.error());
             }
         }
-        if (!writer.writeFrame(
-                0,
-                collectVisualPoses(
-                    destructibles,
-                    projectiles,
-                    nodesPerBuilding,
-                    visualBases,
-                    true)))
+        if (options.enableCrush && !destructibles.empty()
+            && destructibles.front()->isCrushEnabled())
+        {
+            dustPool = std::make_unique<DustPool>(
+                totalAuthoredChunks + static_cast<std::uint32_t>(projectiles.size()),
+                pack.gravity);
+            for (std::uint32_t i = 0; i < DustPool::kCapacity; ++i)
+            {
+                VisualActor actor;
+                actor.shape = VisualActor::Shape::Box;
+                actor.part = DustPool::kDustPart;
+                const float half = DustPool::halfExtent(i);
+                actor.parameters = PxVec3(half, half, half);
+                if (!writer.defineActor(dustPool->firstVisualId() + i, actor))
+                {
+                    throw std::runtime_error(writer.error());
+                }
+            }
+        }
+        std::vector<VisualPose> initialPoses = collectVisualPoses(
+            destructibles,
+            projectiles,
+            nodesPerBuilding,
+            visualBases,
+            true);
+        if (dustPool)
+        {
+            dustPool->appendPoses(initialPoses);
+        }
+        if (!writer.writeFrame(0, initialPoses))
         {
             throw std::runtime_error(writer.error());
         }
@@ -3125,19 +3274,27 @@ int run(const Options& options)
         peaks.peakBodies = std::max(previousPeakBodies, current.peakBodies);
         peaks.peakAwakeBodies = std::max(previousPeakAwake, current.peakAwakeBodies);
 
+        if (dustPool)
+        {
+            dustPool->integrate(physicsDt);
+        }
+
         double stateExportMilliseconds = 0.0;
         if (!options.statePath.empty() && (step + 1) % snapshotStride == 0)
         {
             const auto exportStart = std::chrono::steady_clock::now();
-            if (!writer.writeFrame(
-                    writtenFrames++,
-                    collectVisualPoses(
-                        destructibles,
-                        projectiles,
-                        nodesPerBuilding,
-                        visualBases,
-                        false,
-                        retiredVisuals)))
+            std::vector<VisualPose> framePoses = collectVisualPoses(
+                destructibles,
+                projectiles,
+                nodesPerBuilding,
+                visualBases,
+                false,
+                retiredVisuals);
+            if (dustPool)
+            {
+                dustPool->appendPoses(framePoses);
+            }
+            if (!writer.writeFrame(writtenFrames++, framePoses))
             {
                 throw std::runtime_error(writer.error());
             }
