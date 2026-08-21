@@ -207,6 +207,159 @@ table** from `solver.limits` (or from its placeholder default, with the
 warning) and puts every bond on index 0. Behavior is identical to before v2
 existed, so the Rapier demos and existing assets are unaffected.
 
+## Version 3 — chunk crushing
+
+v2 decides when a **joint** fails. v3 adds the other half: when a **chunk
+itself** is comminuted and leaves the simulation as dust.
+
+Both happen in the same impact. A car into a concrete wall separates most of it
+along its joints, and grinds up the small region under the hit. Without v3 the
+second half is impossible to express: every chunk is indestructible, so a hard
+enough hit just pushes intact rigid bodies around.
+
+v3 adds exactly two optional things.
+
+```jsonc
+{
+  "version": 3,
+  "defaults": { "solver": { "materials": [
+    { "name": "reinforced-concrete",
+      "compressionElastic": 24e6, "compressionFatal": 240e6,
+      "tensionElastic": 3e6,  "tensionFatal": 30e6,
+      "shearElastic": 4e6,    "shearFatal": 40e6,
+      "crush": {                       // OPTIONAL. Absent = this material's
+        "capPressure":   60e6,         //   chunks never comminute.
+        "cohesion":      14.4e6,
+        "frictionSlope": 1.2,
+        "crushEnergy":   1.2e8,
+        "crushViscosity": 2e5
+      } }
+  ] } },
+  "scenario": {
+    "nodes": [
+      { "centroid": {...}, "mass": 1800, "volume": 0.75, "m": 0 }  // OPTIONAL `m`
+    ]
+  }
+}
+```
+
+**`nodes[].m`** — a node's own material index, exactly like `bonds[].m`. It
+selects the chunk's crush properties and nothing else. Absent means 0. Out of
+range is a hard error, never a clamp — same rule as bonds, and for the same
+reason: a silent clamp turns a typo into a mysteriously indestructible chunk.
+
+A chunk's material is deliberately independent of the materials on the bonds
+around it. How hard a column is to grind up is not the same question as how
+strong its connections are, and a real building has facade panels that pulverize
+hanging off clips that are stronger than the panel.
+
+### The crush model
+
+Each solve builds a per-chunk Cauchy stress tensor by the **Love–Weber (virial)
+sum** over the forces acting on the chunk — its bond forces plus any external
+contacts — and reduces it to two invariants:
+
+```
+p = -trace(sigma)/3        confining pressure, positive in compression
+q = sqrt(1.5 * (s:s))      von Mises equivalent, s = sigma + p*I
+```
+
+Yield is a **Drucker–Prager cone with a pressure cap**, with tension excluded:
+
+```
+crushing requires p > 0
+excess = max( q - (cohesion + frictionSlope*p),  p - capPressure )
+```
+
+Flow is **Perzyna overstress viscoplasticity**, and damage is the plastic work
+per unit volume normalized by the specific comminution energy:
+
+```
+D += excess^2 * dt / (crushViscosity * crushEnergy),    pulverized at D >= 1
+```
+
+Three properties of that law are what make it behave:
+
+- **Quadratic in overstress.** A chunk barely past yield takes a very long time
+  to comminute; a chunk hit hard enough to sit far outside the surface goes
+  almost at once. So one material covers "survives ordinary abuse" and
+  "pulverizes under a real hit" without a second threshold to author.
+- **Needs no strain measurement.** A chunk loaded purely through its bonds —
+  buried in a collapse, never touched — comminutes exactly as a struck one does.
+- **Nothing accumulates below yield.** A structure standing under its own weight
+  has `excess = 0` and never grinds itself to dust, however long it stands.
+
+Tension is excluded because comminution is a compressive phenomenon: a chunk in
+net tension fails by cracking, which is what the bond model already represents.
+That exclusion is also what keeps free-floating debris intact — it carries no
+confining pressure, so it tumbles rather than crumbling.
+
+### Fields and units
+
+| Field | Unit | Meaning |
+|---|---|---|
+| `capPressure` | Pa | Hydrostatic cap: confined pore collapse. **Required**; must be > 0. |
+| `cohesion` | Pa | Drucker–Prager deviatoric intercept at `p = 0`. Default 0. |
+| `frictionSlope` | — | `dq/dp` of the cone. Default 0. ~1.2 is concrete-like. |
+| `crushEnergy` | J/m³ | Specific comminution energy. **Required**; must be > 0. |
+| `crushViscosity` | Pa·s | Perzyna flow viscosity. **Required**; must be > 0. |
+| `strainRateExponent` | — | CEB dynamic-increase-factor exponent. Default 0 = no rate hardening. |
+| `referenceStrainRate` | 1/s | Strain rate at which the DIF is 1. Default 1. |
+| `debrisMassFraction` | — | [0,1] of the chunk's mass respawned as rigid fragments. Default 0. |
+| `debrisFragmentCount` | — | Fragments to spawn when `debrisMassFraction > 0`. Default 0. |
+
+Deriving the cone rather than dialling it: under uniaxial compression at a
+material's own compressive strength `fc` the stress state is `p = fc/3, q = fc`,
+so setting
+
+```
+cohesion = fc * (1 - frictionSlope/3)
+```
+
+makes a chunk yield at exactly its authored compressive strength when squeezed
+unconfined, and demand progressively more under confinement. That is one fewer
+number to invent — the cone is pinned to the same `fc` the bonds already use.
+`blast/blast-stress-solver/scripts/export-reference-building.mjs` does this.
+
+### Authoring against it
+
+Crushing has the same shape of measurement as joint strength:
+
+```
+crush utilisation = max( q / (cohesion + frictionSlope*p),  p / capPressure )
+crush safety factor = 1 / crush utilisation
+```
+
+1 means the chunk is exactly at yield. Read it with
+`ExtStressPhysXDestructible::getNodeCrushUtilisation` — it is valid on an intact,
+motionless structure, so the crush margin can be checked without exceeding it,
+exactly as `getBondUtilisations` gives joint margins under gravity alone.
+
+Measured on the reference building
+(`assets/reference/reference-building-crush.json`):
+
+| Load | Peak crush utilisation | Chunks comminuted |
+|---|---|---|
+| Gravity only | 0.12 (safety factor 8.4) | 0 |
+| Ordinary impact | 3.3 | 0 |
+| 2× projectile mass | 4.7 | 3 of 64 (4.7%) |
+| 8× projectile mass | 6.2 | 4 of 64 (6.3%) |
+| 16× projectile mass | 8.0 | 7 of 64 (10.9%) |
+
+That progression is the target behaviour: the structure comes apart at its
+joints under ordinary loads and only begins losing mass when hit hard, with the
+loss staying localized rather than consuming the building.
+
+### Compatibility
+
+v1 and v2 packs load unchanged and behave exactly as before — crushing is
+inert unless a material authors a `crush` block. A `crush` block or a `nodes[].m`
+in a pack declaring version 1 or 2 is a hard error rather than a silent no-op:
+the author is expecting behaviour the declared version does not have.
+
+Verified: the crush-enabled reference building run with crushing disabled
+produces physics identical to the v2 reference building.
+
 ## Conformance
 
 `blast/blast-stress-solver/assets/conformance/structure-conformance-v2.json` is
@@ -237,3 +390,4 @@ concept of, but must not misinterpret one.
 | `optimization` | yes | yes | partial |
 | `camera`, `projectile` | demo-only | demo-only | demo-only |
 | `nodeMeshes` | render only | render only | ignored (boxes/hulls from colliders) |
+| `nodes[].m`, `materials[].crush` (v3) | ignored | ignored | yes |

@@ -32,6 +32,10 @@ struct SceneNode
     float volume{0.0f};
     physx::PxVec3 visualHalfExtents{0.5f};
     SceneCollider collider;
+    // Index into ScenePack::materials (JSON `m`; absent means 0). v3+.
+    // Selects this chunk's CRUSH properties, independently of the materials on
+    // the bonds around it. See SCENE_PACK_FORMAT.md.
+    std::uint32_t material{0};
 };
 
 /**
@@ -67,6 +71,31 @@ struct SceneBond
     std::uint32_t material{0};
 };
 
+/**
+ * Optional per-material chunk comminution (v3+, JSON `crush`).
+ *
+ * Bond limits decide whether a JOINT fails; these decide whether the CHUNK
+ * ITSELF is ground up and leaves the simulation as dust. `enabled` is false
+ * unless the pack authors a `crush` block, and a disabled material behaves
+ * exactly as it did before v3.
+ *
+ * Units: capPressure/cohesion in Pa, crushEnergy in J/m^3, frictionSlope and
+ * strainRateExponent dimensionless, referenceStrainRate in 1/s.
+ */
+struct CrushLimits
+{
+    bool enabled{false};
+    float capPressure{0.0f};
+    float cohesion{0.0f};
+    float frictionSlope{0.0f};
+    float crushEnergy{1.0f};
+    float crushViscosity{1.0f};
+    float strainRateExponent{0.0f};
+    float referenceStrainRate{1.0f};
+    float debrisMassFraction{0.0f};
+    std::uint32_t debrisFragmentCount{0};
+};
+
 struct StressLimits
 {
     float compressionElastic{1.0e6f};
@@ -89,6 +118,8 @@ struct SceneMaterial
 {
     std::string name;
     StressLimits limits;
+    // Optional chunk crushing (v3+). Disabled by default.
+    CrushLimits crush;
 };
 
 struct ScenePack

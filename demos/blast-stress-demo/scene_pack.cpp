@@ -498,7 +498,7 @@ ScenePack loadScenePack(const std::string& path)
     const Json root = JsonParser(readTextFile(path)).parse();
     requireKind(root, Json::Kind::Object, "root");
     const std::uint32_t version = index(root.at("version"), "version");
-    if (version != 1 && version != 2)
+    if (version != 1 && version != 2 && version != 3)
     {
         throw std::runtime_error(
             "unsupported ScenePack version " + std::to_string(version)
@@ -532,6 +532,12 @@ ScenePack loadScenePack(const std::string& path)
         limits.shearFatal = number(source.at("shearFatal"), "shearFatal");
         return limits;
     };
+
+    // v3 adds chunk crushing: an optional `crush` block per material and an
+    // optional `m` per node. Both are v3-only: seeing them in a v2 pack means
+    // the author expects behaviour the declared version does not have, which
+    // is worth an error rather than a silent no-op.
+    const bool allowCrush = version >= 3;
 
     if (version >= 2)
     {
@@ -568,6 +574,61 @@ ScenePack loadScenePack(const std::string& path)
                 throw std::runtime_error(
                     "material '" + material.name
                     + "' needs compressionFatal >= compressionElastic >= 0");
+            }
+            if (const Json* crush = source.find("crush"))
+            {
+                if (!allowCrush)
+                {
+                    throw std::runtime_error(
+                        "material '" + material.name
+                        + "' has a crush block, which requires ScenePack version 3");
+                }
+                requireKind(*crush, Json::Kind::Object, "crush");
+                material.crush.enabled = true;
+                material.crush.capPressure = number(crush->at("capPressure"), "capPressure");
+                material.crush.cohesion = optionalNumber(*crush, "cohesion", 0.0f);
+                material.crush.frictionSlope = optionalNumber(*crush, "frictionSlope", 0.0f);
+                material.crush.crushEnergy = number(crush->at("crushEnergy"), "crushEnergy");
+                material.crush.crushViscosity =
+                    number(crush->at("crushViscosity"), "crushViscosity");
+                material.crush.strainRateExponent =
+                    optionalNumber(*crush, "strainRateExponent", 0.0f);
+                material.crush.referenceStrainRate =
+                    optionalNumber(*crush, "referenceStrainRate", 1.0f);
+                material.crush.debrisMassFraction =
+                    optionalNumber(*crush, "debrisMassFraction", 0.0f);
+                material.crush.debrisFragmentCount = static_cast<std::uint32_t>(
+                    optionalNumber(*crush, "debrisFragmentCount", 0.0f));
+
+                if (!(material.crush.capPressure > 0.0f))
+                {
+                    throw std::runtime_error(
+                        "material '" + material.name
+                        + "' crush.capPressure must be > 0 (omit the crush block to disable)");
+                }
+                if (!(material.crush.crushEnergy > 0.0f))
+                {
+                    throw std::runtime_error(
+                        "material '" + material.name + "' crush.crushEnergy must be > 0");
+                }
+                if (!(material.crush.crushViscosity > 0.0f))
+                {
+                    throw std::runtime_error(
+                        "material '" + material.name + "' crush.crushViscosity must be > 0");
+                }
+                if (material.crush.cohesion < 0.0f || material.crush.frictionSlope < 0.0f)
+                {
+                    throw std::runtime_error(
+                        "material '" + material.name
+                        + "' crush.cohesion and crush.frictionSlope must be >= 0");
+                }
+                if (material.crush.debrisMassFraction < 0.0f
+                    || material.crush.debrisMassFraction > 1.0f)
+                {
+                    throw std::runtime_error(
+                        "material '" + material.name
+                        + "' crush.debrisMassFraction must be in [0, 1]");
+                }
             }
             pack.materials.push_back(std::move(material));
         }
@@ -632,6 +693,26 @@ ScenePack loadScenePack(const std::string& path)
         node.centroid = vec3(source.at("centroid"), "centroid");
         node.mass = number(source.at("mass"), "mass");
         node.volume = number(source.at("volume"), "volume");
+        // Node material index; absent means 0. Same no-clamp rule as bonds:
+        // a silent clamp turns a typo into a mysteriously indestructible chunk.
+        if (const Json* material = source.find("m"))
+        {
+            if (!allowCrush)
+            {
+                throw std::runtime_error(
+                    "node " + std::to_string(i)
+                    + " has a material index, which requires ScenePack version 3");
+            }
+            node.material = index(*material, "m");
+            if (node.material >= pack.materials.size())
+            {
+                throw std::runtime_error(
+                    "scene pack node " + std::to_string(i)
+                    + " references material " + std::to_string(node.material)
+                    + " but the table has only " + std::to_string(pack.materials.size())
+                    + " entries");
+            }
+        }
         const physx::PxVec3 size = vec3(sizes.array[i], "nodeSizes[]");
         node.collider = parseCollider(colliders.array[i], size);
         node.visualHalfExtents =
