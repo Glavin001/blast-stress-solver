@@ -1939,12 +1939,32 @@ DestructionMotion destructionMotion(
     return result;
 }
 
+/**
+ * Park a pulverized chunk's visual out of frame.
+ *
+ * TWSTATE1 declares every actor before frame 0 and then streams pose DELTAS,
+ * holding the last pose for anything that stops updating. A crushed chunk stops
+ * being exported the moment it leaves the simulation, so without this it would
+ * hang frozen in mid-air -- which reads as a stuck body, not as dust.
+ *
+ * This writes ONE final pose far below the world. The delta encoder then never
+ * mentions the actor again, so the cost is a single frame's transform and the
+ * chunk simply vanishes.
+ *
+ * It is a rendering workaround for a format that cannot despawn, not a physics
+ * behaviour: the chunk is already gone from the simulation by the time this
+ * runs. Rendering it as an actual dust burst needs a format that can carry
+ * emission events -- see SCENE_PACK_FORMAT.md and the crush documentation.
+ */
+constexpr float kRetiredVisualDepth = -10000.0f;
+
 std::vector<VisualPose> collectVisualPoses(
     const std::vector<DestructiblePtr>& destructibles,
     const std::vector<Projectile>& projectiles,
     const std::vector<std::uint32_t>& nodesPerBuilding,
     const std::vector<std::uint32_t>& visualBases,
-    bool fullSnapshot)
+    bool fullSnapshot,
+    const std::vector<std::uint32_t>& retiredVisuals = {})
 {
     std::vector<VisualPose> result;
     result.reserve(
@@ -1968,6 +1988,14 @@ std::vector<VisualPose> collectVisualPoses(
             pose.sleeping = shapes[i].bodySleeping;
             result.push_back(pose);
         }
+    }
+    for (std::uint32_t visualId : retiredVisuals)
+    {
+        VisualPose pose;
+        pose.actorId = visualId;
+        pose.pose = PxTransform(PxVec3(0.0f, kRetiredVisualDepth, 0.0f));
+        pose.sleeping = true;
+        result.push_back(pose);
     }
     for (const Projectile& projectile : projectiles)
     {
@@ -2718,6 +2746,10 @@ int run(const Options& options)
     // so: restore rewinds MOTION only, so a chunk crushed on the base pass
     // stays crushed through the resim passes and never re-fires.
     CrushDistribution crush;
+    // Visuals of chunks pulverized since the last exported frame, drained by
+    // collectVisualPoses. Not rewound on a resim rollback, matching the events:
+    // restore rewinds motion only, so a crushed chunk stays crushed.
+    std::vector<std::uint32_t> retiredVisuals;
     hooks.chunkDestroyed = [&](std::size_t building,
                                const ExtStressPhysXChunkDestroyed* events,
                                std::uint32_t count) {
@@ -2743,6 +2775,9 @@ int run(const Options& options)
                     ? buildingPack.materials[event.materialIndex].name
                     : std::string("material?");
             ++crush.byMaterial[material];
+
+            // Its visual has to be told to leave too; see kRetiredVisualDepth.
+            retiredVisuals.push_back(visualBases[building] + event.nodeIndex);
         }
     };
 
@@ -3101,10 +3136,14 @@ int run(const Options& options)
                         projectiles,
                         nodesPerBuilding,
                         visualBases,
-                        false)))
+                        false,
+                        retiredVisuals)))
             {
                 throw std::runtime_error(writer.error());
             }
+            // Each retired visual only needs its one parking pose; the delta
+            // encoder holds it from there.
+            retiredVisuals.clear();
             stateExportMilliseconds =
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - exportStart).count();
