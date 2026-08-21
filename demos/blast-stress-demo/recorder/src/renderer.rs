@@ -328,6 +328,15 @@ pub fn render_recording(
     ))
 }
 
+/// Whether the local FFmpeg advertises an encoder by name.
+fn ffmpeg_has_encoder(name: &str) -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains(name))
+        .unwrap_or(false)
+}
+
 async fn render_recording_async(
     state_path: &Path,
     output_path: &Path,
@@ -524,6 +533,17 @@ async fn render_recording_async(
         })
         .collect();
 
+    // NVENC when the local FFmpeg has it, libx264 otherwise. The renderer
+    // itself is always GPU: this is only the encode step, and hard-requiring
+    // h264_nvenc made the whole pipeline unusable on any FFmpeg built without
+    // it -- including builds that ship av1_nvenc but not h264_nvenc.
+    let codec_args: &[&str] = if ffmpeg_has_encoder("h264_nvenc") {
+        &["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-cq", "18", "-b:v", "0"]
+    } else {
+        eprintln!("h264_nvenc unavailable; encoding with libx264 (CPU)");
+        &["-c:v", "libx264", "-preset", "slow", "-crf", "18"]
+    };
+
     let mut encoder_process = Command::new("ffmpeg")
         .args([
             "-y",
@@ -540,16 +560,9 @@ async fn render_recording_async(
             "-i",
             "-",
             "-an",
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p5",
-            "-tune",
-            "hq",
-            "-cq",
-            "18",
-            "-b:v",
-            "0",
+        ])
+        .args(codec_args)
+        .args([
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -558,7 +571,7 @@ async fn render_recording_async(
         .arg(output_path)
         .stdin(Stdio::piped())
         .spawn()
-        .with_context(|| format!("start NVENC for {}", output_path.display()))?;
+        .with_context(|| format!("start encoder for {}", output_path.display()))?;
     let mut ffmpeg_stdin = encoder_process.stdin.take().context("open FFmpeg stdin")?;
     let mut render_frames =
         BufWriter::new(File::create(render_frames_path).with_context(|| {
