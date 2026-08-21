@@ -559,6 +559,23 @@ public:
         NvVec3 localVel;
         uint32_t solverNode;
         uint32_t neighborsCount;
+
+        // --- chunk crushing (see ExtStressCrushProperties) ---
+        // Love-Weber virial accumulator, sigma*V in Voigt order
+        // [xx, yy, zz, xy, xz, yz]. Symmetric by construction: each
+        // contribution is added as its symmetric part.
+        float virial[6];
+        float strainRate;       // 1/s, supplied by the host
+        float crushDamage;      // [0,1], 1 = pulverized
+        float pressure;         // Pa, p = -trace(sigma)/3, positive in compression
+        float deviator;         // Pa, von Mises equivalent q
+        // How close this chunk is to its crush yield surface: max of
+        // q / (cohesion + slope*p) and p / capPressure. 1 means at yield.
+        // The crush analogue of bond utilisation.
+        float crushUtilisation;
+        bool  crushed;              // latched once crushDamage reaches 1
+        bool  crushReported;        // drained through getCrushedNodes()
+        bool  crushCommandIssued;   // a chunk fracture command was already emitted
     };
 
     struct SolverNodeData
@@ -593,6 +610,7 @@ public:
         memset(m_blastBondIndexMap.begin(), 0xFF, m_blastBondIndexMap.size() * sizeof(uint32_t));
 
         resetVelocities();
+        resetCrushState();
     }
 
     const NodeData& getNodeData(uint32_t node) const
@@ -811,6 +829,28 @@ public:
         }
     }
 
+    /**
+    addNodeForce that also records the force's application point, so an
+    EXTERNAL contact enters the node's Love-Weber virial sum.
+
+    The plain addNodeForce above discards the point (it only ever needed the
+    resultant), which is fine for the bond solve but loses exactly the
+    information a per-chunk stress tensor is built from. Only surface
+    tractions belong in the sum -- gravity and centrifugal loads are body
+    forces and keep using addNodeForce.
+    */
+    void addNodeForceAt(uint32_t node, const NvVec3& localPosition, const NvVec3& force, ExtForceMode::Enum mode)
+    {
+        if (m_crushEnabled && materialForNode(node).crush.enabled())
+        {
+            // The virial is a sum over forces; convert acceleration first.
+            const NvVec3 actualForce =
+                (mode == ExtForceMode::FORCE) ? force : force * m_nodesData[node].mass;
+            accumulateVirial(node, localPosition - m_nodesData[node].localPos, actualForce);
+        }
+        addNodeForce(node, force, mode);
+    }
+
     void addBond(uint32_t node0, uint32_t node1, uint32_t blastBondIndex)
     {
         if (isInvalidIndex(m_blastBondIndexMap[blastBondIndex]))
@@ -901,7 +941,7 @@ public:
         return m_graphReductionLevel;
     }
 
-    void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
+    void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false, bool skipSettled = false, float deltaTime = 0.0f)
     {
         sync(bonds, islandAware);
 
@@ -915,6 +955,10 @@ public:
         resetVelocities();
 
         updateBondStress(bondHealth, bonds);
+
+        // Per-chunk stress runs after the bonds because it consumes the same
+        // solved impulses. Skipped entirely when no material enables crush.
+        updateNodeStress(bondHealth, deltaTime);
     }
 
     bool calcError(float& linear, float& angular) const
@@ -965,6 +1009,265 @@ private:
         for (auto& node : m_nodesData)
         {
             node.localVel = NvVec3(NvZero);
+        }
+    }
+
+    void resetCrushState()
+    {
+        for (auto& node : m_nodesData)
+        {
+            memset(node.virial, 0, sizeof(node.virial));
+            node.strainRate = 0.0f;
+            node.crushDamage = 0.0f;
+            node.pressure = 0.0f;
+            node.deviator = 0.0f;
+            node.crushUtilisation = 0.0f;
+            node.crushed = false;
+            node.crushReported = false;
+            node.crushCommandIssued = false;
+        }
+        m_crushedNodes.clear();
+    }
+
+    void clearVirials()
+    {
+        for (auto& node : m_nodesData)
+        {
+            memset(node.virial, 0, sizeof(node.virial));
+        }
+    }
+
+    /**
+    Add the symmetric part of (branch (outer) force) to a node's virial.
+    Only the symmetric part is meaningful: the antisymmetric part of the sum is
+    the net couple on the chunk, which a Cauchy stress tensor does not carry.
+    */
+    void accumulateVirial(uint32_t node, const NvVec3& branch, const NvVec3& force)
+    {
+        float* v = m_nodesData[node].virial;
+        v[0] += branch.x * force.x;
+        v[1] += branch.y * force.y;
+        v[2] += branch.z * force.z;
+        v[3] += 0.5f * (branch.x * force.y + branch.y * force.x);
+        v[4] += 0.5f * (branch.x * force.z + branch.z * force.x);
+        v[5] += 0.5f * (branch.y * force.z + branch.z * force.y);
+    }
+
+    /**
+    Build each crush-enabled node's Cauchy stress tensor from the solved bond
+    forces plus any external contacts recorded this frame, reduce it to the
+    (p, q) invariants, and integrate crush damage.
+
+    The construction is the Love-Weber (virial) sum, the standard definition of
+    stress in a discrete assembly:
+
+        sigma = (1/V) * sum over contacts of sym( branch (outer) force )
+
+    Bond forces are attributed to member bonds by area share, because graph
+    reduction can merge several asset bonds into one solver constraint that
+    carries a single impulse.
+
+    Body forces (gravity, centrifugal) are deliberately absent: they are not
+    surface tractions and do not belong in the sum. A chunk buried in a pile is
+    still crushed by the weight above it, because that weight reaches it
+    through its bonds and contacts.
+    */
+    void updateNodeStress(const float* bondHealth, float deltaTime)
+    {
+        if (!m_crushEnabled)
+        {
+            return;
+        }
+
+        accumulateBondVirial(bondHealth);
+
+        for (uint32_t node = 0; node < m_nodesData.size(); ++node)
+        {
+            NodeData& data = m_nodesData[node];
+            const ExtStressCrushProperties& crush = materialForNode(node).crush;
+
+            if (!crush.enabled() || data.crushed || data.volume <= 0.0f || data.mass <= 0.0f)
+            {
+                data.pressure = 0.0f;
+                data.deviator = 0.0f;
+                data.crushUtilisation = 0.0f;
+                continue;
+            }
+
+            const float recipVolume = 1.0f / data.volume;
+            const float sxx = data.virial[0] * recipVolume;
+            const float syy = data.virial[1] * recipVolume;
+            const float szz = data.virial[2] * recipVolume;
+            const float sxy = data.virial[3] * recipVolume;
+            const float sxz = data.virial[4] * recipVolume;
+            const float syz = data.virial[5] * recipVolume;
+
+            // p is positive in compression, so it carries the opposite sign to
+            // the trace of the stress tensor.
+            const float pressure = -(sxx + syy + szz) / 3.0f;
+
+            // Deviator s = sigma + p*I, then q = sqrt(1.5 * s:s).
+            const float dxx = sxx + pressure;
+            const float dyy = syy + pressure;
+            const float dzz = szz + pressure;
+            const float deviatorSq =
+                dxx * dxx + dyy * dyy + dzz * dzz + 2.0f * (sxy * sxy + sxz * sxz + syz * syz);
+            const float deviator = sqrtf(1.5f * (deviatorSq > 0.0f ? deviatorSq : 0.0f));
+
+            data.pressure = pressure;
+            data.deviator = deviator;
+
+            // TENSION CUTOFF. Comminution is a compressive phenomenon: a chunk
+            // in net tension fails by cracking, which is exactly what the bond
+            // model already represents, and it does not turn to powder. Without
+            // this the Drucker-Prager cone would make crushing EASIER in
+            // tension (its limit falls with pressure), so free-floating debris
+            // -- which has no confining pressure at all -- would crumble
+            // instead of tumbling. That is the failure mode this whole model
+            // exists to avoid.
+            if (pressure <= 0.0f)
+            {
+                data.crushUtilisation = 0.0f;
+                continue;
+            }
+
+            // Utilisation is a property of the STRESS STATE alone, so compute
+            // it whether or not anything is closing on the chunk. That is what
+            // makes it usable the way bond utilisation is: sample it after a
+            // gravity settle to see how much of a chunk's crush capacity its
+            // own structure already consumes, before anything moves.
+            {
+                const float coneLimitNow = crush.cohesion + crush.frictionSlope * pressure;
+                const float coneUse = coneLimitNow > 0.0f ? deviator / coneLimitNow : 0.0f;
+                const float capUse =
+                    crush.capPressure > 0.0f ? pressure / crush.capPressure : 0.0f;
+                data.crushUtilisation = coneUse > capUse ? coneUse : capUse;
+            }
+
+            if (deltaTime <= 0.0f)
+            {
+                continue;
+            }
+            const float strainRate = data.strainRate;
+
+            // Optional CEB-style dynamic increase factor: concrete is stronger
+            // the faster it is loaded, which is why a fast projectile spalls
+            // where a slow press crushes.
+            float strengthScale = 1.0f;
+            if (crush.strainRateExponent > 0.0f && crush.referenceStrainRate > 0.0f)
+            {
+                strengthScale = powf(strainRate / crush.referenceStrainRate, crush.strainRateExponent);
+                if (strengthScale < 1.0f)
+                {
+                    strengthScale = 1.0f;   // rate hardening only, never softening
+                }
+            }
+
+            // Drucker-Prager cone with a pressure cap. Using a cap surface
+            // rather than a bare pressure threshold is what distinguishes
+            // CONFINED crushing from unconfined shear: unconfined debris sits
+            // at low p, stays inside the cone, and tumbles intact.
+            const float coneLimit = strengthScale * (crush.cohesion + crush.frictionSlope * pressure);
+            const float capLimit = strengthScale * crush.capPressure;
+            const float shearExcess = deviator - coneLimit;
+            const float capExcess = pressure - capLimit;
+            const float excess = shearExcess > capExcess ? shearExcess : capExcess;
+
+            if (excess <= 0.0f)
+            {
+                continue;
+            }
+
+            // Perzyna overstress flow: the plastic strain rate is how far
+            // outside the yield surface the stress sits, divided by the
+            // material's viscosity. Damage is that plastic work per unit
+            // volume, normalized by the specific comminution energy.
+            //
+            //     epsdot_p = excess / crushViscosity
+            //     dD       = excess * epsdot_p * dt / crushEnergy
+            //
+            // Quadratic in overstress, which is what keeps a barely-yielding
+            // chunk intact for a long time while a hard hit comminutes almost
+            // at once. Crucially it needs no strain measurement, so a chunk
+            // loaded purely through its BONDS -- buried in a collapse, never
+            // touched directly -- crushes exactly as a struck one does.
+            const float crushEnergy = crush.crushEnergy > 0.0f ? crush.crushEnergy : 1.0f;
+            const float crushViscosity = crush.crushViscosity > 0.0f ? crush.crushViscosity : 1.0f;
+            data.crushDamage += excess * excess * deltaTime / (crushViscosity * crushEnergy);
+
+            if (data.crushDamage >= 1.0f)
+            {
+                data.crushDamage = 1.0f;
+                data.crushed = true;
+                m_crushedNodes.pushBack(node);
+            }
+        }
+    }
+
+    /**
+    Distribute each solver bond's solved force onto its member bonds by area
+    share and add the result to both endpoint nodes' virials.
+
+    Sign convention: the solver's linear impulse acts on node0 as given and on
+    node1 negated. Combined with the branch vectors this makes a bond in
+    compression produce a positive pressure at both of its nodes, matching
+    getBondStress's convention that a negative stressNormal is compression.
+    */
+    void accumulateBondVirial(const float* bondHealth)
+    {
+        clearVirials();
+
+        for (uint32_t group = 0; group < m_solverBondsData.size(); ++group)
+        {
+            const auto& blastBondIndices = m_solverBondsData[group].blastBondIndices;
+
+            float totalArea = 0.0f;
+            for (auto blastBondIndex : blastBondIndices)
+            {
+                const float remainingArea = bondHealth[blastBondIndex];
+                if (remainingArea > 0.0f && canTakeDamage(remainingArea))
+                {
+                    totalArea += remainingArea;
+                }
+            }
+            if (totalArea <= 0.0f)
+            {
+                continue;
+            }
+
+            NvVec3 impulseLinear, impulseAngular;
+            getSolverInternalBondImpulses(group, impulseLinear, impulseAngular);
+            // impulseAngular is intentionally unused: a self-equilibrated couple
+            // contributes only an antisymmetric term, which vanishes when the
+            // Cauchy stress is symmetrized. Bending-driven edge spall is
+            // therefore not represented in the mean stress.
+            (void)impulseAngular;
+
+            const float recipTotalArea = 1.0f / totalArea;
+            for (auto blastBondIndex : blastBondIndices)
+            {
+                const float remainingArea = bondHealth[blastBondIndex];
+                if (remainingArea <= 0.0f || !canTakeDamage(remainingArea))
+                {
+                    continue;
+                }
+                const uint32_t bondIndex = m_blastBondIndexMap[blastBondIndex];
+                if (isInvalidIndex(bondIndex))
+                {
+                    continue;
+                }
+                const BondData& bond = m_bondsData[bondIndex];
+                const NvVec3 force = impulseLinear * (remainingArea * recipTotalArea);
+
+                if (materialForNode(bond.node0).crush.enabled())
+                {
+                    accumulateVirial(bond.node0, bond.centroid - m_nodesData[bond.node0].localPos, force);
+                }
+                if (materialForNode(bond.node1).crush.enabled())
+                {
+                    accumulateVirial(bond.node1, bond.centroid - m_nodesData[bond.node1].localPos, -force);
+                }
+            }
         }
     }
 
@@ -1449,17 +1752,93 @@ private:
     const ExtStressMaterial*            m_materials{nullptr};
     uint32_t                            m_materialCount{0};
     const uint32_t*                     m_bondMaterials{nullptr};
+    // Per-graph-node material indices, selecting each chunk's crush properties.
+    const uint32_t*                     m_nodeMaterials{nullptr};
+    // True only when some material enables crush AND the graph is unreduced.
+    bool                                m_crushEnabled{false};
+    Array<uint32_t>::type               m_crushedNodes;
 
 public:
     void setMaterialTables(
         const ExtStressMaterial* materials,
         uint32_t materialCount,
-        const uint32_t* bondMaterials)
+        const uint32_t* bondMaterials,
+        const uint32_t* nodeMaterials,
+        bool crushEnabled)
     {
         m_materials = materials;
         m_materialCount = materialCount;
         m_bondMaterials = bondMaterials;
+        m_nodeMaterials = nodeMaterials;
+        m_crushEnabled = crushEnabled;
         m_solver.setMaterialTable(materials, materialCount);
+    }
+
+    const ExtStressMaterial& materialForNode(uint32_t node) const
+    {
+        static const ExtStressMaterial defaultMaterial;
+        if (!m_materials || m_materialCount == 0)
+        {
+            return defaultMaterial;
+        }
+        const uint32_t material = m_nodeMaterials ? m_nodeMaterials[node] : 0;
+        return m_materials[material < m_materialCount ? material : 0];
+    }
+
+    bool isCrushEnabled() const { return m_crushEnabled; }
+
+    void setNodeStrainRate(uint32_t node, float strainRate)
+    {
+        m_nodesData[node].strainRate = strainRate > 0.0f ? strainRate : 0.0f;
+    }
+
+    float getNodeCrushDamage(uint32_t node) const { return m_nodesData[node].crushDamage; }
+    float getNodePressure(uint32_t node) const { return m_nodesData[node].pressure; }
+    float getNodeDeviator(uint32_t node) const { return m_nodesData[node].deviator; }
+    float getNodeCrushUtilisation(uint32_t node) const { return m_nodesData[node].crushUtilisation; }
+    bool  isNodeCrushed(uint32_t node) const { return m_nodesData[node].crushed; }
+    bool  needsCrushCommand(uint32_t node) const
+    {
+        return m_nodesData[node].crushed && !m_nodesData[node].crushCommandIssued;
+    }
+    void  markCrushCommandIssued(uint32_t node) { m_nodesData[node].crushCommandIssued = true; }
+    uint32_t getPendingCrushCount() const
+    {
+        uint32_t pending = 0;
+        for (const auto& node : m_nodesData)
+        {
+            if (node.crushed && !node.crushCommandIssued) ++pending;
+        }
+        return pending;
+    }
+
+    /**
+    Drain the crushed-node queue. Each node is reported exactly once; the
+    latched `crushed` flag keeps it out of the stress loop forever after.
+    */
+    uint32_t drainCrushedNodes(uint32_t* nodeIndices, uint32_t capacity)
+    {
+        const uint32_t count = m_crushedNodes.size() < capacity ? m_crushedNodes.size() : capacity;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            nodeIndices[i] = m_crushedNodes[i];
+            m_nodesData[m_crushedNodes[i]].crushReported = true;
+        }
+        // Keep anything that did not fit; it drains on the next call.
+        if (count == m_crushedNodes.size())
+        {
+            m_crushedNodes.clear();
+        }
+        else
+        {
+            const uint32_t remaining = m_crushedNodes.size() - count;
+            for (uint32_t i = 0; i < remaining; ++i)
+            {
+                m_crushedNodes[i] = m_crushedNodes[i + count];
+            }
+            m_crushedNodes.resize(remaining);
+        }
+        return count;
     }
 
     const ExtStressMaterial& materialForBlastBond(uint32_t blastBondIndex) const
@@ -1541,6 +1920,7 @@ public:
     virtual bool                            addForce(const NvBlastActor& actor, NvcVec3 localPosition, NvcVec3 localForce, ExtForceMode::Enum mode) override;
 
     virtual void                            addForce(uint32_t graphNode, NvcVec3 localForce, ExtForceMode::Enum mode) override;
+    virtual void                            addForceAt(uint32_t graphNode, NvcVec3 localPosition, NvcVec3 localForce, ExtForceMode::Enum mode) override;
 
     virtual bool                            addGravity(const NvBlastActor& actor, NvcVec3 localGravity) override;
     virtual bool                            addCentrifugalAcceleration(const NvBlastActor& actor, NvcVec3 localCenterMass, NvcVec3 localAngularVelocity) override;
@@ -1693,14 +2073,7 @@ public:
         }
         // Storage may have reallocated; re-point the processor and refresh the
         // solver-bond group materials (weakness ordering may have changed).
-        if (m_graphProcessor)
-        {
-            m_graphProcessor->setMaterialTables(
-                m_materials.data(),
-                static_cast<uint32_t>(m_materials.size()),
-                m_bondMaterials.data());
-            m_graphProcessor->refreshGroupMaterials();
-        }
+        pushMaterialTables();
     }
 
     virtual void                            setBondMaterials(const uint32_t* materialIndices, uint32_t bondCount) override
@@ -1713,14 +2086,92 @@ public:
                 (materialIndices && bond < count) ? materialIndices[bond] : 0;
             m_bondMaterials[bond] = material < materialCount ? material : 0;
         }
-        if (m_graphProcessor)
+        pushMaterialTables();
+    }
+
+    virtual void                            setNodeMaterials(const uint32_t* materialIndices, uint32_t nodeCount) override
+    {
+        const uint32_t materialCount = static_cast<uint32_t>(m_materials.size());
+        const uint32_t count = std::min(nodeCount, m_graphNodeCount);
+        for (uint32_t node = 0; node < m_graphNodeCount; ++node)
         {
-            m_graphProcessor->setMaterialTables(
-                m_materials.data(),
-                static_cast<uint32_t>(m_materials.size()),
-                m_bondMaterials.data());
-            m_graphProcessor->refreshGroupMaterials();
+            const uint32_t material =
+                (materialIndices && node < count) ? materialIndices[node] : 0;
+            m_nodeMaterials[node] = material < materialCount ? material : 0;
         }
+        pushMaterialTables();
+    }
+
+    virtual void                            setNodeStrainRates(const float* strainRates, uint32_t nodeCount, float deltaTime) override
+    {
+        m_deltaTime = deltaTime > 0.0f ? deltaTime : 0.0f;
+        if (!m_graphProcessor)
+        {
+            return;
+        }
+        const uint32_t count = std::min(nodeCount, m_graphNodeCount);
+        for (uint32_t node = 0; node < m_graphNodeCount; ++node)
+        {
+            m_graphProcessor->setNodeStrainRate(
+                node, (strainRates && node < count) ? strainRates[node] : 0.0f);
+        }
+    }
+
+    virtual uint32_t                        getNodeCrushDamage(float* damage, uint32_t capacity) const override
+    {
+        if (!damage || !m_graphProcessor)
+        {
+            return 0;
+        }
+        const uint32_t count = std::min(capacity, m_graphNodeCount);
+        for (uint32_t node = 0; node < count; ++node)
+        {
+            damage[node] = m_graphProcessor->getNodeCrushDamage(node);
+        }
+        return count;
+    }
+
+    virtual uint32_t                        getNodeStressInvariants(float* pressure, float* deviator, uint32_t capacity) const override
+    {
+        if (!m_graphProcessor)
+        {
+            return 0;
+        }
+        const uint32_t count = std::min(capacity, m_graphNodeCount);
+        for (uint32_t node = 0; node < count; ++node)
+        {
+            if (pressure) pressure[node] = m_graphProcessor->getNodePressure(node);
+            if (deviator) deviator[node] = m_graphProcessor->getNodeDeviator(node);
+        }
+        return count;
+    }
+
+    virtual uint32_t                        getNodeCrushUtilisation(float* utilisation, uint32_t capacity) const override
+    {
+        if (!utilisation || !m_graphProcessor)
+        {
+            return 0;
+        }
+        const uint32_t count = std::min(capacity, m_graphNodeCount);
+        for (uint32_t node = 0; node < count; ++node)
+        {
+            utilisation[node] = m_graphProcessor->getNodeCrushUtilisation(node);
+        }
+        return count;
+    }
+
+    virtual uint32_t                        getCrushedNodes(uint32_t* nodeIndices, uint32_t capacity) override
+    {
+        if (!nodeIndices || !m_graphProcessor)
+        {
+            return 0;
+        }
+        return m_graphProcessor->drainCrushedNodes(nodeIndices, capacity);
+    }
+
+    virtual bool                            isCrushEnabled() const override
+    {
+        return m_graphProcessor && m_graphProcessor->isCrushEnabled();
     }
 
     virtual uint32_t                        getBondUtilisations(float* utilisation, uint32_t capacity) const override
@@ -1819,6 +2270,51 @@ private:
         return resolved;
     }
 
+    /**
+    Re-point the graph processor at the (possibly reallocated) material storage
+    and recompute whether crush is active at all.
+
+    Crush requires an UNREDUCED graph. Graph reduction merges support nodes into
+    a single solver node, so a per-node stress tensor would describe an
+    aggregate rather than a chunk. Rather than report a plausible wrong number,
+    refuse: with reduction > 0 crush stays off and nothing is ever crushed.
+    */
+    void                                    pushMaterialTables()
+    {
+        if (!m_graphProcessor)
+        {
+            return;
+        }
+
+        bool anyCrush = false;
+        for (const ExtStressMaterial& material : m_materials)
+        {
+            if (material.crush.enabled())
+            {
+                anyCrush = true;
+                break;
+            }
+        }
+
+        const bool reduced = m_settings.graphReductionLevel > 0;
+        if (anyCrush && reduced && !m_crushReductionWarned)
+        {
+            m_crushReductionWarned = true;
+            NVBLAST_LOG_ERROR(
+                "ExtStressSolver: chunk crushing requires graphReductionLevel 0 "
+                "(reduction merges chunks into aggregate solver nodes, so a per-chunk "
+                "stress tensor would be meaningless). Crushing is disabled.");
+        }
+
+        m_graphProcessor->setMaterialTables(
+            m_materials.data(),
+            static_cast<uint32_t>(m_materials.size()),
+            m_bondMaterials.data(),
+            m_nodeMaterials.empty() ? nullptr : m_nodeMaterials.data(),
+            anyCrush && !reduced);
+        m_graphProcessor->refreshGroupMaterials();
+    }
+
     const ExtStressMaterial&                materialForBond(uint32_t blastBondIndex) const
     {
         const uint32_t material = blastBondIndex < m_bondMaterials.size()
@@ -1838,6 +2334,11 @@ private:
     // the graph processor can hold raw pointers into it.
     std::vector<ExtStressMaterial>                                      m_materials;
     std::vector<uint32_t>                                               m_bondMaterials;
+    // Per-GRAPH-NODE material indices, selecting each chunk's crush properties.
+    std::vector<uint32_t>                                               m_nodeMaterials;
+    uint32_t                                                            m_graphNodeCount{0};
+    // Timestep of the pending update(), used to integrate crush plastic work.
+    float                                                               m_deltaTime{0.0f};
     NvBlastSupportGraph                                                 m_graph;
     bool                                                                m_isDirty;
     bool                                                                m_reset;
@@ -1852,7 +2353,9 @@ private:
     bool                                                                m_islandAware;
     bool                                                                m_skipSettled;
     uint32_t                                                            m_framesCount;
+    bool                                                                m_crushReductionWarned{false};
     Array<NvBlastBondFractureData>::type                                m_bondFractureBuffer;
+    Array<NvBlastChunkFractureData>::type                               m_chunkFractureBuffer;
     Array<uint8_t>::type                                                m_scratch;
     Array<DebugLine>::type                                              m_debugLineBuffer;
     bool                                                                m_valid;
@@ -1897,6 +2400,8 @@ ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtS
     const uint32_t bondCount = NvBlastAssetGetBondCount(asset, logLL);
     m_assetBondCount = bondCount;
     m_bondMaterials.assign(bondCount, 0);
+    m_graphNodeCount = m_graph.nodeCount;
+    m_nodeMaterials.assign(m_graphNodeCount, 0);
 
     m_bondFractureBuffer.reserve(bondCount);
 
@@ -1909,10 +2414,7 @@ ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtS
     }
 
     m_graphProcessor = NVBLAST_NEW(SupportGraphProcessor)(m_graph.nodeCount, bondCount);
-    m_graphProcessor->setMaterialTables(
-        m_materials.data(),
-        static_cast<uint32_t>(m_materials.size()),
-        m_bondMaterials.data());
+    pushMaterialTables();
 
     // traverse graph and fill bond info
     for (uint32_t node0 = 0; node0 < m_graph.nodeCount; ++node0)
@@ -2209,7 +2711,10 @@ bool ExtStressSolverImpl::addForce(const NvBlastActor& actor, NvcVec3 localPosit
 
         if (!isInvalidIndex(bestNode))
         {
-            m_graphProcessor->addNodeForce(bestNode, toNvShared(localForce), mode);
+            // Position-aware: an external contact is a surface traction and
+            // belongs in the node's virial sum, unlike gravity below.
+            m_graphProcessor->addNodeForceAt(
+                bestNode, toNvShared(localPosition), toNvShared(localForce), mode);
             return true;
         }
     }
@@ -2219,6 +2724,12 @@ bool ExtStressSolverImpl::addForce(const NvBlastActor& actor, NvcVec3 localPosit
 void ExtStressSolverImpl::addForce(uint32_t graphNode, NvcVec3 localForce, ExtForceMode::Enum mode)
 {
     m_graphProcessor->addNodeForce(graphNode, toNvShared(localForce), mode);
+}
+
+void ExtStressSolverImpl::addForceAt(uint32_t graphNode, NvcVec3 localPosition, NvcVec3 localForce, ExtForceMode::Enum mode)
+{
+    m_graphProcessor->addNodeForceAt(
+        graphNode, toNvShared(localPosition), toNvShared(localForce), mode);
 }
 
 bool ExtStressSolverImpl::addGravity(const NvBlastActor& actor, NvcVec3 localGravity)
@@ -2281,7 +2792,7 @@ void ExtStressSolverImpl::solve()
 {
     NV_SIMD_GUARD;
 
-    m_graphProcessor->solve(m_settings, m_bondHealths, m_bonds, WARM_START && !m_reset, m_islandAware, m_skipSettled);
+    m_graphProcessor->solve(m_settings, m_bondHealths, m_bonds, WARM_START && !m_reset, m_islandAware, m_skipSettled, m_deltaTime);
     m_reset = false;
 
     m_converged = m_graphProcessor->calcError(m_errorLinear, m_errorAngular);
@@ -2352,8 +2863,12 @@ void ExtStressSolverImpl::fillFractureCommands(const NvBlastActor& actor, NvBlas
 {
     const uint32_t graphNodeCount = NvBlastActorGetGraphNodeCount(&actor, logLL);
     uint32_t commandCount = 0;
+    uint32_t chunkCommandCount = 0;
 
-    if (graphNodeCount > 1 && m_graphProcessor->getOverstressedBondCount() > 0)
+    const bool anyBondWork = graphNodeCount > 1 && m_graphProcessor->getOverstressedBondCount() > 0;
+    const bool anyCrushWork = m_graphProcessor->isCrushEnabled() && m_graphProcessor->getPendingCrushCount() > 0;
+
+    if (anyBondWork || anyCrushWork)
     {
         uint32_t* graphNodeIndices = getScratchArray<uint32_t>(graphNodeCount);
         const uint32_t nodeCount = NvBlastActorGetGraphNodeIndices(graphNodeIndices, graphNodeCount, &actor, logLL);
@@ -2361,23 +2876,54 @@ void ExtStressSolverImpl::fillFractureCommands(const NvBlastActor& actor, NvBlas
         for (uint32_t i = 0; i < nodeCount; ++i)
         {
             const uint32_t node0 = graphNodeIndices[i];
-            for (uint32_t adjacencyIndex = m_graph.adjacencyPartition[node0]; adjacencyIndex < m_graph.adjacencyPartition[node0 + 1]; adjacencyIndex++)
+
+            if (anyBondWork)
             {
-                const uint32_t node1 = m_graph.adjacentNodeIndices[adjacencyIndex];
-                if (node0 < node1)
+                for (uint32_t adjacencyIndex = m_graph.adjacencyPartition[node0]; adjacencyIndex < m_graph.adjacencyPartition[node0 + 1]; adjacencyIndex++)
                 {
-                    const uint32_t bondIndex = m_graph.adjacentBondIndices[adjacencyIndex];
-                    if (generateStressDamage(actor, bondIndex, node0, node1))
+                    const uint32_t node1 = m_graph.adjacentNodeIndices[adjacencyIndex];
+                    if (node0 < node1)
                     {
-                        commandCount++;
+                        const uint32_t bondIndex = m_graph.adjacentBondIndices[adjacencyIndex];
+                        if (generateStressDamage(actor, bondIndex, node0, node1))
+                        {
+                            commandCount++;
+                        }
                     }
                 }
+            }
+
+            // A fully crushed chunk is severed through Blast's own chunk
+            // fracture path, which zeroes every incident bond and drops the
+            // node out of the island graph (NvBlastFamily.cpp, fractureWithEvents).
+            //
+            // Note the command is issued ONLY at full crush, never for partial
+            // damage: Blast detaches a support chunk on ANY positive chunk
+            // damage regardless of remaining health, so partial crush damage
+            // cannot be represented in Blast's chunk health without severing
+            // the chunk early. That is why crush damage accumulates here in the
+            // solver instead.
+            if (anyCrushWork && m_graphProcessor->needsCrushCommand(node0))
+            {
+                const NvBlastChunkFractureData data = {
+                    0,
+                    m_graph.chunkIndices[node0],
+                    // Health is a DAMAGE amount here. Blast's health for a
+                    // lower-support chunk is authored as 1.0 by this stack, so
+                    // anything above it exhausts the chunk outright; the
+                    // unbreakable sentinel keeps genuinely indestructible
+                    // chunks out of this path in the first place.
+                    2.0f
+                };
+                m_chunkFractureBuffer.pushBack(data);
+                m_graphProcessor->markCrushCommandIssued(node0);
+                chunkCommandCount++;
             }
         }
     }
 
-    commands.chunkFractureCount = 0;
-    commands.chunkFractures = nullptr;
+    commands.chunkFractureCount = chunkCommandCount;
+    commands.chunkFractures = chunkCommandCount > 0 ? m_chunkFractureBuffer.end() - chunkCommandCount : nullptr;
     commands.bondFractureCount = commandCount;
     commands.bondFractures = commandCount > 0 ? m_bondFractureBuffer.end() - commandCount : nullptr;
 }
@@ -2385,22 +2931,28 @@ void ExtStressSolverImpl::fillFractureCommands(const NvBlastActor& actor, NvBlas
 void ExtStressSolverImpl::generateFractureCommands(const NvBlastActor& actor, NvBlastFractureBuffers& commands)
 {
     m_bondFractureBuffer.clear();
+    m_chunkFractureBuffer.clear();
     fillFractureCommands(actor, commands);
 }
 
 uint32_t ExtStressSolverImpl::generateFractureCommandsPerActor(const NvBlastActor** actorBuffer, NvBlastFractureBuffers* commandsBuffer, uint32_t bufferSize)
 {
-    if (m_graphProcessor->getOverstressedBondCount() == 0)
+    // A crushed chunk is fracture work even when no bond is overstressed: a
+    // chunk can be pulverized while every joint around it is still intact.
+    const bool crushPending =
+        m_graphProcessor->isCrushEnabled() && m_graphProcessor->getPendingCrushCount() > 0;
+    if (m_graphProcessor->getOverstressedBondCount() == 0 && !crushPending)
         return 0;
 
     m_bondFractureBuffer.clear();
+    m_chunkFractureBuffer.clear();
     uint32_t index = 0;
     for (auto it = m_activeActors.getIterator(); !it.done() && index < bufferSize; ++it)
     {
         const NvBlastActor* actor = *it;
         NvBlastFractureBuffers& nextCommand = commandsBuffer[index];
         fillFractureCommands(*actor, nextCommand);
-        if (nextCommand.bondFractureCount > 0)
+        if (nextCommand.bondFractureCount > 0 || nextCommand.chunkFractureCount > 0)
         {
             actorBuffer[index] = actor;
             index++;

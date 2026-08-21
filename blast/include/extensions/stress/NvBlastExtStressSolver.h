@@ -80,6 +80,86 @@ partial damage over many frames (concrete with rebar), a narrow band snaps
 Negative tension/shear limits inherit the corresponding compression limit,
 resolved when the table is set on the solver.
 */
+/**
+Optional per-material CHUNK crushing (comminution) properties.
+
+Bond limits decide whether a JOINT fails; these decide whether the CHUNK ITSELF
+is ground up and leaves the simulation as dust. The two are independent: a wall
+can shed a panel along its joints (bonds) while the small region under an impact
+is pulverized (crush).
+
+The model is standard granular/geomechanics. Each solve builds a per-chunk
+Cauchy stress tensor by the Love-Weber (virial) sum over the forces acting on
+the chunk, reduces it to the pressure/deviator invariants
+
+    p = -trace(sigma)/3        (positive in compression)
+    q = sqrt(1.5 * (s : s))    (von Mises equivalent, s = sigma + p*I)
+
+and yields against a Drucker-Prager cone with a pressure cap:
+
+    excess = max(q - (cohesion + frictionSlope*p),  p - capPressure)
+
+Flow is Perzyna overstress viscoplasticity, the standard rate-dependent
+plasticity law: the plastic strain rate is proportional to how far the stress
+state sits outside the yield surface,
+
+    epsdot_p = excess / crushViscosity
+
+and crush damage accumulates as that plastic work per unit volume, normalized
+by the material's specific comminution energy:
+
+    D += excess * epsdot_p * dt / crushEnergy
+       = excess^2 * dt / (crushViscosity * crushEnergy),   pulverized at D >= 1
+
+Note the QUADRATIC dependence on overstress. That is what makes the behaviour
+read correctly: a chunk just past yield takes a very long time to comminute,
+while a chunk hit hard enough to sit far outside the surface goes almost at
+once. It also means crushing needs no strain measurement, so a chunk loaded
+through its BONDS -- deep inside a collapsing structure, with no contact of its
+own -- comminutes just as a directly struck one does.
+
+A chunk inside the yield surface has excess = 0 and accumulates nothing, so a
+settled structure never grinds itself to dust no matter how long it stands.
+
+Using a cap surface rather than a plain pressure threshold is what separates
+CONFINED crushing from unconfined shear: free-floating debris has low p, stays
+inside the cone, and tumbles intact instead of crumbling.
+
+DISABLED BY DEFAULT. capPressure <= 0 means this material's chunks are
+indestructible in the crush sense and no per-chunk stress work is done at all,
+so existing assets are bit-identical until they opt in.
+*/
+struct ExtStressCrushProperties
+{
+    float capPressure;          //!< Pa. Hydrostatic cap. <= 0 disables crushing for this material.
+    float cohesion;             //!< Pa. Drucker-Prager deviatoric intercept at p = 0.
+    float frictionSlope;        //!< dq/dp of the Drucker-Prager cone. Dimensionless, >= 0.
+    float crushEnergy;          //!< J/m^3 (== Pa). Plastic work per unit volume to fully comminute.
+    //! Pa*s. Perzyna viscosity: how fast the material flows once past yield.
+    //! Larger is more sluggish, so a chunk lingers past yield instead of
+    //! comminuting. Must be > 0 when crushing is enabled.
+    float crushViscosity;
+    float strainRateExponent;   //!< CEB dynamic-increase-factor exponent. 0 disables rate hardening.
+    float referenceStrainRate;  //!< 1/s. Strain rate at which the DIF is 1.
+    float debrisMassFraction;   //!< [0,1] of the chunk's mass respawned as rigid fragments. 0 = all mass leaves.
+    uint32_t debrisFragmentCount; //!< Number of fragments to respawn when debrisMassFraction > 0.
+
+    ExtStressCrushProperties() :
+        capPressure(0.0f),
+        cohesion(0.0f),
+        frictionSlope(0.0f),
+        crushEnergy(1.0f),
+        crushViscosity(1.0f),
+        strainRateExponent(0.0f),
+        referenceStrainRate(1.0f),
+        debrisMassFraction(0.0f),
+        debrisFragmentCount(0)
+    {}
+
+    bool enabled() const { return capPressure > 0.0f; }
+};
+
+
 struct ExtStressMaterial
 {
     float compressionElasticLimit;  //!< below this compression pressure no damage occurs
@@ -88,6 +168,9 @@ struct ExtStressMaterial
     float tensionFatalLimit;        //!< < 0 inherits compression
     float shearElasticLimit;        //!< < 0 inherits compression
     float shearFatalLimit;          //!< < 0 inherits compression
+
+    //! Chunk comminution. Disabled unless crush.capPressure > 0. @see ExtStressCrushProperties
+    ExtStressCrushProperties crush;
 
     ExtStressMaterial() :
         compressionElasticLimit(1.0f),
@@ -214,6 +297,101 @@ public:
     virtual void                            setBondMaterials(const uint32_t* materialIndices, uint32_t bondCount) = 0;
 
     /**
+    Assign each graph NODE a material from the table, which is what selects its
+    ExtStressCrushProperties. Out-of-range indices clamp to 0. Passing null
+    resets all nodes to material 0.
+
+    Node materials are independent of bond materials: a chunk's own crush
+    resistance need not match the joints that hold it. Crush stays disabled
+    unless the selected material has crush.capPressure > 0.
+
+    \param[in] materialIndices  Array of at least `nodeCount` indices, or null.
+    \param[in] nodeCount        Number of entries provided.
+    */
+    virtual void                            setNodeMaterials(const uint32_t* materialIndices, uint32_t nodeCount) = 0;
+
+    /**
+    Supply each graph node's external loading rate (1/s) for the coming
+    update(), and the timestep. Entries persist until overwritten; passing null
+    zeroes them.
+
+    This feeds the OPTIONAL strain-rate hardening term only (the CEB dynamic
+    increase factor), which is what makes a fast projectile spall where a slow
+    press crushes. It is not required for crushing to work: flow is driven by
+    overstress, not by this rate, so leaving every entry at zero simply means
+    no rate hardening. The PhysX adapter derives it from contact closing rates.
+
+    Materials with strainRateExponent == 0 ignore it entirely.
+
+    \param[in] strainRates  Array of at least `nodeCount` rates (1/s), or null.
+    \param[in] nodeCount    Number of entries provided.
+    \param[in] deltaTime    Timestep (s) the next update() advances by. The
+                            solver has no clock of its own; this is what turns a
+                            rate into the work increment.
+    */
+    virtual void                            setNodeStrainRates(const float* strainRates, uint32_t nodeCount, float deltaTime) = 0;
+
+    /**
+    Read back per-node accumulated crush damage in [0, 1], indexed by graph
+    node index. 1 means the chunk pulverized. Nodes on a material without
+    crush enabled always read 0.
+
+    \return entries written (min of capacity and the graph's node count).
+    */
+    virtual uint32_t                        getNodeCrushDamage(float* damage, uint32_t capacity) const = 0;
+
+    /**
+    Read back the per-node stress invariants from the last update(), indexed by
+    graph node index: `pressure` is p = -trace(sigma)/3 in Pa (positive in
+    compression) and `deviator` is the von Mises equivalent q in Pa. Either
+    pointer may be null.
+
+    Unlike the bond readbacks these are populated only for nodes whose material
+    has crush enabled -- the virial sum is skipped entirely otherwise.
+
+    \return entries written (min of capacity and the graph's node count).
+    */
+    virtual uint32_t                        getNodeStressInvariants(float* pressure, float* deviator, uint32_t capacity) const = 0;
+
+    /**
+    Read back how close each chunk is to its crush yield surface, indexed by
+    graph node index: max of q/(cohesion + frictionSlope*p) and p/capPressure.
+    1 means the chunk is exactly at yield; above 1 it is comminuting.
+
+    This is the crush analogue of getBondUtilisations, and it is what makes
+    crush authorable. Sample it after a gravity settle to see how much of each
+    chunk's crush capacity its own structure already consumes, and during an
+    impact to see how close a hit came. It is a property of the stress state
+    alone, so it reads correctly even when nothing is moving and no damage is
+    accumulating.
+
+    \return entries written (min of capacity and the graph's node count).
+    */
+    virtual uint32_t                        getNodeCrushUtilisation(float* utilisation, uint32_t capacity) const = 0;
+
+    /**
+    Drain the list of nodes that reached full crush damage since the last call.
+    Each node is reported exactly once. The caller is responsible for removing
+    the corresponding body/shape from its physics scene -- the solver only
+    severs the chunk structurally.
+
+    \return entries written (the drained count, capped at capacity).
+    */
+    virtual uint32_t                        getCrushedNodes(uint32_t* nodeIndices, uint32_t capacity) = 0;
+
+    /**
+    Whether chunk crushing is active: at least one material has
+    crush.capPressure > 0 AND graphReductionLevel is 0.
+
+    Crush requires unreduced nodes. Graph reduction merges support nodes into
+    one solver node, so a per-node stress tensor would describe an aggregate
+    rather than a chunk. Rather than report a plausible wrong number, the
+    solver refuses: with reduction > 0 this returns false, no per-chunk stress
+    is computed, and nothing is ever crushed.
+    */
+    virtual bool                            isCrushEnabled() const = 0;
+
+    /**
     Read back per-bond utilisation from the last update(), indexed by ASSET
     bond index: max over stress modes of (stress / that bond's own material
     ELASTIC limit). 1/utilisation is the joint's safety factor. Using this
@@ -267,6 +445,27 @@ public:
     \param[in]  mode            The mode to use when applying the force/impulse(see #ExtForceMode)
     */
     virtual void                            addForce(uint32_t graphNodeIndex, NvcVec3 localForce, ExtForceMode::Enum mode = ExtForceMode::FORCE) = 0;
+
+    /**
+    addForce on a known graph node that also records WHERE the force is applied.
+
+    The overload above only needs the resultant and discards the point, which is
+    all the bond solve requires. Chunk crushing needs the point: a per-chunk
+    stress tensor is a sum over (branch vector x force), so a contact whose
+    application point is dropped contributes nothing to the chunk's own stress
+    state and an impact would raise the stress of every chunk around the one it
+    actually hit.
+
+    Prefer this for external CONTACT forces. Body forces (gravity, centrifugal)
+    should keep using the plain overload -- they are not surface tractions and
+    do not belong in the sum.
+
+    \param[in] graphNodeIndex   Node to load.
+    \param[in] localPosition    Application point, actor-local, same frame as the node centroids.
+    \param[in] localForce       Force (or acceleration, per mode), actor-local.
+    \param[in] mode             Whether localForce is a force or an acceleration.
+    */
+    virtual void                            addForceAt(uint32_t graphNodeIndex, NvcVec3 localPosition, NvcVec3 localForce, ExtForceMode::Enum mode = ExtForceMode::FORCE) = 0;
 
     /**
     Apply external gravity on particular actor of family. This function applies gravity on every node withing actor, so it makes sense only for static actors.
