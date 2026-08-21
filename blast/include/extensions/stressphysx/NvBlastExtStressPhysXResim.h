@@ -107,6 +107,26 @@ public:
     virtual void onCapture() {}
     virtual void onRestore() {}
     virtual void onPostFetchResults(uint32_t pass) { (void)pass; }
+
+    /**
+    Chunks were pulverized during this tick. Fires once per chunk, as it
+    happens, before the frame's resimulation passes are decided.
+
+    Resimulation restores MOTION only -- fracture topology, masses and shapes
+    are kept (see ExtStressPhysXDestructible::restoreResimulationSnapshot), so
+    a chunk crushed in pass 0 stays crushed in pass 1 and does not re-fire
+    here. A host counting these does NOT need to rewind them in onRestore(),
+    unlike per-frame impact counters.
+    */
+    virtual void onChunkDestroyed(
+        ExtStressPhysXDestructible& destructible,
+        const ExtStressPhysXChunkDestroyed* events,
+        uint32_t count)
+    {
+        (void)destructible;
+        (void)events;
+        (void)count;
+    }
     virtual bool forceResimulationCapture() const { return false; }
     virtual bool solveAll(
         ExtStressPhysXDestructible* const* destructibles,

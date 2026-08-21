@@ -545,9 +545,40 @@ private:
                 endMilliseconds = stepperElapsedMilliseconds(endStart);
                 return false;
             }
+            drainChunkDestroyed(*destructibles[i], hooks);
         }
         endMilliseconds = stepperElapsedMilliseconds(endStart);
         return true;
+    }
+
+    /**
+    Forward this destructible's chunk-destruction events to the frame hook.
+
+    Drained unconditionally, even when no hook is installed: the queue is
+    bounded only by whoever empties it, and a long demolition with a host that
+    never looks would otherwise grow it for the whole run. A host that wants
+    the events either overrides onChunkDestroyed or calls
+    drainChunkDestroyedEvents itself before the next tick.
+    */
+    static void drainChunkDestroyed(
+        ExtStressPhysXDestructible& destructible,
+        ExtStressPhysXFrameHooks& hooks)
+    {
+        if (!destructible.isCrushEnabled())
+        {
+            return;
+        }
+        ExtStressPhysXChunkDestroyed events[64];
+        uint32_t drained = 0;
+        do
+        {
+            drained = destructible.drainChunkDestroyedEvents(
+                events, static_cast<uint32_t>(sizeof(events) / sizeof(events[0])));
+            if (drained > 0)
+            {
+                hooks.onChunkDestroyed(destructible, events, drained);
+            }
+        } while (drained == sizeof(events) / sizeof(events[0]));
     }
 
     void captureSceneInto(ExtStressPhysXFrameStats& frame)

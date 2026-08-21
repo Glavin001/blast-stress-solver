@@ -137,6 +137,12 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , gpuStressSolveMilliseconds(0.0)
     , gpuStressHostToDeviceBytes(0)
     , gpuStressDeviceToHostBytes(0)
+    , chunksCrushed(0)
+    , crushedMassKg(0.0)
+    , crushedVolumeM3(0.0)
+    , nodesAtCrushYield(0)
+    , peakCrushUtilisation(0.0f)
+    , debrisBodiesSpawned(0)
     , resimulationCaptures(0)
     , resimulationRestores(0)
     , resimulationBodiesRestored(0)
@@ -190,6 +196,7 @@ public:
                 "A destructible requires a stress material table (>= 1 entry).");
         }
         m_materialCount = desc.stressMaterialCount;
+        m_materials.assign(desc.stressMaterials, desc.stressMaterials + desc.stressMaterialCount);
         m_materialDescs.resize(desc.stressMaterialCount);
         for (uint32_t i = 0; i < desc.stressMaterialCount; ++i)
         {
@@ -212,10 +219,59 @@ public:
             target.tension_fatal_limit = source.tensionFatalLimit;
             target.shear_elastic_limit = source.shearElasticLimit;
             target.shear_fatal_limit = source.shearFatalLimit;
+
+            if (source.crushCapPressure > 0.0f)
+            {
+                if (!std::isfinite(source.crushCapPressure)
+                    || !std::isfinite(source.crushCohesion) || source.crushCohesion < 0.0f
+                    || !std::isfinite(source.crushFrictionSlope) || source.crushFrictionSlope < 0.0f
+                    || !std::isfinite(source.crushEnergy) || source.crushEnergy <= 0.0f
+                    || !std::isfinite(source.crushViscosity) || source.crushViscosity <= 0.0f)
+                {
+                    return fail(
+                        ExtStressPhysXError::InvalidDescriptor,
+                        i,
+                        "Crush properties must be finite, non-negative, with crushEnergy > 0 "
+                        "and crushViscosity > 0. "
+                        "Set crushCapPressure <= 0 to disable crushing for this material.");
+                }
+                if (source.crushDebrisMassFraction < 0.0f || source.crushDebrisMassFraction > 1.0f)
+                {
+                    return fail(
+                        ExtStressPhysXError::InvalidDescriptor,
+                        i,
+                        "crushDebrisMassFraction must be in [0, 1].");
+                }
+                m_crushEnabled = true;
+            }
+            target.crush_cap_pressure = source.crushCapPressure;
+            target.crush_cohesion = source.crushCohesion;
+            target.crush_friction_slope = source.crushFrictionSlope;
+            target.crush_energy = source.crushEnergy;
+            target.crush_viscosity = source.crushViscosity;
+            target.crush_strain_rate_exponent = source.crushStrainRateExponent;
+            target.crush_reference_strain_rate = source.crushReferenceStrainRate;
+            target.crush_debris_mass_fraction = source.crushDebrisMassFraction;
+            target.crush_debris_fragment_count = source.crushDebrisFragmentCount;
+        }
+
+        // Crushing needs an unreduced graph: reduction merges chunks into
+        // aggregate solver nodes, so a per-chunk stress tensor would describe
+        // the aggregate rather than the chunk. Report it rather than silently
+        // producing a plausible wrong number.
+        if (m_crushEnabled && desc.settings.graphReductionLevel > 0)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "Chunk crushing requires graphReductionLevel 0.");
         }
 
         m_nodes.resize(desc.nodeCount);
         m_bonds.assign(desc.bonds, desc.bonds + desc.bondCount);
+        m_nodeMaterials.assign(desc.nodeCount, 0);
+        m_nodeStrainRates.assign(desc.nodeCount, 0.0f);
+        m_nodeCharacteristicSize.assign(desc.nodeCount, 0.0f);
 
         std::vector<ExtStressNodeDesc> solverNodes(desc.nodeCount);
         for (uint32_t i = 0; i < desc.nodeCount; ++i)
@@ -231,10 +287,25 @@ public:
                     "Node coordinates, mass, volume, and geometry pose must be valid.");
             }
 
+            if (source.material >= m_materialCount)
+            {
+                return fail(
+                    ExtStressPhysXError::InvalidDescriptor,
+                    i,
+                    "Node material index is outside the stress material table.");
+            }
+
             NodeState& node = m_nodes[i];
             node.mass = source.mass;
+            node.volume = source.volume;
             node.centroid = source.centroid;
             node.shapeId = m_nextShapeId++;
+            node.material = source.material;
+            m_nodeMaterials[i] = source.material;
+            // Characteristic length for turning a contact closing SPEED into a
+            // strain RATE. Cube root of volume, so it is geometry-derived
+            // rather than another authored knob.
+            m_nodeCharacteristicSize[i] = std::cbrt(source.volume);
 
             ExtStressNodeDesc& solverNode = solverNodes[i];
             solverNode.centroid = toStress(source.centroid);
@@ -283,6 +354,13 @@ public:
             m_materialDescs.data(),
             static_cast<uint32_t>(m_materialDescs.size()),
             &solverSettings);
+        if (m_solver && m_crushEnabled)
+        {
+            ext_stress_solver_set_node_materials(
+                m_solver,
+                m_nodeMaterials.data(),
+                static_cast<uint32_t>(m_nodeMaterials.size()));
+        }
         if (!m_solver)
         {
             return fail(
@@ -418,6 +496,8 @@ public:
         queued.nodeIndex = nodeIndex;
         queued.position = contact.worldPosition;
         queued.impulse = contact.worldImpulse;
+        queued.relativeVelocity =
+            contact.worldRelativeVelocity.isFinite() ? contact.worldRelativeVelocity : PxVec3(0.0f);
         queued.wake = contact.wake;
         m_contacts.push_back(queued);
         ++m_telemetry.contactsQueued;
@@ -495,6 +575,79 @@ public:
 
     /// consumeContacts() against snapshot poses, deferring wakeUp() to the
     /// caller because it is a scene write.
+    struct QueuedContact
+    {
+        uint32_t nodeIndex{INVALID_INDEX};
+        PxVec3 position{0.0f};
+        PxVec3 impulse{0.0f};
+        // Other body's velocity minus this one's at the contact point, world
+        // space. Only its closing component is used, and only for crushing.
+        PxVec3 relativeVelocity{0.0f};
+        bool wake{true};
+    };
+
+    /**
+    Record this contact's compaction strain rate on its node.
+
+    The contact impulse direction is the contact normal up to sign, so the
+    closing speed is the relative velocity projected onto it. Only CLOSING
+    counts: a contact that is separating does no work on the chunk, and a
+    resting contact that is neither does none either -- which is why a settled
+    rubble pile accumulates no crush damage. Dividing by the chunk's
+    characteristic size V^(1/3) turns a speed into a strain rate.
+
+    The max (not the sum) over a node's contacts: several contact points from
+    the same impact describe one closing event, and summing them would make
+    crush damage scale with contact-point count rather than with the physics.
+    */
+    void accumulateCrushStrainRate(const QueuedContact& contact)
+    {
+        if (!m_crushEnabled || contact.nodeIndex >= m_nodeCharacteristicSize.size())
+        {
+            return;
+        }
+        const float impulseMagnitude = contact.impulse.magnitude();
+        if (impulseMagnitude <= 0.0f)
+        {
+            return;
+        }
+        const PxVec3 normal = contact.impulse / impulseMagnitude;
+        // Sign: `normal` is the impulse THIS body receives, which points the
+        // same way the approaching body is travelling, and relativeVelocity is
+        // "other minus this". So a closing contact gives a POSITIVE dot; a
+        // separating one gives a negative dot and does no work on the chunk.
+        const float closingSpeed = contact.relativeVelocity.dot(normal);
+        const float size = m_nodeCharacteristicSize[contact.nodeIndex];
+        if (size > 0.0f)
+        {
+            float& rate = m_nodeStrainRates[contact.nodeIndex];
+            rate = std::max(rate, closingSpeed / size);
+        }
+    }
+
+    /// Zero every node's strain rate. Rates describe ONE tick's contacts: a
+    /// chunk that stops being pressed must stop accumulating crush damage.
+    void resetCrushStrainRates()
+    {
+        if (m_crushEnabled)
+        {
+            std::fill(m_nodeStrainRates.begin(), m_nodeStrainRates.end(), 0.0f);
+        }
+    }
+
+    /// Hand this tick's strain rates and timestep to the solver.
+    void pushCrushStrainRates(float dt)
+    {
+        if (m_crushEnabled)
+        {
+            ext_stress_solver_set_node_strain_rates(
+                m_solver,
+                m_nodeStrainRates.data(),
+                static_cast<uint32_t>(m_nodeStrainRates.size()),
+                dt);
+        }
+    }
+
     void consumeContactsFromSnapshot(
         float dt,
         const ExtStressPhysXBodySnapshot* bodies,
@@ -504,6 +657,7 @@ public:
         uint32_t* outWakeCount)
     {
         uint32_t wakeCount = 0;
+        resetCrushStrainRates();
         if (m_contacts.empty())
         {
             // Nothing to look anything up for. Building the index anyway cost
@@ -513,6 +667,7 @@ public:
             m_contactLocalPositions.clear();
             m_contactLocalForces.clear();
             m_contactedActors.clear();
+            pushCrushStrainRates(dt);
             if (outWakeCount != nullptr)
             {
                 *outWakeCount = 0;
@@ -581,6 +736,9 @@ public:
             const PxTransform& pose = body.contactGlobalPose;
             const PxVec3 localPosition = pose.transformInv(contact.position);
             const PxVec3 localForce = pose.q.rotateInv(contact.impulse / dt);
+
+            accumulateCrushStrainRate(contact);
+
             m_contactNodeIndices.push_back(contact.nodeIndex);
             m_contactLocalPositions.insert(
                 m_contactLocalPositions.end(),
@@ -604,6 +762,7 @@ public:
         {
             *outWakeCount = wakeCount;
         }
+        pushCrushStrainRates(dt);
     }
 
     bool beginTickFromSnapshot(
@@ -712,9 +871,71 @@ public:
             ext_stress_solver_gpu_host_to_device_bytes(m_solver);
         m_telemetry.gpuStressDeviceToHostBytes +=
             ext_stress_solver_gpu_device_to_host_bytes(m_solver);
+        drainCrushedNodes();
         m_telemetry.stressSolveMilliseconds += elapsedMilliseconds(phaseStart);
         m_tickPhase = TickPhase::Solved;
         return true;
+    }
+
+    /**
+    Move newly pulverized nodes out of the solver and into the adapter's own
+    pending list. Draining here rather than in endTick keeps solveTick free of
+    PhysX calls, which is what lets it run concurrently across destructibles.
+    */
+    void drainCrushedNodes()
+    {
+        if (!m_crushEnabled)
+        {
+            return;
+        }
+        m_crushScratch.resize(m_nodes.size());
+        uint32_t drained = 0;
+        while ((drained = ext_stress_solver_get_crushed_nodes(
+                    m_solver,
+                    m_crushScratch.data(),
+                    static_cast<uint32_t>(m_crushScratch.size()))) > 0)
+        {
+            m_pendingCrushedNodes.insert(
+                m_pendingCrushedNodes.end(),
+                m_crushScratch.begin(),
+                m_crushScratch.begin() + drained);
+            if (drained < m_crushScratch.size())
+            {
+                break;
+            }
+        }
+
+        // Report how many chunks are currently past their yield surface but not
+        // yet fully comminuted: the crush analogue of the overstressed bond
+        // count, and the number to watch when tuning.
+        m_nodeDamageScratch.resize(m_nodes.size());
+        const uint32_t written = ext_stress_solver_get_node_crush_damage(
+            m_solver,
+            m_nodeDamageScratch.data(),
+            static_cast<uint32_t>(m_nodeDamageScratch.size()));
+        uint32_t yielding = 0;
+        for (uint32_t i = 0; i < written; ++i)
+        {
+            if (m_nodeDamageScratch[i] > 0.0f && m_nodeDamageScratch[i] < 1.0f)
+            {
+                ++yielding;
+            }
+        }
+        m_telemetry.nodesAtCrushYield = yielding;
+
+        // Running peak utilisation. Without this a run that crushes nothing is
+        // indistinguishable from a run that came nowhere near crushing, and
+        // there is no way to author toward the behaviour you want.
+        m_nodeUtilisationScratch.resize(m_nodes.size());
+        const uint32_t utilisationCount = ext_stress_solver_get_node_crush_utilisation(
+            m_solver,
+            m_nodeUtilisationScratch.data(),
+            static_cast<uint32_t>(m_nodeUtilisationScratch.size()));
+        for (uint32_t i = 0; i < utilisationCount; ++i)
+        {
+            m_telemetry.peakCrushUtilisation =
+                std::max(m_telemetry.peakCrushUtilisation, m_nodeUtilisationScratch[i]);
+        }
     }
 
     bool endTick() override
@@ -726,7 +947,9 @@ public:
                 INVALID_INDEX,
                 "endTick requires a successful solveTick.");
         }
-        if (m_telemetry.overstressedBondCount > 0)
+        // A pulverized chunk is topology work even when no bond is overstressed:
+        // a chunk can be ground up while every joint around it still holds.
+        if (m_telemetry.overstressedBondCount > 0 || !m_pendingCrushedNodes.empty())
         {
             const TelemetryClock::time_point phaseStart = TelemetryClock::now();
             const bool fractured = fracture(m_tickDt);
@@ -779,9 +1002,13 @@ public:
             }
         }
 
-        for (uint32_t owners : nodeOwners)
+        for (uint32_t nodeIndex = 0; nodeIndex < nodeOwners.size(); ++nodeIndex)
         {
-            valid = valid && owners == 1;
+            // A pulverized chunk is owned by nothing, by design: its shape was
+            // released and its actor retired. Everything else must have
+            // exactly one owner.
+            const uint32_t expected = m_nodes[nodeIndex].crushed ? 0u : 1u;
+            valid = valid && nodeOwners[nodeIndex] == expected;
         }
 
         const uint32_t solverActorCount = m_solver ? ext_stress_solver_actor_count(m_solver) : 0;
@@ -803,7 +1030,8 @@ public:
         }
         else
         {
-            valid = valid && actorCount == m_actorBodies.size() && nodeCount == m_nodes.size();
+            valid = valid && actorCount == m_actorBodies.size()
+                && nodeCount == m_nodes.size() - m_crushedNodeCount;
             for (uint32_t i = 0; i < actorCount; ++i)
             {
                 const auto bodyFound = m_actorBodies.find(actors[i].actorIndex);
@@ -888,13 +1116,23 @@ public:
         {
             return 0;
         }
-        const uint32_t count =
+        const uint32_t limit =
             std::min(capacity, static_cast<uint32_t>(m_nodes.size()));
         const uint64_t generation = ++m_shapeSnapshotGeneration;
-        for (uint32_t i = 0; i < count; ++i)
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < limit; ++i)
         {
             const NodeState& source = m_nodes[i];
-            ExtStressPhysXShapeSnapshot& target = snapshots[i];
+            // A pulverized chunk has no shape and no body: it is gone. Emitting
+            // a row for it would hand consumers a null shape and an identity
+            // pose, and a renderer driven by this stream would keep drawing the
+            // chunk after it turned to dust. Rows are therefore COMPACTED --
+            // read nodeIndex from the row rather than assuming row i is node i.
+            if (source.crushed)
+            {
+                continue;
+            }
+            ExtStressPhysXShapeSnapshot& target = snapshots[count++];
             target.shapeId = source.shapeId;
             target.bodyId = source.body ? source.body->bodyId : 0;
             target.nodeIndex = i;
@@ -975,6 +1213,77 @@ public:
             std::min(capacity, static_cast<uint32_t>(m_continuity.size()));
         std::copy_n(m_continuity.begin(), count, records);
         return count;
+    }
+
+    uint32_t drainChunkDestroyedEvents(
+        ExtStressPhysXChunkDestroyed* records,
+        uint32_t capacity) override
+    {
+        if (!records || capacity == 0 || m_chunkDestroyed.empty())
+        {
+            return 0;
+        }
+        const uint32_t count =
+            std::min(capacity, static_cast<uint32_t>(m_chunkDestroyed.size()));
+        std::copy_n(m_chunkDestroyed.begin(), count, records);
+        m_chunkDestroyed.erase(
+            m_chunkDestroyed.begin(), m_chunkDestroyed.begin() + count);
+        return count;
+    }
+
+    uint32_t getNodeCrushDamage(float* damage, uint32_t capacity) const override
+    {
+        if (!damage || capacity == 0)
+        {
+            return 0;
+        }
+        if (!m_crushEnabled)
+        {
+            const uint32_t count = std::min(capacity, static_cast<uint32_t>(m_nodes.size()));
+            std::fill_n(damage, count, 0.0f);
+            return count;
+        }
+        return ext_stress_solver_get_node_crush_damage(m_solver, damage, capacity);
+    }
+
+    uint32_t getNodeStressInvariants(
+        float* pressure,
+        float* deviator,
+        uint32_t capacity) const override
+    {
+        if ((!pressure && !deviator) || capacity == 0)
+        {
+            return 0;
+        }
+        if (!m_crushEnabled)
+        {
+            const uint32_t count = std::min(capacity, static_cast<uint32_t>(m_nodes.size()));
+            if (pressure) std::fill_n(pressure, count, 0.0f);
+            if (deviator) std::fill_n(deviator, count, 0.0f);
+            return count;
+        }
+        return ext_stress_solver_get_node_stress_invariants(
+            m_solver, pressure, deviator, capacity);
+    }
+
+    uint32_t getNodeCrushUtilisation(float* utilisation, uint32_t capacity) const override
+    {
+        if (!utilisation || capacity == 0)
+        {
+            return 0;
+        }
+        if (!m_crushEnabled)
+        {
+            const uint32_t count = std::min(capacity, static_cast<uint32_t>(m_nodes.size()));
+            std::fill_n(utilisation, count, 0.0f);
+            return count;
+        }
+        return ext_stress_solver_get_node_crush_utilisation(m_solver, utilisation, capacity);
+    }
+
+    bool isCrushEnabled() const override
+    {
+        return m_crushEnabled;
     }
 
     uint32_t getBondStresses(
@@ -1253,11 +1562,16 @@ private:
     struct NodeState
     {
         float mass{1.0f};
+        float volume{1.0f};
         PxVec3 centroid{0.0f};
         ExtStressPhysXId shapeId{0};
         PxShape* shape{nullptr};
         PxConvexMesh* convexMesh{nullptr};
         BodyState* body{nullptr};
+        uint32_t material{0};
+        // Pulverized: shape detached and released, no longer part of any body.
+        // Latched, so a crushed node is never resurrected by a later split.
+        bool crushed{false};
     };
 
     struct BodyState
@@ -1361,13 +1675,6 @@ private:
             &bridgeAngular);
     }
 
-    struct QueuedContact
-    {
-        uint32_t nodeIndex{INVALID_INDEX};
-        PxVec3 position{0.0f};
-        PxVec3 impulse{0.0f};
-        bool wake{true};
-    };
 
     // Motion state of one body at capture time, keyed by the stable bodyId
     // (actorIndex is reassigned across splits). worldCenterOfMass feeds the
@@ -1720,6 +2027,7 @@ private:
 
     void consumeContacts(float dt)
     {
+        resetCrushStrainRates();
         m_contactNodeIndices.clear();
         m_contactLocalPositions.clear();
         m_contactLocalForces.clear();
@@ -1755,6 +2063,9 @@ private:
             const PxTransform& pose = body.contactGlobalPose;
             const PxVec3 localPosition = pose.transformInv(contact.position);
             const PxVec3 localForce = pose.q.rotateInv(contact.impulse / dt);
+
+            accumulateCrushStrainRate(contact);
+
             m_contactNodeIndices.push_back(contact.nodeIndex);
             m_contactLocalPositions.insert(
                 m_contactLocalPositions.end(),
@@ -1773,6 +2084,7 @@ private:
                 static_cast<uint32_t>(m_contactNodeIndices.size()),
                 0);
         }
+        pushCrushStrainRates(dt);
         m_contacts.clear();
     }
 
@@ -1882,6 +2194,28 @@ private:
         return plan;
     }
 
+    /**
+    Exit fracture() having still retired any pulverized chunks.
+
+    Every early return in fracture() predates crushing and means "no SPLIT
+    work this tick". A tick can pulverize chunks without splitting anything --
+    a chunk comminuted while its joints hold produces no bond fractures and no
+    split event -- so none of those returns may skip this.
+    */
+    bool finishCrushOnly()
+    {
+        if (m_pendingCrushedNodes.empty())
+        {
+            return true;
+        }
+        {
+            SceneWriteLock lock(m_scene);
+            applyCrushedNodes();
+        }
+        rebuildLookupTables();
+        return validateMappings();
+    }
+
     bool fracture(float dt)
     {
         const uint32_t actorCapacity = ext_stress_solver_actor_count(m_solver);
@@ -1920,7 +2254,7 @@ private:
         }
         if (commandCount == 0)
         {
-            return true;
+            return finishCrushOnly();
         }
 
 
@@ -1938,7 +2272,9 @@ private:
         if (m_settings.maximumBodies > 0
             && static_cast<uint32_t>(m_actorBodies.size()) >= m_settings.maximumBodies)
         {
-            return true;
+            // Still retire pulverized chunks: they REDUCE the body count, so
+            // skipping them here would deadlock the structure at the cap.
+            return finishCrushOnly();
         }
         std::vector<ExtStressFractureCommands> limitedCommands;
         limitedCommands.reserve(commands.size());
@@ -1950,7 +2286,11 @@ private:
                     command.bondFractureCount,
                     m_settings.maximumFracturesPerActorPerTick);
             }
-            if (command.bondFractureCount == 0)
+            // A command with no bond fractures but a pulverized chunk is real
+            // work: a chunk can be comminuted while every joint around it
+            // still holds, and dropping it here left the chunk severed in the
+            // solver but still present in the scene.
+            if (command.bondFractureCount == 0 && command.chunkFractureCount == 0)
             {
                 continue;
             }
@@ -1960,7 +2300,7 @@ private:
         commandCount = static_cast<uint32_t>(commands.size());
         if (commandCount == 0)
         {
-            return true;
+            return finishCrushOnly();
         }
 
         std::vector<NodeSnapshot> nodeSnapshots(m_nodes.size());
@@ -2002,7 +2342,7 @@ private:
         }
         if (eventCount == 0)
         {
-            return true;
+            return finishCrushOnly();
         }
 
         events.resize(eventCount);
@@ -2026,10 +2366,261 @@ private:
                     return false;
                 }
             }
+            // After the splits, so a crushed chunk is removed from whichever
+            // body it ended up on rather than the one it started the tick on.
+            applyCrushedNodes();
         }
 
         rebuildLookupTables();
         return validateMappings();
+    }
+
+    /**
+    Remove every pulverized chunk from the scene and record its event.
+
+    Blast has already severed the chunk structurally (the chunk fracture
+    command zeroed its bonds and dropped its node from the island graph), but
+    Blast never removes anything: a health-exhausted leaf chunk stays alive as
+    an inert, still-visible actor forever. The physics-side removal is ours.
+
+    Must be called under the scene write lock.
+    */
+    void applyCrushedNodes()
+    {
+        if (m_pendingCrushedNodes.empty())
+        {
+            return;
+        }
+
+        m_nodePressureScratch.resize(m_nodes.size());
+        m_nodeDeviatorScratch.resize(m_nodes.size());
+        ext_stress_solver_get_node_stress_invariants(
+            m_solver,
+            m_nodePressureScratch.data(),
+            m_nodeDeviatorScratch.data(),
+            static_cast<uint32_t>(m_nodes.size()));
+
+        for (const uint32_t nodeIndex : m_pendingCrushedNodes)
+        {
+            if (nodeIndex >= m_nodes.size())
+            {
+                continue;
+            }
+            NodeState& node = m_nodes[nodeIndex];
+            if (node.crushed)
+            {
+                continue;   // already removed; never resurrect a crushed chunk
+            }
+
+            ExtStressPhysXChunkDestroyed record;
+            record.sequence = ++m_crushSequence;
+            record.nodeIndex = nodeIndex;
+            record.materialIndex = node.material;
+            record.shapeId = node.shapeId;
+            record.mass = node.mass;
+            record.volume = node.volume;
+            record.peakPressure =
+                nodeIndex < m_nodePressureScratch.size() ? m_nodePressureScratch[nodeIndex] : 0.0f;
+            record.peakDeviator =
+                nodeIndex < m_nodeDeviatorScratch.size() ? m_nodeDeviatorScratch[nodeIndex] : 0.0f;
+
+            const ExtStressPhysXMaterial& material = m_materials[node.material];
+            record.debrisMassFraction = material.crushDebrisMassFraction;
+
+            BodyState* body = node.body;
+            if (body && body->body)
+            {
+                record.bodyId = body->bodyId;
+                const PxTransform bodyPose = body->body->getGlobalPose();
+                record.worldPose =
+                    node.shape ? bodyPose * node.shape->getLocalPose() : bodyPose;
+                record.angularVelocity = body->body->getAngularVelocity();
+                // Velocity AT THE CHUNK, not at the body's centre of mass:
+                // a dust cloud spawned with the body's COM velocity drifts
+                // visibly wrong on a large tumbling piece.
+                const PxVec3 comWorld = bodyPose.transform(
+                    body->body->getCMassLocalPose().p);
+                record.linearVelocity = body->body->getLinearVelocity() +
+                    record.angularVelocity.cross(record.worldPose.p - comWorld);
+            }
+            else
+            {
+                record.worldPose = PxTransform(m_worldTransform.transform(node.centroid));
+            }
+
+            detachCrushedShape(node);
+            node.crushed = true;
+            ++m_crushedNodeCount;
+
+            // Blast keeps a health-exhausted leaf chunk alive as an inert
+            // actor forever, so the solver would go on reporting an actor with
+            // no body behind it. Retire it explicitly.
+            if (ext_stress_solver_retire_crushed_node(m_solver, nodeIndex) == 0)
+            {
+                fail(
+                    ExtStressPhysXError::MappingInvalid,
+                    nodeIndex,
+                    "A pulverized chunk's solver actor could not be retired.");
+            }
+
+            record.debrisBodiesSpawned = spawnCrushDebris(record, material);
+
+            ++m_telemetry.chunksCrushed;
+            m_telemetry.crushedMassKg += record.mass;
+            m_telemetry.crushedVolumeM3 += record.volume;
+            m_telemetry.debrisBodiesSpawned += record.debrisBodiesSpawned;
+            m_chunkDestroyed.push_back(record);
+        }
+
+        m_pendingCrushedNodes.clear();
+    }
+
+    /**
+    Detach and release a crushed chunk's shape, and retire its body if that was
+    the last chunk on it.
+    */
+    void detachCrushedShape(NodeState& node)
+    {
+        BodyState* body = node.body;
+        if (node.shape)
+        {
+            if (body && body->body)
+            {
+                body->body->detachShape(*node.shape, false);
+                ++m_telemetry.shapesMigrated;
+            }
+            m_shapeToNode.erase(node.shape);
+            node.shape->release();
+            node.shape = nullptr;
+        }
+        m_shapeIdToNode.erase(node.shapeId);
+
+        if (!body)
+        {
+            return;
+        }
+
+        body->nodes.erase(
+            std::remove(body->nodes.begin(), body->nodes.end(),
+                        static_cast<uint32_t>(&node - m_nodes.data())),
+            body->nodes.end());
+        node.body = nullptr;
+
+        if (body->nodes.empty())
+        {
+            // The whole island was pulverized. Retire the body rather than
+            // leaving an empty rigid actor in the scene.
+            const auto found = m_actorBodies.find(body->actorIndex);
+            if (found != m_actorBodies.end())
+            {
+                if (found->second->body)
+                {
+                    PxRigidDynamic* retiring = found->second->body;
+
+                    // The resimulation seed list holds RAW body pointers and is
+                    // only cleared at the next capture, so this body must not
+                    // be handed to the frame stepper again.
+                    m_resimSeeds.erase(
+                        std::remove(m_resimSeeds.begin(), m_resimSeeds.end(), retiring),
+                        m_resimSeeds.end());
+
+                    // Remove from the scene, but do NOT release yet.
+                    //
+                    // The frame stepper captures every scene body BEFORE
+                    // simulate and restores them after the ticks, and its
+                    // restore already skips anything that has left the scene --
+                    // but it checks that by calling getScene() on the pointer.
+                    // Freeing the body here makes that check itself the crash.
+                    // Deferring is not enough either: a fracture frame runs
+                    // several restore passes against the same capture, so there
+                    // is no point inside the frame where the pointer is
+                    // provably unheld.
+                    //
+                    // So retired bodies are parked, empty and out of the scene,
+                    // until release(). They cost a few hundred bytes each and
+                    // are bounded by the number of fully pulverized islands,
+                    // which is exactly the quantity crushing is authored to
+                    // keep small.
+                    m_scene.removeActor(*retiring);
+                    m_retiredBodies.push_back(retiring);
+                    found->second->body = nullptr;
+                }
+                m_actorBodies.erase(found);
+                ++m_telemetry.bodiesRecycled;
+            }
+        }
+        else if (body->body)
+        {
+            updateMassProperties(*body);
+        }
+    }
+
+    /**
+    Optionally respawn part of a pulverized chunk's mass as rigid fragments.
+
+    Default is zero fragments: all the mass leaves the rigid-body simulation
+    and the event reports it so a consumer can render it as dust. Authoring a
+    non-zero fraction trades body count for a pile that keeps some real mass.
+    */
+    uint32_t spawnCrushDebris(
+        const ExtStressPhysXChunkDestroyed& record,
+        const ExtStressPhysXMaterial& material)
+    {
+        const uint32_t fragmentCount = material.crushDebrisFragmentCount;
+        if (material.crushDebrisMassFraction <= 0.0f || fragmentCount == 0 ||
+            record.mass <= 0.0f || record.volume <= 0.0f)
+        {
+            return 0;
+        }
+
+        const float debrisMass = record.mass * material.crushDebrisMassFraction;
+        const float debrisVolume = record.volume * material.crushDebrisMassFraction;
+        const float fragmentMass = debrisMass / static_cast<float>(fragmentCount);
+        const float fragmentVolume = debrisVolume / static_cast<float>(fragmentCount);
+        const float halfExtent = 0.5f * std::cbrt(fragmentVolume);
+        if (!(halfExtent > 0.0f))
+        {
+            return 0;
+        }
+
+        uint32_t spawned = 0;
+        for (uint32_t i = 0; i < fragmentCount; ++i)
+        {
+            // Deterministic placement on a lattice around the chunk centre:
+            // no RNG, so a replay of the same run produces the same debris.
+            const float spread = std::cbrt(record.volume) * 0.25f;
+            const PxVec3 offset(
+                spread * ((i & 1u) ? 1.0f : -1.0f),
+                spread * ((i & 2u) ? 1.0f : -1.0f),
+                spread * ((i & 4u) ? 1.0f : -1.0f));
+
+            PxRigidDynamic* fragment =
+                m_physics.createRigidDynamic(PxTransform(record.worldPose.p + offset, record.worldPose.q));
+            if (!fragment)
+            {
+                break;
+            }
+            PxShape* shape = m_physics.createShape(
+                PxBoxGeometry(halfExtent, halfExtent, halfExtent), m_material, true, m_settings.shapeFlags);
+            if (!shape)
+            {
+                fragment->release();
+                break;
+            }
+            fragment->attachShape(*shape);
+            shape->release();
+            PxRigidBodyExt::setMassAndUpdateInertia(*fragment, fragmentMass);
+            fragment->setLinearDamping(m_settings.linearDamping);
+            fragment->setAngularDamping(m_settings.angularDamping);
+            // Momentum-consistent: the fragments carry the chunk's motion, plus
+            // a small outward component from the released elastic energy.
+            fragment->setLinearVelocity(record.linearVelocity + offset.getNormalized() * 0.5f);
+            fragment->setAngularVelocity(record.angularVelocity);
+            m_scene.addActor(*fragment);
+            m_crushDebris.push_back(fragment);
+            ++spawned;
+        }
+        return spawned;
     }
 
     bool applySplit(
@@ -2327,6 +2918,30 @@ private:
     void destroy()
     {
         m_contacts.clear();
+        m_pendingCrushedNodes.clear();
+        m_chunkDestroyed.clear();
+        for (PxRigidDynamic* body : m_retiredBodies)
+        {
+            if (body)
+            {
+                body->release();
+            }
+        }
+        m_retiredBodies.clear();
+        if (!m_crushDebris.empty())
+        {
+            // Crush debris are adapter-created bodies with no NodeState, so the
+            // node loops below would leak them.
+            SceneWriteLock lock(m_scene);
+            for (PxRigidDynamic* body : m_crushDebris)
+            {
+                if (body)
+                {
+                    body->release();
+                }
+            }
+            m_crushDebris.clear();
+        }
         if (!m_actorBodies.empty())
         {
             SceneWriteLock lock(m_scene);
@@ -2405,7 +3020,35 @@ private:
     // Converted material table forwarded to the bridge at create; kept for
     // re-creation and validation of bond material indices.
     std::vector<ExtStressMaterialDesc> m_materialDescs;
+    // The unconverted table, kept because crush properties (debris fraction and
+    // fragment count) are consumed on the PhysX side, not by the solver.
+    std::vector<ExtStressPhysXMaterial> m_materials;
     uint32_t m_materialCount{0};
+
+    // --- chunk crushing ---
+    bool m_crushEnabled{false};
+    std::vector<uint32_t> m_nodeMaterials;
+    std::vector<float> m_nodeStrainRates;
+    // Cube root of each node's authored volume: the length that turns a contact
+    // closing speed into a strain rate.
+    std::vector<float> m_nodeCharacteristicSize;
+    // Nodes pulverized this tick, awaiting scene removal in endTick.
+    std::vector<uint32_t> m_pendingCrushedNodes;
+    std::vector<uint32_t> m_crushScratch;
+    std::vector<float> m_nodeDamageScratch;
+    std::vector<float> m_nodeUtilisationScratch;
+    std::vector<float> m_nodePressureScratch;
+    std::vector<float> m_nodeDeviatorScratch;
+    // Drained by the host; unlike m_continuity this never grows without bound.
+    std::vector<ExtStressPhysXChunkDestroyed> m_chunkDestroyed;
+    std::vector<PxRigidDynamic*> m_crushDebris;
+    // Bodies whose every chunk was pulverized: out of the scene, kept alive
+    // until release() so the frame stepper's restore can safely test them.
+    std::vector<PxRigidDynamic*> m_retiredBodies;
+    uint64_t m_crushSequence{0};
+    // Chunks that have left the simulation. Subtracted from the expected node
+    // total in validateMappings.
+    std::size_t m_crushedNodeCount{0};
     ExtStressPhysXTelemetry m_telemetry;
     ExtStressPhysXId m_nextBodyId{1};
     ExtStressPhysXId m_nextShapeId{1};

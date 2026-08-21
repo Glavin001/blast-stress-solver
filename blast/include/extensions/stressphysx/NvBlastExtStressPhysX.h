@@ -84,11 +84,17 @@ struct ExtStressPhysXNodeDesc
     float mass;
     float volume;
     ExtStressPhysXNodeGeometry geometry;
+    // Index into ExtStressPhysXDesc::stressMaterials, selecting this chunk's
+    // CRUSH properties. Independent of the materials on its bonds: a chunk's
+    // own resistance to being ground up need not match the joints holding it.
+    // Irrelevant unless that material sets crushCapPressure > 0.
+    uint32_t material;
 
     ExtStressPhysXNodeDesc()
         : centroid(0.0f)
         , mass(1.0f)
         , volume(1.0f)
+        , material(0)
     {
     }
 };
@@ -231,6 +237,14 @@ struct ExtStressPhysXTelemetry
     double gpuStressSolveMilliseconds;
     uint64_t gpuStressHostToDeviceBytes;
     uint64_t gpuStressDeviceToHostBytes;
+    uint64_t chunksCrushed;
+    double crushedMassKg;
+    double crushedVolumeM3;
+    uint32_t nodesAtCrushYield;
+    //! Highest crush utilisation any chunk has reached over this run. Below 1
+    //! nothing ever came close; 1/this is the chunk's crush safety factor.
+    float peakCrushUtilisation;
+    uint64_t debrisBodiesSpawned;
     uint64_t resimulationCaptures;
     uint64_t resimulationRestores;
     uint64_t resimulationBodiesRestored;
@@ -280,6 +294,18 @@ struct ExtStressPhysXContact
     const physx::PxShape* shape;
     physx::PxVec3 worldPosition;
     physx::PxVec3 worldImpulse;
+    /**
+    Relative velocity of the two bodies at the contact point, other minus this,
+    in world space. Only its component along the contact normal matters and only
+    when crushing is enabled: it supplies the compaction strain rate the crush
+    work integral needs.
+
+    The stress solver is quasi-static and produces forces, not strains, so it
+    has no strain rate of its own. Leaving this at zero is safe -- the chunk
+    simply accumulates no crush damage from this contact, which is the right
+    answer for a resting contact that is not closing.
+    */
+    physx::PxVec3 worldRelativeVelocity;
     // Whether this contact may wake a sleeping body. New impacts should;
     // PERSISTING resting contacts must not -- in a rubble pile every body has
     // one, and waking for them re-opens the whole contact island every tick,
@@ -293,7 +319,59 @@ struct ExtStressPhysXContact
         , shape(nullptr)
         , worldPosition(0.0f)
         , worldImpulse(0.0f)
+        , worldRelativeVelocity(0.0f)
         , wake(true)
+    {
+    }
+};
+
+/**
+One chunk was pulverized: its crush damage reached 1, it was severed from every
+bond, and its shape has been removed from the scene. It no longer exists as a
+rigid body.
+
+Everything a consumer needs to spawn a momentum-matched dust cloud is here --
+where it was, how fast it was going, and how much mass and volume left the
+simulation. Without mass and momentum on the event a dust effect can only be
+guessed at, and guessed dust is what makes destruction read as a cartoon.
+
+Drained through drainChunkDestroyedEvents(), or pushed to
+ExtStressPhysXFrameHooks::onChunkDestroyed() as it happens.
+*/
+struct ExtStressPhysXChunkDestroyed
+{
+    uint64_t sequence;                  //!< Monotonic, per destructible.
+    uint32_t nodeIndex;                 //!< Authored node index of the pulverized chunk.
+    uint32_t materialIndex;             //!< Its material, for per-material reporting.
+    ExtStressPhysXId shapeId;           //!< The shape that was removed (now invalid).
+    ExtStressPhysXId bodyId;            //!< The body it belonged to (may still exist).
+    physx::PxTransform worldPose;       //!< Where the chunk was when it went.
+    physx::PxVec3 linearVelocity;       //!< Of the chunk's centroid, world space.
+    physx::PxVec3 angularVelocity;      //!< Of its body, world space.
+    float mass;                         //!< kg leaving the rigid-body simulation.
+    float volume;                       //!< m^3 leaving the rigid-body simulation.
+    float peakPressure;                 //!< Pa. Confining pressure at the moment it failed.
+    float peakDeviator;                 //!< Pa. Von Mises deviator at the moment it failed.
+    //! Fraction of `mass` that was respawned as rigid debris rather than lost.
+    //! The dust cloud should carry the remainder: mass * (1 - debrisMassFraction).
+    float debrisMassFraction;
+    uint32_t debrisBodiesSpawned;       //!< How many debris bodies were actually created.
+
+    ExtStressPhysXChunkDestroyed()
+        : sequence(0)
+        , nodeIndex(0)
+        , materialIndex(0)
+        , shapeId(0)
+        , bodyId(0)
+        , worldPose(physx::PxIdentity)
+        , linearVelocity(0.0f)
+        , angularVelocity(0.0f)
+        , mass(0.0f)
+        , volume(0.0f)
+        , peakPressure(0.0f)
+        , peakDeviator(0.0f)
+        , debrisMassFraction(0.0f)
+        , debrisBodiesSpawned(0)
     {
     }
 };
@@ -326,6 +404,43 @@ struct ExtStressPhysXMaterial
     float shearElasticLimit;
     float shearFatalLimit;
 
+    /*
+    Optional CHUNK crushing (comminution). The limits above decide whether a
+    JOINT fails; these decide whether the CHUNK ITSELF is ground up and leaves
+    the rigid-body simulation as dust. Both happen in the same impact: most of
+    a wall separates along its joints while the small region under the hit is
+    pulverized.
+
+    Each solve builds a per-chunk Cauchy stress tensor from the forces acting
+    on the chunk (Love-Weber virial sum), reduces it to pressure p and von
+    Mises deviator q, and yields against a Drucker-Prager cone with a pressure
+    cap. Damage accumulates as plastic work per unit volume normalized by
+    crushEnergy; the chunk pulverizes at damage 1.
+
+    Comminution is a COMPRESSIVE phenomenon, so a chunk in net tension is
+    excluded outright: it fails by cracking, which the bond model already
+    represents. With the cone, that is what keeps free-floating debris intact --
+    it carries no confining pressure, so it tumbles rather than crumbling.
+
+    DISABLED unless crushCapPressure > 0. A default-constructed material is
+    bond-only and behaves exactly as it did before crushing existed.
+    */
+    float crushCapPressure;         //!< Pa. Hydrostatic cap. <= 0 disables crushing.
+    float crushCohesion;            //!< Pa. Drucker-Prager deviatoric intercept at p = 0.
+    float crushFrictionSlope;       //!< dq/dp of the cone. Dimensionless, >= 0.
+    float crushEnergy;              //!< J/m^3. Plastic work per unit volume to fully comminute.
+    //! Pa*s. Perzyna viscosity: how fast the material flows once past yield.
+    //! Larger is more sluggish. Must be > 0 when crushing is enabled.
+    float crushViscosity;
+    float crushStrainRateExponent;  //!< CEB dynamic-increase-factor exponent. 0 disables rate hardening.
+    float crushReferenceStrainRate; //!< 1/s. Strain rate at which the DIF is 1.
+    //! Fraction of a pulverized chunk's mass respawned as rigid fragments.
+    //! 0 (default) means all of its mass leaves the simulation; the
+    //! chunk-destroyed event still reports that mass and momentum so a
+    //! consumer can spawn a matching dust cloud.
+    float crushDebrisMassFraction;
+    uint32_t crushDebrisFragmentCount;
+
     ExtStressPhysXMaterial()
         : compressionElasticLimit(1.0f)
         , compressionFatalLimit(2.0f)
@@ -333,6 +448,15 @@ struct ExtStressPhysXMaterial
         , tensionFatalLimit(-1.0f)
         , shearElasticLimit(-1.0f)
         , shearFatalLimit(-1.0f)
+        , crushCapPressure(0.0f)
+        , crushCohesion(0.0f)
+        , crushFrictionSlope(0.0f)
+        , crushEnergy(1.0f)
+        , crushViscosity(1.0f)
+        , crushStrainRateExponent(0.0f)
+        , crushReferenceStrainRate(1.0f)
+        , crushDebrisMassFraction(0.0f)
+        , crushDebrisFragmentCount(0)
     {
     }
 };
@@ -454,6 +578,66 @@ public:
     virtual uint32_t getSplitContinuity(
         ExtStressPhysXSplitContinuity* records,
         uint32_t capacity) const = 0;
+
+    /**
+     * Drain chunk-destruction events recorded since the last call. Each chunk
+     * is reported exactly once.
+     *
+     * This is a DRAIN, not a peek: anything returned is removed from the queue.
+     * A host that never calls it and never installs the onChunkDestroyed hook
+     * would otherwise grow the queue without bound over a long demolition.
+     *
+     * Returns the number written; call again while the return value equals
+     * `capacity` to be sure the queue is empty.
+     */
+    virtual uint32_t drainChunkDestroyedEvents(
+        ExtStressPhysXChunkDestroyed* records,
+        uint32_t capacity) = 0;
+
+    /**
+     * Per-node accumulated crush damage in [0,1], indexed by authored node
+     * index. 1 means the chunk pulverized. Nodes whose material has crushing
+     * disabled always read 0.
+     *
+     * Sampling this is the crush analogue of getBondUtilisations: it says how
+     * close each chunk is to being ground up, before anything visibly happens.
+     */
+    virtual uint32_t getNodeCrushDamage(
+        float* damage,
+        uint32_t capacity) const = 0;
+
+    /**
+     * Per-node stress invariants from the last solve, authored-node-indexed:
+     * `pressure` is p (Pa, positive in compression) and `deviator` is the von
+     * Mises equivalent q (Pa). Either pointer may be null.
+     *
+     * These are the two numbers the crush yield surface is evaluated on, so
+     * they are what to look at when a structure crushes where it should not.
+     * Populated only for nodes on a crush-enabled material.
+     */
+    virtual uint32_t getNodeStressInvariants(
+        float* pressure,
+        float* deviator,
+        uint32_t capacity) const = 0;
+
+    /**
+     * Per-node crush utilisation, authored-node-indexed: max of
+     * q/(cohesion + frictionSlope*p) and p/capPressure. 1 means the chunk is at
+     * its crush yield surface; above 1 it is comminuting.
+     *
+     * This is to crushing what getBondUtilisations is to joints, and it is the
+     * number to author against. Sampling it after a gravity settle says how
+     * much of each chunk's crush capacity its own weight already consumes;
+     * sampling the peak over an impact says how close that hit came. It reads
+     * correctly even when nothing is moving, because it is a property of the
+     * stress state and not of the damage rate.
+     */
+    virtual uint32_t getNodeCrushUtilisation(
+        float* utilisation,
+        uint32_t capacity) const = 0;
+
+    /** Whether chunk crushing is active (a material enables it and the graph is unreduced). */
+    virtual bool isCrushEnabled() const = 0;
 
     /**
      * Per-bond stress from the last solve, indexed by the authored bond index
