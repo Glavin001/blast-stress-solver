@@ -42,7 +42,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OUTPUT = path.resolve(__dirname, '../assets/reference/reference-building.json');
+// CRUSH=1 emits the v3 chunk-crushing variant to a SEPARATE file, so the
+// committed v2 reference building stays byte-identical and every existing test
+// keeps measuring the same structure. Crushing is purely additive on top.
+const CRUSH = process.env.CRUSH === '1';
+const OUTPUT = path.resolve(
+  __dirname,
+  CRUSH
+    ? '../assets/reference/reference-building-crush.json'
+    : '../assets/reference/reference-building.json');
 
 // ── Geometry ────────────────────────────────────────────────────────────────
 const BAY = 4.0; // m between column lines
@@ -124,6 +132,59 @@ const MATERIALS = [
     shearElastic: 0.60e6 * FACADE_SCALE, shearFatal: 1.3e6 * FACADE_SCALE,
   },
 ];
+/*
+ * Chunk crushing (v3). Bond limits above decide whether a JOINT fails; these
+ * decide whether the CHUNK ITSELF is comminuted and leaves the simulation.
+ *
+ * Yield is a Drucker-Prager cone with a pressure cap, so the two knobs that
+ * matter are the cone (cohesion + frictionSlope * p) and the cap. They are
+ * derived here rather than dialled: for uniaxial compression at f'c the stress
+ * state is p = f'c/3, q = f'c, so setting
+ *
+ *     cohesion = f'c * (1 - frictionSlope / 3)
+ *
+ * makes the chunk yield exactly at its own authored compressive strength under
+ * an unconfined squeeze, and require progressively more under confinement.
+ * That is one less number to invent: the cone is pinned to the same f'c the
+ * bonds already use. frictionSlope 1.2 corresponds to an internal friction
+ * angle around 30 degrees, the usual range for concrete.
+ *
+ * The cap is where confined pore collapse begins, ~2.5x f'c for concrete.
+ *
+ * crushEnergy is the specific comminution energy, the real material property
+ * that decides how much work grinding a cubic metre takes. Concrete's Bond
+ * work index puts it near 1e8 J/m^3; gypsum board is orders of magnitude more
+ * friable. This is the knob that separates "the impact zone turns to dust"
+ * from "the whole building does".
+ *
+ * crushViscosity is the Perzyna flow viscosity (Pa*s): how fast the material
+ * comminutes once past yield. Because flow is quadratic in overstress, this
+ * sets the threshold of violence at which crushing stops being negligible.
+ * 2e5 Pa*s is the right order for concrete (10 MPa of overstress flowing at
+ * ~50/s).
+ */
+const CRUSH_VISCOSITY = 2.0e5;
+const DP_SLOPE = 1.2;
+const coneCohesion = (fc) => fc * (1 - DP_SLOPE / 3);
+const crushProps = (fc, crushEnergy, crushViscosity) => ({
+  capPressure: 2.5 * fc,
+  cohesion: coneCohesion(fc),
+  frictionSlope: DP_SLOPE,
+  crushEnergy,
+  crushViscosity,
+});
+
+if (CRUSH) {
+  // Reinforced concrete: tough. Only a direct, confined hit comminutes it.
+  MATERIALS[0].crush = crushProps(24e6 * FRAME_SCALE, 1.2e8, CRUSH_VISCOSITY);
+  // Slab concrete: unreinforced, so meaningfully more friable than the frame.
+  MATERIALS[1].crush = crushProps(12e6 * SLAB_SCALE, 6.0e7, CRUSH_VISCOSITY);
+  // Gypsum board: pulverizes. This is the material that should read as dust.
+  MATERIALS[2].crush = crushProps(0.8e6 * FACADE_SCALE, 2.0e6, CRUSH_VISCOSITY);
+  // facade-clip (index 3) gets no crush block: it is a connector, never a body,
+  // and no node is ever assigned to it.
+}
+
 MATERIALS.push({
   name: 'footing-anchor',
   compressionElastic: 24e6 * ANCHOR_SCALE, compressionFatal: 24e6 * ANCHOR_SCALE * FRAME_BAND,
@@ -141,16 +202,31 @@ const nodeTypes = [];
 const nodeSizes = [];
 const nodeColliders = [];
 
+// A chunk's own material, which is what selects its crush properties. Distinct
+// from the materials on its bonds: how hard a column is to grind up is not the
+// same question as how strong its connections are. Foundations deliberately map
+// to a material with no crush block — a vaporizing footing is never the story.
+const NODE_MATERIAL = {
+  foundation: M_ANCHOR,
+  column: M_FRAME,
+  slab: M_SLAB,
+  infill: M_PANEL,
+};
+
 function addNode(role, centre, half, density, fixed = false) {
   const volume = 8 * half[0] * half[1] * half[2];
-  nodes.push({
+  const node = {
     centroid: v(...centre),
     // mass 0 marks a support: pinned to the world. ONLY footings get it —
     // pinning columns too was how an earlier revision made a tower that
     // projectiles bounced off (it had no load path, just scenery).
     mass: fixed ? 0 : round(volume * density),
     volume: round(volume),
-  });
+  };
+  // Only v3 packs carry node materials; omitting the field keeps the v2 output
+  // byte-identical.
+  if (CRUSH) node.m = NODE_MATERIAL[role] ?? 0;
+  nodes.push(node);
   nodeTypes.push(role);
   nodeSizes.push(v(half[0] * 2, half[1] * 2, half[2] * 2));
   nodeColliders.push({ kind: 'cuboid', halfExtents: v(...half) });
@@ -312,9 +388,11 @@ for (let f = 0; f < FLOORS; ++f) {
 }
 
 const pack = {
-  version: 2,
-  key: 'reference-building',
-  title: 'Reference building (2x2 bay, 3 floors)',
+  version: CRUSH ? 3 : 2,
+  key: CRUSH ? 'reference-building-crush' : 'reference-building',
+  title: CRUSH
+    ? 'Reference building (2x2 bay, 3 floors, chunk crushing)'
+    : 'Reference building (2x2 bay, 3 floors)',
   defaults: {
     camera: { target: v(0, 5, 0), distance: 26 },
     projectile: { radius: 0.5, mass: 2000, speed: 18, ttlMs: 8000 },

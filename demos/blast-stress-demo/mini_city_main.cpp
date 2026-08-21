@@ -77,6 +77,12 @@ struct Options
     // Multiplies the pack's authored material limits. 1.0 = the concrete the
     // pack claims to be made of.
     float stressLimitScale{1.0f};
+    // Chunk crushing. On when the pack authors it; --no-crush forces it off so
+    // the same pack can be run with and without to isolate its contribution.
+    bool enableCrush{true};
+    float crushEnergyScale{1.0f};
+    float requireCrushFractionMin{-1.0f};
+    float requireCrushFractionMax{-1.0f};
     float excessForceScale{0.017f};
     std::uint32_t resimPasses{1};
     bool scopedResim{true};
@@ -114,7 +120,9 @@ struct BuildingVariant
  */
 std::vector<Nv::Blast::ExtStressPhysXMaterial> makeMaterialTable(
     const ScenePack& pack,
-    float stressLimitScale)
+    float stressLimitScale,
+    bool enableCrush,
+    float crushEnergyScale)
 {
     std::vector<Nv::Blast::ExtStressPhysXMaterial> table;
     table.reserve(pack.materials.size());
@@ -128,6 +136,24 @@ std::vector<Nv::Blast::ExtStressPhysXMaterial> makeMaterialTable(
         material.tensionFatalLimit = source.limits.tensionFatal * stressLimitScale;
         material.shearElasticLimit = source.limits.shearElastic * stressLimitScale;
         material.shearFatalLimit = source.limits.shearFatal * stressLimitScale;
+
+        if (source.crush.enabled && enableCrush)
+        {
+            // Cap and cohesion are strengths, so they follow the same global
+            // stress scale as the bond limits; crush energy is a toughness and
+            // gets its own knob so brittleness can be swept independently of
+            // strength (the same elastic-vs-band separation the bond materials
+            // use).
+            material.crushCapPressure = source.crush.capPressure * stressLimitScale;
+            material.crushCohesion = source.crush.cohesion * stressLimitScale;
+            material.crushFrictionSlope = source.crush.frictionSlope;
+            material.crushEnergy = source.crush.crushEnergy * crushEnergyScale;
+            material.crushViscosity = source.crush.crushViscosity;
+            material.crushStrainRateExponent = source.crush.strainRateExponent;
+            material.crushReferenceStrainRate = source.crush.referenceStrainRate;
+            material.crushDebrisMassFraction = source.crush.debrisMassFraction;
+            material.crushDebrisFragmentCount = source.crush.debrisFragmentCount;
+        }
         table.push_back(material);
     }
     return table;
@@ -378,6 +404,27 @@ public:
     std::function<void(const ImpactCounters&)> restoreImpactCounters;
     std::function<void(std::uint32_t pass)> postFetchResults;
     std::function<bool()> shouldForceResimulationCapture;
+    std::function<void(std::size_t building, const ExtStressPhysXChunkDestroyed*, std::uint32_t)>
+        chunkDestroyed;
+
+    void onChunkDestroyed(
+        ExtStressPhysXDestructible& destructible,
+        const ExtStressPhysXChunkDestroyed* events,
+        std::uint32_t count) override
+    {
+        if (!chunkDestroyed || count == 0)
+        {
+            return;
+        }
+        for (std::size_t building = 0; building < m_destructibles.size(); ++building)
+        {
+            if (m_destructibles[building].get() == &destructible)
+            {
+                chunkDestroyed(building, events, count);
+                return;
+            }
+        }
+    }
 
     void onCapture() override
     {
@@ -446,6 +493,12 @@ struct AggregateTelemetry
     std::uint32_t peakBodies{0};
     std::uint32_t peakAwakeBodies{0};
     std::uint32_t overstressedBonds{0};
+    std::uint64_t chunksCrushed{0};
+    double crushedMassKg{0.0};
+    double crushedVolumeM3{0.0};
+    std::uint32_t nodesAtCrushYield{0};
+    float peakCrushUtilisation{0.0f};
+    std::uint64_t debrisBodiesSpawned{0};
     std::uint32_t solverIslands{0};
     std::uint32_t solverIslandsSkipped{0};
     float maxPositionDrift{0.0f};
@@ -503,6 +556,8 @@ struct FrameMetrics
     AggregateTelemetry telemetry;
     std::uint64_t frameContacts{0};
     std::uint64_t frameSplits{0};
+    std::uint64_t frameChunksCrushed{0};
+    double frameCrushedMassKg{0.0};
     std::uint64_t frameShapesMigrated{0};
     std::uint64_t projectileImpactContacts{0};
     std::uint64_t frameProjectileImpactContacts{0};
@@ -545,6 +600,27 @@ struct RuntimeTimings
     double resimTickMilliseconds{0.0};
     std::uint64_t resimBodiesCapturedTotal{0};
     std::uint64_t resimBodiesRestoredTotal{0};
+};
+
+/**
+ * Where the pulverized chunks went, by authored role and by material.
+ *
+ * The aggregate crushed count cannot answer the question that matters: a run
+ * that grinds up twenty facade panels is working as intended, and a run that
+ * grinds up two columns is a structural failure with the same headline number.
+ * Same reasoning as NodeTypeMotion below.
+ */
+struct CrushDistribution
+{
+    std::uint64_t chunksCrushed{0};
+    double crushedMassKg{0.0};
+    double crushedVolumeM3{0.0};
+    double peakPressurePa{0.0};
+    double peakDeviatorPa{0.0};
+    std::uint64_t debrisBodiesSpawned{0};
+    // role/material name -> chunks crushed. Ordered so the report is stable.
+    std::map<std::string, std::uint64_t> byNodeType;
+    std::map<std::string, std::uint64_t> byMaterial;
 };
 
 struct DestructionDistribution
@@ -744,6 +820,14 @@ void usage(const char* executable)
         "  --contact-force-scale X      Multiply stress contact impulse transfer\n"
         "  --min-stress-contact-impulse X  Ignore weaker non-projectile stress feedback\n"
         "  --stress-limit-scale X       Multiply all elastic/fatal stress limits\n"
+        "  --no-crush                   Disable chunk crushing even if the pack\n"
+        "                               authors it (isolate its contribution)\n"
+        "  --crush-energy-scale X       Multiply every material\'s crush energy.\n"
+        "                               >1 is tougher (crushes less), <1 more friable\n"
+        "  --require-crush-fraction-min X  Fail unless at least this fraction of\n"
+        "                               chunks were pulverized\n"
+        "  --require-crush-fraction-max X  Fail if more than this fraction were\n"
+        "                               pulverized (guards over-comminution)\n"
         "  --excess-force-scale X       Scale released bond load applied to new debris\n"
         "  --impact-transfer-scale X    Alias for --excess-force-scale\n"
         "  --resim-passes N        Rollback + re-step passes on fracture frames (default 1;\n"
@@ -882,6 +966,15 @@ Options parseOptions(int argc, char** argv)
                 parseFloat(argument(), "--min-stress-contact-impulse");
         else if (option == "--stress-limit-scale")
             options.stressLimitScale = parseFloat(argument(), "--stress-limit-scale");
+        else if (option == "--no-crush") options.enableCrush = false;
+        else if (option == "--crush-energy-scale")
+            options.crushEnergyScale = parseFloat(argument(), "--crush-energy-scale");
+        else if (option == "--require-crush-fraction-min")
+            options.requireCrushFractionMin =
+                parseFloat(argument(), "--require-crush-fraction-min");
+        else if (option == "--require-crush-fraction-max")
+            options.requireCrushFractionMax =
+                parseFloat(argument(), "--require-crush-fraction-max");
         else if (option == "--excess-force-scale" || option == "--impact-transfer-scale")
             options.excessForceScale = parseFloat(argument(), option.c_str());
         else if (option == "--resim-passes")
@@ -933,9 +1026,16 @@ Options parseOptions(int argc, char** argv)
         || options.contactForceScale <= 0.0f
         || options.minimumStressContactImpulse < 0.0f
         || options.stressLimitScale <= 0.0f
+        || options.crushEnergyScale <= 0.0f
         || options.excessForceScale < 0.0f)
     {
         throw std::runtime_error("destruction tuning scales must be positive");
+    }
+    if (options.requireCrushFractionMin > options.requireCrushFractionMax
+        && options.requireCrushFractionMax >= 0.0f)
+    {
+        throw std::runtime_error(
+            "--require-crush-fraction-min must not exceed --require-crush-fraction-max");
     }
     if (options.snapshotFps == 0 || options.snapshotFps > 60 || 60 % options.snapshotFps != 0)
     {
@@ -1021,7 +1121,7 @@ public:
     }
 
     void onContact(
-        const PxContactPairHeader&,
+        const PxContactPairHeader& header,
         const PxContactPair* pairs,
         PxU32 pairCount) override
     {
@@ -1059,8 +1159,15 @@ public:
                 {
                     continue;
                 }
-                queue(owner0, pair.shapes[0], points[i].position, points[i].impulse);
-                queue(owner1, pair.shapes[1], points[i].position, -points[i].impulse);
+                // Relative velocity at the contact point, needed by chunk
+                // crushing to know how fast the two bodies are closing. Each
+                // side gets it from ITS OWN point of view (other minus self),
+                // hence the sign flip, matching the impulse convention above.
+                const PxVec3 velocity0 = pointVelocity(header.actors[0], points[i].position);
+                const PxVec3 velocity1 = pointVelocity(header.actors[1], points[i].position);
+                const PxVec3 relative = velocity1 - velocity0;
+                queue(owner0, pair.shapes[0], points[i].position, points[i].impulse, relative);
+                queue(owner1, pair.shapes[1], points[i].position, -points[i].impulse, -relative);
             }
         }
         m_callbackMilliseconds +=
@@ -1097,15 +1204,41 @@ private:
             : nullptr;
     }
 
+    /// World-space velocity of a rigid body at a world point, including spin.
+    /// Static actors and null actors read zero.
+    ///
+    /// Takes the ACTOR, not the shape: the destruction adapter creates shared
+    /// (non-exclusive) shapes so they can migrate between bodies across a
+    /// split, and PxShape::getActor() is null for a shared shape. The contact
+    /// pair header is the only place the actors are available here.
+    static PxVec3 pointVelocity(const PxActor* actor, const PxVec3& worldPoint)
+    {
+        const PxRigidBody* body = actor ? actor->is<PxRigidBody>() : nullptr;
+        if (!body)
+        {
+            return PxVec3(0.0f);
+        }
+        const PxVec3 centerOfMass =
+            body->getGlobalPose().transform(body->getCMassLocalPose().p);
+        return body->getLinearVelocity() +
+            body->getAngularVelocity().cross(worldPoint - centerOfMass);
+    }
+
     void queue(
         ExtStressPhysXDestructible* destructible,
         const PxShape* shape,
         const PxVec3& position,
-        const PxVec3& impulse)
+        const PxVec3& impulse,
+        const PxVec3& relativeVelocity)
     {
         if (destructible)
         {
-            destructible->queueContact(*shape, position, impulse * m_forceScale);
+            ExtStressPhysXContact contact;
+            contact.shape = shape;
+            contact.worldPosition = position;
+            contact.worldImpulse = impulse * m_forceScale;
+            contact.worldRelativeVelocity = relativeVelocity;
+            destructible->queueContact(contact);
         }
     }
 
@@ -1142,6 +1275,7 @@ std::vector<ExtStressPhysXNodeDesc> makeNodeDescs(const ScenePack& pack)
         target.centroid = source.centroid;
         target.mass = source.mass;
         target.volume = source.volume;
+        target.material = source.material;
         target.geometry.localPose = PxTransform(source.centroid);
         target.geometry.halfExtents = source.collider.halfExtents;
         if (source.collider.kind == SceneColliderKind::ConvexHull)
@@ -1252,7 +1386,9 @@ ScenePack truncateToFloors(
 std::vector<BuildingVariant> makeBuildingVariants(
     const ScenePack& source,
     bool variedBuildingHeights,
-    float stressLimitScale)
+    float stressLimitScale,
+    bool enableCrush,
+    float crushEnergyScale)
 {
     constexpr std::uint32_t maximumFloors = 3;
     const std::uint32_t firstFloor = variedBuildingHeights ? 1 : maximumFloors;
@@ -1263,7 +1399,8 @@ std::vector<BuildingVariant> makeBuildingVariants(
         variant.pack = truncateToFloors(source, floors, maximumFloors);
         variant.nodes = makeNodeDescs(variant.pack);
         variant.bonds = makeBondDescs(variant.pack);
-        variant.materials = makeMaterialTable(variant.pack, stressLimitScale);
+        variant.materials =
+            makeMaterialTable(variant.pack, stressLimitScale, enableCrush, crushEnergyScale);
         variant.floors = floors;
         for (const SceneNode& node : variant.pack.nodes)
         {
@@ -1509,6 +1646,13 @@ AggregateTelemetry aggregate(const std::vector<DestructiblePtr>& destructibles)
         result.peakBodies += source.bodyCount;
         result.peakAwakeBodies += source.awakeDynamicBodyCount;
         result.overstressedBonds += source.overstressedBondCount;
+        result.chunksCrushed += source.chunksCrushed;
+        result.crushedMassKg += source.crushedMassKg;
+        result.crushedVolumeM3 += source.crushedVolumeM3;
+        result.nodesAtCrushYield += source.nodesAtCrushYield;
+        result.peakCrushUtilisation =
+            std::max(result.peakCrushUtilisation, source.peakCrushUtilisation);
+        result.debrisBodiesSpawned += source.debrisBodiesSpawned;
         result.solverIslands += source.solverIslandCount;
         result.solverIslandsSkipped += source.solverIslandsSkipped;
         result.maxPositionDrift =
@@ -1862,6 +2006,8 @@ public:
                "overstressed_bonds,contacts_frame,contacts_total,contacts_dropped_total,"
                "projectile_impacts_frame,projectile_impacts_total,"
                "projectile_impulse_frame,projectile_impulse_total,"
+               "chunks_crushed_frame,chunks_crushed_total,crushed_mass_frame,"
+               "crushed_mass_total,nodes_at_crush_yield,debris_bodies_total,"
                "splits_frame,splits_total,shapes_migrated_frame,shapes_migrated_total,"
                "sleeping_actors_skipped,max_position_drift,max_point_velocity_drift,"
                "resim_passes,resim_bodies_captured,resim_bodies_restored,"
@@ -1915,6 +2061,12 @@ public:
             << frame.projectileImpactContacts << ','
             << frame.frameProjectileImpactImpulse << ','
             << frame.projectileImpactImpulse << ','
+            << frame.frameChunksCrushed << ','
+            << frame.telemetry.chunksCrushed << ','
+            << frame.frameCrushedMassKg << ','
+            << frame.telemetry.crushedMassKg << ','
+            << frame.telemetry.nodesAtCrushYield << ','
+            << frame.telemetry.debrisBodiesSpawned << ','
             << frame.frameSplits << ','
             << frame.telemetry.splits << ','
             << frame.frameShapesMigrated << ','
@@ -1978,6 +2130,22 @@ PhaseStats summarizePhase(const std::vector<double>& samples)
     return result;
 }
 
+/// Render a name -> count map as JSON object members (no braces), so an empty
+/// map produces an empty object rather than a trailing comma.
+std::string jsonCountMap(const std::map<std::string, std::uint64_t>& counts)
+{
+    std::string result;
+    for (const auto& entry : counts)
+    {
+        if (!result.empty())
+        {
+            result += ", ";
+        }
+        result += '"' + entry.first + "\": " + std::to_string(entry.second);
+    }
+    return result;
+}
+
 void writeMetadata(
     const std::string& path,
     const Options& options,
@@ -1987,6 +2155,7 @@ void writeMetadata(
     const RuntimeTimings& timings,
     const DestructionDistribution& destruction,
     const DestructionMotion& motion,
+    const CrushDistribution& crush,
     std::uint64_t projectileImpactContacts,
     double projectileImpactImpulse,
     double wallSeconds,
@@ -2198,6 +2367,23 @@ void writeMetadata(
         << "    \"meanBodiesPerStructure\": "
         << destruction.meanBodiesPerStructure << "\n"
         << "  },\n"
+        << "  \"crushDistribution\": {\n"
+        << "    \"enabled\": " << (options.enableCrush ? "true" : "false") << ",\n"
+        << "    \"chunksCrushed\": " << crush.chunksCrushed << ",\n"
+        << "    \"crushedFraction\": "
+        << (totalAuthoredChunks > 0
+                ? static_cast<double>(crush.chunksCrushed) / static_cast<double>(totalAuthoredChunks)
+                : 0.0)
+        << ",\n"
+        << "    \"crushedMassKg\": " << crush.crushedMassKg << ",\n"
+        << "    \"crushedVolumeM3\": " << crush.crushedVolumeM3 << ",\n"
+        << "    \"debrisBodiesSpawned\": " << crush.debrisBodiesSpawned << ",\n"
+        << "    \"peakPressurePa\": " << crush.peakPressurePa << ",\n"
+        << "    \"peakDeviatorPa\": " << crush.peakDeviatorPa << ",\n"
+        << "    \"peakCrushUtilisation\": " << telemetry.peakCrushUtilisation << ",\n"
+        << "    \"byNodeType\": {" << jsonCountMap(crush.byNodeType) << "},\n"
+        << "    \"byMaterial\": {" << jsonCountMap(crush.byMaterial) << "}\n"
+        << "  },\n"
         << "  \"destructionMotion\": {\n"
         << "    \"structuresWithMovedChunks\": " << motion.structuresWithMovedChunks << ",\n"
         << "    \"structuresWithFallenChunks\": " << motion.structuresWithFallenChunks << ",\n"
@@ -2257,11 +2443,21 @@ int run(const Options& options)
 
     const ScenePack pack = loadScenePack(options.scenePath);
     const std::vector<BuildingVariant> variants =
-        makeBuildingVariants(pack, options.variedBuildingHeights, options.stressLimitScale);
+        makeBuildingVariants(
+            pack,
+            options.variedBuildingHeights,
+            options.stressLimitScale,
+            options.enableCrush,
+            options.crushEnergyScale);
     if (options.selfTest)
     {
         const std::vector<BuildingVariant> testVariants =
-            makeBuildingVariants(pack, true, options.stressLimitScale);
+            makeBuildingVariants(
+                pack,
+                true,
+                options.stressLimitScale,
+                options.enableCrush,
+                options.crushEnergyScale);
         requireContract(testVariants.size() == 3, "skyline must expose three floor variants");
         for (std::size_t i = 0; i < testVariants.size(); ++i)
         {
@@ -2517,6 +2713,39 @@ int run(const Options& options)
     hooks.restoreImpactCounters = [&contacts](const ImpactCounters& counters) {
         contacts.restoreImpactCounters(counters);
     };
+    // Chunk pulverization, attributed to the authored role and material of the
+    // chunk that went. Not rewound on a resimulation rollback, and correctly
+    // so: restore rewinds MOTION only, so a chunk crushed on the base pass
+    // stays crushed through the resim passes and never re-fires.
+    CrushDistribution crush;
+    hooks.chunkDestroyed = [&](std::size_t building,
+                               const ExtStressPhysXChunkDestroyed* events,
+                               std::uint32_t count) {
+        const ScenePack& buildingPack = variants[buildings[building].variantIndex].pack;
+        for (std::uint32_t i = 0; i < count; ++i)
+        {
+            const ExtStressPhysXChunkDestroyed& event = events[i];
+            ++crush.chunksCrushed;
+            crush.crushedMassKg += event.mass;
+            crush.crushedVolumeM3 += event.volume;
+            crush.debrisBodiesSpawned += event.debrisBodiesSpawned;
+            crush.peakPressurePa = std::max<double>(crush.peakPressurePa, event.peakPressure);
+            crush.peakDeviatorPa = std::max<double>(crush.peakDeviatorPa, event.peakDeviator);
+
+            const std::string role =
+                event.nodeIndex < buildingPack.nodeTypes.size()
+                    ? buildingPack.nodeTypes[event.nodeIndex]
+                    : std::string("unlabelled");
+            ++crush.byNodeType[role];
+
+            const std::string material =
+                event.materialIndex < buildingPack.materials.size()
+                    ? buildingPack.materials[event.materialIndex].name
+                    : std::string("material?");
+            ++crush.byMaterial[material];
+        }
+    };
+
     hooks.shouldForceResimulationCapture = [&projectiles]() {
         for (const Projectile& projectile : projectiles)
         {
@@ -2914,6 +3143,10 @@ int run(const Options& options)
         frame.frameContacts =
             current.contactsProcessed - previousFrameTelemetry.contactsProcessed;
         frame.frameSplits = current.splits - previousFrameTelemetry.splits;
+        frame.frameChunksCrushed =
+            current.chunksCrushed - previousFrameTelemetry.chunksCrushed;
+        frame.frameCrushedMassKg =
+            current.crushedMassKg - previousFrameTelemetry.crushedMassKg;
         frame.frameShapesMigrated =
             current.shapesMigrated - previousFrameTelemetry.shapesMigrated;
         frame.projectileImpactContacts = contacts.projectileImpactContacts();
@@ -3028,6 +3261,7 @@ int run(const Options& options)
         runtimeTimings,
         destruction,
         motion,
+        crush,
         contacts.projectileImpactContacts(),
         contacts.projectileImpactImpulse(),
         wallSeconds,
@@ -3046,6 +3280,7 @@ int run(const Options& options)
             runtimeTimings,
             destruction,
             motion,
+            crush,
             contacts.projectileImpactContacts(),
             contacts.projectileImpactImpulse(),
             wallSeconds,
@@ -3103,6 +3338,18 @@ int run(const Options& options)
         || totalChunks >= options.requireMinimumAuthoredChunks;
     const bool realtimeValid =
         !options.requireRealtime || runtimeTimings.budgetMissFrames == 0;
+    // Crushed fraction of the authored chunks. Bounded from BOTH sides on
+    // purpose: too little and the feature did nothing, too much and the
+    // structure comminuted instead of breaking apart, which is the failure
+    // mode this repo already calls "dust".
+    const double crushedFraction = totalChunks > 0
+        ? static_cast<double>(crush.chunksCrushed) / static_cast<double>(totalChunks)
+        : 0.0;
+    const bool crushFractionValid =
+        (options.requireCrushFractionMin < 0.0f
+         || crushedFraction >= options.requireCrushFractionMin)
+        && (options.requireCrushFractionMax < 0.0f
+            || crushedFraction <= options.requireCrushFractionMax);
     std::printf(
         "Blast PhysX mini-city finished: mode=%s gpu=%s buildings=%zu nodes=%zu "
         "bodies=%u awake=%u splits=%llu contacts=%llu drift=(%.3g,%.3g) "
@@ -3134,6 +3381,39 @@ int run(const Options& options)
         static_cast<unsigned long long>(contacts.projectileImpactContacts()),
         wallSeconds,
         (options.durationSeconds + options.settleSeconds) / std::max(wallSeconds, 1.0e-9));
+
+    if (options.enableCrush && destructibles.front()->isCrushEnabled())
+    {
+        std::printf(
+            "chunk crushing: crushed=%llu (%.2f%% of authored) mass=%.1f kg "
+            "volume=%.2f m^3 debris=%llu peakUtil=%.4g crushSafetyFactor=%.4g "
+            "peak p=%.3g Pa q=%.3g Pa\n",
+            static_cast<unsigned long long>(crush.chunksCrushed),
+            100.0 * crushedFraction,
+            crush.crushedMassKg,
+            crush.crushedVolumeM3,
+            static_cast<unsigned long long>(crush.debrisBodiesSpawned),
+            static_cast<double>(peaks.peakCrushUtilisation),
+            peaks.peakCrushUtilisation > 0.0f
+                ? 1.0 / static_cast<double>(peaks.peakCrushUtilisation)
+                : std::numeric_limits<double>::infinity(),
+            crush.peakPressurePa,
+            crush.peakDeviatorPa);
+        for (const auto& item : crush.byNodeType)
+        {
+            std::printf(
+                "  crushed %-12s %llu\n",
+                item.first.c_str(),
+                static_cast<unsigned long long>(item.second));
+        }
+        for (const auto& item : crush.byMaterial)
+        {
+            std::printf(
+                "  crushed material %-20s %llu\n",
+                item.first.c_str(),
+                static_cast<unsigned long long>(item.second));
+        }
+    }
 
     if (!motion.byNodeType.empty())
     {
@@ -3212,8 +3492,16 @@ int run(const Options& options)
         || !continuityValid
         || !partialDestructionValid
         || !authoredChunkScaleValid
+        || !crushFractionValid
         || !realtimeValid)
     {
+        std::fprintf(
+            stderr,
+            "crushed-fraction=%.4f (min=%.4f max=%.4f) valid=%s\n",
+            crushedFraction,
+            static_cast<double>(options.requireCrushFractionMin),
+            static_cast<double>(options.requireCrushFractionMax),
+            crushFractionValid ? "true" : "false");
         std::fprintf(
             stderr,
             "contract validation failed: mappings=%s self-test-fractured=%s "
