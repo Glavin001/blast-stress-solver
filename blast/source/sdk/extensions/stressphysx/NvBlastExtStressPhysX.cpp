@@ -143,6 +143,8 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , nodesAtCrushYield(0)
     , peakCrushUtilisation(0.0f)
     , debrisBodiesSpawned(0)
+    , crushResistanceJoules(0.0)
+    , crushResistanceImpulses(0)
     , resimulationCaptures(0)
     , resimulationRestores(0)
     , resimulationBodiesRestored(0)
@@ -272,6 +274,8 @@ public:
         m_nodeMaterials.assign(desc.nodeCount, 0);
         m_nodeStrainRates.assign(desc.nodeCount, 0.0f);
         m_nodeCharacteristicSize.assign(desc.nodeCount, 0.0f);
+        m_nodeCrusher.assign(desc.nodeCount, CrusherTrack{});
+        m_prevCrushDamage.assign(desc.nodeCount, 0.0f);
 
         std::vector<ExtStressNodeDesc> solverNodes(desc.nodeCount);
         for (uint32_t i = 0; i < desc.nodeCount; ++i)
@@ -498,6 +502,7 @@ public:
         queued.impulse = contact.worldImpulse;
         queued.relativeVelocity =
             contact.worldRelativeVelocity.isFinite() ? contact.worldRelativeVelocity : PxVec3(0.0f);
+        queued.otherActor = contact.otherActor;
         queued.wake = contact.wake;
         m_contacts.push_back(queued);
         ++m_telemetry.contactsQueued;
@@ -583,6 +588,9 @@ public:
         // Other body's velocity minus this one's at the contact point, world
         // space. Only its closing component is used, and only for crushing.
         PxVec3 relativeVelocity{0.0f};
+        // The body pressing on us, when the host supplied it. Crush
+        // resistance charges comminution work to this body.
+        PxRigidActor* otherActor{nullptr};
         bool wake{true};
     };
 
@@ -617,11 +625,59 @@ public:
         // "other minus this". So a closing contact gives a POSITIVE dot; a
         // separating one gives a negative dot and does no work on the chunk.
         const float closingSpeed = contact.relativeVelocity.dot(normal);
-        const float size = m_nodeCharacteristicSize[contact.nodeIndex];
-        if (size > 0.0f)
+        if (closingSpeed > 0.0f)
         {
-            float& rate = m_nodeStrainRates[contact.nodeIndex];
-            rate = std::max(rate, closingSpeed / size);
+            const float size = m_nodeCharacteristicSize[contact.nodeIndex];
+            if (size > 0.0f)
+            {
+                float& rate = m_nodeStrainRates[contact.nodeIndex];
+                rate = std::max(rate, closingSpeed / size);
+            }
+        }
+
+        // Remember the strongest external body pressing on this node this
+        // tick: it is who pays the comminution bill. The strongest, not the
+        // sum -- several contact points from one impactor describe one press,
+        // and the payer is a body, not a contact.
+        //
+        // Deliberately NOT gated on the closing speed: relative velocities are
+        // sampled after fetchResults, and a hard impact reads near zero there
+        // because PhysX already stopped the impactor within the step. The
+        // impulse direction still names the approach axis, and every path that
+        // CHARGES the payer re-reads its live velocity at charge time -- so a
+        // stale track can never over-extract, only fail to identify.
+        if (m_settings.applyCrushResistance && contact.otherActor)
+        {
+            PxRigidBody* other = contact.otherActor->is<PxRigidBody>();
+            // Our OWN bodies never pay: once a structure splits, its debris
+            // pieces trade enormous internal contact impulses, and without
+            // this exclusion the "dominant crusher" is invariably one of them
+            // -- a sideways wall-on-wall press outbidding the actual impactor,
+            // billing a flying plug along an axis it never travels. Internal
+            // energy exchange is already inside the solve; only EXTERNAL
+            // bodies owe comminution work.
+            const bool internal = other != nullptr
+                && m_bodyToId.find(static_cast<const PxRigidDynamic*>(
+                       static_cast<const PxRigidBody*>(other)))
+                       != m_bodyToId.end();
+            if (other && !internal
+                && !(other->getRigidBodyFlags() & PxRigidBodyFlag::eKINEMATIC)
+                && impulseMagnitude > m_nodeCrusher[contact.nodeIndex].impulseMagnitude)
+            {
+                CrusherTrack& track = m_nodeCrusher[contact.nodeIndex];
+                track.body = other;
+                track.direction = normal;
+                track.closingSpeed = std::max(closingSpeed, 0.0f);
+                track.impulseMagnitude = impulseMagnitude;
+                // The tick's dominant impactor. An impact's stress spreads
+                // through bonds, so most chunks it comminutes never touch the
+                // impactor -- but the energy still came from it, and it is who
+                // pays when a crushed node has no contact of its own.
+                if (impulseMagnitude > m_tickDominantCrusher.impulseMagnitude)
+                {
+                    m_tickDominantCrusher = track;
+                }
+            }
         }
     }
 
@@ -632,6 +688,8 @@ public:
         if (m_crushEnabled)
         {
             std::fill(m_nodeStrainRates.begin(), m_nodeStrainRates.end(), 0.0f);
+            std::fill(m_nodeCrusher.begin(), m_nodeCrusher.end(), CrusherTrack{});
+            m_tickDominantCrusher = CrusherTrack{};
         }
     }
 
@@ -938,6 +996,196 @@ public:
         }
     }
 
+    /**
+    Charge this tick's comminution work to the bodies that did the crushing.
+
+    Each node's damage increment dD dissipated dD * crushEnergy * volume of
+    work grinding the material. That work is extracted from the strongest
+    external contactor's kinetic energy along the closing axis: the impulse J
+    on a payer of mass M closing at speed v that removes energy dE is
+
+        J = M * (v - sqrt(v^2 - 2*dE/M)),   capped at M*v
+
+    -- the cap is what makes this a resistance and not a spring: it can bring
+    the crusher to a stop but can never bounce it. The momentum-conserving
+    reaction goes to the chunk's own body (a no-op while the structure is
+    kinematic, real once it is debris).
+
+    Runs BEFORE fracture applies, while every damaged chunk still has its
+    shape and pose. Bond-borne crushes with no external contactor charge
+    nobody: their load path is the structure itself and the reaction is
+    already inside the solve. Must run in endTick -- impulses are scene
+    writes, and solveTick is the phase that must stay free of them.
+    */
+    /**
+    Levy the deferred comminution charges after a resim restore.
+
+    Runs under the scene write lock. Velocities are re-read fresh, but impulses
+    applied here only land at the next simulate, so a per-payer running
+    velocity estimate is kept locally -- several chunks charged against one
+    ball must share ONE kinetic-energy budget, or the sum of individually
+    clamped impulses would reverse it (the exact bug the per-tick path fixed,
+    one level up).
+    */
+    void levyPendingResistance()
+    {
+        if (!m_pendingResistanceArmed || m_pendingResistance.empty())
+        {
+            return;
+        }
+        m_pendingResistanceArmed = false;
+
+        std::unordered_map<PxRigidBody*, PxVec3> velocityEstimate;
+        for (const PendingResistance& pending : m_pendingResistance)
+        {
+            if (!pending.payer || pending.payer->getScene() != &m_scene
+                || pending.work <= 0.0f)
+            {
+                continue;
+            }
+            const float mass = pending.payer->getMass();
+            if (mass <= 0.0f)
+            {
+                continue;
+            }
+
+            auto estimate = velocityEstimate.find(pending.payer);
+            if (estimate == velocityEstimate.end())
+            {
+                estimate = velocityEstimate
+                               .emplace(pending.payer, pending.payer->getLinearVelocity())
+                               .first;
+            }
+
+            // Charge OPPOSING THE PAYER'S MOTION, not along the recorded
+            // contact axis. The recorded axis is whichever contact impulse
+            // happened to be strongest -- late in a penetration that is a
+            // grazing, friction-dominated side contact, and projecting onto
+            // it voids the bill on exactly the impacts that owe the most.
+            // Comminution resistance is drag-like: it acts against wherever
+            // the penetrator is actually going, and charging that way also
+            // makes reversal impossible by construction.
+            const PxVec3 velocity = estimate->second;
+            const float speed = velocity.magnitude();
+            if (speed <= 1.0e-3f)
+            {
+                continue;
+            }
+            const PxVec3 motion = velocity / speed;
+            const float kineticEnergy = 0.5f * mass * speed * speed;
+            const float charged = std::min(pending.work, kineticEnergy);
+            const float impulse = pending.work >= kineticEnergy
+                ? mass * speed
+                : mass
+                      * (speed
+                         - std::sqrt(std::max(
+                               0.0f, speed * speed - 2.0f * pending.work / mass)));
+
+            pending.payer->addForce(-motion * impulse, PxForceMode::eIMPULSE);
+            estimate->second -= motion * (impulse / mass);
+
+            // No reaction impulse: the chunk this bill is for no longer
+            // exists, and its share of the momentum leaves with the dust.
+            m_telemetry.crushResistanceJoules += charged;
+            ++m_telemetry.crushResistanceImpulses;
+        }
+        m_pendingResistance.clear();
+    }
+
+    void applyCrushResistanceImpulses()
+    {
+        if (!m_crushEnabled || !m_settings.applyCrushResistance)
+        {
+            return;
+        }
+
+        m_resistanceDamageScratch.resize(m_nodes.size());
+        const uint32_t count = ext_stress_solver_get_node_crush_damage(
+            m_solver,
+            m_resistanceDamageScratch.data(),
+            static_cast<uint32_t>(m_resistanceDamageScratch.size()));
+
+        SceneWriteLock lock(m_scene);
+
+        levyPendingResistance();
+
+        for (uint32_t node = 0; node < count; ++node)
+        {
+            const float delta = m_resistanceDamageScratch[node] - m_prevCrushDamage[node];
+            m_prevCrushDamage[node] = m_resistanceDamageScratch[node];
+            if (delta <= 1.0e-6f)
+            {
+                continue;
+            }
+            if (m_nodes[node].crushed)
+            {
+                // A crushed node's whole bill went through the pending path;
+                // charging its damage increment here too would double-bill the
+                // resim pass.
+                continue;
+            }
+
+            const CrusherTrack& crusher = m_nodeCrusher[node];
+            if (!crusher.body)
+            {
+                continue;
+            }
+
+            const NodeState& state = m_nodes[node];
+            const ExtStressPhysXMaterial& material = m_materials[state.material];
+            const float work = delta * material.crushEnergy * state.volume;
+            const float mass = crusher.body->getMass();
+            if (work <= 0.0f || mass <= 0.0f)
+            {
+                continue;
+            }
+
+            // Charge against the payer's CURRENT closing speed, not the one
+            // recorded at contact time. An impulse applied here only takes
+            // effect at the next simulate, so the recorded speed can be one
+            // tick stale -- and charging the full axis energy twice off the
+            // same stale reading would REVERSE the crusher instead of
+            // stopping it. Recomputing at charge time makes the ledger
+            // self-limiting: once the payer has been stopped along this axis,
+            // its current closing speed is zero and nothing more can be
+            // extracted, whatever the host fed us.
+            const PxVec3 position = state.body && state.body->body
+                ? (state.body->body->getGlobalPose()
+                       * (state.shape ? state.shape->getLocalPose() : PxTransform(PxIdentity))).p
+                : m_worldTransform.transform(state.centroid);
+
+            const PxVec3 payerCom = crusher.body->getGlobalPose().transform(
+                crusher.body->getCMassLocalPose().p);
+            const PxVec3 payerVelocity = crusher.body->getLinearVelocity()
+                + crusher.body->getAngularVelocity().cross(position - payerCom);
+            // Live closing speed only: the recorded one is post-fetchResults
+            // and reads zero exactly when the press is hardest, and the live
+            // value is what the clamp needs anyway -- the energy actually
+            // still available along this axis.
+            const float closing = payerVelocity.dot(crusher.direction);
+            if (closing <= 1.0e-4f)
+            {
+                continue;
+            }
+            const float axisEnergy = 0.5f * mass * closing * closing;
+            const float charged = std::min(work, axisEnergy);
+            const float impulse = work >= axisEnergy
+                ? mass * closing
+                : mass * (closing - std::sqrt(std::max(0.0f, closing * closing - 2.0f * work / mass)));
+
+            PxRigidBodyExt::addForceAtPos(
+                *crusher.body, -crusher.direction * impulse, position, PxForceMode::eIMPULSE);
+            if (state.body && state.body->body && !isKinematic(*state.body))
+            {
+                PxRigidBodyExt::addForceAtPos(
+                    *state.body->body, crusher.direction * impulse, position, PxForceMode::eIMPULSE);
+            }
+
+            m_telemetry.crushResistanceJoules += charged;
+            ++m_telemetry.crushResistanceImpulses;
+        }
+    }
+
     bool endTick() override
     {
         if (m_tickPhase != TickPhase::Solved)
@@ -947,6 +1195,8 @@ public:
                 INVALID_INDEX,
                 "endTick requires a successful solveTick.");
         }
+        applyCrushResistanceImpulses();
+
         // A pulverized chunk is topology work even when no bond is overstressed:
         // a chunk can be ground up while every joint around it still holds.
         if (m_telemetry.overstressedBondCount > 0 || !m_pendingCrushedNodes.empty())
@@ -1325,6 +1575,23 @@ public:
         m_resimIndexByBodyId.clear();
         m_resimProvenance.clear();
         m_resimSeeds.clear();
+        // The crush-damage baseline travels with the motion snapshot: a
+        // rewound frame rewinds the crusher's velocity, so re-running it must
+        // re-charge the same comminution work against that restored motion.
+        // Without this the resim pass would see almost no damage increment and
+        // fracture frames would systematically under-charge resistance.
+        m_resimPrevCrushDamage = m_prevCrushDamage;
+        // Charges never levied belong to a frame that was never refunded:
+        // without a restore, PhysX's own contact kept the momentum exchange
+        // and there is nothing to reclaim. Drop them -- UNLESS they are armed:
+        // the frame stepper re-captures immediately after a restore so the
+        // resim pass can itself be rewound, and that capture arrives between
+        // arming and the levy. Clearing armed charges there silently voided
+        // every bill the mechanism exists to collect.
+        if (!m_pendingResistanceArmed)
+        {
+            m_pendingResistance.clear();
+        }
 
         SceneWriteLock lock(m_scene);
         const uint32_t bodyCount = static_cast<uint32_t>(m_actorBodies.size());
@@ -1371,6 +1638,15 @@ public:
         PxRigidDynamic* const* activeBodies,
         uint32_t activeCount) override
     {
+        // Arm the comminution charges on the restore REQUEST, not on its
+        // success. The frame stepper rewinds scene motion itself before
+        // calling here, so the refund the charges exist to reclaim has already
+        // happened even when this adapter holds no snapshot of its own --
+        // which is precisely the case on an impact frame that arrives out of a
+        // quiet spell, when needsResimulationSnapshot() had said no at frame
+        // start and the early-outs below fire.
+        m_pendingResistanceArmed = !m_pendingResistance.empty();
+
         if (m_tickPhase != TickPhase::Idle)
         {
             return fail(
@@ -1386,6 +1662,11 @@ public:
                 "restoreResimulationSnapshot requires a prior capture.");
         }
         const TelemetryClock::time_point restoreStart = TelemetryClock::now();
+        // Rewind the crush-damage baseline with the motion; see the capture.
+        if (m_resimPrevCrushDamage.size() == m_prevCrushDamage.size())
+        {
+            m_prevCrushDamage = m_resimPrevCrushDamage;
+        }
         SceneWriteLock lock(m_scene);
 
         std::unordered_set<PxRigidDynamic*> activeSet;
@@ -2448,6 +2729,34 @@ private:
                 record.worldPose = PxTransform(m_worldTransform.transform(node.centroid));
             }
 
+            // The comminution bill for this chunk, owed by whoever pressed it.
+            // Deferred to the resim pass; see PendingResistance.
+            if (m_settings.applyCrushResistance)
+            {
+                // A node the impactor touched pays along its own contact
+                // axis; every other comminuted node bills the tick's dominant
+                // impactor, whose energy drove the stress that crushed it.
+                const CrusherTrack& crusher = m_nodeCrusher[nodeIndex].body
+                    ? m_nodeCrusher[nodeIndex]
+                    : m_tickDominantCrusher;
+                if (crusher.body)
+                {
+                    const float baseline =
+                        m_resimPrevCrushDamage.size() == m_prevCrushDamage.size()
+                            ? m_resimPrevCrushDamage[nodeIndex]
+                            : 0.0f;
+                    PendingResistance pending;
+                    pending.payer = crusher.body;
+                    pending.direction = crusher.direction;
+                    pending.work =
+                        material.crushEnergy * node.volume * std::max(0.0f, 1.0f - baseline);
+                    if (pending.work > 0.0f)
+                    {
+                        m_pendingResistance.push_back(pending);
+                    }
+                }
+            }
+
             detachCrushedShape(node);
             node.crushed = true;
             ++m_crushedNodeCount;
@@ -3032,6 +3341,47 @@ private:
     // Cube root of each node's authored volume: the length that turns a contact
     // closing speed into a strain rate.
     std::vector<float> m_nodeCharacteristicSize;
+    // The strongest external body pressing on each node this tick: who pays
+    // the comminution bill when crush resistance is on.
+    struct CrusherTrack
+    {
+        PxRigidBody* body{nullptr};
+        PxVec3 direction{0.0f};
+        float closingSpeed{0.0f};
+        float impulseMagnitude{0.0f};
+    };
+    std::vector<CrusherTrack> m_nodeCrusher;
+    CrusherTrack m_tickDominantCrusher;
+    /**
+    Comminution charges owed to crushing bodies, levied on the resim pass.
+
+    Why deferred: contact relative velocities are sampled after fetchResults,
+    when PhysX has already done its rigid momentum exchange -- by then the
+    payer's closing speed is near zero and an immediate charge extracts almost
+    nothing. The energy the payer wrongly keeps only comes into existence on
+    the RESIMULATION pass: motion is rewound to full speed, the crushed chunks
+    are gone, and the contact that stopped the payer is never re-issued. That
+    refunded pass is where the bill lands, against the restored velocity.
+
+    Armed by restoreResimulationSnapshot, applied by the following endTick,
+    cleared at the next capture. Without resim there is no refund -- PhysX's
+    own contact kept the momentum exchange -- so unapplied charges are simply
+    dropped, which is the correct ledger.
+    */
+    struct PendingResistance
+    {
+        PxRigidBody* payer{nullptr};
+        PxVec3 direction{0.0f};
+        float work{0.0f};
+    };
+    std::vector<PendingResistance> m_pendingResistance;
+    bool m_pendingResistanceArmed{false};
+    // Last tick's crush damage, so endTick can charge only the increment.
+    // Snapshotted and restored with the resim capture: a rewound frame rewinds
+    // the crusher's motion, so re-running it must re-charge the same work.
+    std::vector<float> m_prevCrushDamage;
+    std::vector<float> m_resimPrevCrushDamage;
+    std::vector<float> m_resistanceDamageScratch;
     // Nodes pulverized this tick, awaiting scene removal in endTick.
     std::vector<uint32_t> m_pendingCrushedNodes;
     std::vector<uint32_t> m_crushScratch;

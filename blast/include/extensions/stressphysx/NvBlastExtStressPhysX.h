@@ -142,6 +142,26 @@ struct ExtStressPhysXSettings
     slab is stress-free no matter how fast it turns.
     */
     bool applyCentrifugal;
+    /**
+    Charge comminution work to the crusher.
+
+    The crush model's crushEnergy is the work per unit volume it takes to grind
+    the material up. Without this flag that energy is only a damage-rate
+    calibration: a chunk comminutes and whatever pressed on it keeps every
+    joule of its kinetic energy, so a penetrator gets its hole for free. With
+    it, each tick's damage increment dD on a chunk of volume V extracts
+    dD * crushEnergy * V from the strongest external contactor's kinetic
+    energy along the closing axis -- a resistive impulse, applied with its
+    momentum-conserving reaction on the chunk's own body, clamped so it can
+    slow the crusher to a stop but never reverse it.
+
+    This is the crumple-zone half of the crush physics: material that is being
+    ground up eats the impact instead of merely getting out of the way. It is
+    not a velocity cap and never overrides a fracture verdict; it is the
+    reaction force comminution exerts, sized by the same authored crushEnergy
+    that drives the damage.
+    */
+    bool applyCrushResistance;
     // Opt-in hard stop only: when >0 and the structure already has this many
     // bodies, skip further fracture. Default 0 = unlimited. Do not use this as
     // a perf "budget" — capping fracture falsifies impact/resim behavior.
@@ -191,6 +211,7 @@ struct ExtStressPhysXSettings
         , applyExcessForces(true)
         , excessForceScale(1.0f)
         , applyCentrifugal(true)
+        , applyCrushResistance(true)
         , maximumBodies(0)
         , maximumFracturesPerActorPerTick(0)
         , idleSkip(true)
@@ -245,6 +266,10 @@ struct ExtStressPhysXTelemetry
     //! nothing ever came close; 1/this is the chunk's crush safety factor.
     float peakCrushUtilisation;
     uint64_t debrisBodiesSpawned;
+    //! Total comminution work charged to crushing bodies (J), and how many
+    //! resistive impulses carried it.
+    double crushResistanceJoules;
+    uint64_t crushResistanceImpulses;
     uint64_t resimulationCaptures;
     uint64_t resimulationRestores;
     uint64_t resimulationBodiesRestored;
@@ -306,6 +331,13 @@ struct ExtStressPhysXContact
     answer for a resting contact that is not closing.
     */
     physx::PxVec3 worldRelativeVelocity;
+    /**
+    The body on the other side of the contact, when the host knows it. Optional
+    and only consumed by crush resistance: comminution work is charged to this
+    body's kinetic energy, so without it a crush dissipates topologically but
+    the crusher sails on unslowed. Null is always safe.
+    */
+    physx::PxRigidActor* otherActor;
     // Whether this contact may wake a sleeping body. New impacts should;
     // PERSISTING resting contacts must not -- in a rubble pile every body has
     // one, and waking for them re-opens the whole contact island every tick,
@@ -320,6 +352,7 @@ struct ExtStressPhysXContact
         , worldPosition(0.0f)
         , worldImpulse(0.0f)
         , worldRelativeVelocity(0.0f)
+        , otherActor(nullptr)
         , wake(true)
     {
     }

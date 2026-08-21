@@ -657,6 +657,125 @@ void testDebrisFractionRespawnsMass()
     require(holder.value->validateMappings(), "mappings must stay valid with debris present");
 }
 
+// ── Comminution work is charged to the crusher ───────────────────────────────
+//
+// The crumple-zone half of the model: material being ground up eats the
+// impact. Each tick's damage increment dD on a chunk of volume V extracts
+// dD * crushEnergy * V from the pressing body's kinetic energy along the
+// closing axis. Without the charge, a penetrator gets its hole for free and
+// exits as fast as it entered.
+
+void testCrushResistanceChargesTheCrusher()
+{
+    // Same fixture and press, once per resistance setting. The presses are
+    // synthetic contacts naming a real dynamic ball as the payer.
+    const auto ballSpeedAfter = [](bool resistance) {
+        PhysXScene context(PhysicsMode::Cpu, false, SceneCapacity{}, nullptr);
+        const Structure structure = makeColumn(4, 5000.0f);
+        const std::vector<ExtStressPhysXMaterial> materials{
+            withCrush(unbreakableJoints(), 0.8e6f, 2.0e6f)};
+
+        Holder holder;
+        {
+            ExtStressPhysXDesc desc;
+            desc.physics = &context.physics();
+            desc.scene = &context.scene();
+            desc.material = &context.material();
+            desc.nodes = structure.nodes.data();
+            desc.nodeCount = static_cast<std::uint32_t>(structure.nodes.size());
+            desc.bonds = structure.bonds.data();
+            desc.bondCount = static_cast<std::uint32_t>(structure.bonds.size());
+            desc.worldTransform = PxTransform(PxVec3(0.0f));
+            desc.stressMaterials = materials.data();
+            desc.stressMaterialCount = static_cast<std::uint32_t>(materials.size());
+            desc.settings.applyExcessForces = false;
+            desc.settings.skipSettledIslands = false;
+            desc.settings.idleSkip = false;
+            desc.settings.applyCrushResistance = resistance;
+            ExtStressPhysXTelemetry failure;
+            holder.value = ExtStressPhysXDestructible::create(desc, &failure);
+            require(holder.value != nullptr, "destructible creation failed");
+        }
+
+        // A free ball, gravity off, travelling HORIZONTALLY well away from the
+        // column (and above nothing it can land on) so PhysX itself generates
+        // no contacts: the only coupling is the resistive impulse under test,
+        // so the measurement is exact. Horizontal, because a falling ball
+        // reaches the fixture's ground plane inside the window and the test
+        // would measure the floor.
+        PxRigidDynamic* ball =
+            context.physics().createRigidDynamic(PxTransform(PxVec3(50.0f, 5.0f, 0.0f)));
+        require(ball != nullptr, "ball creation failed");
+        PxShape* ballShape = context.physics().createShape(
+            PxSphereGeometry(0.5f), context.material(), true);
+        ball->attachShape(*ballShape);
+        ballShape->release();
+        PxRigidBodyExt::setMassAndUpdateInertia(*ball, 500.0f);
+        ball->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
+        const PxVec3 initialVelocity(-20.0f, 0.0f, 0.0f);
+        ball->setLinearVelocity(initialVelocity);
+        context.scene().addActor(*ball);
+
+        const std::uint32_t topNode = static_cast<std::uint32_t>(structure.nodes.size() - 1);
+        for (std::uint32_t i = 0; i < 120; ++i)
+        {
+            std::vector<ExtStressPhysXShapeSnapshot> shapes(structure.nodes.size());
+            const std::uint32_t count = holder.value->getShapeSnapshots(
+                shapes.data(), static_cast<std::uint32_t>(shapes.size()));
+            for (std::uint32_t shapeIndex = 0; shapeIndex < count; ++shapeIndex)
+            {
+                if (shapes[shapeIndex].nodeIndex != topNode)
+                {
+                    continue;
+                }
+                ExtStressPhysXContact contact;
+                contact.shapeId = shapes[shapeIndex].shapeId;
+                contact.worldPosition = shapes[shapeIndex].worldPose.p;
+                // Press direction matches the ball's travel so the closing
+                // speed (relvel dot impulse-direction) is positive.
+                contact.worldImpulse = PxVec3(-4.0e6f, 0.0f, 0.0f) * kDt;
+                contact.worldRelativeVelocity = ball->getLinearVelocity();
+                contact.otherActor = ball;
+                holder.value->queueContact(contact);
+            }
+            step(context, *holder.value, 1);
+        }
+
+        const float speed = -ball->getLinearVelocity().x;
+        const ExtStressPhysXTelemetry& telemetry = holder.value->getTelemetry();
+        if (resistance)
+        {
+            require(telemetry.crushResistanceImpulses > 0,
+                    "resistance impulses should have been applied");
+            require(telemetry.crushResistanceJoules > 0.0,
+                    "comminution work should have been charged");
+        }
+        else
+        {
+            require(telemetry.crushResistanceImpulses == 0,
+                    "no impulses may be applied with resistance disabled");
+        }
+        ball->release();
+        return speed;
+    };
+
+    const float withResistance = ballSpeedAfter(true);
+    const float withoutResistance = ballSpeedAfter(false);
+
+    require(withoutResistance > 19.0f,
+            "without resistance the ball must keep its speed, got "
+                + std::to_string(withoutResistance));
+    require(withResistance < withoutResistance - 1.0f,
+            "resistance must slow the crusher (with="
+                + std::to_string(withResistance)
+                + " without=" + std::to_string(withoutResistance) + ")");
+    // The clamp: resistance may stop the crusher along the closing axis but
+    // never bounce it back.
+    require(withResistance > -0.5f,
+            "resistance must never reverse the crusher, got "
+                + std::to_string(withResistance));
+}
+
 } // namespace
 
 int main()
@@ -674,6 +793,7 @@ int main()
         testFlowIsQuadraticInOverstress();
         testCrushEnergyControlsHowMuchIsLost();
         testDebrisFractionRespawnsMass();
+        testCrushResistanceChargesTheCrusher();
     }
     catch (const std::exception& error)
     {

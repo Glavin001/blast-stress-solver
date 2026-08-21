@@ -80,6 +80,7 @@ struct Options
     // Chunk crushing. On when the pack authors it; --no-crush forces it off so
     // the same pack can be run with and without to isolate its contribution.
     bool enableCrush{true};
+    bool crushResistance{true};
     float crushEnergyScale{1.0f};
     float requireCrushFractionMin{-1.0f};
     float requireCrushFractionMax{-1.0f};
@@ -498,6 +499,8 @@ struct AggregateTelemetry
     double crushedVolumeM3{0.0};
     std::uint32_t nodesAtCrushYield{0};
     float peakCrushUtilisation{0.0f};
+    double crushResistanceJoules{0.0};
+    std::uint64_t crushResistanceImpulses{0};
     std::uint64_t debrisBodiesSpawned{0};
     std::uint32_t solverIslands{0};
     std::uint32_t solverIslandsSkipped{0};
@@ -822,6 +825,8 @@ void usage(const char* executable)
         "  --stress-limit-scale X       Multiply all elastic/fatal stress limits\n"
         "  --no-crush                   Disable chunk crushing even if the pack\n"
         "                               authors it (isolate its contribution)\n"
+        "  --no-crush-resistance        Crush without charging comminution work\n"
+        "                               to the crusher (isolate the energy cost)\n"
         "  --crush-energy-scale X       Multiply every material\'s crush energy.\n"
         "                               >1 is tougher (crushes less), <1 more friable\n"
         "  --require-crush-fraction-min X  Fail unless at least this fraction of\n"
@@ -967,6 +972,7 @@ Options parseOptions(int argc, char** argv)
         else if (option == "--stress-limit-scale")
             options.stressLimitScale = parseFloat(argument(), "--stress-limit-scale");
         else if (option == "--no-crush") options.enableCrush = false;
+        else if (option == "--no-crush-resistance") options.crushResistance = false;
         else if (option == "--crush-energy-scale")
             options.crushEnergyScale = parseFloat(argument(), "--crush-energy-scale");
         else if (option == "--require-crush-fraction-min")
@@ -1166,8 +1172,10 @@ public:
                 const PxVec3 velocity0 = pointVelocity(header.actors[0], points[i].position);
                 const PxVec3 velocity1 = pointVelocity(header.actors[1], points[i].position);
                 const PxVec3 relative = velocity1 - velocity0;
-                queue(owner0, pair.shapes[0], points[i].position, points[i].impulse, relative);
-                queue(owner1, pair.shapes[1], points[i].position, -points[i].impulse, -relative);
+                queue(owner0, pair.shapes[0], points[i].position, points[i].impulse, relative,
+                      header.actors[1]);
+                queue(owner1, pair.shapes[1], points[i].position, -points[i].impulse, -relative,
+                      header.actors[0]);
             }
         }
         m_callbackMilliseconds +=
@@ -1229,7 +1237,8 @@ private:
         const PxShape* shape,
         const PxVec3& position,
         const PxVec3& impulse,
-        const PxVec3& relativeVelocity)
+        const PxVec3& relativeVelocity,
+        PxActor* otherActor)
     {
         if (destructible)
         {
@@ -1238,6 +1247,8 @@ private:
             contact.worldPosition = position;
             contact.worldImpulse = impulse * m_forceScale;
             contact.worldRelativeVelocity = relativeVelocity;
+            // Who pays the comminution bill if this contact crushes something.
+            contact.otherActor = otherActor ? otherActor->is<PxRigidActor>() : nullptr;
             destructible->queueContact(contact);
         }
     }
@@ -1652,6 +1663,8 @@ AggregateTelemetry aggregate(const std::vector<DestructiblePtr>& destructibles)
         result.nodesAtCrushYield += source.nodesAtCrushYield;
         result.peakCrushUtilisation =
             std::max(result.peakCrushUtilisation, source.peakCrushUtilisation);
+        result.crushResistanceJoules += source.crushResistanceJoules;
+        result.crushResistanceImpulses += source.crushResistanceImpulses;
         result.debrisBodiesSpawned += source.debrisBodiesSpawned;
         result.solverIslands += source.solverIslandCount;
         result.solverIslandsSkipped += source.solverIslandsSkipped;
@@ -2766,6 +2779,7 @@ int run(const Options& options)
         // kick and the outward separation impulse would double-count with the
         // re-solved contact.
         desc.settings.applyExcessForces = options.resimPasses == 0;
+        desc.settings.applyCrushResistance = options.crushResistance;
         desc.settings.excessForceScale = options.excessForceScale;
         desc.settings.maximumBodies = options.maximumBodiesPerStructure;
         desc.settings.maximumFracturesPerActorPerTick =
@@ -3583,7 +3597,7 @@ int run(const Options& options)
         std::printf(
             "chunk crushing: crushed=%llu (%.2f%% of authored) mass=%.1f kg "
             "volume=%.2f m^3 debris=%llu peakUtil=%.4g crushSafetyFactor=%.4g "
-            "peak p=%.3g Pa q=%.3g Pa\n",
+            "peak p=%.3g Pa q=%.3g Pa resistance=%.3g J (%llu impulses)\n",
             static_cast<unsigned long long>(crush.chunksCrushed),
             100.0 * crushedFraction,
             crush.crushedMassKg,
@@ -3594,7 +3608,9 @@ int run(const Options& options)
                 ? 1.0 / static_cast<double>(peaks.peakCrushUtilisation)
                 : std::numeric_limits<double>::infinity(),
             crush.peakPressurePa,
-            crush.peakDeviatorPa);
+            crush.peakDeviatorPa,
+            peaks.crushResistanceJoules,
+            static_cast<unsigned long long>(peaks.crushResistanceImpulses));
         for (const auto& item : crush.byNodeType)
         {
             std::printf(
