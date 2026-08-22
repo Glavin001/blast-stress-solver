@@ -1114,6 +1114,20 @@ private:
                 dxx * dxx + dyy * dyy + dzz * dzz + 2.0f * (sxy * sxy + sxz * sxz + syz * syz);
             const float deviator = sqrtf(1.5f * (deviatorSq > 0.0f ? deviatorSq : 0.0f));
 
+            // A jammed debris pile can feed the solver forces large enough to
+            // overflow the virial into inf/nan (measured on a 20k-chunk city:
+            // one degenerate island reported q = inf, which crushed everything
+            // it touched and poisoned every peak statistic downstream).
+            // A non-finite stress state is not "very crushed", it is "not a
+            // number": treat the tick as unreadable and do nothing.
+            if (!std::isfinite(pressure) || !std::isfinite(deviator))
+            {
+                data.pressure = 0.0f;
+                data.deviator = 0.0f;
+                data.crushUtilisation = 0.0f;
+                continue;
+            }
+
             data.pressure = pressure;
             data.deviator = deviator;
 
