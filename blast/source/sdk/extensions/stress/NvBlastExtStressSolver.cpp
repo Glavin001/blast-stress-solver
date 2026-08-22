@@ -2404,6 +2404,12 @@ ExtStressSolverImpl::ExtStressSolverImpl(const NvBlastFamily& family, const ExtS
     m_nodeMaterials.assign(m_graphNodeCount, 0);
 
     m_bondFractureBuffer.reserve(bondCount);
+    // Reserved for the same reason as the bond buffer, and the bug is worth
+    // naming: fillFractureCommands stores POINTERS into this buffer while it
+    // keeps growing across actors, so a reallocation mid-generate dangles
+    // every earlier actor's chunkFractures. One command per node per generate
+    // is the hard ceiling, so nodeCount capacity makes growth impossible.
+    m_chunkFractureBuffer.reserve(m_graph.nodeCount);
 
     {
         NvBlastActor* actor;
