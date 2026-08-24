@@ -120,6 +120,25 @@ The same canonical run is available as
 See [`recorder/README.md`](recorder/README.md) for rendering existing state
 files, telemetry sidecars, and the `TWSTATE1` layout.
 
+## Chunk crushing
+
+Chunks can be comminuted -- removed from the simulation as dust -- as well as
+separated along their bonds. Opt-in per material; a pack that authors no `crush`
+block is unaffected.
+
+```sh
+# every published A/B comparison (crush on vs off), or one scenario
+./record_crush_videos.sh /tmp/out
+./record_crush_videos.sh /tmp/out wall-punch
+
+ctest --test-dir build -R crush --output-on-failure
+```
+
+The model, API, measured results and limits are in
+`blast/blast-stress-solver/docs/chunk-crushing.md`; the pack schema is in
+`SCENE_PACK_FORMAT.md` ("Version 3"); authoring targets and the symptom table
+are in `.cursor/skills/blast-structure-authoring/SKILL.md`.
+
 ## PhysX GPU configuration and safeguards
 
 GPU mode creates a validated `PxCudaContextManager` and configures:

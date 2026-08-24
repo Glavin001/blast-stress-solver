@@ -321,6 +321,9 @@ unconfined, and demand progressively more under confinement. That is one fewer
 number to invent — the cone is pinned to the same `fc` the bonds already use.
 `blast/blast-stress-solver/scripts/export-reference-building.mjs` does this.
 
+See `blast/blast-stress-solver/docs/chunk-crushing.md` for the model's
+derivation, the runtime API, measured behaviour, and known limits.
+
 ### The energy bill
 
 `crushEnergy` is charged, not just referenced: the PhysX adapter (setting
