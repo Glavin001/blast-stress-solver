@@ -9,7 +9,8 @@
 //! bonds, and a fracture in one must not touch the other's graph.
 
 use crate::backend::PhysicsBackend;
-use crate::pipeline::destructible::{Destructible, DestructibleConfig, StepReport};
+use crate::pipeline::destructible::{Destructible, DestructibleConfig, IslandMotion, StepReport};
+use crate::pipeline::events::DestructionEvent;
 use crate::types::ScenarioDesc;
 
 /// A structure's stable identity within the set.
@@ -24,8 +25,10 @@ pub struct StructureId(pub u32);
 pub struct SetStepReport {
     pub per_structure: Vec<(StructureId, StepReport)>,
     pub fractures: usize,
+    pub bond_damage_events: usize,
     pub split_events: usize,
     pub bodies_created: usize,
+    pub shapes_reparented: usize,
     pub bodies_retired: usize,
     pub writes_elided: usize,
 }
@@ -70,11 +73,43 @@ impl<B: PhysicsBackend> DestructibleSet<B> {
         for (id, d) in self.structures.iter_mut() {
             let r = d.step(backend, dt);
             out.fractures += r.fractures;
+            out.bond_damage_events += r.bond_damage_events;
             out.split_events += r.split_events;
             out.bodies_created += r.bodies_created;
+            out.shapes_reparented += r.shapes_reparented;
             out.bodies_retired += r.bodies_retired;
             out.writes_elided += r.writes_elided;
             out.per_structure.push((*id, r));
+        }
+        out
+    }
+
+    /// Drain every structure's events, tagged with which structure they came
+    /// from.
+    ///
+    /// Structure order is the sorted attach order, and each structure's events
+    /// stay contiguous and in their own causal order. That matters: the
+    /// ordering contract (promoted before migrated-onto, retired only when
+    /// empty) is per-structure, and interleaving would break it for a consumer
+    /// that applies the stream linearly.
+    ///
+    /// Island serials are per-structure, so a consumer must key on the pair.
+    /// That is deliberate -- a global serial space would make every structure's
+    /// numbering depend on every other structure's damage history, which is
+    /// exactly what makes a late joiner unable to reconstruct state.
+    pub fn drain_events(&mut self) -> Vec<(StructureId, DestructionEvent)> {
+        let mut out = Vec::new();
+        for (id, d) in self.structures.iter_mut() {
+            out.extend(d.drain_events().into_iter().map(|e| (*id, e)));
+        }
+        out
+    }
+
+    /// Live COM-frame motion of every island in every structure.
+    pub fn island_poses(&self, backend: &B) -> Vec<(StructureId, IslandMotion)> {
+        let mut out = Vec::new();
+        for (id, d) in self.structures.iter() {
+            out.extend(d.island_poses(backend).into_iter().map(|m| (*id, m)));
         }
         out
     }

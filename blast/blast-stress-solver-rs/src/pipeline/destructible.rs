@@ -104,7 +104,14 @@ pub struct IslandMotion {
 /// What one step did.
 #[derive(Clone, Debug, Default)]
 pub struct StepReport {
+    /// Bonds that actually broke this step -- health crossed zero.
     pub fractures: usize,
+    /// Fracture commands Blast issued. This is a *damage* count and is
+    /// legitimately much larger than `fractures`: a bond under sustained
+    /// overstress is damaged every tick until its health reaches zero. Kept
+    /// separate rather than conflated, because the old conflation made every
+    /// measurement built on "fracture count" measure the wrong thing.
+    pub bond_damage_events: usize,
     pub split_events: usize,
     pub bodies_created: usize,
     pub shapes_reparented: usize,
@@ -140,6 +147,18 @@ pub struct Destructible<B: PhysicsBackend> {
     island_sleeping: HashMap<IslandSerial, bool>,
     /// Unordered node pair -> bond index. See `DestructionEvent::BondBroken`.
     bond_index: HashMap<(u32, u32), u32>,
+    /// Live bond health, re-read each tick, and which bonds are still whole.
+    ///
+    /// A bond breaks when its health crosses zero -- not when Blast issues a
+    /// fracture command for it. Commands are a *damage* stream: one is issued
+    /// every tick a bond is overstressed while its health is still positive,
+    /// and the command's own `health` field is the damage applied rather than
+    /// what remains. Counting commands as breaks overcounts, measured at 1067
+    /// against a 546-bond tower.
+    bond_health: Vec<f32>,
+    bond_alive: Vec<bool>,
+    /// Bond index -> its node pair, so a break can name its endpoints.
+    bond_nodes: Vec<(u32, u32)>,
     events: EventSink,
 }
 
@@ -173,6 +192,9 @@ impl<B: PhysicsBackend> Destructible<B> {
             serials: SerialAllocator::default(),
             body_serial: HashMap::new(),
             island_sleeping: HashMap::new(),
+            bond_health: Vec::new(),
+            bond_alive: Vec::new(),
+            bond_nodes: bonds.iter().map(|b| (b.node0, b.node1)).collect(),
             bond_index: bonds
                 .iter()
                 .enumerate()
@@ -235,6 +257,14 @@ impl<B: PhysicsBackend> Destructible<B> {
         d.cmds.clear();
         d.cmds.recompute_mass.extend(bodies.iter().copied());
         backend.apply(Phase::Topology, &d.cmds, &mut d.out).ok()?;
+
+        // Seed the break detector from the solver's own initial healths rather
+        // than assuming every bond starts whole: the seed is per-bond (it
+        // tracks bond area), and an authored pack can legitimately ship a bond
+        // at zero.
+        let bond_count = d.bond_index.len();
+        d.solver.bond_healths(bond_count, &mut d.bond_health);
+        d.bond_alive = d.bond_health.iter().map(|h| *h > 0.0).collect();
 
         // Promotions are emitted only after the mass recompute above, because
         // the COM read below is meaningless before it: both engines defer mass
@@ -496,35 +526,31 @@ impl<B: PhysicsBackend> Destructible<B> {
 
         if self.solver.overstressed_bond_count() > 0 {
             let cmds = self.solver.generate_fracture_commands();
-            report.fractures = cmds.iter().map(|c| c.bond_fractures.len()).sum();
-            // Emitted here, ahead of the splits, and emitted for every broken
-            // bond rather than only the ones that sever an island. Most breaks
-            // merely weaken a structure without partitioning it, and a consumer
-            // rendering damage needs exactly those.
-            for c in &cmds {
-                for f in &c.bond_fractures {
-                    let key = (
-                        f.node_index0.min(f.node_index1),
-                        f.node_index0.max(f.node_index1),
-                    );
-                    // A break with no matching bond would be a pipeline bug,
-                    // not a data condition, so it is worth being loud about
-                    // rather than silently reporting bond 0 -- which is exactly
-                    // what trusting the solver's userdata would do.
-                    let Some(&bond) = self.bond_index.get(&key) else {
-                        debug_assert!(false, "broken bond {key:?} is not in the scenario");
-                        continue;
-                    };
-                    self.events.push(DestructionEvent::BondBroken {
-                        bond,
-                        node0: f.node_index0,
-                        node1: f.node_index1,
-                        health: f.health,
-                    });
-                }
-            }
+            report.bond_damage_events = cmds.iter().map(|c| c.bond_fractures.len()).sum();
             if !cmds.is_empty() {
                 self.pending.extend(self.solver.apply_fracture_commands(&cmds));
+            }
+
+            // Breaks are read back from health after the damage is applied, and
+            // emitted ahead of the splits they cause. Every break is reported,
+            // not only the ones that sever an island: most breaks merely weaken
+            // a structure without partitioning it, and a consumer rendering
+            // damage needs exactly those.
+            let bond_count = self.bond_alive.len();
+            self.solver.bond_healths(bond_count, &mut self.bond_health);
+            for bond in 0..self.bond_health.len().min(bond_count) {
+                if !self.bond_alive[bond] || self.bond_health[bond] > 0.0 {
+                    continue;
+                }
+                self.bond_alive[bond] = false;
+                report.fractures += 1;
+                let (node0, node1) = self.bond_nodes[bond];
+                self.events.push(DestructionEvent::BondBroken {
+                    bond: bond as u32,
+                    node0,
+                    node1,
+                    health: self.bond_health[bond],
+                });
             }
         }
 

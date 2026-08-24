@@ -1143,6 +1143,56 @@ ext_stress_solver_get_bond_stresses(const ExtStressSolverHandle* handlePtr,
 }
 
 extern "C" uint32_t
+ext_stress_solver_get_bond_healths(const ExtStressSolverHandle* handlePtr,
+                                   float* out_health,
+                                   uint32_t capacity)
+{
+    // Live bond health, indexed by ASSET bond index -- the same indexing as
+    // NvBlastAssetGetBonds and as ext_stress_solver_get_bond_stresses.
+    //
+    // This exists because the fracture command stream is a *damage* stream, not
+    // a break stream: generateStressDamage issues a command every tick a bond
+    // is overstressed while its health is still above zero, and the command's
+    // `health` field is the damage applied, not what remains. A caller that
+    // treats each command as a break overcounts badly -- measured 1067
+    // "breaks" against a 546-bond tower. Health crossing zero is the break.
+    auto* handle = const_cast<ExtStressSolverHandleImpl*>(
+        reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr));
+    if (!handle || !handle->family || !out_health || capacity == 0U)
+    {
+        return 0U;
+    }
+
+    // The health array is per-family, so any live actor exposes the whole of
+    // it. Actors are searched rather than assuming slot 0 is alive: slots are
+    // vacated as actors are destroyed.
+    const float* healths = nullptr;
+    for (const auto& entry : handle->actors)
+    {
+        if (entry.actor)
+        {
+            healths = NvBlastActorGetBondHealths(entry.actor, logLL);
+            if (healths)
+            {
+                break;
+            }
+        }
+    }
+    if (!healths)
+    {
+        return 0U;
+    }
+
+    const uint32_t bondCount = handle->asset ? NvBlastAssetGetBondCount(handle->asset, logLL) : 0U;
+    const uint32_t n = bondCount < capacity ? bondCount : capacity;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        out_health[i] = healths[i];
+    }
+    return n;
+}
+
+extern "C" uint32_t
 ext_stress_solver_fill_debug_render(const ExtStressSolverHandle* handlePtr,
                                     uint32_t mode,
                                     float scale,

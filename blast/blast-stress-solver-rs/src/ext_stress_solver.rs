@@ -70,6 +70,31 @@ impl ExtStressSolver {
     ///
     /// Reads the solver's own view rather than recomputing it, so it can be
     /// compared directly against the material limits that decide fracture.
+    /// Live per-bond health, indexed by asset bond index.
+    ///
+    /// Health crossing zero is the break. The fracture *command* stream is a
+    /// damage stream: Blast issues a command every tick a bond is overstressed
+    /// while its health is still positive, and the command's `health` field is
+    /// the damage applied rather than what remains. Counting commands as breaks
+    /// overcounts -- measured 1067 against a 546-bond tower.
+    /// `out` is resized to `bond_count` and filled; the return is how many the
+    /// solver actually wrote. Capacity is the caller's because `bond_count()`
+    /// reports the post-graph-reduction count, which is not the asset bond
+    /// indexing this array uses.
+    pub fn bond_healths(&self, bond_count: usize, out: &mut Vec<f32>) -> usize {
+        out.clear();
+        out.resize(bond_count, 0.0);
+        if bond_count == 0 {
+            return 0;
+        }
+        let n = bond_count;
+        let written = unsafe {
+            ffi::ext_stress_solver_get_bond_healths(self.handle, out.as_mut_ptr(), n as u32)
+        } as usize;
+        out.truncate(written);
+        written
+    }
+
     pub fn bond_stresses(&self) -> Vec<BondStressResult> {
         let n = self.bond_count() as usize;
         let mut c = vec![0.0f32; n];

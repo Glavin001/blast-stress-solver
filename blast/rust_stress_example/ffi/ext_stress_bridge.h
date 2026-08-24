@@ -272,6 +272,12 @@ uint32_t ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* 
 // shear is independent. All values are pressures comparable to the settings' elastic/fatal
 // limits, so limit/stress is the joint's safety factor. Broken or graph-absent bonds read 0.
 // Any output pointer may be null. Returns the number of entries written.
+/// Live per-bond health, indexed by ASSET bond index. Health crossing zero is
+/// the break; the fracture command stream reports damage, not breaks.
+uint32_t ext_stress_solver_get_bond_healths(const ExtStressSolverHandle* handle,
+                                            float* out_health,
+                                            uint32_t capacity);
+
 uint32_t ext_stress_solver_get_bond_stresses(const ExtStressSolverHandle* handle,
                                              float* out_compression,
                                              float* out_tension,

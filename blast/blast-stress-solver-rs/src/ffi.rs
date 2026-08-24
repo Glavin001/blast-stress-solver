@@ -346,6 +346,12 @@ extern "C" {
     pub(crate) fn ext_stress_solver_is_crush_enabled(handle: *const ExtStressSolverHandle) -> u8;
 
     // ---- Bond stress readback ----
+    pub(crate) fn ext_stress_solver_get_bond_healths(
+        handle: *const ExtStressSolverHandle,
+        out_health: *mut f32,
+        capacity: u32,
+    ) -> u32;
+
     pub(crate) fn ext_stress_solver_get_bond_stresses(
         handle: *const ExtStressSolverHandle,
         out_compression: *mut f32,
