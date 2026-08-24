@@ -138,6 +138,8 @@ pub struct Destructible<B: PhysicsBackend> {
     /// Last observed sleep level per island, so the settle/wake *edges* can be
     /// emitted. Only islands actually observed appear here.
     island_sleeping: HashMap<IslandSerial, bool>,
+    /// Unordered node pair -> bond index. See `DestructionEvent::BondBroken`.
+    bond_index: HashMap<(u32, u32), u32>,
     events: EventSink,
 }
 
@@ -171,6 +173,14 @@ impl<B: PhysicsBackend> Destructible<B> {
             serials: SerialAllocator::default(),
             body_serial: HashMap::new(),
             island_sleeping: HashMap::new(),
+            bond_index: bonds
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let (a, c) = (b.node0.min(b.node1), b.node0.max(b.node1));
+                    ((a, c), i as u32)
+                })
+                .collect(),
             events: EventSink::default(),
         };
 
@@ -493,7 +503,20 @@ impl<B: PhysicsBackend> Destructible<B> {
             // rendering damage needs exactly those.
             for c in &cmds {
                 for f in &c.bond_fractures {
+                    let key = (
+                        f.node_index0.min(f.node_index1),
+                        f.node_index0.max(f.node_index1),
+                    );
+                    // A break with no matching bond would be a pipeline bug,
+                    // not a data condition, so it is worth being loud about
+                    // rather than silently reporting bond 0 -- which is exactly
+                    // what trusting the solver's userdata would do.
+                    let Some(&bond) = self.bond_index.get(&key) else {
+                        debug_assert!(false, "broken bond {key:?} is not in the scenario");
+                        continue;
+                    };
                     self.events.push(DestructionEvent::BondBroken {
+                        bond,
                         node0: f.node_index0,
                         node1: f.node_index1,
                         health: f.health,

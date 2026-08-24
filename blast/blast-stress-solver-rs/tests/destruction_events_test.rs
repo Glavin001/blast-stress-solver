@@ -59,6 +59,8 @@ struct Ledger {
     /// for these, so a missed wake edge leaves geometry frozen on screen.
     asleep: HashSet<IslandSerial>,
     broken_bonds: usize,
+    broken: HashSet<u32>,
+    bond_pairs: HashMap<u32, (u32, u32)>,
     /// Every violation of the stream's own ordering contract.
     order_violations: Vec<String>,
 }
@@ -67,7 +69,15 @@ impl Ledger {
     fn apply(&mut self, events: &[DestructionEvent]) {
         for e in events {
             match e {
-                DestructionEvent::BondBroken { .. } => self.broken_bonds += 1,
+                DestructionEvent::BondBroken { bond, node0, node1, .. } => {
+                    self.broken_bonds += 1;
+                    // The bond index must agree with the node pair it names,
+                    // and no bond may break twice.
+                    if !self.broken.insert(*bond) {
+                        self.order_violations.push(format!("bond {bond} broke twice"));
+                    }
+                    self.bond_pairs.insert(*bond, (*node0, *node1));
+                }
                 DestructionEvent::IslandPromoted {
                     serial,
                     pose,
@@ -201,7 +211,24 @@ fn run<B: PhysicsBackend>(backend: &mut B, steps: usize) -> (Ledger, Destructibl
     (ledger, d)
 }
 
-fn check(engine: &str, ledger: &Ledger, expected_nodes: usize) {
+fn check(engine: &str, ledger: &Ledger, expected_nodes: usize, scenario: &ScenarioDesc) {
+    // Every reported bond index must name the pair the scenario has at that
+    // index. The solver's own `userdata` is 0 for every bond, so a pipeline
+    // that trusted it would report every break as bond 0 and this would catch
+    // it on the second break.
+    let (_, bonds) = scenario.to_solver_descs();
+    for (bond, (n0, n1)) in &ledger.bond_pairs {
+        let b = bonds
+            .get(*bond as usize)
+            .unwrap_or_else(|| panic!("[{engine}] bond {bond} is past the scenario's {} bonds", bonds.len()));
+        let got = (*n0.min(n1), *n0.max(n1));
+        let want = (b.node0.min(b.node1), b.node0.max(b.node1));
+        assert_eq!(
+            got, want,
+            "[{engine}] bond {bond} was reported for nodes {got:?} but the scenario has {want:?}"
+        );
+    }
+
     assert!(
         ledger.order_violations.is_empty(),
         "[{engine}] the stream broke its own ordering contract: {:#?}",
@@ -253,14 +280,14 @@ fn check(engine: &str, ledger: &Ledger, expected_nodes: usize) {
 fn the_event_stream_alone_tracks_every_chunk_on_rapier() {
     let mut w = RapierWorld::new(G);
     let (ledger, d) = run(&mut w, 90);
-    check("rapier", &ledger, d.node_count());
+    check("rapier", &ledger, d.node_count(), &scenario());
 }
 
 #[test]
 fn the_event_stream_alone_tracks_every_chunk_on_physx() {
     let mut w = PhysXWorld::new_cpu(G, 2).expect("physx cpu world");
     let (ledger, d) = run(&mut w, 90);
-    check("physx-cpu", &ledger, d.node_count());
+    check("physx-cpu", &ledger, d.node_count(), &scenario());
 }
 
 /// The reason poses are COM-frame rather than actor-frame.

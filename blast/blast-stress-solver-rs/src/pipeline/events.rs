@@ -75,6 +75,14 @@ pub enum DestructionEvent {
     /// emitted even when it causes none -- most broken bonds only weaken a
     /// structure, and a consumer showing damage needs those too.
     BondBroken {
+        /// Index into the scenario's bond list.
+        ///
+        /// Resolved by the pipeline from the node pair, because the solver's
+        /// own `userdata` field is not the bond index -- it is left at 0 for
+        /// every bond, so a consumer trusting it would report every break as
+        /// bond 0. Every consumer would otherwise build the same node-pair map,
+        /// which is the definition of something belonging here.
+        bond: u32,
         node0: u32,
         node1: u32,
         /// Health at the moment of breaking. Negative means the bond was
