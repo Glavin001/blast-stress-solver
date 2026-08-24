@@ -34,6 +34,9 @@ use crate::backend::{
 use crate::ext_stress_solver::ExtStressSolver;
 use crate::pipeline::motion_fit::{fit_rigid_motion, weighted_center_of_mass};
 use crate::pipeline::split_planner::{plan_split_migration, ExistingBodyState};
+use crate::pipeline::events::{
+    ChunkPlacement, DestructionEvent, EventSink, IslandSerial, SerialAllocator,
+};
 use crate::types::{ScenarioCollider, ScenarioDesc, SolverSettings, SplitEvent, Vec3};
 
 /// Tuning that is genuinely engine-independent.
@@ -63,6 +66,17 @@ impl Default for DestructibleConfig {
             max_new_bodies_per_step: usize::MAX,
         }
     }
+}
+
+/// Live motion of one island, COM-frame. See [`Destructible::island_poses`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IslandMotion {
+    pub serial: IslandSerial,
+    /// Translation is the world centre of mass, not the actor origin.
+    pub pose: Pose,
+    pub linvel: Vec3,
+    pub angvel: Vec3,
+    pub sleeping: bool,
 }
 
 /// What one step did.
@@ -95,6 +109,11 @@ pub struct Destructible<B: PhysicsBackend> {
     scratch_ids: Vec<B::BodyId>,
     scratch_com: Vec<Vec3>,
     pending: Vec<SplitEvent>,
+    /// Island identity, independent of engine handles. See
+    /// [`events`](crate::pipeline::events) for why handles cannot serve.
+    serials: SerialAllocator,
+    body_serial: HashMap<B::BodyId, IslandSerial>,
+    events: EventSink,
 }
 
 impl<B: PhysicsBackend> Destructible<B> {
@@ -124,6 +143,9 @@ impl<B: PhysicsBackend> Destructible<B> {
             scratch_ids: Vec::new(),
             scratch_com: Vec::new(),
             pending: Vec::new(),
+            serials: SerialAllocator::default(),
+            body_serial: HashMap::new(),
+            events: EventSink::default(),
         };
 
         // One body per actor (connected component), one shape per node.
@@ -177,7 +199,156 @@ impl<B: PhysicsBackend> Destructible<B> {
         d.cmds.clear();
         d.cmds.recompute_mass.extend(bodies.iter().copied());
         backend.apply(Phase::Topology, &d.cmds, &mut d.out).ok()?;
+
+        // Promotions are emitted only after the mass recompute above, because
+        // the COM read below is meaningless before it: both engines defer mass
+        // properties after a shape edit, so reading COM first returns the
+        // pre-insertion value and every offset would be wrong by exactly the
+        // island's COM.
+        d.scratch_ids.clear();
+        d.scratch_ids.extend(bodies.iter().copied());
+        backend.read_bodies(&d.scratch_ids, &mut d.soa);
+        let poses: Vec<Pose> = d.soa.pose[..bodies.len()].to_vec();
+        backend.read_center_of_mass(&d.scratch_ids, &mut d.scratch_com);
+        for (ai, ns) in actor_nodes.iter().enumerate() {
+            let serial = d.serials.next();
+            d.body_serial.insert(bodies[ai], serial);
+            d.emit_promotion(serial, poses[ai], d.scratch_com[ai], Vec3::ZERO, Vec3::ZERO, ns, IslandSerial::NONE);
+            for &node in ns {
+                d.events.push(DestructionEvent::ChunkMigrated {
+                    chunk: node,
+                    from: IslandSerial::NONE,
+                    to: serial,
+                });
+            }
+        }
         Some(d)
+    }
+
+    /// Member placements in an island's COM frame.
+    ///
+    /// Shared by promotion and recomposition on purpose: the two events differ
+    /// in what they mean, not in how a placement is computed, and letting them
+    /// drift apart would produce a stream that is self-consistent only until an
+    /// island is reused.
+    fn placements(&self, body_pose: Pose, engine_com: Vec3, nodes: &[u32]) -> Vec<ChunkPlacement> {
+        // node_world = body_pose.t + R*node_local, com_world = body_pose.t + R*com_local
+        //  => node_world = com_world + R*(node_local - com_local)
+        let com_local = body_pose.inverse_transform_point(engine_com);
+        nodes
+            .iter()
+            .map(|n| ChunkPlacement {
+                chunk: *n,
+                offset: self.node_local[*n as usize] - com_local,
+            })
+            .collect()
+    }
+
+    fn emit_recomposition(
+        &mut self,
+        serial: IslandSerial,
+        body_pose: Pose,
+        engine_com: Vec3,
+        nodes: &[u32],
+    ) {
+        let members = self.placements(body_pose, engine_com, nodes);
+        let mass: f32 = nodes.iter().map(|n| self.node_mass[*n as usize].max(0.0)).sum();
+        self.events.push(DestructionEvent::IslandRecomposed { serial, mass, members });
+    }
+
+    /// Emit one promotion, normalising the pose into the COM frame.
+    ///
+    /// Takes the engine COM rather than deriving one, because the two differ:
+    /// the library's COM is the mass-weighted mean of *authored* node
+    /// centroids, while the engine computes a volume centroid from hull
+    /// geometry. For boxes they coincide, which is how a volume-centroid COM
+    /// once shipped unnoticed; for authored convex hulls they differ by tens of
+    /// centimetres and every chunk draws displaced by exactly that difference.
+    fn emit_promotion(
+        &mut self,
+        serial: IslandSerial,
+        body_pose: Pose,
+        engine_com: Vec3,
+        linvel: Vec3,
+        angvel: Vec3,
+        nodes: &[u32],
+        provenance: IslandSerial,
+    ) {
+        let members = self.placements(body_pose, engine_com, nodes);
+        let mass: f32 = nodes.iter().map(|n| self.node_mass[*n as usize].max(0.0)).sum();
+        let anchored = nodes.iter().any(|n| self.support.contains(n));
+        self.events.push(DestructionEvent::IslandPromoted {
+            serial,
+            pose: Pose::new(engine_com, body_pose.rotation),
+            linvel,
+            angvel,
+            mass,
+            anchored,
+            provenance,
+            members,
+        });
+    }
+
+    /// Everything the pipeline decided since the last drain, in causal order.
+    ///
+    /// See [`events`](crate::pipeline::events) for the ordering contract: a
+    /// consumer applying this in order never sees a chunk on an island it has
+    /// not been told about.
+    pub fn drain_events(&mut self) -> Vec<DestructionEvent> {
+        self.events.drain()
+    }
+
+    /// Peek without draining -- for shadow-mode differs.
+    pub fn events(&self) -> &[DestructionEvent] {
+        self.events.as_slice()
+    }
+
+    /// The island a body currently belongs to.
+    pub fn island_of(&self, body: &B::BodyId) -> Option<IslandSerial> {
+        self.body_serial.get(body).copied()
+    }
+
+    /// Live COM-frame pose and velocity of every island, in one batched read.
+    ///
+    /// This is the per-tick half of the event contract. Events carry topology
+    /// -- what broke, what moved, what came into existence -- and are emitted
+    /// only when something changes. Motion is continuous, so it is sampled
+    /// instead; streaming a pose per island per event would put the whole
+    /// structure on the wire every tick, which is the cost the snapshot diff
+    /// had and the reason it was worth deleting.
+    ///
+    /// The pose returned is COM-frame, matching
+    /// [`IslandPromoted::pose`](crate::pipeline::events::DestructionEvent), so
+    /// a consumer composes it with the member offsets it already has:
+    ///
+    /// ```text
+    /// chunk_world = pose.translation + pose.rotation * member.offset
+    /// ```
+    ///
+    /// Returning the raw actor frame here instead would be wrong for exactly
+    /// the islands that reuse a parent body -- one per split -- which is the
+    /// hardest kind of bug to see, because most chunks would look right.
+    pub fn island_poses(&self, backend: &B) -> Vec<IslandMotion> {
+        let bodies = self.bodies();
+        let mut soa = BodyStateSoa::default();
+        backend.read_bodies(&bodies, &mut soa);
+        let mut com = Vec::new();
+        backend.read_center_of_mass(&bodies, &mut com);
+        let mut out: Vec<IslandMotion> = bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                Some(IslandMotion {
+                    serial: self.body_serial.get(b).copied()?,
+                    pose: Pose::new(com[i], soa.pose[i].rotation),
+                    linvel: soa.linvel[i],
+                    angvel: soa.angvel[i],
+                    sleeping: soa.is_sleeping(i),
+                })
+            })
+            .collect();
+        out.sort_by_key(|m| m.serial);
+        out
     }
 
     fn centre_of(&self, nodes: &[u32]) -> Vec3 {
@@ -245,6 +416,32 @@ impl<B: PhysicsBackend> Destructible<B> {
         self.node_body.get(node as usize).copied().flatten()
     }
 
+    /// Nodes in the authored structure, live or not.
+    pub fn node_count(&self) -> usize {
+        self.node_centroid.len()
+    }
+
+    /// Live world position of every node, indexed by node.
+    ///
+    /// `None` where a node has no body -- destroyed, or never embodied because
+    /// it fell below `min_child_nodes`. Composed from the body pose and the
+    /// stored local offset rather than queried per node, so it costs one
+    /// batched read regardless of how many chunks there are.
+    pub fn node_world_positions(&self, backend: &B) -> Vec<Option<Vec3>> {
+        let bodies = self.bodies();
+        let mut soa = BodyStateSoa::default();
+        backend.read_bodies(&bodies, &mut soa);
+        let pose_of: HashMap<B::BodyId, Pose> =
+            bodies.iter().copied().zip(soa.pose.iter().copied()).collect();
+        (0..self.node_centroid.len())
+            .map(|n| {
+                let body = self.node_body[n]?;
+                let pose = pose_of.get(&body)?;
+                Some(pose.transform_point(self.node_local[n]))
+            })
+            .collect()
+    }
+
     /// Apply an external force to a node, in the structure's authored frame.
     pub fn add_force(&mut self, node: u32, position: Vec3, force: Vec3) {
         self.solver.add_force(node, position, force, crate::types::ForceMode::Force);
@@ -264,6 +461,19 @@ impl<B: PhysicsBackend> Destructible<B> {
         if self.solver.overstressed_bond_count() > 0 {
             let cmds = self.solver.generate_fracture_commands();
             report.fractures = cmds.iter().map(|c| c.bond_fractures.len()).sum();
+            // Emitted here, ahead of the splits, and emitted for every broken
+            // bond rather than only the ones that sever an island. Most breaks
+            // merely weaken a structure without partitioning it, and a consumer
+            // rendering damage needs exactly those.
+            for c in &cmds {
+                for f in &c.bond_fractures {
+                    self.events.push(DestructionEvent::BondBroken {
+                        node0: f.node_index0,
+                        node1: f.node_index1,
+                        health: f.health,
+                    });
+                }
+            }
             if !cmds.is_empty() {
                 self.pending.extend(self.solver.apply_fracture_commands(&cmds));
             }
@@ -327,6 +537,19 @@ impl<B: PhysicsBackend> Destructible<B> {
         if parent_bodies.is_empty() {
             return total;
         }
+        // Pre-split island membership, captured before any edit rewrites
+        // `node_body`. A migration event is only truthful if `from` is what the
+        // chunk actually left, so it cannot be read back afterwards.
+        let prev_island: HashMap<u32, IslandSerial> = event
+            .children
+            .iter()
+            .flat_map(|c| c.nodes.iter())
+            .filter_map(|n| {
+                let b = self.node_body(*n)?;
+                Some((*n, self.body_serial.get(&b).copied().unwrap_or(IslandSerial::NONE)))
+            })
+            .collect();
+
         backend.read_bodies(&parent_bodies, &mut self.soa);
         let parent_state: HashMap<B::BodyId, (Pose, Vec3, Vec3, bool)> = parent_bodies
             .iter()
@@ -396,8 +619,16 @@ impl<B: PhysicsBackend> Destructible<B> {
         }
         let a = backend.apply(Phase::Topology, &self.cmds, &mut self.out).unwrap_or_default();
         total.bodies_created += a.bodies_created;
+        let mut promoted: Vec<(B::BodyId, IslandSerial, usize)> = Vec::new();
         for (i, ci) in create_order.iter().enumerate() {
-            target[*ci] = Some(self.out.created_bodies[i]);
+            let body = self.out.created_bodies[i];
+            target[*ci] = Some(body);
+            // A created body is a new island. A reused one keeps its parent's
+            // serial: the island did not become a different island by shedding
+            // chunks, and re-issuing would make every consumer re-key it.
+            let serial = self.serials.next();
+            self.body_serial.insert(body, serial);
+            promoted.push((body, serial, *ci));
         }
 
         // --- Topology: migrate shapes, then force a mass recompute ---
@@ -433,14 +664,93 @@ impl<B: PhysicsBackend> Destructible<B> {
         backend.read_center_of_mass(&self.scratch_ids, &mut self.scratch_com);
 
         self.cmds.clear();
+        let mut corrected_motion: HashMap<B::BodyId, (Vec3, Vec3)> = HashMap::new();
         for (i, (body, fit_center, lin, ang)) in fit_centers.iter().enumerate() {
             let engine_com = self.scratch_com[i];
             // linvel_at(engine_com) = linvel_at(fit_center) + ω × (engine_com − fit_center)
             let corrected = *lin + ang.cross(engine_com - *fit_center);
+            corrected_motion.insert(*body, (corrected, *ang));
             self.cmds.set_velocity.push((*body, corrected, *ang));
         }
         let a = backend.apply(Phase::Motion, &self.cmds, &mut self.out).unwrap_or_default();
         total.writes_elided += a.writes_elided;
+
+        // --- Emit: promotions first, so no migration lands on an unknown island ---
+        let com_of: HashMap<B::BodyId, Vec3> = self
+            .scratch_ids
+            .iter()
+            .copied()
+            .zip(self.scratch_com.iter().copied())
+            .collect();
+        // Every island this split touched, new or reused. A reused island is
+        // included because shedding chunks moved its centre of mass, so the
+        // offsets it was last given no longer describe it.
+        let touched: Vec<(B::BodyId, usize)> = (0..owned.len())
+            .filter_map(|ci| Some((target[ci]?, ci)))
+            .collect();
+        let new_body: HashMap<B::BodyId, (IslandSerial, usize)> =
+            promoted.iter().map(|(b, s, ci)| (*b, (*s, *ci))).collect();
+
+        self.scratch_ids.clear();
+        self.scratch_ids.extend(touched.iter().map(|(b, _)| *b));
+        if !self.scratch_ids.is_empty() {
+            backend.read_bodies(&self.scratch_ids, &mut self.soa);
+            let poses: Vec<Pose> = self.soa.pose[..touched.len()].to_vec();
+
+            // Promotions first: a recomposition or migration naming an island
+            // the consumer has not been told about is unusable.
+            for (i, (body, ci)) in touched.iter().enumerate() {
+                let Some((serial, _)) = new_body.get(body).copied() else { continue };
+                let ci = *ci;
+                let body = *body;
+                let nodes = owned[ci].nodes.clone();
+                // Provenance is the island most of these chunks came from. A
+                // split can draw from more than one parent when an earlier
+                // event in the same tick already moved chunks around, so this
+                // is a plurality rather than a lookup -- and ties break on the
+                // lower serial so the choice is reproducible.
+                let mut tally: HashMap<IslandSerial, usize> = HashMap::new();
+                for n in &nodes {
+                    if let Some(p) = prev_island.get(n) {
+                        *tally.entry(*p).or_default() += 1;
+                    }
+                }
+                let provenance = tally
+                    .into_iter()
+                    .max_by_key(|(s, c)| (*c, std::cmp::Reverse(*s)))
+                    .map(|(s, _)| s)
+                    .unwrap_or(IslandSerial::NONE);
+                let com = com_of.get(&body).copied().unwrap_or(poses[i].translation);
+                let (lin, ang) = corrected_motion.get(&body).copied().unwrap_or((Vec3::ZERO, Vec3::ZERO));
+                self.emit_promotion(serial, poses[i], com, lin, ang, &nodes, provenance);
+            }
+
+            // Then the reused islands, restated in their new COM frame.
+            for (i, (body, ci)) in touched.iter().enumerate() {
+                if new_body.contains_key(body) {
+                    continue;
+                }
+                let Some(serial) = self.body_serial.get(body).copied() else { continue };
+                let nodes = owned[*ci].nodes.clone();
+                let com = com_of.get(body).copied().unwrap_or(poses[i].translation);
+                self.emit_recomposition(serial, poses[i], com, &nodes);
+            }
+        }
+
+        for (ci, child) in owned.iter().enumerate() {
+            let Some(body) = target[ci] else { continue };
+            let to = self.body_serial.get(&body).copied().unwrap_or(IslandSerial::NONE);
+            for &n in &child.nodes {
+                let from = prev_island.get(&n).copied().unwrap_or(IslandSerial::NONE);
+                // Only a real change is an event. A chunk that stayed on the
+                // reused parent did not migrate, and emitting it anyway would
+                // make the stream's size track the structure rather than the
+                // damage -- which is the cost profile the snapshot diff had.
+                if from != to {
+                    self.events.push(DestructionEvent::ChunkMigrated { chunk: n, from, to });
+                }
+            }
+        }
 
         // --- Retire: parents that kept no nodes ---
         let kept: HashSet<B::BodyId> = target.iter().flatten().copied().collect();
@@ -450,6 +760,12 @@ impl<B: PhysicsBackend> Destructible<B> {
         retire.sort_by_key(|h| h.sort_key());
         for b in &retire {
             self.body_nodes.remove(b);
+            // Retirement is emitted last: every chunk has already been reported
+            // migrated off, so a consumer that drops the island here loses
+            // nothing. The serial is retired with it and never reissued.
+            if let Some(serial) = self.body_serial.remove(b) {
+                self.events.push(DestructionEvent::IslandRetired { serial });
+            }
         }
         self.cmds.remove_bodies.extend(retire);
         let a = backend.apply(Phase::Retire, &self.cmds, &mut self.out).unwrap_or_default();
