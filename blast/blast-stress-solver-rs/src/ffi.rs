@@ -154,6 +154,15 @@ pub(crate) struct FfiExtStressBondDesc {
 }
 
 /// Per-material stress limits (Pa). Negative tension/shear inherit compression.
+///
+/// **Layout is load-bearing.** This must mirror `ExtStressMaterialDesc` in
+/// `ext_stress_bridge.h` field-for-field. It previously declared only the six
+/// stress limits while the C struct carried nine further crush fields, so
+/// `ext_stress_solver_create` read 60 bytes out of a 24-byte Rust allocation —
+/// a 36-byte out-of-bounds read per material, with the crush parameters coming
+/// from whatever happened to follow in memory. `material_desc_matches_c_abi`
+/// in `tests/ffi_abi_test.rs` pins the size against
+/// `ext_stress_sizeof_material_desc()`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FfiExtStressMaterialDesc {
@@ -163,6 +172,47 @@ pub(crate) struct FfiExtStressMaterialDesc {
     pub tension_fatal_limit: f32,
     pub shear_elastic_limit: f32,
     pub shear_fatal_limit: f32,
+    /// Pa. `<= 0` disables crushing for this material.
+    pub crush_cap_pressure: f32,
+    /// Pa. Drucker-Prager intercept at p = 0.
+    pub crush_cohesion: f32,
+    /// dq/dp of the cone, dimensionless.
+    pub crush_friction_slope: f32,
+    /// J/m^3. Plastic work to fully comminute.
+    pub crush_energy: f32,
+    /// Pa*s. Perzyna viscosity; > 0 when enabled.
+    pub crush_viscosity: f32,
+    /// CEB DIF exponent. 0 disables.
+    pub crush_strain_rate_exponent: f32,
+    /// 1/s.
+    pub crush_reference_strain_rate: f32,
+    /// [0,1] respawned as rigid fragments.
+    pub crush_debris_mass_fraction: f32,
+    pub crush_debris_fragment_count: u32,
+}
+
+impl Default for FfiExtStressMaterialDesc {
+    /// All-zero crush fields, which leaves `crush_cap_pressure == 0.0` and so
+    /// keeps crushing disabled unless a caller opts in explicitly.
+    fn default() -> Self {
+        Self {
+            compression_elastic_limit: 1.0,
+            compression_fatal_limit: 2.0,
+            tension_elastic_limit: -1.0,
+            tension_fatal_limit: -1.0,
+            shear_elastic_limit: -1.0,
+            shear_fatal_limit: -1.0,
+            crush_cap_pressure: 0.0,
+            crush_cohesion: 0.0,
+            crush_friction_slope: 0.0,
+            crush_energy: 0.0,
+            crush_viscosity: 0.0,
+            crush_strain_rate_exponent: 0.0,
+            crush_reference_strain_rate: 0.0,
+            crush_debris_mass_fraction: 0.0,
+            crush_debris_fragment_count: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -206,6 +256,19 @@ pub(crate) struct FfiExtStressSplitEvent {
 }
 
 extern "C" {
+    /// ABI revision of the C bridge these declarations mirror.
+    pub(crate) fn ext_stress_abi_version() -> u32;
+
+    // ---- ABI size probes (used by tests/ffi_abi_test.rs to pin struct layout) ----
+    pub(crate) fn ext_stress_sizeof_material_desc() -> u32;
+    pub(crate) fn ext_stress_sizeof_ext_node_desc() -> u32;
+    pub(crate) fn ext_stress_sizeof_ext_bond_desc() -> u32;
+    pub(crate) fn ext_stress_sizeof_ext_settings() -> u32;
+    pub(crate) fn ext_stress_sizeof_ext_bond_fracture() -> u32;
+    pub(crate) fn ext_stress_sizeof_ext_fracture_commands() -> u32;
+    pub(crate) fn ext_stress_sizeof_actor() -> u32;
+    pub(crate) fn ext_stress_sizeof_ext_split_event() -> u32;
+
     pub(crate) fn ext_stress_solver_create(
         nodes: *const FfiExtStressNodeDesc,
         node_count: u32,
@@ -215,6 +278,90 @@ extern "C" {
         material_count: u32,
         settings: *const FfiExtStressSolverSettingsDesc,
     ) -> *mut ExtStressSolverHandle;
+
+    // ---- Per-bond material table (replaces the settings-borne limits) ----
+    pub(crate) fn ext_stress_solver_set_materials(
+        handle: *mut ExtStressSolverHandle,
+        materials: *const FfiExtStressMaterialDesc,
+        material_count: u32,
+    ) -> u8;
+
+    pub(crate) fn ext_stress_solver_set_node_materials(
+        handle: *mut ExtStressSolverHandle,
+        material_indices: *const u32,
+        node_count: u32,
+    ) -> u8;
+
+    // ---- Island-aware solving (Stage 4) ----
+    pub(crate) fn ext_stress_solver_set_island_aware(handle: *mut ExtStressSolverHandle, enabled: u8);
+    pub(crate) fn ext_stress_solver_get_island_aware(handle: *const ExtStressSolverHandle) -> u8;
+    pub(crate) fn ext_stress_solver_set_skip_settled(handle: *mut ExtStressSolverHandle, enabled: u8);
+    pub(crate) fn ext_stress_solver_get_skip_settled(handle: *const ExtStressSolverHandle) -> u8;
+    pub(crate) fn ext_stress_solver_island_count(handle: *const ExtStressSolverHandle) -> u32;
+    pub(crate) fn ext_stress_solver_islands_skipped(handle: *const ExtStressSolverHandle) -> u32;
+    pub(crate) fn ext_stress_solver_islands_total(handle: *const ExtStressSolverHandle) -> u32;
+
+    // ---- Batched per-actor gravity (one crossing instead of one per actor) ----
+    pub(crate) fn ext_stress_solver_add_all_actor_gravity(
+        handle: *mut ExtStressSolverHandle,
+        world_gravity_x: f32,
+        world_gravity_y: f32,
+        world_gravity_z: f32,
+        actor_rotations: *const f32,
+        rotation_count: u32,
+    ) -> u32;
+
+    // ---- Crush / comminution ----
+    pub(crate) fn ext_stress_solver_set_node_strain_rates(
+        handle: *mut ExtStressSolverHandle,
+        strain_rates: *const f32,
+        node_count: u32,
+        delta_time: f32,
+    ) -> u8;
+    pub(crate) fn ext_stress_solver_get_node_crush_damage(
+        handle: *const ExtStressSolverHandle,
+        out_damage: *mut f32,
+        capacity: u32,
+    ) -> u32;
+    pub(crate) fn ext_stress_solver_get_node_stress_invariants(
+        handle: *const ExtStressSolverHandle,
+        out_pressure: *mut f32,
+        out_deviator: *mut f32,
+        capacity: u32,
+    ) -> u32;
+    pub(crate) fn ext_stress_solver_get_node_crush_utilisation(
+        handle: *const ExtStressSolverHandle,
+        out_utilisation: *mut f32,
+        capacity: u32,
+    ) -> u32;
+    pub(crate) fn ext_stress_solver_get_crushed_nodes(
+        handle: *mut ExtStressSolverHandle,
+        out_node_indices: *mut u32,
+        capacity: u32,
+    ) -> u32;
+    pub(crate) fn ext_stress_solver_retire_crushed_node(
+        handle: *mut ExtStressSolverHandle,
+        node_index: u32,
+    ) -> u8;
+    pub(crate) fn ext_stress_solver_is_crush_enabled(handle: *const ExtStressSolverHandle) -> u8;
+
+    // ---- Bond stress readback ----
+    pub(crate) fn ext_stress_solver_get_bond_stresses(
+        handle: *const ExtStressSolverHandle,
+        out_compression: *mut f32,
+        out_tension: *mut f32,
+        out_shear: *mut f32,
+        capacity: u32,
+    ) -> u32;
+
+    // ---- CUDA stress-solve backend (orthogonal to the physics engine) ----
+    pub(crate) fn ext_stress_solver_set_gpu_accelerated(handle: *mut ExtStressSolverHandle, enabled: u8) -> u8;
+    pub(crate) fn ext_stress_solver_get_gpu_accelerated(handle: *const ExtStressSolverHandle) -> u8;
+    pub(crate) fn ext_stress_solver_set_gpu_cuda_context(handle: *mut ExtStressSolverHandle, cuda_context: *mut std::ffi::c_void);
+    pub(crate) fn ext_stress_solver_set_gpu_minimum_bond_count(handle: *mut ExtStressSolverHandle, bond_count: u32);
+    pub(crate) fn ext_stress_solver_gpu_solve_milliseconds(handle: *const ExtStressSolverHandle) -> f32;
+    pub(crate) fn ext_stress_solver_gpu_host_to_device_bytes(handle: *const ExtStressSolverHandle) -> u64;
+    pub(crate) fn ext_stress_solver_gpu_device_to_host_bytes(handle: *const ExtStressSolverHandle) -> u64;
 
     pub(crate) fn ext_stress_solver_get_bond_utilisations(
         handle: *const ExtStressSolverHandle,

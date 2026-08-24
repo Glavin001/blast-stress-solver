@@ -32,6 +32,10 @@ bench-support = ["rapier", "scenarios"]
 # `wasm32-unknown-unknown` target and a wasi C++ toolchain
 # (e.g. `libc++-18-dev-wasm32`) to be installed on the host.
 wasm-smoke = []
+# PhysX backend. Requires a PhysX 5 SDK: set PHYSX_ROOT (defaults to the usual
+# install location). Off by default so the crate still builds with nothing but
+# a C++ toolchain.
+physx = []
 
 [dependencies]
 rapier3d = { version = "0.30", default-features = false, features = ["dim3", "f32"], optional = true }

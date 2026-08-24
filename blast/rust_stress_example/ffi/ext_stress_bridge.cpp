@@ -1116,6 +1116,11 @@ ext_stress_solver_is_crush_enabled(const ExtStressSolverHandle* handlePtr)
     return (handle && handle->solver && handle->solver->isCrushEnabled()) ? 1U : 0U;
 }
 
+extern "C" uint32_t ext_stress_abi_version(void)
+{
+    return EXT_STRESS_ABI_VERSION;
+}
+
 extern "C" uint32_t ext_stress_sizeof_material_desc(void)
 {
     return static_cast<uint32_t>(sizeof(ExtStressMaterialDesc));

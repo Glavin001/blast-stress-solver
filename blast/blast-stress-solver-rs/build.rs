@@ -13,6 +13,11 @@ fn main() {
     let is_wasm_unknown = is_wasm && target == "wasm32-unknown-unknown";
 
     let blast = repo_root.join("blast");
+
+    // The PhysX backend is an independent native unit: it links the PhysX SDK
+    // and shares no translation units with the Blast bridge below.
+    #[cfg(feature = "physx")]
+    build_physx_backend(&blast);
     let ffi_dir = blast.join("rust_stress_example/ffi");
 
     // --- Source files ---
@@ -274,6 +279,64 @@ fn probe_libcxx_wasm_include() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Compile the PhysX backend and link the PhysX SDK.
+///
+/// Kept behind the `physx` feature so the crate's default build needs nothing
+/// but a C++ toolchain. `PHYSX_ROOT` overrides the SDK location; a missing SDK
+/// fails with the path it looked for rather than a wall of linker errors.
+#[cfg(feature = "physx")]
+fn build_physx_backend(blast: &Path) {
+    const DEFAULT_PHYSX_ROOT: &str = "/root/PhysX/physx/install/linux-clang/PhysX";
+    let root = PathBuf::from(
+        env::var_os("PHYSX_ROOT").unwrap_or_else(|| DEFAULT_PHYSX_ROOT.into()),
+    );
+    let include = root.join("include");
+    assert!(
+        include.join("PxPhysicsAPI.h").is_file(),
+        "PhysX SDK not found: expected {} (set PHYSX_ROOT)",
+        include.display()
+    );
+    let src = blast.join("physx_backend/physx_backend.cpp");
+    assert!(src.is_file(), "missing {}", src.display());
+    println!("cargo:rerun-if-env-changed=PHYSX_ROOT");
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", blast.join("physx_backend/physx_backend.h").display());
+
+    let mut b = cc::Build::new();
+    b.cpp(true)
+        .std("c++17")
+        .file(&src)
+        .include(blast.join("physx_backend"))
+        .include(&include)
+        .define("NDEBUG", None)
+        .define("PX_PHYSX_STATIC_LIB", None)
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unused-variable");
+    b.compile("blast_physx_backend");
+
+    // Static archives are order sensitive: dependents first.
+    let libdir = root.join("bin/linux.x86_64/release");
+    assert!(libdir.is_dir(), "PhysX libs not found at {}", libdir.display());
+    println!("cargo:rustc-link-search=native={}", libdir.display());
+    for lib in [
+        "PhysXExtensions_static_64",
+        "PhysX_static_64",
+        "PhysXPvdSDK_static_64",
+        "PhysXCooking_static_64",
+        "PhysXCommon_static_64",
+        "PhysXFoundation_static_64",
+    ] {
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
+    // PhysX dlopens libPhysXGpu_64.so at CUDA-context creation. Without an
+    // rpath the GPU scene fails to construct and the backend correctly reports
+    // "no GPU" -- which reads as a missing GPU rather than a missing link path.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libdir.display());
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=dylib=dl");
+    println!("cargo:rustc-link-lib=dylib=pthread");
 }
 
 // Silence dead_code on native builds where `Path` is unused by the wasm

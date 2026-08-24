@@ -66,6 +66,59 @@ impl ExtStressSolver {
         }
     }
 
+    /// Per-bond decomposed stress (compression, tension, shear) in Pascals.
+    ///
+    /// Reads the solver's own view rather than recomputing it, so it can be
+    /// compared directly against the material limits that decide fracture.
+    pub fn bond_stresses(&self) -> Vec<BondStressResult> {
+        let n = self.bond_count() as usize;
+        let mut c = vec![0.0f32; n];
+        let mut t = vec![0.0f32; n];
+        let mut sh = vec![0.0f32; n];
+        let written = unsafe {
+            ffi::ext_stress_solver_get_bond_stresses(
+                self.handle,
+                c.as_mut_ptr(),
+                t.as_mut_ptr(),
+                sh.as_mut_ptr(),
+                n as u32,
+            )
+        } as usize;
+        (0..written)
+            .map(|i| BondStressResult { compression: c[i], tension: t[i], shear: sh[i] })
+            .collect()
+    }
+
+    /// Whether the solver is running island-aware (per-component) solves.
+    pub fn island_aware(&self) -> bool {
+        unsafe { ffi::ext_stress_solver_get_island_aware(self.handle) != 0 }
+    }
+
+    /// Enable island-aware solving: solve each disconnected component
+    /// independently. Observationally identical to the whole-graph solve, and
+    /// far cheaper once activity is localized.
+    pub fn set_island_aware(&mut self, enabled: bool) {
+        unsafe { ffi::ext_stress_solver_set_island_aware(self.handle, enabled as u8) }
+    }
+
+    /// Skip components whose velocity inputs are unchanged since their last
+    /// solve and which already converged. A settled component re-solves the
+    /// same frame its load changes, so it is paused, never frozen.
+    pub fn set_skip_settled(&mut self, enabled: bool) {
+        unsafe { ffi::ext_stress_solver_set_skip_settled(self.handle, enabled as u8) }
+    }
+
+    /// Components in the live graph, and how many were skipped last update.
+    pub fn island_stats(&self) -> (u32, u32, u32) {
+        unsafe {
+            (
+                ffi::ext_stress_solver_island_count(self.handle),
+                ffi::ext_stress_solver_islands_total(self.handle),
+                ffi::ext_stress_solver_islands_skipped(self.handle),
+            )
+        }
+    }
+
     /// Update solver settings.
     pub fn set_settings(&mut self, settings: &SolverSettings) {
         let ffi_settings = to_ffi_settings(settings);
@@ -505,5 +558,9 @@ fn to_ffi_materials(s: &SolverSettings) -> [ffi::FfiExtStressMaterialDesc; 1] {
         tension_fatal_limit: s.tension_fatal_limit,
         shear_elastic_limit: s.shear_elastic_limit,
         shear_fatal_limit: s.shear_fatal_limit,
+        // Crush stays off here: `crush_cap_pressure == 0.0` disables it. These
+        // fields exist so the struct matches the C ABI byte-for-byte; opting
+        // into crushing goes through `set_materials`, not `SolverSettings`.
+        ..ffi::FfiExtStressMaterialDesc::default()
     }]
 }

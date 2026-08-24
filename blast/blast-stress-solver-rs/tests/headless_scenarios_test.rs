@@ -87,12 +87,40 @@ mod headless {
         ExtStressSolver::new(&nodes, &bonds, settings).unwrap()
     }
 
+    /// Reference concrete, matching `scene_pack::FALLBACK_LIMITS`.
+    ///
+    /// `strong_settings()` is not strong: its 270 kPa compression fatal limit is
+    /// roughly 100x weaker than concrete, and `examples/strong_wall_adjudication.rs`
+    /// measures this wall carrying 315,768 Pa of compression under its own
+    /// weight on frame 0. So the wall genuinely cannot stand on that material,
+    /// and the recorded "0 fractures" was asserting the solver ignore its own
+    /// limits.
+    ///
+    /// The gravity-stability cases want the opposite invariant -- an anchored
+    /// structure must not shed a single bond under gravity alone -- so they get
+    /// a material that is actually above the load rather than an assertion
+    /// lowered to whatever the weak material happened to produce. Every other
+    /// user of `strong_settings()` is left alone; those cases are tuned around
+    /// it and green.
+    fn gravity_stable_settings() -> SolverSettings {
+        SolverSettings {
+            max_solver_iterations_per_frame: 24,
+            compression_elastic_limit: 12.0e6,
+            compression_fatal_limit: 30.0e6,
+            tension_elastic_limit: 1.2e6,
+            tension_fatal_limit: 3.0e6,
+            shear_elastic_limit: 1.6e6,
+            shear_fatal_limit: 4.0e6,
+            ..SolverSettings::default()
+        }
+    }
+
     // === A. Gravity stability ===
 
     #[test]
     fn wall_stable_under_normal_gravity() {
         let wall = build_wall_scenario(&WallOptions::default());
-        let mut solver = make_solver(&wall, &strong_settings());
+        let mut solver = make_solver(&wall, &gravity_stable_settings());
         let r = simulate(&mut solver, gravity(), 120);
         assert_eq!(r.total_fractures, 0);
         assert_eq!(r.actor_count, 1);
@@ -101,7 +129,7 @@ mod headless {
     #[test]
     fn tower_stable_under_normal_gravity() {
         let tower = build_tower_scenario(&TowerOptions::default());
-        let mut solver = make_solver(&tower, &strong_settings());
+        let mut solver = make_solver(&tower, &gravity_stable_settings());
         let r = simulate(&mut solver, gravity(), 120);
         assert_eq!(r.total_fractures, 0);
         assert_eq!(r.actor_count, 1);

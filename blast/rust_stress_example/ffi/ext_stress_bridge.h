@@ -101,6 +101,17 @@ typedef struct ExtStressSplitEvent {
     uint32_t childCount;
 } ExtStressSplitEvent;
 
+/* ABI revision of this bridge. Bump whenever a struct crossing the boundary
+   changes layout or an existing function changes signature. Consumers that
+   compile these sources out-of-tree (the Rust crate, the CMake demo, and
+   applications that point a BLAST_ROOT at this checkout) assert against it, so
+   a layout drift fails loudly at startup instead of becoming an out-of-bounds
+   read. Additive changes -- new functions, new trailing struct fields that the
+   producer zero-fills -- do not require a bump. */
+#define EXT_STRESS_ABI_VERSION 1u
+
+uint32_t ext_stress_abi_version(void);
+
 /* materials may be null (with material_count 0) to get a single default
    material — every bond must then use index 0. Any bond whose material index
    is out of range of the effective table is an authoring error and creation

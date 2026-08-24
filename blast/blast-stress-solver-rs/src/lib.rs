@@ -55,6 +55,68 @@ mod wasm_runtime_shims;
 #[cfg(target_arch = "wasm32")]
 mod wasm_cxa_stubs;
 
+/// C-ABI struct sizes, as reported by the C bridge itself.
+///
+/// Exposed so `tests/ffi_abi_test.rs` can pin the Rust `#[repr(C)]` mirrors
+/// against the authoritative layout. These structs cross the boundary by
+/// pointer, so a field-count drift is a runtime out-of-bounds read rather than
+/// a compile error — see the note on `FfiExtStressMaterialDesc`.
+#[doc(hidden)]
+pub mod abi {
+    /// Byte sizes the C bridge reports for the descriptors Rust mirrors.
+    #[derive(Clone, Copy, Debug)]
+    pub struct CAbiSizes {
+        pub material_desc: usize,
+        pub settings_desc: usize,
+        pub bond_fracture: usize,
+        pub node_desc: usize,
+        pub bond_desc: usize,
+    }
+
+    /// ABI revision this crate was built against. Must equal the C bridge's
+    /// `EXT_STRESS_ABI_VERSION`; a mismatch means the crate and the native
+    /// sources come from different checkouts.
+    pub const EXPECTED_ABI_VERSION: u32 = 1;
+
+    /// The ABI revision the linked C bridge reports.
+    pub fn c_abi_version() -> u32 {
+        unsafe { crate::ffi::ext_stress_abi_version() }
+    }
+
+    /// Query the C bridge for its own struct sizes.
+    pub fn c_abi_sizes() -> CAbiSizes {
+        unsafe {
+            CAbiSizes {
+                material_desc: crate::ffi::ext_stress_sizeof_material_desc() as usize,
+                settings_desc: crate::ffi::ext_stress_sizeof_ext_settings() as usize,
+                bond_fracture: crate::ffi::ext_stress_sizeof_ext_bond_fracture() as usize,
+                node_desc: crate::ffi::ext_stress_sizeof_ext_node_desc() as usize,
+                bond_desc: crate::ffi::ext_stress_sizeof_ext_bond_desc() as usize,
+            }
+        }
+    }
+
+    /// Sizes of the Rust mirrors, for comparison against [`c_abi_sizes`].
+    pub fn rust_mirror_sizes() -> CAbiSizes {
+        use std::mem::size_of;
+        CAbiSizes {
+            material_desc: size_of::<crate::ffi::FfiExtStressMaterialDesc>(),
+            settings_desc: size_of::<crate::ffi::FfiExtStressSolverSettingsDesc>(),
+            bond_fracture: size_of::<crate::ffi::FfiExtStressBondFracture>(),
+            node_desc: size_of::<crate::ffi::FfiExtStressNodeDesc>(),
+            bond_desc: size_of::<crate::ffi::FfiExtStressBondDesc>(),
+        }
+    }
+}
+
+#[macro_use]
+mod bitflags_lite;
+
+pub mod backend;
+pub mod backends;
+pub mod pipeline;
+pub mod scene_pack;
+
 pub mod bond_stress;
 pub mod ext_stress_solver;
 pub mod stress_processor;
