@@ -113,6 +113,7 @@ pub mod abi {
 mod bitflags_lite;
 
 pub mod backend;
+pub mod ids;
 pub mod backends;
 pub mod pipeline;
 pub mod scene_pack;
