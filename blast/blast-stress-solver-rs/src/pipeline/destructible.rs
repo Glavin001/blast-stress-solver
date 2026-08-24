@@ -51,6 +51,26 @@ pub struct DestructibleConfig {
     pub gravity: Vec3,
     pub solver: SolverSettings,
     /// Children below this node count are not given a body.
+    /// Apply the strain energy released by a broken bond as a one-shot impulse
+    /// on the fragments that separated.
+    ///
+    /// **This is the pipeline's only source of fragment momentum, so it is on
+    /// by default.** Without it a fragment inherits nothing but the parent's
+    /// velocity field from the rigid-motion fit: correct continuity, but the
+    /// energy that broke the bond simply vanishes, and a building separates and
+    /// slides apart rather than bursting.
+    ///
+    /// The alternative and more physically sound source is resimulation, which
+    /// re-solves the impact contact against the fractured pieces. The two are
+    /// mutually exclusive -- resim *replaces* this path rather than
+    /// supplementing it, and running both double-counts the same released load.
+    /// Resim is not in the core pipeline yet; when it lands, enabling it must
+    /// clear this flag.
+    pub apply_excess_forces: bool,
+    /// Multiplier on the released load. 1.0 is the value the solver computed;
+    /// anything else is a tuning knob standing in front of the physics, so it
+    /// is worth being able to see in a config dump.
+    pub excess_force_scale: f32,
     pub min_child_nodes: usize,
     /// Cap on bodies created in one step; the remainder carries to the next.
     pub max_new_bodies_per_step: usize,
@@ -62,6 +82,8 @@ impl Default for DestructibleConfig {
             world_pose: Pose::IDENTITY,
             gravity: Vec3::new(0.0, -9.81, 0.0),
             solver: SolverSettings::default(),
+            apply_excess_forces: true,
+            excess_force_scale: 1.0,
             min_child_nodes: 1,
             max_new_bodies_per_step: usize::MAX,
         }
@@ -452,7 +474,7 @@ impl<B: PhysicsBackend> Destructible<B> {
     }
 
     /// Advance the stress solve and apply any resulting topology change.
-    pub fn step(&mut self, backend: &mut B, _dt: f32) -> StepReport {
+    pub fn step(&mut self, backend: &mut B, dt: f32) -> StepReport {
         let mut report = StepReport::default();
 
         // Gravity in each actor's current frame, so a rotated chunk feels it
@@ -490,7 +512,7 @@ impl<B: PhysicsBackend> Destructible<B> {
             }
             self.pending.remove(0);
             report.split_events += 1;
-            let applied = self.apply_split(backend, &event, &mut budget);
+            let applied = self.apply_split(backend, &event, &mut budget, dt);
             report.bodies_created += applied.bodies_created;
             report.shapes_reparented += applied.shapes_reparented;
             report.bodies_retired += applied.bodies_removed;
@@ -539,7 +561,13 @@ impl<B: PhysicsBackend> Destructible<B> {
         }
     }
 
-    fn apply_split(&mut self, backend: &mut B, event: &SplitEvent, budget: &mut usize) -> Applied {
+    fn apply_split(
+        &mut self,
+        backend: &mut B,
+        event: &SplitEvent,
+        budget: &mut usize,
+        dt: f32,
+    ) -> Applied {
         let mut total = Applied::default();
 
         // Children too small to embody are dropped rather than paying a full
@@ -696,13 +724,53 @@ impl<B: PhysicsBackend> Destructible<B> {
         let a = backend.apply(Phase::Motion, &self.cmds, &mut self.out).unwrap_or_default();
         total.writes_elided += a.writes_elided;
 
-        // --- Emit: promotions first, so no migration lands on an unknown island ---
+        // Engine COM per touched body, read above and reused by both the
+        // momentum impulse and the COM-frame placements below.
         let com_of: HashMap<B::BodyId, Vec3> = self
             .scratch_ids
             .iter()
             .copied()
             .zip(self.scratch_com.iter().copied())
             .collect();
+
+        // --- Momentum: the strain energy the broken bonds released ---
+        //
+        // Ordered here deliberately. Blast's contract is that this is read
+        // "after damage is applied to bonds and actors are split, but before
+        // the next call to update()", which this satisfies: the fracture
+        // commands were applied at the top of `step` and `update` does not run
+        // again until the next one.
+        //
+        // Applied as force x dt -- a one-shot impulse -- not as a standing
+        // force. A persistent force keeps re-accelerating the fragment every
+        // step afterwards, which is a fragment that gains energy forever from a
+        // bond that broke once.
+        if self.cfg.apply_excess_forces && dt > 0.0 {
+            self.cmds.clear();
+            let scale = dt * self.cfg.excess_force_scale;
+            for (ci, child) in owned.iter().enumerate() {
+                let Some(body) = target[ci] else { continue };
+                // The body's real centre of mass, not its origin. Blast
+                // converts the off-COM component of the released load into
+                // torque about the point given, so passing the actor origin
+                // instead would invent spin proportional to the lever arm --
+                // the same class of error that produced a 946 m/s fragment on
+                // the PhysX path.
+                let com = com_of.get(&body).copied().unwrap_or(Vec3::ZERO);
+                let Some((force, torque)) = self.solver.get_excess_forces(child.actor_index, com)
+                else {
+                    continue;
+                };
+                if force.magnitude_squared() > 1.0e-6 || torque.magnitude_squared() > 1.0e-6 {
+                    self.cmds.apply_impulse.push((body, force * scale, torque * scale));
+                }
+            }
+            if !self.cmds.apply_impulse.is_empty() {
+                let _ = backend.apply(Phase::Motion, &self.cmds, &mut self.out);
+            }
+        }
+
+        // --- Emit: promotions first, so no migration lands on an unknown island ---
         // Every island this split touched, new or reused. A reused island is
         // included because shedding chunks moved its centre of mass, so the
         // offsets it was last given no longer describe it.
