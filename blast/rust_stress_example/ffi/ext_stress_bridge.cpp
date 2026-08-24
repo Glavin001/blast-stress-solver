@@ -47,10 +47,38 @@ struct ExtStressSolverHandleImpl
     // (rebuildActorTable / apply_fracture_commands / reset). Replaces the former
     // O(total nodes) linear scan that ran once per injected force.
     std::vector<uint32_t> inputNodeToActorSlot;
+    // O(1) actorIndex -> slot lookup, rebuilt alongside inputNodeToActorSlot.
+    // Gravity injection asks for one actor per body every tick, so a linear
+    // scan here is quadratic in the body count of a collapsing structure --
+    // which is exactly the case that has to stay real time.
+    std::vector<uint32_t> actorIndexToSlot;
     bool actorIndexDirty{true};
     std::vector<uint8_t> splitScratch;
     std::vector<NvBlastActor*> splitActors;
     std::vector<NvBlastBondFractureData> fractureScratch;
+
+    // Chunk fracture commands produced by the last generate*() call, keyed by
+    // actorIndex. They are addressed by ASSET CHUNK INDEX, which is an internal
+    // detail of how this bridge lays out its single-level asset, so they are
+    // not handed to the caller -- apply_fracture_commands re-attaches them.
+    // Copied rather than pointed at: the solver's own buffer is only valid
+    // until its next generate*() call.
+    std::vector<std::pair<uint32_t, std::vector<NvBlastChunkFractureData>>> pendingChunkFractures;
+    std::vector<uint32_t> crushScratch;
+    std::vector<float> nodeScratch;
+    std::vector<NvBlastChunkFractureData> chunkFractureScratch;
+
+    const std::vector<NvBlastChunkFractureData>* findPendingChunkFractures(uint32_t actorIndex) const
+    {
+        for (const auto& entry : pendingChunkFractures)
+        {
+            if (entry.first == actorIndex)
+            {
+                return &entry.second;
+            }
+        }
+        return nullptr;
+    }
 };
 
 uint32_t mapGraphNodeToInput(const ExtStressSolverHandleImpl& handle, uint32_t graphIndex)
@@ -171,13 +199,28 @@ inline ExtStressSolverSettings toSettings(const ExtStressSolverSettingsDesc* set
 
     settings.maxSolverIterationsPerFrame = settingsDesc->max_solver_iterations_per_frame;
     settings.graphReductionLevel = settingsDesc->graph_reduction_level;
-    settings.compressionElasticLimit = settingsDesc->compression_elastic_limit;
-    settings.compressionFatalLimit = settingsDesc->compression_fatal_limit;
-    settings.tensionElasticLimit = settingsDesc->tension_elastic_limit;
-    settings.tensionFatalLimit = settingsDesc->tension_fatal_limit;
-    settings.shearElasticLimit = settingsDesc->shear_elastic_limit;
-    settings.shearFatalLimit = settingsDesc->shear_fatal_limit;
     return settings;
+}
+
+inline ExtStressMaterial toMaterial(const ExtStressMaterialDesc& desc)
+{
+    ExtStressMaterial material;
+    material.compressionElasticLimit = desc.compression_elastic_limit;
+    material.compressionFatalLimit = desc.compression_fatal_limit;
+    material.tensionElasticLimit = desc.tension_elastic_limit;
+    material.tensionFatalLimit = desc.tension_fatal_limit;
+    material.shearElasticLimit = desc.shear_elastic_limit;
+    material.shearFatalLimit = desc.shear_fatal_limit;
+    material.crush.capPressure = desc.crush_cap_pressure;
+    material.crush.cohesion = desc.crush_cohesion;
+    material.crush.frictionSlope = desc.crush_friction_slope;
+    material.crush.crushEnergy = desc.crush_energy;
+    material.crush.crushViscosity = desc.crush_viscosity;
+    material.crush.strainRateExponent = desc.crush_strain_rate_exponent;
+    material.crush.referenceStrainRate = desc.crush_reference_strain_rate;
+    material.crush.debrisMassFraction = desc.crush_debris_mass_fraction;
+    material.crush.debrisFragmentCount = desc.crush_debris_fragment_count;
+    return material;
 }
 
 extern "C" uint32_t ext_stress_sizeof_actor()
@@ -236,13 +279,17 @@ void rebuildActorTable(ExtStressSolverHandleImpl& handle)
     handle.actorIndexDirty = true;
 }
 
+void ensureActorIndex(ExtStressSolverHandleImpl& handle);
+
 ExtStressSolverHandleImpl::ActorEntry* findActorByIndex(ExtStressSolverHandleImpl& handle, uint32_t actorIndex)
 {
-    for (auto& entry : handle.actors)
+    ensureActorIndex(handle);
+    if (actorIndex < handle.actorIndexToSlot.size())
     {
-        if (entry.actorIndex == actorIndex)
+        const uint32_t slot = handle.actorIndexToSlot[actorIndex];
+        if (slot < handle.actors.size())
         {
-            return &entry;
+            return &handle.actors[slot];
         }
     }
     return nullptr;
@@ -273,8 +320,21 @@ void ensureActorIndex(ExtStressSolverHandleImpl& handle)
     }
 
     handle.inputNodeToActorSlot.assign(handle.inputToGraph.size(), UINT32_MAX);
+    uint32_t maxActorIndex = 0;
+    for (const auto& entry : handle.actors)
+    {
+        maxActorIndex = std::max(maxActorIndex, entry.actorIndex);
+    }
+    handle.actorIndexToSlot.assign(
+        handle.actors.empty() ? 0 : static_cast<size_t>(maxActorIndex) + 1, UINT32_MAX);
     for (uint32_t slot = 0; slot < handle.actors.size(); ++slot)
     {
+        const uint32_t actorIndex = handle.actors[slot].actorIndex;
+        if (actorIndex < handle.actorIndexToSlot.size()
+            && handle.actorIndexToSlot[actorIndex] == UINT32_MAX)
+        {
+            handle.actorIndexToSlot[actorIndex] = slot;
+        }
         for (uint32_t inputNode : handle.actors[slot].inputNodes)
         {
             // First writer wins, matching the prior loop's first-match semantics
@@ -311,11 +371,30 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
                         uint32_t node_count,
                         const ExtStressBondDesc* bonds,
                         uint32_t bond_count,
+                        const ExtStressMaterialDesc* materials,
+                        uint32_t material_count,
                         const ExtStressSolverSettingsDesc* settingsDesc)
 {
     if (!nodes || node_count == 0U || !bonds || bond_count == 0U)
     {
         return nullptr;
+    }
+    // Every bond must reference a material inside the effective table (one
+    // default entry when no table is supplied). An out-of-range index is an
+    // authoring error, reported loudly rather than clamped into silence.
+    const uint32_t effectiveMaterialCount =
+        (materials && material_count > 0U) ? material_count : 1U;
+    for (uint32_t i = 0; i < bond_count; ++i)
+    {
+        if (bonds[i].material >= effectiveMaterialCount)
+        {
+            kLogFn(
+                NvBlastMessage::Error,
+                "ext_stress_solver_create: bond material index out of range",
+                __FILE__,
+                __LINE__);
+            return nullptr;
+        }
     }
 
     ExtStressSolverHandleImpl* handle = new (std::nothrow) ExtStressSolverHandleImpl();
@@ -413,7 +492,17 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
     }
 
     NvBlastActorDesc actorDesc{};
-    actorDesc.uniformInitialBondHealth = 1.0f;
+    // Bond health is remaining contact area — pure geometry. Strength is the
+    // per-bond material's limits; ductility is that material's elastic->fatal
+    // band. Uniform health=1 once made every joint equally fragile regardless
+    // of authored area; do not reintroduce it.
+    std::vector<float> initialBondHealths(bond_count);
+    for (uint32_t i = 0; i < bond_count; ++i)
+    {
+        initialBondHealths[i] = bonds[i].area > 0.0f ? bonds[i].area : 1.0f;
+    }
+    actorDesc.initialBondHealths = initialBondHealths.data();
+    actorDesc.uniformInitialBondHealth = 0.0f;
     actorDesc.uniformInitialLowerSupportChunkHealth = 1.0f;
 
     const size_t actorScratchSize = NvBlastFamilyGetRequiredScratchForCreateFirstActor(handle->family, kLogFn);
@@ -437,6 +526,24 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
     {
         releaseHandle(handle);
         return nullptr;
+    }
+
+    if (materials && material_count > 0U)
+    {
+        std::vector<ExtStressMaterial> table(material_count);
+        for (uint32_t i = 0; i < material_count; ++i)
+        {
+            table[i] = toMaterial(materials[i]);
+        }
+        handle->solver->setMaterials(table.data(), material_count);
+    }
+    {
+        std::vector<uint32_t> bondMaterials(bond_count);
+        for (uint32_t i = 0; i < bond_count; ++i)
+        {
+            bondMaterials[i] = bonds[i].material;
+        }
+        handle->solver->setBondMaterials(bondMaterials.data(), bond_count);
     }
 
     const NvBlastSupportGraph supportGraph = NvBlastAssetGetSupportGraph(handle->asset, kLogFn);
@@ -535,10 +642,11 @@ ext_stress_solver_reset(ExtStressSolverHandle* handlePtr)
 namespace
 {
 // Shared force-application path used by both the single-force and batched
-// entry points so their behaviour can never diverge. Mirrors the original
-// ext_stress_solver_add_force logic exactly: prefer the actor that owns the
-// input node (so the force lands in the right family after splits); otherwise
-// fall back to the graph-node index.
+// entry points so their behaviour can never diverge. Bond-graph nodes keep
+// stable graph indices after actor splits, so inject those in O(1) rather than
+// asking addForce(actor, position) to scan every graph node in the actor for
+// every contact. Subsupport chunks have no graph index and retain the actor
+// position lookup as their fallback.
 inline void applyForceToInputNode(ExtStressSolverHandleImpl& handle,
                                   uint32_t node_index,
                                   const NvcVec3& pos,
@@ -552,6 +660,14 @@ inline void applyForceToInputNode(ExtStressSolverHandleImpl& handle,
 
     const uint32_t graphIndex = handle.inputToGraph[node_index];
 
+    if (graphIndex != UINT32_MAX)
+    {
+        // Position-aware: these are contact forces, and a per-chunk stress
+        // tensor is built from where they act, not just their resultant.
+        handle.solver->addForceAt(graphIndex, pos, force, mode);
+        return;
+    }
+
     if (auto* entry = findActorOwningInputNode(handle, node_index))
     {
         if (entry->actor)
@@ -559,11 +675,6 @@ inline void applyForceToInputNode(ExtStressSolverHandleImpl& handle,
             handle.solver->addForce(*entry->actor, pos, force, mode);
             return;
         }
-    }
-
-    if (graphIndex != UINT32_MAX)
-    {
-        handle.solver->addForce(graphIndex, force, mode);
     }
 }
 } // namespace
@@ -765,6 +876,265 @@ ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* handlePtr
 {
     const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
     return (handle && handle->solver) ? handle->solver->getOverstressedBondCount() : 0U;
+}
+
+extern "C" uint8_t
+ext_stress_solver_set_materials(ExtStressSolverHandle* handlePtr,
+                                const ExtStressMaterialDesc* materials,
+                                uint32_t material_count)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || !materials || material_count == 0U)
+    {
+        return 0;
+    }
+    std::vector<ExtStressMaterial> table(material_count);
+    for (uint32_t i = 0; i < material_count; ++i)
+    {
+        table[i] = toMaterial(materials[i]);
+    }
+    handle->solver->setMaterials(table.data(), material_count);
+    return 1;
+}
+
+extern "C" uint32_t
+ext_stress_solver_get_bond_utilisations(const ExtStressSolverHandle* handlePtr,
+                                        float* out_utilisation,
+                                        uint32_t capacity)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0U;
+    }
+    return handle->solver->getBondUtilisations(out_utilisation, capacity);
+}
+
+/* --- chunk crushing -------------------------------------------------------
+   The solver speaks GRAPH node indices; every C entry point speaks INPUT node
+   indices (the order nodes were supplied to create). These translate. */
+
+extern "C" uint8_t
+ext_stress_solver_set_node_materials(ExtStressSolverHandle* handlePtr,
+                                     const uint32_t* material_indices,
+                                     uint32_t node_count)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0;
+    }
+
+    const uint32_t graphCount = static_cast<uint32_t>(handle->graphNodeIndices.size());
+    std::vector<uint32_t> graphMaterials(graphCount, 0U);
+    if (material_indices)
+    {
+        const uint32_t count = std::min<uint32_t>(node_count, static_cast<uint32_t>(handle->inputToGraph.size()));
+        for (uint32_t input = 0; input < count; ++input)
+        {
+            const uint32_t graphIndex = handle->inputToGraph[input];
+            if (graphIndex < graphCount)
+            {
+                graphMaterials[graphIndex] = material_indices[input];
+            }
+        }
+    }
+    handle->solver->setNodeMaterials(graphMaterials.data(), graphCount);
+    return 1;
+}
+
+extern "C" uint8_t
+ext_stress_solver_set_node_strain_rates(ExtStressSolverHandle* handlePtr,
+                                        const float* strain_rates,
+                                        uint32_t node_count,
+                                        float delta_time)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0;
+    }
+
+    const uint32_t graphCount = static_cast<uint32_t>(handle->graphNodeIndices.size());
+    handle->nodeScratch.assign(graphCount, 0.0f);
+    if (strain_rates)
+    {
+        const uint32_t count = std::min<uint32_t>(node_count, static_cast<uint32_t>(handle->inputToGraph.size()));
+        for (uint32_t input = 0; input < count; ++input)
+        {
+            const uint32_t graphIndex = handle->inputToGraph[input];
+            if (graphIndex < graphCount)
+            {
+                handle->nodeScratch[graphIndex] = strain_rates[input];
+            }
+        }
+    }
+    handle->solver->setNodeStrainRates(handle->nodeScratch.data(), graphCount, delta_time);
+    return 1;
+}
+
+extern "C" uint32_t
+ext_stress_solver_get_node_crush_damage(const ExtStressSolverHandle* handlePtr,
+                                        float* out_damage,
+                                        uint32_t capacity)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || !out_damage)
+    {
+        return 0U;
+    }
+
+    const uint32_t graphCount = static_cast<uint32_t>(handle->graphNodeIndices.size());
+    std::vector<float> graphDamage(graphCount, 0.0f);
+    handle->solver->getNodeCrushDamage(graphDamage.data(), graphCount);
+
+    const uint32_t count = std::min<uint32_t>(capacity, static_cast<uint32_t>(handle->inputToGraph.size()));
+    for (uint32_t input = 0; input < count; ++input)
+    {
+        const uint32_t graphIndex = handle->inputToGraph[input];
+        out_damage[input] = graphIndex < graphCount ? graphDamage[graphIndex] : 0.0f;
+    }
+    return count;
+}
+
+extern "C" uint32_t
+ext_stress_solver_get_node_stress_invariants(const ExtStressSolverHandle* handlePtr,
+                                             float* out_pressure,
+                                             float* out_deviator,
+                                             uint32_t capacity)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || (!out_pressure && !out_deviator))
+    {
+        return 0U;
+    }
+
+    const uint32_t graphCount = static_cast<uint32_t>(handle->graphNodeIndices.size());
+    std::vector<float> pressure(graphCount, 0.0f);
+    std::vector<float> deviator(graphCount, 0.0f);
+    handle->solver->getNodeStressInvariants(pressure.data(), deviator.data(), graphCount);
+
+    const uint32_t count = std::min<uint32_t>(capacity, static_cast<uint32_t>(handle->inputToGraph.size()));
+    for (uint32_t input = 0; input < count; ++input)
+    {
+        const uint32_t graphIndex = handle->inputToGraph[input];
+        const bool valid = graphIndex < graphCount;
+        if (out_pressure) out_pressure[input] = valid ? pressure[graphIndex] : 0.0f;
+        if (out_deviator) out_deviator[input] = valid ? deviator[graphIndex] : 0.0f;
+    }
+    return count;
+}
+
+extern "C" uint32_t
+ext_stress_solver_get_node_crush_utilisation(const ExtStressSolverHandle* handlePtr,
+                                             float* out_utilisation,
+                                             uint32_t capacity)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || !out_utilisation)
+    {
+        return 0U;
+    }
+
+    const uint32_t graphCount = static_cast<uint32_t>(handle->graphNodeIndices.size());
+    std::vector<float> graphUtilisation(graphCount, 0.0f);
+    handle->solver->getNodeCrushUtilisation(graphUtilisation.data(), graphCount);
+
+    const uint32_t count = std::min<uint32_t>(capacity, static_cast<uint32_t>(handle->inputToGraph.size()));
+    for (uint32_t input = 0; input < count; ++input)
+    {
+        const uint32_t graphIndex = handle->inputToGraph[input];
+        out_utilisation[input] = graphIndex < graphCount ? graphUtilisation[graphIndex] : 0.0f;
+    }
+    return count;
+}
+
+extern "C" uint32_t
+ext_stress_solver_get_crushed_nodes(ExtStressSolverHandle* handlePtr,
+                                    uint32_t* out_node_indices,
+                                    uint32_t capacity)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || !out_node_indices || capacity == 0U)
+    {
+        return 0U;
+    }
+
+    handle->crushScratch.resize(capacity);
+    const uint32_t drained = handle->solver->getCrushedNodes(handle->crushScratch.data(), capacity);
+
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < drained; ++i)
+    {
+        const uint32_t input = mapGraphNodeToInput(*handle, handle->crushScratch[i]);
+        if (input != UINT32_MAX)
+        {
+            out_node_indices[written++] = input;
+        }
+    }
+    return written;
+}
+
+extern "C" uint8_t
+ext_stress_solver_retire_crushed_node(ExtStressSolverHandle* handlePtr, uint32_t node_index)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0U;
+    }
+
+    ensureActorIndex(*handle);
+    if (node_index >= handle->inputNodeToActorSlot.size())
+    {
+        return 0U;
+    }
+    const uint32_t slot = handle->inputNodeToActorSlot[node_index];
+    if (slot >= handle->actors.size())
+    {
+        return 0U;
+    }
+
+    auto& entry = handle->actors[slot];
+    if (!entry.actor || entry.inputNodes.size() != 1U || entry.inputNodes[0] != node_index)
+    {
+        // Still load-bearing for other chunks; retiring it would delete them too.
+        return 0U;
+    }
+
+    handle->solver->notifyActorDestroyed(*entry.actor);
+    NvBlastActorDeactivate(entry.actor, kLogFn);
+    handle->actors.erase(handle->actors.begin() + static_cast<std::ptrdiff_t>(slot));
+    handle->actorIndexDirty = true;
+    return 1U;
+}
+
+extern "C" uint8_t
+ext_stress_solver_is_crush_enabled(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver && handle->solver->isCrushEnabled()) ? 1U : 0U;
+}
+
+extern "C" uint32_t ext_stress_sizeof_material_desc(void)
+{
+    return static_cast<uint32_t>(sizeof(ExtStressMaterialDesc));
+}
+
+extern "C" uint32_t
+ext_stress_solver_get_bond_stresses(const ExtStressSolverHandle* handlePtr,
+                                    float* out_compression,
+                                    float* out_tension,
+                                    float* out_shear,
+                                    uint32_t capacity)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver)
+    {
+        return 0U;
+    }
+    return handle->solver->getBondStresses(
+        out_compression, out_tension, out_shear, capacity);
 }
 
 extern "C" uint32_t
@@ -1001,6 +1371,66 @@ ext_stress_solver_islands_total(const ExtStressSolverHandle* handlePtr)
     return (handle && handle->solver) ? handle->solver->getIslandsTotal() : 0U;
 }
 
+extern "C" uint8_t
+ext_stress_solver_set_gpu_accelerated(ExtStressSolverHandle* handlePtr, uint8_t enabled)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver
+            && handle->solver->setGpuAccelerated(enabled != 0))
+        ? 1U
+        : 0U;
+}
+
+extern "C" void
+ext_stress_solver_set_gpu_cuda_context(ExtStressSolverHandle* handlePtr, void* cudaContext)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setGpuCudaContext(cudaContext);
+    }
+}
+
+extern "C" void
+ext_stress_solver_set_gpu_minimum_bond_count(
+    ExtStressSolverHandle* handlePtr,
+    uint32_t bondCount)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setGpuMinimumBondCount(bondCount);
+    }
+}
+
+extern "C" uint8_t
+ext_stress_solver_get_gpu_accelerated(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver && handle->solver->getGpuAccelerated()) ? 1U : 0U;
+}
+
+extern "C" float
+ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuSolveMilliseconds() : 0.0f;
+}
+
+extern "C" uint64_t
+ext_stress_solver_gpu_host_to_device_bytes(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuHostToDeviceBytes() : 0U;
+}
+
+extern "C" uint64_t
+ext_stress_solver_gpu_device_to_host_bytes(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuDeviceToHostBytes() : 0U;
+}
+
 extern "C" uint32_t
 ext_stress_sizeof_ext_node_desc()
 {
@@ -1137,6 +1567,10 @@ extern "C" uint8_t ext_stress_solver_generate_fracture_commands_per_actor(const 
     // so that buffers[i] corresponds to llActors[i].
     const uint32_t generated = handle->solver->generateFractureCommandsPerActor(llActors.data(), buffers.data(), totalActors);
 
+    // Non-const: the chunk fracture cache is rebuilt from this generate pass.
+    auto* mutableHandle = const_cast<ExtStressSolverHandleImpl*>(handle);
+    mutableHandle->pendingChunkFractures.clear();
+
     for (uint32_t i = 0; i < generated && commandCount < command_capacity; ++i)
     {
         const NvBlastFractureBuffers& buffer = buffers[i];
@@ -1144,9 +1578,18 @@ extern "C" uint8_t ext_stress_solver_generate_fracture_commands_per_actor(const 
         const uint32_t actorIndex = entry ? entry->actorIndex : UINT32_MAX;
 
         const uint32_t bondCount = buffer.bondFractureCount;
-        if (bondCount == 0)
+        const uint32_t chunkCount = buffer.chunkFractureCount;
+        // A crush-only actor has no bond fractures but is still real work.
+        if (bondCount == 0 && chunkCount == 0)
         {
             continue;
+        }
+
+        if (chunkCount > 0 && buffer.chunkFractures)
+        {
+            std::vector<NvBlastChunkFractureData> chunks(
+                buffer.chunkFractures, buffer.chunkFractures + chunkCount);
+            mutableHandle->pendingChunkFractures.emplace_back(actorIndex, std::move(chunks));
         }
 
         if (bondOffset + bondCount > bond_capacity)
@@ -1175,8 +1618,9 @@ extern "C" uint8_t ext_stress_solver_generate_fracture_commands_per_actor(const 
 
         ExtStressFractureCommands cmd{};
         cmd.actorIndex = actorIndex;
-        cmd.bondFractures = bond_buffer + bondOffset;
+        cmd.bondFractures = bondCount > 0 ? bond_buffer + bondOffset : nullptr;
         cmd.bondFractureCount = bondCount;
+        cmd.chunkFractureCount = chunkCount;
 
         command_buffer[commandCount++] = cmd;
         bondOffset += bondCount;
@@ -1229,10 +1673,13 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
     {
         const ExtStressFractureCommands& command = command_buffer[commandIndex];
         const ExtStressBondFracture* fractures = command.bondFractures;
-        const uint32_t fractureCount = command.bondFractureCount;
+        const uint32_t fractureCount = (fractures != nullptr) ? command.bondFractureCount : 0U;
         const uint32_t actorIndex = command.actorIndex;
 
-        if (!fractures || fractureCount == 0U)
+        const std::vector<NvBlastChunkFractureData>* chunkFractures =
+            command.chunkFractureCount > 0U ? handle->findPendingChunkFractures(actorIndex) : nullptr;
+
+        if (fractureCount == 0U && chunkFractures == nullptr)
         {
             continue;
         }
@@ -1259,7 +1706,19 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
 
         NvBlastFractureBuffers buffers{};
         buffers.bondFractureCount = fractureCount;
-        buffers.bondFractures = handle->fractureScratch.data();
+        buffers.bondFractures = fractureCount > 0U ? handle->fractureScratch.data() : nullptr;
+
+        // Applying a chunk fracture zeroes every bond incident on that chunk
+        // and drops its node out of the island graph, which is exactly the
+        // structural meaning of "this chunk is gone". The caller still has to
+        // remove the corresponding body/shape from its own physics scene --
+        // Blast keeps a health-exhausted leaf chunk alive as an inert actor.
+        if (chunkFractures != nullptr)
+        {
+            handle->chunkFractureScratch = *chunkFractures;
+            buffers.chunkFractureCount = static_cast<uint32_t>(handle->chunkFractureScratch.size());
+            buffers.chunkFractures = handle->chunkFractureScratch.data();
+        }
 
         NvBlastActorApplyFracture(nullptr, actorEntry->actor, &buffers, kLogFn, nullptr);
 
@@ -1294,6 +1753,15 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
         if (entryIndex < handle->actors.size())
         {
             handle->actors.erase(handle->actors.begin() + static_cast<std::ptrdiff_t>(entryIndex));
+            // Erasing shifts every later entry left. The actorIndex -> slot
+            // table must be invalidated HERE, not just on push_back: a second
+            // fracture command in this same call would otherwise resolve its
+            // actor through stale slots and read a DIFFERENT actor's node
+            // list -- which is exactly how promotions ended up pairing chunks
+            // from buildings seventy metres apart. The old linear scan was
+            // immune because it read the live vector; the indexed lookup is
+            // only correct if every mutation marks it dirty.
+            handle->actorIndexDirty = true;
         }
 
         ExtStressSplitEvent* evt = nullptr;
@@ -1374,6 +1842,7 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
             }
 
             handle->actors.push_back(std::move(entry));
+            handle->actorIndexDirty = true;
         }
 
         if (evt)

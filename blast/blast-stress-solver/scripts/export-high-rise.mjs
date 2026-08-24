@@ -20,15 +20,82 @@ import { buildHighRiseScenario } from '../dist/scenarios.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const floorCount = Number.parseInt(process.env.HIGH_RISE_FLOORS ?? '9', 10);
+if (!Number.isInteger(floorCount) || floorCount < 1 || floorCount > 40) {
+  throw new Error('HIGH_RISE_FLOORS must be an integer between 1 and 40');
+}
+// Local-damage profile: weaken wall/infill attachments and harden foundation
+// anchors so projectiles tear facade panels instead of shoving the whole tower.
+const localDamage = process.env.HIGH_RISE_LOCAL_DAMAGE === '1';
+const outputStem =
+  floorCount === 9 && !localDamage
+    ? 'high-rise'
+    : `high-rise-${floorCount}f${localDamage ? '-local' : ''}`;
+// Local-damage authoring = civil load-path model, not collapse choreography.
+//
+// Real buildings stand because connection *capacity* exceeds gravity *demand*
+// along a designed path (slab → column → footing). They collapse when damage
+// removes a capacity link and demand redistributes onto neighbors that then
+// fail — progressive collapse.
+//
+// A multiplier here scales bond AREA, and bond area is the denominator of
+// stress (pressure = force / area) as well as the bond's damage pool (Blast
+// treats bond health as remaining contact area). So a multiplier is a claim
+// about *material* capacity relative to plain concrete, and it has to stay
+// within a range a material can actually justify:
+//
+//   > 1   rebar continuity / monolithic pour (frame joints)
+//   ~ 1   plain concrete, geometric truth
+//   < 1   drywall + light clip attachment (non-structural facade)
+//
+// These deliberately reuse the library's own DEFAULT_HIGH_RISE_MULTIPLIERS
+// band (foundation ~24, frame 7–14, drywall 0.015–0.03) instead of inventing a
+// local table. An earlier revision of this file used 2e5–1e6 here, which put
+// the frame ~7 orders of magnitude below its elastic limit: the skeleton could
+// not break under *any* impulse the sim can produce, so "partial destruction"
+// was satisfied by an indestructible structure rather than by a working load
+// path, and the demo needed a 650 t projectile and a 99x contact-force
+// multiplier to move anything at all. Keep these O(10).
+// Calibrated against a stated physical target, measured by the demo's
+// "gravity load path" report (peak stress / elastic limit under self-weight):
+//
+//   base anchor   safety factor ~30-70   (never the failure point)
+//   frame joints  safety factor ~5-15    (textbook structural design margin)
+//   facade        safety factor ~2-4     (the deliberate weak link)
+//
+// Every value sits within an order of magnitude of geometric truth, so a
+// multiplier is a claim about rebar continuity or a cladding track rather than
+// a way to make a joint unbreakable. Re-derive them by running any grid with
+// tiny projectiles and reading the report — do not guess.
+const LOCAL_DAMAGE_MULTIPLIERS = {
+  // Footing is a genuinely beefier section than the column it receives.
+  foundationColumn: 2.0,
+  foundationSkeleton: 1.5,
+  // Reinforced concrete: rebar carried through the joint roughly doubles the
+  // capacity of the plain-concrete section. Strong, and still breakable.
+  columnColumn: 2.0,
+  columnSlab: 2.0,
+  slabSlab: 1.5,
+  // Non-structural facade. These are BELOW geometric truth on purpose: the
+  // solver has one global material (concrete), so a drywall panel's weaker
+  // material is expressed as a smaller effective bonded area. The hard
+  // constraint is that a panel must still hang off its own track under
+  // gravity — an earlier revision used 0.015-0.03 here and the cladding tore
+  // itself off the frame during warmup (column~infill safety factor 0.03).
+  infillInfill: 1.0, // taped panel-to-panel seam over the full panel edge
+  slabInfill: 0.09, // panel head/base track into the slab band
+  frameInfill: 1.5, // full-height track against a column ~0.5 m^2
+};
+
 // Canonical output for the Rust/Bevy demo + Rust headless tests, plus a copy in the
 // library's own dist/ so the web demo can fetch it via the /vendor/blast-stress-solver
 // serve route. Both locations are git-ignored and regenerated from this script.
 const OUTPUT_PATHS = [
-  path.resolve(__dirname, '../../blast-stress-demo-rs/assets/scenes/high-rise.json'),
-  path.resolve(__dirname, '../dist/high-rise.json'),
+  path.resolve(__dirname, `../../blast-stress-demo-rs/assets/scenes/${outputStem}.json`),
+  path.resolve(__dirname, `../dist/${outputStem}.json`),
 ];
 
-const TITLE = 'High-Rise Apartment';
+const TITLE = `High-Rise Apartment ${floorCount}F`;
 
 // Scene defaults shared by both runtimes. `solver.limits` is the optional schema
 // extension carrying realistic, DECOUPLED concrete limits (Pa): strong in
@@ -53,7 +120,12 @@ const DEFAULTS = {
     debrisCollisionMode: 'all',
     friction: 0.25,
     restitution: 0.0,
-    contactForceScale: 30,
+    // Unity: the engine→solver path already converts a solved contact impulse
+    // (N·s) into a force (N) by dividing by dt, so the physically correct
+    // transfer is 1.0. Anything above that is an unexplained gain that has to
+    // be cancelled somewhere else (weaker limits, heavier projectiles) and
+    // destroys the correspondence between the sim and its own material model.
+    contactForceScale: 1,
     skipSingleBodies: false,
   },
   // CONTACT-DAMAGE layer (per-chunk health + splash) — the local-destruction knob.
@@ -154,8 +226,24 @@ function summarize(scenario) {
 }
 
 async function main() {
-  const scenario = buildHighRiseScenario();
+  const scenario = buildHighRiseScenario({
+    floorCount,
+    ...(localDamage ? { multipliers: LOCAL_DAMAGE_MULTIPLIERS } : {}),
+  });
   const pack = serializeScenePack(scenario);
+
+  if (localDamage) {
+    // World-fix only true ground anchors. Columns/slabs keep authored mass so
+    // gravity demand flows through the stress graph: remove a column → neighbors
+    // pick up load → joints that exceed capacity fail. Pinning columns to mass 0
+    // made them immortal kinematics (balls bounced; towers never crumbled).
+    const types = pack.scenario.nodeTypes ?? [];
+    for (let i = 0; i < pack.scenario.nodes.length; ++i) {
+      if (types[i] === 'foundation') {
+        pack.scenario.nodes[i].mass = 0;
+      }
+    }
+  }
 
   // Compact JSON: this is a generated, git-ignored artifact, so favor small size
   // and fast (re)generation over human-readable diffs.

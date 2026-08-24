@@ -481,6 +481,31 @@ group "sdk"
                 }
         filter {}
 
+    -- PhysX is intentionally optional so the portable Blast, Rust, and WASM
+    -- builds do not acquire a CUDA/PhysX dependency. Set PHYSX_ROOT while
+    -- generating projects to include the native CPU/GPU adapter.
+    local physx_root = os.getenv("PHYSX_ROOT")
+    if physx_root ~= nil and physx_root ~= "" then
+        project "NvBlastExtStressPhysX"
+            link_dependents({"NvBlast", "NvBlastGlobals", "NvBlastExtStress"})
+            blast_sdklib_standard_setup("extensions/stressphysx")
+            includedirs {
+                "include/lowlevel",
+                "include/globals",
+                "include/extensions/stress",
+                "include/shared/NvFoundation",
+                "source/sdk/lowlevel",
+                "source/shared/NsFoundation/include",
+                "rust_stress_example/ffi",
+                physx_root.."/include",
+            }
+            files {
+                "rust_stress_example/ffi/ext_stress_bridge.cpp",
+                "rust_stress_example/ffi/ext_stress_bridge.h",
+            }
+            defines { "PX_PHYSX_STATIC_LIB" }
+    end
+
     project "NvBlastExtSerialization"
         filter { "system:linux"}
             rules { "c++" }

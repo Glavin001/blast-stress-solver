@@ -19,20 +19,46 @@ typedef struct ExtStressNodeDesc {
 typedef struct ExtStressBondDesc {
     StressVec3 centroid;
     StressVec3 normal;
+    /* Geometry only: the bond's real contact patch in m^2. It is also the
+       damage pool. Strength is authored via `material`, never by scaling
+       area. */
     float area;
     uint32_t node0;
     uint32_t node1;
+    /* Index into the material table passed to ext_stress_solver_create. */
+    uint32_t material;
 } ExtStressBondDesc;
 
-typedef struct ExtStressSolverSettingsDesc {
-    uint32_t max_solver_iterations_per_frame;
-    uint32_t graph_reduction_level;
+/* Per-material stress limits (Pa). Negative tension/shear limits inherit the
+   corresponding compression limit (resolved inside the solver).
+
+   The crush_* fields are the optional CHUNK comminution model: bond limits
+   decide whether a JOINT fails, crush decides whether the CHUNK ITSELF is
+   ground up and leaves the simulation. Disabled unless crush_cap_pressure > 0,
+   so a caller that zero-initializes this struct gets the historical bond-only
+   behavior exactly. See ExtStressCrushProperties in NvBlastExtStressSolver.h
+   for the model. */
+typedef struct ExtStressMaterialDesc {
     float compression_elastic_limit;
     float compression_fatal_limit;
     float tension_elastic_limit;
     float tension_fatal_limit;
     float shear_elastic_limit;
     float shear_fatal_limit;
+    float crush_cap_pressure;         /* Pa. <= 0 disables crushing. */
+    float crush_cohesion;             /* Pa. Drucker-Prager intercept at p = 0. */
+    float crush_friction_slope;       /* dq/dp of the cone, dimensionless. */
+    float crush_energy;               /* J/m^3. Plastic work to fully comminute. */
+    float crush_viscosity;            /* Pa*s. Perzyna viscosity; > 0 when enabled. */
+    float crush_strain_rate_exponent; /* CEB DIF exponent. 0 disables. */
+    float crush_reference_strain_rate;/* 1/s. */
+    float crush_debris_mass_fraction; /* [0,1] respawned as rigid fragments. */
+    uint32_t crush_debris_fragment_count;
+} ExtStressMaterialDesc;
+
+typedef struct ExtStressSolverSettingsDesc {
+    uint32_t max_solver_iterations_per_frame;
+    uint32_t graph_reduction_level;
 } ExtStressSolverSettingsDesc;
 
 typedef struct ExtStressDebugLine {
@@ -53,6 +79,14 @@ typedef struct ExtStressFractureCommands {
     uint32_t actorIndex;
     ExtStressBondFracture* bondFractures;
     uint32_t bondFractureCount;
+    /* Number of fully-crushed chunks severed on this actor. The command payload
+       itself stays inside the bridge (it is addressed by asset chunk index,
+       which is an internal detail) and is re-attached automatically by
+       ext_stress_solver_apply_fracture_commands. A command with zero bond
+       fractures and a non-zero count here is still real work and must be
+       applied -- a chunk can pulverize while every joint around it holds.
+       Drain ext_stress_solver_get_crushed_nodes for the node-level events. */
+    uint32_t chunkFractureCount;
 } ExtStressFractureCommands;
 
 typedef struct ExtStressActor {
@@ -67,11 +101,95 @@ typedef struct ExtStressSplitEvent {
     uint32_t childCount;
 } ExtStressSplitEvent;
 
+/* materials may be null (with material_count 0) to get a single default
+   material — every bond must then use index 0. Any bond whose material index
+   is out of range of the effective table is an authoring error and creation
+   returns null. */
 ExtStressSolverHandle* ext_stress_solver_create(const ExtStressNodeDesc* nodes,
                                                 uint32_t node_count,
                                                 const ExtStressBondDesc* bonds,
                                                 uint32_t bond_count,
+                                                const ExtStressMaterialDesc* materials,
+                                                uint32_t material_count,
                                                 const ExtStressSolverSettingsDesc* settings);
+
+/* Replace the material table (e.g. sweep a global strength scale). Does not
+   rebuild the graph. Count must be >= 1 and must cover every bond's index. */
+uint8_t ext_stress_solver_set_materials(ExtStressSolverHandle* handle,
+                                        const ExtStressMaterialDesc* materials,
+                                        uint32_t material_count);
+
+/* Per-bond utilisation from the last update(), asset-bond-indexed: max over
+   modes of stress / that bond's OWN material elastic limit. 1/utilisation is
+   the joint's safety factor. Broken bonds read 0. Returns entries written. */
+uint32_t ext_stress_solver_get_bond_utilisations(const ExtStressSolverHandle* handle,
+                                                 float* out_utilisation,
+                                                 uint32_t capacity);
+
+uint32_t ext_stress_sizeof_material_desc(void);
+
+/* --- chunk crushing ------------------------------------------------------
+   All node indices below are INPUT node indices (the order nodes were supplied
+   to ext_stress_solver_create), matching every other node-indexed call. */
+
+/* Assign each node the material whose crush properties govern it. Out-of-range
+   indices clamp to 0; null resets every node to material 0. */
+uint8_t ext_stress_solver_set_node_materials(ExtStressSolverHandle* handle,
+                                             const uint32_t* material_indices,
+                                             uint32_t node_count);
+
+/* Supply each node's compaction strain rate (1/s) and the timestep the next
+   update() advances by. The solver has no strain measure of its own; with all
+   rates zero no crush damage ever accumulates. Null zeroes every rate. */
+uint8_t ext_stress_solver_set_node_strain_rates(ExtStressSolverHandle* handle,
+                                                const float* strain_rates,
+                                                uint32_t node_count,
+                                                float delta_time);
+
+/* Per-node accumulated crush damage in [0,1]. Returns entries written. */
+uint32_t ext_stress_solver_get_node_crush_damage(const ExtStressSolverHandle* handle,
+                                                 float* out_damage,
+                                                 uint32_t capacity);
+
+/* Per-node stress invariants from the last update(): pressure p (Pa, positive
+   in compression) and von Mises deviator q (Pa). Either pointer may be null.
+   Populated only for nodes on a crush-enabled material. */
+uint32_t ext_stress_solver_get_node_stress_invariants(const ExtStressSolverHandle* handle,
+                                                      float* out_pressure,
+                                                      float* out_deviator,
+                                                      uint32_t capacity);
+
+/* Per-node crush utilisation: max of q/(cohesion + frictionSlope*p) and
+   p/capPressure. 1 means at yield. The crush analogue of bond utilisation, and
+   readable whether or not anything is currently moving. Returns entries written. */
+uint32_t ext_stress_solver_get_node_crush_utilisation(const ExtStressSolverHandle* handle,
+                                                      float* out_utilisation,
+                                                      uint32_t capacity);
+
+/* Drain nodes that reached full crush damage. Each is reported exactly once.
+   The caller owns removing the corresponding body/shape from its scene. */
+uint32_t ext_stress_solver_get_crushed_nodes(ExtStressSolverHandle* handle,
+                                             uint32_t* out_node_indices,
+                                             uint32_t capacity);
+
+/* Retire a pulverized chunk's actor.
+
+   A chunk fracture severs the chunk structurally, but NvBlast never removes
+   anything: a health-exhausted leaf chunk stays alive as an inert actor
+   forever (NvBlastActor.cpp, partitionSingleLowerSupportChunk returns 0 before
+   reaching release()). This calls NvBlastActorDeactivate, the SDK's only
+   removal primitive, so the solver stops reporting an actor the caller has
+   already removed from its scene.
+
+   Only valid for an actor that consists solely of this node, which is what a
+   crushed chunk always becomes once its bonds are zeroed. Returns 0 if the
+   node is unknown or its actor still holds other nodes. */
+uint8_t ext_stress_solver_retire_crushed_node(ExtStressSolverHandle* handle,
+                                              uint32_t node_index);
+
+/* Whether crushing is active at all: some material enables it AND the graph is
+   unreduced. Crush requires graph_reduction_level 0. */
+uint8_t ext_stress_solver_is_crush_enabled(const ExtStressSolverHandle* handle);
 
 void ext_stress_solver_destroy(ExtStressSolverHandle* handle);
 
@@ -137,6 +255,17 @@ uint32_t ext_stress_solver_add_all_actor_gravity(ExtStressSolverHandle* handle,
 void ext_stress_solver_update(ExtStressSolverHandle* handle);
 
 uint32_t ext_stress_solver_overstressed_bond_count(const ExtStressSolverHandle* handle);
+
+// Per-bond stress from the last update(), indexed by ASSET bond index (same order as the
+// bonds passed to ext_stress_solver_create). Compression and tension are mutually exclusive;
+// shear is independent. All values are pressures comparable to the settings' elastic/fatal
+// limits, so limit/stress is the joint's safety factor. Broken or graph-absent bonds read 0.
+// Any output pointer may be null. Returns the number of entries written.
+uint32_t ext_stress_solver_get_bond_stresses(const ExtStressSolverHandle* handle,
+                                             float* out_compression,
+                                             float* out_tension,
+                                             float* out_shear,
+                                             uint32_t capacity);
 
 uint32_t ext_stress_solver_fill_debug_render(const ExtStressSolverHandle* handle,
                                              uint32_t mode,
@@ -206,6 +335,14 @@ uint8_t ext_stress_solver_get_skip_settled(const ExtStressSolverHandle* handle);
 uint32_t ext_stress_solver_islands_skipped(const ExtStressSolverHandle* handle);
 // Islands the last update partitioned the graph into for the per-island solve (islands_skipped <= this).
 uint32_t ext_stress_solver_islands_total(const ExtStressSolverHandle* handle);
+
+uint8_t ext_stress_solver_set_gpu_accelerated(ExtStressSolverHandle* handle, uint8_t enabled);
+void ext_stress_solver_set_gpu_cuda_context(ExtStressSolverHandle* handle, void* cuda_context);
+void ext_stress_solver_set_gpu_minimum_bond_count(ExtStressSolverHandle* handle, uint32_t bond_count);
+uint8_t ext_stress_solver_get_gpu_accelerated(const ExtStressSolverHandle* handle);
+float ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handle);
+uint64_t ext_stress_solver_gpu_host_to_device_bytes(const ExtStressSolverHandle* handle);
+uint64_t ext_stress_solver_gpu_device_to_host_bytes(const ExtStressSolverHandle* handle);
 
 uint32_t ext_stress_sizeof_ext_node_desc();
 uint32_t ext_stress_sizeof_ext_bond_desc();

@@ -168,11 +168,21 @@ const commonArgs = [
   '-DCOMPILE_VECTOR_INTRINSICS=0',
   '-DNDEBUG=1',
   '-std=c++17',
+  // The sources are C++ but the driver is invoked as `emcc`, which picks the C
+  // runtime at link time. Emscripten >= 4 stopped inferring this and fails with
+  // undefined `operator new` / `__cxa_throw` / `std::nothrow`; this restores
+  // the C++ runtime without changing the driver.
+  '-sDEFAULT_TO_CXX=1',
   '-O3',
   '-msimd128',            // Enable WASM SIMD auto-vectorization for scalar math loops
   '-sWASM=1',
   '-sMODULARIZE=1',
   '-sALLOW_MEMORY_GROWTH=1',
+  // Emscripten >= 4 trims the accepted incoming Module properties and aborts on
+  // anything undeclared. src/stress.ts supplies both of these: locateFile to
+  // resolve the .wasm next to the bundle, and wasmBinary to hand it the bytes
+  // directly under Node.
+  '-sINCOMING_MODULE_JS_API=[locateFile,wasmBinary,instantiateWasm,print,printErr,onAbort]',
   `-sEXPORTED_FUNCTIONS=[${exportedFunctions.map((fn) => `"${fn}"`).join(',')}]`,
   `-sEXPORTED_RUNTIME_METHODS=[${exportedRuntimeMethods.map((name) => `"${name}"`).join(',')}]`
 ];

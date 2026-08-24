@@ -50,7 +50,19 @@ pub struct LoadedScenePack {
     pub gravity: f32,
     pub material_scale: f32,
     /// Explicit decoupled stress limits if the pack provided them.
+    /// Equivalent to `materials[0].limits`; kept for existing callers.
     pub stress_limits: Option<StressLimits>,
+    /// Material table, always >= 1 entry. A v1 pack synthesizes one entry from
+    /// `solver.limits` so consumers see one shape regardless of pack version.
+    /// See SCENE_PACK_FORMAT.md.
+    pub materials: Vec<SceneMaterial>,
+    /// Authored node roles ("foundation", "column", "slab", "infill", ...),
+    /// parallel to `scenario.nodes`. Empty when the pack omits `nodeTypes`.
+    pub node_types: Vec<String>,
+    /// Per-bond index into `materials`, parallel to `scenario.bonds`.
+    pub bond_materials: Vec<u32>,
+    /// Pack schema version as loaded (1 or 2).
+    pub version: u32,
     pub skip_single_bodies: bool,
     pub small_body_damping: SmallBodyDampingOptions,
     pub debris_cleanup: DebrisCleanupOptions,
@@ -103,9 +115,21 @@ struct SolverDefaultsJson {
     /// these verbatim instead of scaling base ratios by `material_scale`.
     #[serde(default)]
     limits: Option<LimitsJson>,
+    /// v2: the material table. Required when `version` is 2.
+    #[serde(default)]
+    materials: Option<Vec<MaterialJson>>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MaterialJson {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(flatten)]
+    limits: LimitsJson,
+}
+
+#[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 struct LimitsJson {
     compression_elastic: f32,
@@ -114,6 +138,16 @@ struct LimitsJson {
     tension_fatal: f32,
     shear_elastic: f32,
     shear_fatal: f32,
+}
+
+/// One entry of the pack's material table. `name` is author-defined and exists
+/// for reports and debugging — there is no material enum and the library ships
+/// no material library; see SCENE_PACK_FORMAT.md. Ductility is the width of the
+/// (fatal - elastic) band, independent of raw strength.
+#[derive(Clone, Debug)]
+pub struct SceneMaterial {
+    pub name: String,
+    pub limits: StressLimits,
 }
 
 /// Explicit, decoupled stress limits (Pa) carried by a scene pack.
@@ -156,6 +190,9 @@ struct ScenarioJson {
     bonds: Vec<ScenarioBondJson>,
     node_sizes: Vec<Vec3Json>,
     node_colliders: Vec<NodeColliderJson>,
+    /// Optional authored node roles, parallel to `nodes`.
+    #[serde(default)]
+    node_types: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +204,9 @@ struct ScenarioNodeJson {
 
 #[derive(Deserialize)]
 struct ScenarioBondJson {
+    /// Material index into `defaults.solver.materials`; absent means 0.
+    #[serde(default)]
+    m: u32,
     node0: u32,
     node1: u32,
     centroid: Vec3Json,
@@ -234,9 +274,93 @@ pub fn load_scene_pack_file(path: &std::path::Path) -> Result<LoadedScenePack, S
 fn parse_scene_pack(payload: &str) -> Result<LoadedScenePack, String> {
     let pack: ScenePackJson = serde_json::from_str(payload)
         .map_err(|error| format!("invalid scene pack JSON: {error}"))?;
-    if pack.version != 1 {
-        return Err(format!("unsupported scene pack version {}", pack.version));
+    if pack.version != 1 && pack.version != 2 {
+        return Err(format!(
+            "unsupported scene pack version {} (see SCENE_PACK_FORMAT.md)",
+            pack.version
+        ));
     }
+
+    // Material table. v2 requires it; v1 synthesizes a single entry so every
+    // consumer sees one shape regardless of pack version.
+    let to_limits = |l: &LimitsJson| StressLimits {
+        compression_elastic: l.compression_elastic,
+        compression_fatal: l.compression_fatal,
+        tension_elastic: l.tension_elastic,
+        tension_fatal: l.tension_fatal,
+        shear_elastic: l.shear_elastic,
+        shear_fatal: l.shear_fatal,
+    };
+    let materials: Vec<SceneMaterial> = if pack.version >= 2 {
+        let table = pack
+            .defaults
+            .solver
+            .materials
+            .as_ref()
+            .filter(|table| !table.is_empty())
+            .ok_or_else(|| {
+                "scene pack v2 requires a non-empty defaults.solver.materials array".to_string()
+            })?;
+        table
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let limits = to_limits(&m.limits);
+                if !(limits.compression_elastic >= 0.0)
+                    || !(limits.compression_fatal >= limits.compression_elastic)
+                {
+                    return Err(format!(
+                        "material '{}' needs compressionFatal >= compressionElastic >= 0",
+                        m.name.clone().unwrap_or_else(|| i.to_string())
+                    ));
+                }
+                Ok(SceneMaterial {
+                    name: m.name.clone().unwrap_or_else(|| format!("material{i}")),
+                    limits,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else if let Some(limits) = pack.defaults.solver.limits.as_ref() {
+        vec![SceneMaterial {
+            name: "pack-limits".to_string(),
+            limits: to_limits(limits),
+        }]
+    } else {
+        // v1 without limits: the demo's material_scale-derived defaults apply.
+        // Named "unstated" so a report can say so rather than implying the pack
+        // authored a material.
+        vec![SceneMaterial {
+            name: "unstated".to_string(),
+            limits: StressLimits {
+                compression_elastic: 1.0e6,
+                compression_fatal: 2.0e6,
+                tension_elastic: 1.0e6,
+                tension_fatal: 2.0e6,
+                shear_elastic: 1.0e6,
+                shear_fatal: 2.0e6,
+            },
+        }]
+    };
+
+    // Out of range is a hard error, never a clamp — a silent clamp to material 0
+    // turns an authoring typo into a mysteriously strong joint.
+    let bond_materials: Vec<u32> = pack
+        .scenario
+        .bonds
+        .iter()
+        .enumerate()
+        .map(|(i, bond)| {
+            if bond.m as usize >= materials.len() {
+                return Err(format!(
+                    "scene pack bond {} references material {} but the table has {} entries",
+                    i,
+                    bond.m,
+                    materials.len()
+                ));
+            }
+            Ok(bond.m)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     // `nodeMeshes` may be omitted (empty) for all-box scenes; in that case meshes
     // are derived from the per-node collider/size below. When present, counts must match.
@@ -298,14 +422,15 @@ fn parse_scene_pack(payload: &str) -> Result<LoadedScenePack, String> {
         projectile_ttl_secs: pack.defaults.projectile.ttl_ms / 1000.0,
         gravity: pack.defaults.solver.gravity,
         material_scale: pack.defaults.solver.material_scale,
-        stress_limits: pack.defaults.solver.limits.as_ref().map(|l| StressLimits {
-            compression_elastic: l.compression_elastic,
-            compression_fatal: l.compression_fatal,
-            tension_elastic: l.tension_elastic,
-            tension_fatal: l.tension_fatal,
-            shear_elastic: l.shear_elastic,
-            shear_fatal: l.shear_fatal,
-        }),
+        stress_limits: if pack.version >= 2 || pack.defaults.solver.limits.is_some() {
+            Some(materials[0].limits)
+        } else {
+            None
+        },
+        materials,
+        bond_materials,
+        node_types: pack.scenario.node_types.clone(),
+        version: pack.version,
         skip_single_bodies: pack.defaults.physics.skip_single_bodies,
         small_body_damping: SmallBodyDampingOptions {
             mode: parse_optimization_mode(&pack.defaults.optimization.small_body_damping_mode)?,
@@ -460,6 +585,134 @@ impl From<Vec3Json> for SolverVec3 {
 #[cfg(test)]
 mod tests {
     use super::{load_embedded_scene_pack, parse_scene_pack, EmbeddedSceneKey};
+
+    /// Cross-runtime ScenePack conformance — Rust side.
+    ///
+    /// The ScenePack JSON is the contract that lets the same structure run
+    /// under TS/Rapier, Rust/Rapier and C++/PhysX so their APIs, behavior and
+    /// performance can be compared without the structure being a variable.
+    /// That only holds if all three loaders interpret the file identically.
+    ///
+    /// All three load the SAME fixture and assert the SAME digest, so a loader
+    /// that drifts fails its own suite. The digest pins interpretation of the
+    /// ASSET, not simulation results — Rapier and PhysX legitimately produce
+    /// different trajectories from identical input.
+    ///
+    /// See SCENE_PACK_FORMAT.md and the siblings:
+    ///   demos/blast-stress-demo/tests/scene_pack_conformance_test.cpp
+    ///   blast/blast-stress-solver/src/tests/scenePack.conformance.test.ts
+    mod conformance {
+        use super::super::parse_scene_pack;
+        use std::collections::BTreeMap;
+
+        const FIXTURE: &str = include_str!(
+            "../../blast-stress-solver/assets/conformance/structure-conformance-v2.json"
+        );
+
+        #[test]
+        fn matches_the_golden_digest() {
+            let pack = parse_scene_pack(FIXTURE).expect("fixture must load");
+
+            assert_eq!(pack.version, 2, "version");
+            assert_eq!(pack.scenario.nodes.len(), 7, "nodeCount");
+            assert_eq!(pack.scenario.bonds.len(), 7, "bondCount");
+            assert_eq!(pack.materials.len(), 3, "materialCount");
+            assert_eq!(
+                pack.materials.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                vec!["reinforced-concrete", "concrete", "drywall-track"],
+                "materialNames"
+            );
+
+            let support = pack.scenario.nodes.iter().filter(|n| n.mass == 0.0).count();
+            assert_eq!(support, 2, "supportNodeCount");
+
+            let total_mass: f32 = pack.scenario.nodes.iter().map(|n| n.mass).sum();
+            assert!((total_mass - 6000.0).abs() < 1e-3, "totalMassKg: {total_mass}");
+
+            let total_area: f32 = pack.scenario.bonds.iter().map(|b| b.area).sum();
+            assert!((total_area - 1.46).abs() < 1e-5, "totalBondAreaM2: {total_area}");
+
+            let mut per_material = vec![0usize; pack.materials.len()];
+            for m in &pack.bond_materials {
+                per_material[*m as usize] += 1;
+            }
+            assert_eq!(per_material, vec![2, 2, 3], "bondsPerMaterial");
+
+            let mut per_class: BTreeMap<String, usize> = BTreeMap::new();
+            for bond in &pack.scenario.bonds {
+                let mut pair = [
+                    pack.node_types[bond.node0 as usize].clone(),
+                    pack.node_types[bond.node1 as usize].clone(),
+                ];
+                pair.sort();
+                *per_class.entry(pair.join("~")).or_insert(0) += 1;
+            }
+            let expected: BTreeMap<String, usize> = [
+                ("column~foundation", 2usize),
+                ("column~infill", 2),
+                ("column~slab", 2),
+                ("infill~infill", 1),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+            assert_eq!(per_class, expected, "bondsPerJointClass");
+
+            assert!((pack.gravity - (-9.81)).abs() < 1e-6, "gravity");
+        }
+
+        #[test]
+        fn routes_material_indices_to_the_right_bonds() {
+            let pack = parse_scene_pack(FIXTURE).expect("fixture must load");
+            // Footings use the frame default; facade clips are drywall-track.
+            assert_eq!(pack.materials[pack.bond_materials[0] as usize].name, "reinforced-concrete");
+            assert_eq!(pack.materials[pack.bond_materials[4] as usize].name, "drywall-track");
+        }
+
+        #[test]
+        fn omitted_material_index_means_zero() {
+            // Bonds 0 and 1 carry no `m` field at all in the fixture.
+            let pack = parse_scene_pack(FIXTURE).expect("fixture must load");
+            assert_eq!(pack.bond_materials[0], 0);
+            assert_eq!(pack.bond_materials[1], 0);
+        }
+
+        #[test]
+        fn rejects_v2_without_materials() {
+            let mut json: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+            json["defaults"]["solver"].as_object_mut().unwrap().remove("materials");
+            let error = parse_scene_pack(&json.to_string()).unwrap_err();
+            assert!(error.contains("materials"), "unexpected error: {error}");
+        }
+
+        #[test]
+        fn rejects_out_of_range_bond_material_instead_of_clamping() {
+            // A silent clamp to material 0 would turn an authoring typo into a
+            // mysteriously strong joint — the bug class this format prevents.
+            let mut json: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+            json["scenario"]["bonds"][2]["m"] = serde_json::json!(99);
+            let error = parse_scene_pack(&json.to_string()).unwrap_err();
+            assert!(error.contains("references material 99"), "unexpected error: {error}");
+        }
+
+        #[test]
+        fn v1_packs_still_load_via_a_synthesized_table() {
+            let mut json: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+            let concrete = json["defaults"]["solver"]["materials"][1].clone();
+            json["version"] = serde_json::json!(1);
+            json["defaults"]["solver"]["limits"] = concrete;
+            json["defaults"]["solver"].as_object_mut().unwrap().remove("materials");
+            for bond in json["scenario"]["bonds"].as_array_mut().unwrap() {
+                bond.as_object_mut().unwrap().remove("m");
+            }
+
+            let pack = parse_scene_pack(&json.to_string()).expect("v1 must still load");
+            assert_eq!(pack.version, 1);
+            assert_eq!(pack.materials.len(), 1);
+            assert!(pack.bond_materials.iter().all(|m| *m == 0));
+            assert_eq!(pack.stress_limits.unwrap().compression_elastic, 12e6);
+        }
+    }
 
     /// A pack that omits `nodeMeshes` (all-box scene) and carries explicit limits —
     /// the shape produced by the high-rise generator. Meshes must be derived and the

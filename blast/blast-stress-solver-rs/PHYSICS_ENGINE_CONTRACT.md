@@ -159,6 +159,19 @@ The reference colliders are created with
 `ActiveHooks::FILTER_CONTACT_PAIRS | FILTER_INTERSECTION_PAIR` (see
 `build_node_collider`).
 
+**Verdict-integrity invariant.** Contact feedback is *pure force injection*:
+the engine adapter converts solved impulses to forces (impulse ÷ dt, unity
+gain) and hands them to the stress solver — and then it accepts whatever the
+solver decides. An adapter must never edit, veto, or amplify fracture
+commands (e.g. dropping breaks on bonds that touch support nodes, or forcing
+full-health damage on contacted bonds), and must never install persistent
+per-body velocity caps on fracture bodies. Joint strength is authored: bond
+area is geometry, material limits are strength. If a structure breaks too
+easily or refuses to break, the fix is authoring — not a post-solve filter.
+Every such filter that existed in an earlier PhysX port revision turned out
+to be compensation for authoring the solver could not yet express, and each
+one silently invalidated the destruction results it was protecting.
+
 ### 2.6 Collision filtering — *optional (debris scaling & split cleanliness)*
 
 Two independent filtering mechanisms are used:
@@ -288,3 +301,97 @@ To bring up the pipeline on a new engine, provide an equivalent of
 Everything else — the stress solve, actor/island bookkeeping, fracture command
 generation, split planning (`split_migrator`), and the rigid-motion fit
 (`motion_fit`) — is already engine-independent and reused as-is.
+
+---
+
+## 6. PhysX 5 C++ implementation
+
+The repository now contains a native implementation of this contract:
+
+- public adapter:
+  `blast/include/extensions/stressphysx/NvBlastExtStressPhysX.h`
+- implementation:
+  `blast/source/sdk/extensions/stressphysx/NvBlastExtStressPhysX.cpp`
+- CPU/GPU host and benchmark:
+  `demos/blast-stress-demo`
+
+The implementation maps the contract to PhysX as follows:
+
+- Every Blast actor owns one `PxRigidDynamic`; support-containing actors use
+  `PxRigidBodyFlag::eKINEMATIC`, which can be toggled in place when a split
+  changes support membership.
+- Every node owns one stable `PxShape`. A split calls `detachShape(..., false)`,
+  computes the new parent-local pose from the captured world pose, and calls
+  `attachShape` on the assigned child body. The shape is not recooked or
+  recreated during migration.
+- Cuboids use `PxBoxGeometry`. Convexes are cooked with
+  `PxCookingParams::buildGPUData = true` and reject more than 64 input points;
+  the ScenePack loader performs deterministic point reduction before adapter
+  creation.
+- Child mass, COM, mass frame, and inertia are recomputed from node geometry
+  with `PxMassProperties::sum`, then written with `setMass`,
+  `setCMassLocalPose`, and `setMassSpaceInertiaTensor`.
+- Parent shape world poses and point velocities are captured before topology
+  edits. Child state is fitted from those samples, with explicit telemetry for
+  maximum world-position and point-velocity drift.
+- `PxSimulationEventCallback` contact points/impulses are routed back to the
+  owning adapter shape, queued, and injected into the stress graph before the
+  next solve.
+- Stable adapter-owned 64-bit body and shape IDs provide deterministic mapping
+  independent of PhysX pointer values. Snapshot APIs expose the resulting
+  bodies/shapes for rendering and validation.
+- §2.8 snapshot/restore is implemented per destructible
+  (`captureResimulationSnapshot`/`restoreResimulationSnapshot`, keyed by stable
+  body ID) and orchestrated by the library-owned `ExtStressPhysXFrameStepper`
+  (`NvBlastExtStressPhysXResim.h`), which owns the full §4 loop:
+  simulate/fetchResults → tick → on fracture, rollback + re-step up to
+  `maxPasses` times, skipping the dead re-capture on the final pass. The
+  scene-wide rollback restores every `PxRigidDynamic` that existed at capture
+  (host projectiles included — the Rapier "every non-fixed body" semantics);
+  restore order matches the Rust reference (pose → velocities → force/torque
+  clear → sleep state), with two PhysX-specific rules: kinematic bodies are
+  pose-only (velocity writes are rejected), and the stored linvel is
+  re-expressed at the current COM (`linvel += ω × ΔCOM`) because a split moves
+  a reused body's mass frame. Bodies created since the capture carry
+  provenance (source parent + parent-relative pose) and are re-derived from
+  their parent's restored state, the TS `restoreCreatedBodyFromSource`
+  behavior. Excess forces and the separation impulse are disabled by the host
+  when resimulation is on — the re-solved contact is the momentum source.
+- GPU mode validates a `PxCudaContextManager`, enables
+  `PxSceneFlag::eENABLE_GPU_DYNAMICS`, selects `PxBroadPhaseType::eGPU`, cooks
+  GPU convex data, and sizes fixed GPU buffers from scene capacity.
+
+### Implementation status against the checklist
+
+Implemented: dynamic/kinematic body creation and removal, stable IDs, in-place
+support mutation, cuboid/convex shape creation, shape migration and local-pose
+updates, aggregate mass properties, pose/velocity/sleep access, contact impulse
+feedback, body wake-up, continuity checks, §2.8 body-state snapshot/restore
+with fracture-frame resimulation (`ExtStressPhysXFrameStepper`), CPU contract
+tests including a behavioral penetrate-vs-deflect resimulation probe, and
+strict GPU activation/capacity health checks.
+
+Deferred: sibling contact grace, debris collision tiers/TTL cleanup, and body
+pooling. Scoped (island-limited) resimulation is implemented in
+`ExtStressPhysXFrameStepper` (`scopedResim`, default on) using the island-exact
+algorithm: pre-fracture dynamic contact components seeded by this tick's
+fracture bodies; settled outsiders skip restore and sleep through the re-step;
+missing-seed graphs fall back to full-scene restore. Quiet-frame capture skip,
+snapshot buffer reuse, and optional `baseStepSleep` are available. Direct GPU
+batched motion state (`ExtStressPhysXDirectGpuMotionBuffer`) and contact-pair
+drain (`ExtStressPhysXDirectGpuContactDrain`) are available behind
+`useDirectGpuMotionState` / a Direct-GPU scene; topology edits still use the
+CPU mutation window, and production city demos keep CPU `onContact` inject
+unless the host opts into the Direct GPU path.
+
+Determinism caveat: the restore itself is exact, but PhysX solver warm-start
+and contact caches do not survive a rollback, so a re-stepped frame is
+output-faithful rather than bit-identical (and GPU PhysX is not bit-reproducible
+regardless). Tests assert behavioral outcomes, not bit equality — per the
+product guidance, do not chase it.
+
+The older `getBodySnapshots`/`getShapeSnapshots` APIs remain read-only
+integration output for rendering/validation and are unrelated to §2.8.
+
+For reproducible commands, recorder details, measured GPU/CPU results, and
+known limits, see `demos/blast-stress-demo/README.md`.
