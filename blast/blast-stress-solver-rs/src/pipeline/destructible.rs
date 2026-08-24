@@ -113,6 +113,9 @@ pub struct Destructible<B: PhysicsBackend> {
     /// [`events`](crate::pipeline::events) for why handles cannot serve.
     serials: SerialAllocator,
     body_serial: HashMap<B::BodyId, IslandSerial>,
+    /// Last observed sleep level per island, so the settle/wake *edges* can be
+    /// emitted. Only islands actually observed appear here.
+    island_sleeping: HashMap<IslandSerial, bool>,
     events: EventSink,
 }
 
@@ -145,6 +148,7 @@ impl<B: PhysicsBackend> Destructible<B> {
             pending: Vec::new(),
             serials: SerialAllocator::default(),
             body_serial: HashMap::new(),
+            island_sleeping: HashMap::new(),
             events: EventSink::default(),
         };
 
@@ -516,6 +520,23 @@ impl<B: PhysicsBackend> Destructible<B> {
             let local_g = self.soa.pose[i].rotation.rotate_inverse(self.cfg.gravity);
             self.solver.add_actor_gravity(*actor, local_g);
         }
+
+        // Settle and wake edges, folded into the read above rather than paying
+        // for a second one. `collect_actor_reps` yields exactly one body per
+        // actor, and an actor is an island, so this already covers every island
+        // -- and on an idle frame it costs nothing extra at all.
+        for (i, body) in self.scratch_ids.iter().enumerate() {
+            let Some(serial) = self.body_serial.get(body).copied() else { continue };
+            let sleeping = self.soa.is_sleeping(i);
+            match self.island_sleeping.insert(serial, sleeping) {
+                // First observation is a level, not an edge. Emitting a settle
+                // here would fire for every anchored island on tick one.
+                None => {}
+                Some(was) if was == sleeping => {}
+                Some(false) => self.events.push(DestructionEvent::IslandSettled { serial }),
+                Some(true) => self.events.push(DestructionEvent::IslandWoke { serial }),
+            }
+        }
     }
 
     fn apply_split(&mut self, backend: &mut B, event: &SplitEvent, budget: &mut usize) -> Applied {
@@ -764,6 +785,9 @@ impl<B: PhysicsBackend> Destructible<B> {
             // migrated off, so a consumer that drops the island here loses
             // nothing. The serial is retired with it and never reissued.
             if let Some(serial) = self.body_serial.remove(b) {
+                // Dropped from the sleep map too: serials are never reused, so
+                // keeping it would only grow the map for the rest of the match.
+                self.island_sleeping.remove(&serial);
                 self.events.push(DestructionEvent::IslandRetired { serial });
             }
         }

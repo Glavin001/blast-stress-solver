@@ -55,6 +55,9 @@ struct Ledger {
     offset: HashMap<(IslandSerial, u32), Vec3>,
     live: HashSet<IslandSerial>,
     retired: HashSet<IslandSerial>,
+    /// Islands the stream says are at rest. A consumer stops sending updates
+    /// for these, so a missed wake edge leaves geometry frozen on screen.
+    asleep: HashSet<IslandSerial>,
     broken_bonds: usize,
     /// Every violation of the stream's own ordering contract.
     order_violations: Vec<String>,
@@ -137,10 +140,23 @@ impl Ledger {
                         }
                     }
                     self.live.remove(serial);
+                    self.asleep.remove(serial);
                     self.retired.insert(*serial);
                 }
-                DestructionEvent::IslandSettled { .. }
-                | DestructionEvent::ChunkDestroyed { .. } => {}
+                DestructionEvent::IslandSettled { serial } => {
+                    if !self.live.contains(serial) {
+                        self.order_violations
+                            .push(format!("island {serial:?} settled while not live"));
+                    }
+                    self.asleep.insert(*serial);
+                }
+                DestructionEvent::IslandWoke { serial } => {
+                    if !self.asleep.remove(serial) {
+                        self.order_violations
+                            .push(format!("island {serial:?} woke without having settled"));
+                    }
+                }
+                DestructionEvent::ChunkDestroyed { .. } => {}
             }
         }
     }

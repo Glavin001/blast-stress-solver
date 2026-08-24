@@ -13,15 +13,14 @@
 //!
 //! # Not yet produced
 //!
-//! Two variants are declared and never emitted, and are called out here rather
-//! than left for a consumer to discover by waiting for one:
+//! One variant is declared and never emitted, called out here rather than left
+//! for a consumer to discover by waiting for one:
 //!
 //! - [`DestructionEvent::ChunkDestroyed`] needs crush/comminution, which is not
 //!   in the core pipeline yet.
-//! - [`DestructionEvent::IslandSettled`] needs the settle edge.
 //!
-//! They are declared now because their shape is settled and consumers can match
-//! exhaustively today, but nothing synthesises them. A fabricated event would be
+//! It is declared now because its shape is settled and consumers can match
+//! exhaustively today, but nothing synthesises it. A fabricated event would be
 //! worse than a missing one -- the same reason `DestructionStats` refuses to
 //! report a figure it cannot produce.
 //!
@@ -136,9 +135,31 @@ pub enum DestructionEvent {
     /// A chunk was comminuted and is gone. Distinct from migration: nothing
     /// receives it.
     ChunkDestroyed { chunk: u32 },
-    /// The island is definitively at rest. This is the edge every networked
-    /// consumer needs in order to stop sending updates for it.
+    /// The island is definitively at rest -- the edge every networked consumer
+    /// needs in order to stop sending updates for it.
+    ///
+    /// The trigger is the *engine's own* sleep transition, not a threshold this
+    /// library invented. That distinction is the whole point. The alternative
+    /// on offer was a tracker that force-slept a body a fixed number of ticks
+    /// after promotion regardless of whether it had stopped moving, with an
+    /// early exit on a speed floor. The deadline half of that is not a settle
+    /// signal at all: it declares "at rest" about a body that is demonstrably
+    /// still moving, and the consumer then stops updating something the physics
+    /// is still integrating. It is not carried forward.
+    ///
+    /// Engine sleep is a real predicate over real state, and both engines
+    /// already compute it. Where their sleep *thresholds* differ, that is a
+    /// tuning difference between engines, not a difference in what "at rest"
+    /// means.
     IslandSettled { serial: IslandSerial },
+    /// The island started moving again after having settled.
+    ///
+    /// Emitted for the same reason as its opposite: a consumer that stopped
+    /// sending updates needs to be told to resume, and deriving the edge is
+    /// exactly the kind of per-tick bookkeeping every consumer would otherwise
+    /// reimplement. [`IslandMotion::sleeping`](crate::pipeline::IslandMotion)
+    /// carries the level; these two carry the edges.
+    IslandWoke { serial: IslandSerial },
 }
 
 /// Ordered event sink, drained by the host once per step.
@@ -226,7 +247,8 @@ impl DestructionEvent {
             DestructionEvent::IslandPromoted { serial, .. }
             | DestructionEvent::IslandRecomposed { serial, .. }
             | DestructionEvent::IslandRetired { serial }
-            | DestructionEvent::IslandSettled { serial } => Some(*serial),
+            | DestructionEvent::IslandSettled { serial }
+            | DestructionEvent::IslandWoke { serial } => Some(*serial),
             DestructionEvent::ChunkMigrated { to, .. } => Some(*to),
             DestructionEvent::BondBroken { .. } | DestructionEvent::ChunkDestroyed { .. } => None,
         }
