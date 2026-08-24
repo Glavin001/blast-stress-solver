@@ -25,6 +25,7 @@ pub fn to_scenario_desc(pack: &ScenePack) -> ScenarioDesc {
             centroid: b.centroid,
             normal: b.normal,
             area: b.area,
+        material: b.material,
         })
         .collect();
 

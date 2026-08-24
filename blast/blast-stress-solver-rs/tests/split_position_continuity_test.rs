@@ -55,8 +55,7 @@ fn beam_scenario(n: usize, weak_bond: usize) -> ScenarioDesc {
             node1: (i + 1) as u32,
             centroid: Vec3::new(i as f32 + 0.5, 5.0, 0.0),
             normal: Vec3::new(1.0, 0.0, 0.0),
-            area: if i == weak_bond { 0.01 } else { 50.0 },
-        })
+            area: if i == weak_bond { 0.01 } else { 50.0 }, material: 0, })
         .collect();
     ScenarioDesc {
         nodes,

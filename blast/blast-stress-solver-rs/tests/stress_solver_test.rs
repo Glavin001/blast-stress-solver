@@ -26,22 +26,19 @@ fn triangle_nodes_and_bonds() -> (Vec<NodeDesc>, Vec<BondDesc>) {
             normal: Vec3::new(0.55, 0.83, 0.0),
             area: 0.6,
             node0: 0,
-            node1: 2,
-        },
+            node1: 2, material: 0, },
         BondDesc {
             centroid: Vec3::new(0.5, 0.75, 0.0),
             normal: Vec3::new(-0.55, 0.83, 0.0),
             area: 0.6,
             node0: 1,
-            node1: 2,
-        },
+            node1: 2, material: 0, },
         BondDesc {
             centroid: Vec3::new(0.0, 0.0, 0.0),
             normal: Vec3::new(1.0, 0.0, 0.0),
             area: 0.9,
             node0: 0,
-            node1: 1,
-        },
+            node1: 1, material: 0, },
     ];
 
     (nodes, bonds)
@@ -567,8 +564,7 @@ fn ext_solver_empty_input_rejected() {
         normal: Vec3::new(0.0, 1.0, 0.0),
         area: 1.0,
         node0: 0,
-        node1: 1,
-    }];
+        node1: 1, material: 0, }];
     assert!(ExtStressSolver::new(&[], &bonds, &settings).is_none());
 }
 

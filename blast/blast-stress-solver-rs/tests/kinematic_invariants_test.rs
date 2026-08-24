@@ -79,8 +79,7 @@ fn pair_scenario(node1_collider: Option<ScenarioCollider>) -> ScenarioDesc {
             node1: 1,
             centroid: Vec3::new(0.0, 0.5, 0.0),
             normal: Vec3::new(1.0, 0.0, 0.0),
-            area: 0.25,
-        }],
+            area: 0.25, material: 0, }],
         node_sizes: vec![size, size],
         collider_shapes: vec![None, node1_collider],
     }

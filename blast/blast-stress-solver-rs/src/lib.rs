@@ -26,6 +26,10 @@
 //!         area: 1.0,
 //!         node0: 0,
 //!         node1: 1,
+//!         // Index into the material table. `new` puts every bond on a
+//!         // one-entry table built from `settings`; use
+//!         // `new_with_materials` for a pack that authors several.
+//!         material: 0,
 //!     },
 //! ];
 //! let settings = SolverSettings::default();

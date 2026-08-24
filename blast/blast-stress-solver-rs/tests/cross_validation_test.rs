@@ -335,8 +335,7 @@ mod parity {
             normal: Vec3::new(0.0, 1.0, 0.0),
             area: 1.0,
             node0: 0,
-            node1: 1,
-        }];
+            node1: 1, material: 0 }];
         let settings = SolverSettings {
             max_solver_iterations_per_frame: 16,
             compression_elastic_limit: 0.5,

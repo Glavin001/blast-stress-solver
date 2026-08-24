@@ -33,8 +33,7 @@ fn free_bar() -> ScenarioDesc {
             node1: i + 1,
             centroid: (a + b) * 0.5,
             normal: Vec3::new(1.0, 0.0, 0.0),
-            area: 0.5,
-        });
+            area: 0.5, material: 0, });
     }
     ScenarioDesc {
         nodes,

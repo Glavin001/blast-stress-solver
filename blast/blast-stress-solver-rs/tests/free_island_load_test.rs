@@ -40,8 +40,7 @@ fn stack(n: u32, anchored: bool) -> (Vec<NodeDesc>, Vec<BondDesc>) {
             normal: Vec3::new(0.0, 1.0, 0.0),
             area: 1.0,
             node0: i,
-            node1: i + 1,
-        });
+            node1: i + 1, material: 0 });
     }
     (nodes, bonds)
 }

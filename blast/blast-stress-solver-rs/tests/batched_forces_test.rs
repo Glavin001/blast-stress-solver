@@ -15,9 +15,9 @@ fn triangle() -> (Vec<NodeDesc>, Vec<BondDesc>) {
         NodeDesc { centroid: Vec3::new(0.0, 1.5, 0.0), mass: 15.0, volume: 1.0 },
     ];
     let bonds = vec![
-        BondDesc { centroid: Vec3::new(-0.5, 0.75, 0.0), normal: Vec3::new(0.55, 0.83, 0.0), area: 0.6, node0: 0, node1: 2 },
-        BondDesc { centroid: Vec3::new(0.5, 0.75, 0.0), normal: Vec3::new(-0.55, 0.83, 0.0), area: 0.6, node0: 1, node1: 2 },
-        BondDesc { centroid: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), area: 0.9, node0: 0, node1: 1 },
+        BondDesc { centroid: Vec3::new(-0.5, 0.75, 0.0), normal: Vec3::new(0.55, 0.83, 0.0), area: 0.6, node0: 0, node1: 2, material: 0 },
+        BondDesc { centroid: Vec3::new(0.5, 0.75, 0.0), normal: Vec3::new(-0.55, 0.83, 0.0), area: 0.6, node0: 1, node1: 2, material: 0 },
+        BondDesc { centroid: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), area: 0.9, node0: 0, node1: 1, material: 0 },
     ];
     (nodes, bonds)
 }

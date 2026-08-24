@@ -145,6 +145,7 @@ pub fn build_tower_scenario(opts: &TowerOptions) -> ScenarioDesc {
                             ),
                             normal,
                             area,
+                        material: 0,
                         });
                     }
                 }
@@ -179,6 +180,7 @@ pub fn build_tower_scenario(opts: &TowerOptions) -> ScenarioDesc {
                                 ),
                                 normal: n,
                                 area: diag_area,
+                            material: 0,
                             });
                         }
                     }

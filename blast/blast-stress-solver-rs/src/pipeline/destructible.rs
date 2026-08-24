@@ -83,6 +83,13 @@ pub struct DestructibleConfig {
     /// bits and never touches a host body's filtering -- the previous Rapier
     /// integration hardcoded GROUP_1/2/3 over whatever the host had set, which
     /// is exactly the behaviour that makes a library unusable in a real game.
+    /// The structure's authored material table.
+    ///
+    /// Empty means "single material", and `solver`'s limits are used for every
+    /// bond. Supply the pack's real table whenever it has one: flattening it is
+    /// not a strength rescale, it re-materials the bonds the author made
+    /// strongest. See [`ExtStressSolver::new_with_materials`].
+    pub materials: Vec<crate::types::StressLimits>,
     pub collision_groups: Option<crate::backend::InteractionGroups>,
     pub min_child_nodes: usize,
     /// Cap on bodies created in one step; the remainder carries to the next.
@@ -95,6 +102,7 @@ impl Default for DestructibleConfig {
             world_pose: Pose::IDENTITY,
             gravity: Vec3::new(0.0, -9.81, 0.0),
             solver: SolverSettings::default(),
+            materials: Vec::new(),
             collision_groups: None,
             apply_excess_forces: true,
             excess_force_scale: 1.0,
@@ -180,7 +188,11 @@ impl<B: PhysicsBackend> Destructible<B> {
     /// Build the structure and instantiate it in `backend`.
     pub fn attach(backend: &mut B, scenario: &ScenarioDesc, cfg: DestructibleConfig) -> Option<Self> {
         let (nodes, bonds) = scenario.to_solver_descs();
-        let solver = ExtStressSolver::new(&nodes, &bonds, &cfg.solver)?;
+        let solver = if cfg.materials.is_empty() {
+            ExtStressSolver::new(&nodes, &bonds, &cfg.solver)?
+        } else {
+            ExtStressSolver::new_with_materials(&nodes, &bonds, &cfg.materials, &cfg.solver)?
+        };
         let n = nodes.len();
 
         let mut d = Self {

@@ -66,8 +66,7 @@ pub fn blast_wasm_smoke() -> u32 {
         normal: Vec3::new(0.0, 1.0, 0.0),
         area: 1.0,
         node0: 0,
-        node1: 1,
-    }];
+        node1: 1, material: 0 }];
     let settings = SolverSettings::default();
 
     let Some(mut solver) = ExtStressSolver::new(&nodes, &bonds, &settings) else {
