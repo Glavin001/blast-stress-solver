@@ -169,6 +169,13 @@ struct CCommands {
     ccd_ids: *const u64,
     ccd_values: *const u8,
     ccd_count: u32,
+    // Order matches physx_backend.h exactly; this struct is passed by pointer,
+    // so a field out of place is silently reinterpreted memory.
+    group_shapes: *const u64,
+    group_memberships: *const u32,
+    group_filters: *const u32,
+    group_entities: *const u32,
+    group_count: u32,
     shape_enabled_ids: *const u64,
     shape_enabled_values: *const u8,
     shape_enabled_count: u32,
@@ -279,6 +286,10 @@ struct Scratch {
     thr_ang: Vec<f32>,
     ccd_ids: Vec<u64>,
     ccd_vals: Vec<u8>,
+    grp_shapes: Vec<u64>,
+    grp_members: Vec<u32>,
+    grp_filters: Vec<u32>,
+    grp_entities: Vec<u32>,
     en_ids: Vec<u64>,
     en_vals: Vec<u8>,
     imp_ids: Vec<u64>,
@@ -553,6 +564,10 @@ impl PhysicsBackend for PhysXWorld {
         s.thr_lin.clear();
         s.thr_ang.clear();
         s.ccd_ids.clear();
+        s.grp_shapes.clear();
+        s.grp_members.clear();
+        s.grp_filters.clear();
+        s.grp_entities.clear();
         s.ccd_vals.clear();
         s.en_ids.clear();
         s.en_vals.clear();
@@ -638,6 +653,12 @@ impl PhysicsBackend for PhysXWorld {
             s.thr_lin.push(*l);
             s.thr_ang.push(*a);
         }
+        for (sh, g) in &cmds.set_groups {
+            s.grp_shapes.push(sh.0);
+            s.grp_members.push(g.memberships);
+            s.grp_filters.push(g.filter);
+            s.grp_entities.push(g.entity);
+        }
         for (b, on) in &cmds.set_ccd {
             s.ccd_ids.push(b.0);
             s.ccd_vals.push(*on as u8);
@@ -687,6 +708,11 @@ impl PhysicsBackend for PhysXWorld {
             sleep_thr_lin: s.thr_lin.as_ptr(),
             sleep_thr_ang: s.thr_ang.as_ptr(),
             sleep_thr_count: s.thr_ids.len() as u32,
+            group_shapes: s.grp_shapes.as_ptr(),
+            group_memberships: s.grp_members.as_ptr(),
+            group_filters: s.grp_filters.as_ptr(),
+            group_entities: s.grp_entities.as_ptr(),
+            group_count: s.grp_shapes.len() as u32,
             ccd_ids: s.ccd_ids.as_ptr(),
             ccd_values: s.ccd_vals.as_ptr(),
             ccd_count: s.ccd_ids.len() as u32,

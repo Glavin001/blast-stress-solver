@@ -71,6 +71,19 @@ pub struct DestructibleConfig {
     /// anything else is a tuning knob standing in front of the physics, so it
     /// is worth being able to see in a config dump.
     pub excess_force_scale: f32,
+    /// Collision groups stamped on every shape the library creates.
+    ///
+    /// `None` leaves filter data alone, which is right when the library owns
+    /// the whole world. Under bring-your-own-world it is almost never right:
+    /// a shape with no filter data is invisible to the host's raycasts and to
+    /// its collision filtering, so a hitscan into a destructible reports a
+    /// clean miss and nothing indicates why.
+    ///
+    /// The library writes only what it is given here. It never invents group
+    /// bits and never touches a host body's filtering -- the previous Rapier
+    /// integration hardcoded GROUP_1/2/3 over whatever the host had set, which
+    /// is exactly the behaviour that makes a library unusable in a real game.
+    pub collision_groups: Option<crate::backend::InteractionGroups>,
     pub min_child_nodes: usize,
     /// Cap on bodies created in one step; the remainder carries to the next.
     pub max_new_bodies_per_step: usize,
@@ -82,6 +95,7 @@ impl Default for DestructibleConfig {
             world_pose: Pose::IDENTITY,
             gravity: Vec3::new(0.0, -9.81, 0.0),
             solver: SolverSettings::default(),
+            collision_groups: None,
             apply_excess_forces: true,
             excess_force_scale: 1.0,
             min_child_nodes: 1,
@@ -252,6 +266,19 @@ impl<B: PhysicsBackend> Destructible<B> {
         backend.apply(Phase::Topology, &d.cmds, &mut d.out).ok()?;
         for (i, node) in shape_owner.iter().enumerate() {
             d.node_shape[*node as usize] = Some(d.out.created_shapes[i]);
+        }
+
+        if let Some(groups) = d.cfg.collision_groups {
+            d.cmds.clear();
+            for node in &shape_owner {
+                if let Some(shape) = d.node_shape[*node as usize] {
+                    d.cmds.set_groups.push((shape, groups));
+                }
+            }
+            // Tuning, not Topology: filter data is a property write, and the
+            // phase ordering is what keeps property writes out of the topology
+            // window where they would race the shape edits.
+            backend.apply(Phase::Tuning, &d.cmds, &mut d.out).ok()?;
         }
 
         d.cmds.clear();
@@ -451,26 +478,44 @@ impl<B: PhysicsBackend> Destructible<B> {
     /// position, and needs the stress-graph node to drive the load through.
     /// Support nodes are skipped because they are world-anchored and absorb
     /// force without ever failing, so aiming at one is silently a no-op.
-    pub fn nearest_dynamic_node(&self, world_point: Vec3) -> Option<u32> {
+    pub fn nearest_dynamic_node(&self, backend: &B, world_point: Vec3) -> Option<u32> {
+        self.nearest_dynamic_node_within(backend, world_point, f32::MAX).map(|(n, _)| n)
+    }
+
+    /// Nearest load-bearing node and its distance, or `None` if nothing is
+    /// within `max_distance`.
+    ///
+    /// Positions are read live from the backend, not from the authored
+    /// centroids. That distinction is not cosmetic and was a real bug here: an
+    /// authored centroid is in the structure's own frame, so every building in
+    /// a grid reported its nodes as though it stood at the origin, and a shot
+    /// at the far corner of a 16-building city resolved to a node in the first
+    /// building. Authored centroids are also stale the moment a chunk moves.
+    ///
+    /// `max_distance` is what makes a miss a miss. Without it the "nearest"
+    /// node to a shot into open sky is whichever chunk happens to be least far
+    /// away, so every shot hits something.
+    pub fn nearest_dynamic_node_within(
+        &self,
+        backend: &B,
+        world_point: Vec3,
+        max_distance: f32,
+    ) -> Option<(u32, f32)> {
+        let positions = self.node_world_positions(backend);
         let mut best = None;
-        let mut best_d = f32::MAX;
-        for node in 0..self.node_centroid.len() as u32 {
+        let mut best_d = max_distance * max_distance;
+        for node in 0..positions.len() as u32 {
             if self.support.contains(&node) {
                 continue;
             }
-            // Track the node's live position: after a fracture a chunk has
-            // moved, and its authored centroid no longer says where it is.
-            let p = match self.node_body(node) {
-                Some(_) => self.node_centroid[node as usize],
-                None => continue,
-            };
+            let Some(p) = positions[node as usize] else { continue };
             let d = (p - world_point).magnitude_squared();
             if d < best_d {
                 best_d = d;
                 best = Some(node);
             }
         }
-        best
+        best.map(|n| (n, best_d.sqrt()))
     }
 
     /// Authored centroid of a node, in the structure's own frame.

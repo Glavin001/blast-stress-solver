@@ -80,6 +80,14 @@ pub struct ReparentShape<B, S> {
 pub struct InteractionGroups {
     pub memberships: u32,
     pub filter: u32,
+    /// Host entity id carried alongside the groups.
+    ///
+    /// Engines pack an application id into the same filter payload as the
+    /// groups -- PhysX puts both in one `PxFilterData` -- and a host that
+    /// raycasts its own scene needs the shape to answer "which entity am I".
+    /// Zero means "the host did not say", which is what a backend writes when
+    /// the library creates a shape the host never claimed.
+    pub entity: u32,
 }
 
 /// One phase's worth of edits, in struct-of-arrays form.

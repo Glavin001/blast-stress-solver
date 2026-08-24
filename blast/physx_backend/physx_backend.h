@@ -91,6 +91,17 @@ typedef struct PxbCommands {
     const uint64_t* damping_ids;             const float* damping_lin; const float* damping_ang; uint32_t damping_count;
     const uint64_t* sleep_thr_ids;           const float* sleep_thr_lin; const float* sleep_thr_ang; uint32_t sleep_thr_count;
     const uint64_t* ccd_ids;                 const uint8_t* ccd_values; uint32_t ccd_count;
+    /* Collision groups on shapes the library created.
+     *
+     * Required for bring-your-own-world: without filter data the host's own
+     * raycasts and collision filtering cannot see library shapes at all, so a
+     * hitscan into a destructible reports a miss.
+     *
+     * `entity` rides along because the host's query convention pairs a group
+     * with an entity id in the same PxFilterData. */
+    const uint64_t* group_shapes;            const uint32_t* group_memberships;
+    const uint32_t* group_filters;           const uint32_t* group_entities;
+    uint32_t group_count;
     const uint64_t* shape_enabled_ids;       const uint8_t* shape_enabled_values; uint32_t shape_enabled_count;
     const uint64_t* impulse_ids;             const PxbVec3* impulse_lin; const PxbVec3* impulse_ang; uint32_t impulse_count;
 } PxbCommands;

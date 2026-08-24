@@ -663,6 +663,34 @@ uint8_t pxb_apply(PxbWorld* w, uint32_t phase, const PxbCommands* c,
         bi->second.actor->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_SPECULATIVE_CCD, on);
     }
 
+    for (uint32_t i = 0; i < c->group_count; ++i) {
+        auto si = w->shapes.find(c->group_shapes[i]);
+        if (si == w->shapes.end() || !si->second.shape) continue;
+        PxShape* s = si->second.shape;
+        const PxU32 group  = c->group_memberships[i];
+        const PxU32 mask   = c->group_filters[i];
+        const PxU32 entity = c->group_entities ? c->group_entities[i] : 0U;
+        // Layout mirrors the host's exactly, and deliberately so: simulation
+        // data is (group, mask, entity), query data is (group, entity). A host
+        // raycast tests `queryFilterData.word0 & mask`, so a shape with no
+        // filter data is invisible to every query the host makes -- which reads
+        // as "the shot missed" rather than as a configuration problem.
+        const PxFilterData sim(group, mask, entity, 0);
+        const PxFilterData query(group, entity, 0, 0);
+        const PxFilterData cur_sim = s->getSimulationFilterData();
+        const PxFilterData cur_q   = s->getQueryFilterData();
+        const bool sim_same = cur_sim.word0 == sim.word0 && cur_sim.word1 == sim.word1
+                           && cur_sim.word2 == sim.word2 && cur_sim.word3 == sim.word3;
+        const bool q_same   = cur_q.word0 == query.word0 && cur_q.word1 == query.word1
+                           && cur_q.word2 == query.word2 && cur_q.word3 == query.word3;
+        if (sim_same && q_same) { ++done.writes_elided; continue; }
+        // Writing shape filter data does NOT wake the owning actor, unlike a
+        // rigid-body property write. Re-stamping every shape each tick would
+        // otherwise be the mechanism that once held ~600 of ~735 bodies awake.
+        if (!sim_same) s->setSimulationFilterData(sim);
+        if (!q_same)   s->setQueryFilterData(query);
+    }
+
     for (uint32_t i = 0; i < c->shape_enabled_count; ++i) {
         auto si = w->shapes.find(c->shape_enabled_ids[i]);
         if (si == w->shapes.end() || !si->second.shape) continue;
