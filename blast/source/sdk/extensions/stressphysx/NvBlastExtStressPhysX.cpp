@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <memory>
 #include <new>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -2513,8 +2515,31 @@ private:
         }
 
         TelemetryClock::time_point phase = TelemetryClock::now();
-        std::vector<ExtStressFractureCommands> commands(actorCapacity);
-        std::vector<ExtStressBondFracture> fractures(bondCapacity);
+        // A/B on one binary: BLAST_FRACTURE_REUSE_BUFFERS=0 restores the
+        // allocate-every-tick path. Value-checked, not presence-checked --
+        // presence checks made `=0` mean "on" elsewhere in this tree.
+        static const bool reuseBuffers = [] {
+            const char* raw = std::getenv("BLAST_FRACTURE_REUSE_BUFFERS");
+            return raw == nullptr || std::string(raw) != "0";
+        }();
+        if (reuseBuffers)
+        {
+            // resize() only grows here, and every element the callee reads it
+            // writes first, so there is nothing to clear.
+            m_fractureCommands.resize(
+                std::max<std::size_t>(m_fractureCommands.size(), actorCapacity));
+            m_fractureBonds.resize(
+                std::max<std::size_t>(m_fractureBonds.size(), bondCapacity));
+        }
+        else
+        {
+            m_fractureCommands.assign(actorCapacity, ExtStressFractureCommands{});
+            m_fractureBonds.assign(bondCapacity, ExtStressBondFracture{});
+            m_fractureCommands.shrink_to_fit();
+            m_fractureBonds.shrink_to_fit();
+        }
+        std::vector<ExtStressFractureCommands>& commands = m_fractureCommands;
+        std::vector<ExtStressBondFracture>& fractures = m_fractureBonds;
         uint32_t commandCount = 0;
         uint32_t fractureCount = 0;
         const uint8_t generated = ext_stress_solver_generate_fracture_commands_per_actor(
@@ -2565,10 +2590,20 @@ private:
             // skipping them here would deadlock the structure at the cap.
             return finishCrushOnly();
         }
-        std::vector<ExtStressFractureCommands> limitedCommands;
-        limitedCommands.reserve(commands.size());
-        for (ExtStressFractureCommands command : commands)
+        // Bounded by commandCount, not by the buffer's size. That was harmless
+        // when the buffer was freshly value-initialised every tick (the tail
+        // read as zero counts and got skipped); with the buffer reused it is
+        // load-bearing, because the tail now holds last tick's commands.
+        std::vector<ExtStressFractureCommands>& limitedCommands = m_fractureLimited;
+        limitedCommands.clear();
+        if (!reuseBuffers)
         {
+            limitedCommands.shrink_to_fit();
+        }
+        limitedCommands.reserve(commandCount);
+        for (uint32_t commandIndex = 0; commandIndex < commandCount; ++commandIndex)
+        {
+            ExtStressFractureCommands command = commands[commandIndex];
             if (m_settings.maximumFracturesPerActorPerTick > 0)
             {
                 command.bondFractureCount = std::min(
@@ -3319,6 +3354,19 @@ private:
     ExtStressSolverHandle* m_solver{nullptr};
     std::vector<NodeState> m_nodes;
     std::vector<ExtStressPhysXBondDesc> m_bonds;
+    /// Reused across ticks. These are sized by BOND count, and fracture() ran
+    /// on every tick with an overstressed bond -- so a downtown-scale graph
+    /// allocated and zero-filled ~1.2 MB (74k bonds x 16 B) per tick, then
+    /// usually found commandCount == 0 and returned without using any of it.
+    /// Measured before this: `generate` was ~75% of the whole topology phase,
+    /// while apply/scene/rebuild sat at 0.00 because they were never reached.
+    ///
+    /// Two command buffers, not one, because the limit pass swaps: with a local
+    /// on one side of the swap the big allocation would be freed every tick and
+    /// the reuse would buy nothing.
+    std::vector<ExtStressFractureCommands> m_fractureCommands;
+    std::vector<ExtStressFractureCommands> m_fractureLimited;
+    std::vector<ExtStressBondFracture> m_fractureBonds;
     std::map<uint32_t, std::unique_ptr<BodyState>> m_actorBodies;
     std::unordered_map<const PxShape*, uint32_t> m_shapeToNode;
     std::unordered_map<ExtStressPhysXId, uint32_t> m_shapeIdToNode;
