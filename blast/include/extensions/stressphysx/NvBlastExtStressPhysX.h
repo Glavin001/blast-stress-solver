@@ -254,6 +254,20 @@ struct ExtStressPhysXTelemetry
     double gravityMilliseconds;
     double stressSolveMilliseconds;
     double fractureTopologyMilliseconds;
+    /// The interior of fractureTopologyMilliseconds. That phase is the largest
+    /// in the tick during a collapse (9.8 ms at 7k awake, 0.000 at rest) and
+    /// nobody had ever looked inside it -- it was one number covering a solver
+    /// call, three whole-population rebuilds and a scene mutation loop.
+    ///
+    /// These are children of fractureTopology and must not be summed with it.
+    /// mappingValidationMilliseconds is ALSO inside it (fracture() ends with
+    /// `return validateMappings()`), so the unattributed remainder is
+    /// fractureTopology - (these five) - mappingValidation.
+    double fractureGenerateMilliseconds;  ///< generating fracture commands from the solver
+    double fracturePrepMilliseconds;  ///< command sort/limit, node snapshot, parent motion capture
+    double fractureApplyMilliseconds;  ///< the solver's own island split
+    double fractureSceneMilliseconds;  ///< event sort plus the applySplit loop under the scene write lock
+    double fractureRebuildMilliseconds;  ///< rebuildLookupTables: three whole-population hash maps
     double mappingValidationMilliseconds;
     double gpuStressSolveMilliseconds;
     uint64_t gpuStressHostToDeviceBytes;

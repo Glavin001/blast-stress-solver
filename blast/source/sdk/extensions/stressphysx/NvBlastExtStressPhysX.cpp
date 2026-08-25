@@ -133,6 +133,11 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , gravityMilliseconds(0.0)
     , stressSolveMilliseconds(0.0)
     , fractureTopologyMilliseconds(0.0)
+    , fractureGenerateMilliseconds(0.0)
+    , fracturePrepMilliseconds(0.0)
+    , fractureApplyMilliseconds(0.0)
+    , fractureSceneMilliseconds(0.0)
+    , fractureRebuildMilliseconds(0.0)
     , mappingValidationMilliseconds(0.0)
     , gpuStressSolveMilliseconds(0.0)
     , gpuStressHostToDeviceBytes(0)
@@ -2507,6 +2512,7 @@ private:
             return true;
         }
 
+        TelemetryClock::time_point phase = TelemetryClock::now();
         std::vector<ExtStressFractureCommands> commands(actorCapacity);
         std::vector<ExtStressBondFracture> fractures(bondCapacity);
         uint32_t commandCount = 0;
@@ -2519,6 +2525,8 @@ private:
             bondCapacity,
             &commandCount,
             &fractureCount);
+        m_telemetry.fractureGenerateMilliseconds += elapsedMilliseconds(phase);
+        phase = TelemetryClock::now();
         if (generated == 0)
         {
             return fail(
@@ -2587,6 +2595,8 @@ private:
         std::vector<NodeSnapshot> nodeSnapshots(m_nodes.size());
         const std::map<uint32_t, ParentMotion> parentMotions =
             snapshotParents(commands, nodeSnapshots);
+        m_telemetry.fracturePrepMilliseconds += elapsedMilliseconds(phase);
+        phase = TelemetryClock::now();
 
         std::vector<ExtStressSplitEvent> events(commandCount);
         std::vector<ExtStressActor> children(m_nodes.size());
@@ -2626,6 +2636,9 @@ private:
             return finishCrushOnly();
         }
 
+        m_telemetry.fractureApplyMilliseconds += elapsedMilliseconds(phase);
+        phase = TelemetryClock::now();
+
         events.resize(eventCount);
         std::sort(events.begin(), events.end(), [&](const ExtStressSplitEvent& a,
                                                     const ExtStressSplitEvent& b) {
@@ -2652,7 +2665,11 @@ private:
             applyCrushedNodes();
         }
 
+        m_telemetry.fractureSceneMilliseconds += elapsedMilliseconds(phase);
+
+        phase = TelemetryClock::now();
         rebuildLookupTables();
+        m_telemetry.fractureRebuildMilliseconds += elapsedMilliseconds(phase);
         return validateMappings();
     }
 
