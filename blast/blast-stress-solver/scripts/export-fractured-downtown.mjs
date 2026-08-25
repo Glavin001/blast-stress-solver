@@ -29,7 +29,9 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { FLOOR_HEIGHT, MATERIALS, buildBuilding, mulberry32, round, v } from './export-fractured-city.mjs';
+import {
+  FLOOR_HEIGHT, MATERIALS, buildBuilding, mulberry32, round, shardShapeLibrary, v,
+} from './export-fractured-city.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SEED = Number(process.env.SEED ?? 7);
@@ -92,6 +94,52 @@ function hullVolumeCentroid(flat) {
     centroid[axis] = (minimum[axis] + maximum[axis]) / 2;
   }
   return { volume, centroid, count: points.length };
+}
+
+/**
+ * Distinct vertices in a collider -- what PhysX actually cooks.
+ *
+ * Not the stored array length. `nodeColliders` reuses the render prism's
+ * positions, which repeat every vertex three times so faces can carry flat
+ * normals, so the stored count runs 3x the real hull. Checking the array length
+ * would reject a legal 30-vertex hull as "90 points" and, worse, was measuring
+ * the wrong quantity in a check that is meant to keep physics and the renderer
+ * agreeing on one shape.
+ */
+function distinctHullVertices(points) {
+  const seen = new Set();
+  for (let i = 0; i + 2 < points.length; i += 3) {
+    seen.add(`${round(points[i])},${round(points[i + 1])},${round(points[i + 2])}`);
+  }
+  return seen.size;
+}
+
+/**
+ * Enforce the GPU convex cap over everything the pack can draw.
+ *
+ * Replaces a check that never ran. `correctCentroids` below tests
+ * `kind !== 'hull'` against colliders emitted as `'convex_hull'`, so it returned
+ * 0 for every building and `maxPoints > MAX_HULL_POINTS` was unreachable. The
+ * packs happen to be well inside the cap (downtown measures 18 distinct
+ * vertices at worst), but nothing was checking.
+ *
+ * Deliberately NOT fixing `correctCentroids` itself: `hullVolumeCentroid`
+ * derives volume from the AABB, which is right for a general hull and wrong for
+ * the extruded prisms this exporter emits -- the builder already sets the exact
+ * prism volume (polygon area x thickness). Enabling it would replace correct
+ * volumes with bounding-box ones, and mass follows volume.
+ */
+function maxHullVertices(colliders, library) {
+  let worst = 0;
+  for (const collider of colliders) {
+    if (!collider) continue;
+    if (collider.kind === 'convex_hull') {
+      worst = Math.max(worst, distinctHullVertices(collider.points));
+    } else if (collider.kind === 'shape') {
+      worst = Math.max(worst, distinctHullVertices(library[collider.shape].points));
+    }
+  }
+  return worst;
 }
 
 function correctCentroids(building) {
@@ -179,6 +227,7 @@ function main() {
   const nodeTypes = [];
   const nodeSizes = [];
   const nodeColliders = [];
+  const nodeShapeIds = [];
   const bonds = [];
   const placed = [];
   let maxPoints = 0;
@@ -205,6 +254,7 @@ function main() {
     nodeTypes.push(...building.nodeTypes);
     nodeSizes.push(...building.nodeSizes);
     nodeColliders.push(...building.nodeColliders);
+    nodeShapeIds.push(...building.nodeShapeIds);
     for (const bond of building.bonds) {
       bonds.push({
         node0: bond.node0 + base,
@@ -224,8 +274,17 @@ function main() {
     });
   }
 
-  if (maxPoints > MAX_HULL_POINTS) {
-    throw new Error(`hull with ${maxPoints} points exceeds the ${MAX_HULL_POINTS}-point GPU cap`);
+  const { shapes, driftM } = shardShapeLibrary();
+  const worstHull = maxHullVertices(nodeColliders, shapes);
+  if (worstHull > MAX_HULL_POINTS) {
+    throw new Error(`hull with ${worstHull} vertices exceeds the ${MAX_HULL_POINTS}-vertex GPU cap`);
+  }
+  // A shape id must mean one solid. The library is authoritative -- later cuts
+  // reference the first one's geometry -- so any drift here is the same cell of
+  // the same pattern landing differently on another floor, which would mean the
+  // id is claiming an identity the geometry does not have.
+  if (driftM > 1e-4) {
+    throw new Error(`shape library drift ${driftM} m: same id, different geometry`);
   }
 
   return {
@@ -234,14 +293,22 @@ function main() {
       key: 'fractured-downtown',
       title: 'Fractured downtown (dense mixed-height blocks, street spacing)',
       defaults: { solver: { gravity: -9.81, materialScale: 1, materials: MATERIALS } },
-      scenario: { nodeTypes, nodes, bonds, nodeSizes, nodeColliders },
+      scenario: {
+        nodeTypes, nodes, bonds, nodeSizes, nodeColliders,
+        // Present only when the fracturer bounded its pattern count. Each
+        // distinct shard is stored ONCE and referenced by id, so a consumer
+        // reads which shards are alike instead of comparing point arrays to
+        // find out.
+        ...(shapes.length > 0 ? { shapeLibrary: shapes, nodeShapeIds } : {}),
+      },
     },
     placed,
-    maxPoints,
+    maxPoints: worstHull,
+    shapes: shapes.length,
   };
 }
 
-const { pack, placed, maxPoints } = main();
+const { pack, placed, maxPoints, shapes } = main();
 await mkdir(path.dirname(OUTPUT), { recursive: true });
 await writeFile(OUTPUT, JSON.stringify(pack));
 

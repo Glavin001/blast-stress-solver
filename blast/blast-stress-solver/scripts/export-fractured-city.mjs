@@ -135,6 +135,66 @@ export function panelPatternStats() {
   return { classes: patternLibrary.size, patternsPerClass: Math.max(1, SHARD_PATTERNS) };
 }
 
+/**
+ * The shard shape library: every distinct fractured piece, stored once.
+ *
+ * This is the point of bounding the pattern count, and it has to be built HERE,
+ * as each cut is made -- not recovered afterwards by comparing meshes. The
+ * fracturer already knows it is stamping cell `c` of pattern `k` onto a panel
+ * of class `cls`; that triple IS the shape's identity, known before a single
+ * vertex is written. A consumer then reads an id instead of hashing point
+ * arrays to guess which shards are alike.
+ *
+ * The library entry is also AUTHORITATIVE: the first cut of a given id defines
+ * the geometry and every later instance references it rather than emitting its
+ * own copy. That removes a real hazard. A panel's polygon is computed in
+ * absolute panel coordinates and then made centroid-relative, so the same cell
+ * on floor 1 and floor 9 goes through a different subtraction and can land a
+ * few ULPs apart. Recovered-by-comparison identity is at the mercy of that;
+ * referenced identity is not, and cannot drift by construction.
+ */
+const shapeLibrary = [];
+const shapeIdByKey = new Map();
+/** Largest deviation seen between a reused shape and the cut it replaced. */
+let shapeReuseDriftM = 0;
+
+/**
+ * Identity of a shard: panel class, pattern, and which cell of it.
+ *
+ * `sign` is deliberately absent. A panel's two facing directions differ only in
+ * the sign of the thickness axis, and the prism spans +/- half a thickness
+ * either way, so the two carry the SAME point set walked in a different order.
+ * Treating them as one shape is what turns 320 emitted arrays into 160 solids.
+ * The drift assertion below is what proves that claim rather than assuming it.
+ */
+export function shardShapeId(cls, patternIndex, cellIndex, positions) {
+  const key = `${cls}#${patternIndex}#${cellIndex}`;
+  const existing = shapeIdByKey.get(key);
+  if (existing !== undefined) {
+    const stored = shapeLibrary[existing].points;
+    if (stored.length === positions.length) {
+      // Same id must mean same solid. Compare as SETS: the mirrored face emits
+      // the identical points in a different order.
+      const a = [...stored].sort((x, y) => x - y);
+      const b = [...positions].sort((x, y) => x - y);
+      for (let i = 0; i < a.length; i++) {
+        shapeReuseDriftM = Math.max(shapeReuseDriftM, Math.abs(a[i] - b[i]));
+      }
+    } else {
+      throw new Error(`shape ${key} reused with ${positions.length} coords, library has ${stored.length}`);
+    }
+    return existing;
+  }
+  const id = shapeLibrary.length;
+  shapeLibrary.push({ kind: 'convex_hull', points: positions });
+  shapeIdByKey.set(key, id);
+  return id;
+}
+
+export function shardShapeLibrary() {
+  return { shapes: shapeLibrary, driftM: shapeReuseDriftM };
+}
+
 const BAY = 4.0;
 export const FLOOR_HEIGHT = 3.0;
 const COL = Number(process.env.COL ?? 0.4);
@@ -359,6 +419,9 @@ function prismMesh(poly, thickness, toWorld, centroid) {
 // ── Per-building authoring ──────────────────────────────────────────────────
 export function buildBuilding({ width, floors, rng }) {
   const nodes = [], nodeTypes = [], nodeSizes = [], nodeColliders = [], nodeMeshes = [], bonds = [];
+  // Shape-library id per node, or -1 for a node that carries its own geometry
+  // (every cuboid, and every shard when the pattern pool is off).
+  const nodeShapeIds = [];
 
   function addBox(type, centre, half, density, fixed = false) {
     const volume = 8 * half[0] * half[1] * half[2];
@@ -366,6 +429,10 @@ export function buildBuilding({ width, floors, rng }) {
     nodeTypes.push(type);
     nodeSizes.push(v(half[0] * 2, half[1] * 2, half[2] * 2));
     nodeColliders.push({ kind: 'cuboid', halfExtents: v(...half) });
+    // Cuboids are already one shared shape carried in the instance matrix, so
+    // they need no library entry. Pushed anyway to keep the array parallel to
+    // `nodes` -- a hole here would silently misalign every node after it.
+    nodeShapeIds.push(-1);
     nodeMeshes.push(null); // boxes render through the shared instanced draw call
     return nodes.length - 1;
   }
@@ -517,8 +584,10 @@ export function buildBuilding({ width, floors, rng }) {
       // That is the whole reason to do the pooling here rather than by
       // substituting shapes at render time, where the shards stop tiling the
       // panel and an intact wall reads as rubble.
+      const patternIndex = SHARD_PATTERNS > 0 ? Math.floor(rng() * SHARD_PATTERNS) : -1;
+      const panelClass = panelPatternClass(face.axis, u1 - u0, w1 - w0);
       const seeds = SHARD_PATTERNS > 0
-        ? panelPattern(face.axis, u1 - u0, w1 - w0, Math.floor(rng() * SHARD_PATTERNS))
+        ? panelPattern(face.axis, u1 - u0, w1 - w0, patternIndex)
           .map(([su, sw]) => [u0 + su * (u1 - u0), w0 + sw * (w1 - w0)])
         : Array.from({ length: SHARDS_PER_PANEL }, () => [
           u0 + rng() * (u1 - u0), w0 + rng() * (w1 - w0),
@@ -555,7 +624,16 @@ export function buildBuilding({ width, floors, rng }) {
         nodes.push({ centroid: v(...centre), mass: round(volume * FACADE_DENSITY), volume: round(volume) });
         nodeTypes.push('wall');
         nodeSizes.push(face.axis === 'z' ? v(sizeU, sizeW, WALL_T) : v(WALL_T, sizeW, sizeU));
-        nodeColliders.push({ kind: 'convex_hull', points: mesh.positions });
+        if (SHARD_PATTERNS > 0) {
+          // Identity is known here, before the geometry is stored: this is
+          // cell `c` of pattern `patternIndex` on a panel of `panelClass`.
+          const shapeId = shardShapeId(panelClass, patternIndex, c, mesh.positions);
+          nodeShapeIds.push(shapeId);
+          nodeColliders.push({ kind: 'shape', shape: shapeId });
+        } else {
+          nodeShapeIds.push(-1);
+          nodeColliders.push({ kind: 'convex_hull', points: mesh.positions });
+        }
         nodeMeshes.push(mesh);
         cells.push({ poly, node: nodes.length - 1, seed: seeds[c], area });
       }
@@ -672,7 +750,10 @@ export function buildBuilding({ width, floors, rng }) {
 
   const mass = nodes.reduce((s, n) => s + n.mass, 0);
   const wallCount = nodeTypes.filter((t) => t === 'wall').length;
-  return { nodes, nodeTypes, nodeSizes, nodeColliders, nodeMeshes, bonds, mass, wallCount, footprint: FOOTPRINT };
+  if (nodeShapeIds.length !== nodes.length) {
+    throw new Error(`nodeShapeIds ${nodeShapeIds.length} != nodes ${nodes.length}`);
+  }
+  return { nodes, nodeTypes, nodeSizes, nodeColliders, nodeMeshes, nodeShapeIds, bonds, mass, wallCount, footprint: FOOTPRINT };
 }
 
 // ── City assembly ───────────────────────────────────────────────────────────
