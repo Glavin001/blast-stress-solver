@@ -119,14 +119,14 @@ fn cascading_grid() -> ScenarioDesc {
         for c in 0..cols - 1 {
             let (n0, n1) = (idx(r, c), idx(r, c + 1));
             let (a, b) = (nodes[n0 as usize].centroid, nodes[n1 as usize].centroid);
-            bonds.push(ScenarioBond { node0: n0, node1: n1, centroid: (a + b) * 0.5, normal: Vec3::new(1.0, 0.0, 0.0), area: 2.0 });
+            bonds.push(ScenarioBond { node0: n0, node1: n1, centroid: (a + b) * 0.5, normal: Vec3::new(1.0, 0.0, 0.0), area: 2.0, material: 0, });
         }
     }
     for r in 0..rows - 1 {
         for c in 0..cols {
             let (n0, n1) = (idx(r, c), idx(r + 1, c));
             let (a, b) = (nodes[n0 as usize].centroid, nodes[n1 as usize].centroid);
-            bonds.push(ScenarioBond { node0: n0, node1: n1, centroid: (a + b) * 0.5, normal: Vec3::new(0.0, 1.0, 0.0), area: 0.02 });
+            bonds.push(ScenarioBond { node0: n0, node1: n1, centroid: (a + b) * 0.5, normal: Vec3::new(0.0, 1.0, 0.0), area: 0.02, material: 0, });
         }
     }
     let n = (rows * cols) as usize;

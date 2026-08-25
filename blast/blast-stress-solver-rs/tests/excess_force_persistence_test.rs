@@ -35,14 +35,14 @@ fn wall(cols: u32, rows: u32) -> ScenarioDesc {
         for c in 0..cols - 1 {
             let (n0, n1) = (idx(c, r), idx(c + 1, r));
             let (a, b) = (nodes[n0 as usize].centroid, nodes[n1 as usize].centroid);
-            bonds.push(ScenarioBond { node0: n0, node1: n1, centroid: (a + b) * 0.5, normal: Vec3::new(1.0, 0.0, 0.0), area: bh * bd });
+            bonds.push(ScenarioBond { node0: n0, node1: n1, centroid: (a + b) * 0.5, normal: Vec3::new(1.0, 0.0, 0.0), area: bh * bd, material: 0, });
         }
     }
     for r in 0..rows - 1 {
         for c in 0..cols {
             let (n0, n1) = (idx(c, r), idx(c, r + 1));
             let (a, b) = (nodes[n0 as usize].centroid, nodes[n1 as usize].centroid);
-            bonds.push(ScenarioBond { node0: n0, node1: n1, centroid: (a + b) * 0.5, normal: Vec3::new(0.0, 1.0, 0.0), area: bw * bd });
+            bonds.push(ScenarioBond { node0: n0, node1: n1, centroid: (a + b) * 0.5, normal: Vec3::new(0.0, 1.0, 0.0), area: bw * bd, material: 0, });
         }
     }
     ScenarioDesc { nodes, bonds, node_sizes: vec![Vec3::new(bw, bh, bd); (cols * rows) as usize], collider_shapes: Vec::new() }

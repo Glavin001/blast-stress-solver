@@ -181,6 +181,7 @@ pub fn load_scenario_str(json: &str) -> Result<LoadedScenario, String> {
             centroid: b.centroid.into(),
             normal: b.normal.into(),
             area: b.area,
+        material: 0,
         })
         .collect();
 

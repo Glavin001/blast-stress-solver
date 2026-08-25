@@ -156,6 +156,7 @@ pub fn build_wall_scenario(opts: &WallOptions) -> ScenarioDesc {
             centroid,
             normal,
             area: area.max(1e-8),
+        material: 0,
         });
     };
 

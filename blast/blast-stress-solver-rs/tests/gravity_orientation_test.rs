@@ -37,7 +37,7 @@ fn cantilever() -> ScenarioDesc {
     }
     for i in 0..n - 1 {
         let (a, b) = (nodes[i as usize].centroid, nodes[(i + 1) as usize].centroid);
-        bonds.push(ScenarioBond { node0: i, node1: i + 1, centroid: (a + b) * 0.5, normal: Vec3::new(1.0, 0.0, 0.0), area: 0.5 });
+        bonds.push(ScenarioBond { node0: i, node1: i + 1, centroid: (a + b) * 0.5, normal: Vec3::new(1.0, 0.0, 0.0), area: 0.5, material: 0, });
     }
     ScenarioDesc { nodes, bonds, node_sizes: vec![Vec3::new(0.9, 0.3, 0.3); n as usize], collider_shapes: Vec::new() }
 }

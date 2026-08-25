@@ -203,6 +203,7 @@ pub fn build_bridge_scenario(opts: &BridgeOptions) -> ScenarioDesc {
                 centroid: c,
                 normal: n,
                 area: area.max(EPS),
+            material: 0,
             });
         };
 

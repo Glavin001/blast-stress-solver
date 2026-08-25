@@ -16,9 +16,55 @@ unsafe impl Sync for ExtStressSolver {}
 
 impl ExtStressSolver {
     /// Create a solver from node and bond descriptors with the given settings.
+    /// Build with a single global strength: every bond is put on material 0 of
+    /// a one-entry table synthesised from `settings`.
+    ///
+    /// Correct only for a genuinely single-material structure. For an authored
+    /// pack use [`new_with_materials`](Self::new_with_materials) -- see its
+    /// docs for why flattening a real table is not a rescaling.
     pub fn new(nodes: &[NodeDesc], bonds: &[BondDesc], settings: &SolverSettings) -> Option<Self> {
+        Self::build(nodes, bonds, None, settings)
+    }
+
+    /// Build with the pack's own material table, honouring each bond's index.
+    ///
+    /// Flattening a real table to one material is not a strength rescale, and
+    /// it fails in the least obvious direction. A district pack authors its
+    /// foundation bonds strongest *because* they carry the most load; put
+    /// everything on the column material and those foundation bonds end up
+    /// weaker than the load they were sized for, so the building demolishes
+    /// itself under gravity while every other bond looks fine. Measured on
+    /// `fractured-downtown`: 867 bonds broken at rest against zero with the
+    /// authored table.
+    pub fn new_with_materials(
+        nodes: &[NodeDesc],
+        bonds: &[BondDesc],
+        materials: &[StressLimits],
+        settings: &SolverSettings,
+    ) -> Option<Self> {
+        Self::build(nodes, bonds, Some(materials), settings)
+    }
+
+    fn build(
+        nodes: &[NodeDesc],
+        bonds: &[BondDesc],
+        materials: Option<&[StressLimits]>,
+        settings: &SolverSettings,
+    ) -> Option<Self> {
         if nodes.is_empty() || bonds.is_empty() {
             return None;
+        }
+        // An out-of-range index would be read by the C solver as whatever sits
+        // past the table, so it is rejected here rather than clamped: clamping
+        // silently re-materials a bond, which is the class of bug this whole
+        // table exists to avoid.
+        if let Some(table) = materials {
+            if table.is_empty() {
+                return None;
+            }
+            if bonds.iter().any(|b| b.material as usize >= table.len()) {
+                return None;
+            }
         }
 
         let ffi_nodes: Vec<ffi::FfiExtStressNodeDesc> = nodes
@@ -38,14 +84,18 @@ impl ExtStressSolver {
                 area: b.area,
                 node0: b.node0,
                 node1: b.node1,
-                // This crate exposes a single global strength; every bond uses
-                // material 0 of the one-entry table built below.
-                material: 0,
+                // Honoured when a table was supplied; otherwise every bond
+                // sits on material 0 of the one-entry table below.
+                material: if materials.is_some() { b.material } else { 0 },
             })
             .collect();
 
         let ffi_settings = to_ffi_settings(settings);
-        let ffi_materials = to_ffi_materials(settings);
+        let owned_materials: Vec<ffi::FfiExtStressMaterialDesc> = match materials {
+            Some(table) => table.iter().map(material_from_limits).collect(),
+            None => to_ffi_materials(settings).to_vec(),
+        };
+        let ffi_materials = owned_materials;
 
         let handle = unsafe {
             ffi::ext_stress_solver_create(
@@ -63,6 +113,84 @@ impl ExtStressSolver {
             None
         } else {
             Some(Self { handle })
+        }
+    }
+
+    /// Per-bond decomposed stress (compression, tension, shear) in Pascals.
+    ///
+    /// Reads the solver's own view rather than recomputing it, so it can be
+    /// compared directly against the material limits that decide fracture.
+    /// Live per-bond health, indexed by asset bond index.
+    ///
+    /// Health crossing zero is the break. The fracture *command* stream is a
+    /// damage stream: Blast issues a command every tick a bond is overstressed
+    /// while its health is still positive, and the command's `health` field is
+    /// the damage applied rather than what remains. Counting commands as breaks
+    /// overcounts -- measured 1067 against a 546-bond tower.
+    /// `out` is resized to `bond_count` and filled; the return is how many the
+    /// solver actually wrote. Capacity is the caller's because `bond_count()`
+    /// reports the post-graph-reduction count, which is not the asset bond
+    /// indexing this array uses.
+    pub fn bond_healths(&self, bond_count: usize, out: &mut Vec<f32>) -> usize {
+        out.clear();
+        out.resize(bond_count, 0.0);
+        if bond_count == 0 {
+            return 0;
+        }
+        let n = bond_count;
+        let written = unsafe {
+            ffi::ext_stress_solver_get_bond_healths(self.handle, out.as_mut_ptr(), n as u32)
+        } as usize;
+        out.truncate(written);
+        written
+    }
+
+    pub fn bond_stresses(&self) -> Vec<BondStressResult> {
+        let n = self.bond_count() as usize;
+        let mut c = vec![0.0f32; n];
+        let mut t = vec![0.0f32; n];
+        let mut sh = vec![0.0f32; n];
+        let written = unsafe {
+            ffi::ext_stress_solver_get_bond_stresses(
+                self.handle,
+                c.as_mut_ptr(),
+                t.as_mut_ptr(),
+                sh.as_mut_ptr(),
+                n as u32,
+            )
+        } as usize;
+        (0..written)
+            .map(|i| BondStressResult { compression: c[i], tension: t[i], shear: sh[i] })
+            .collect()
+    }
+
+    /// Whether the solver is running island-aware (per-component) solves.
+    pub fn island_aware(&self) -> bool {
+        unsafe { ffi::ext_stress_solver_get_island_aware(self.handle) != 0 }
+    }
+
+    /// Enable island-aware solving: solve each disconnected component
+    /// independently. Observationally identical to the whole-graph solve, and
+    /// far cheaper once activity is localized.
+    pub fn set_island_aware(&mut self, enabled: bool) {
+        unsafe { ffi::ext_stress_solver_set_island_aware(self.handle, enabled as u8) }
+    }
+
+    /// Skip components whose velocity inputs are unchanged since their last
+    /// solve and which already converged. A settled component re-solves the
+    /// same frame its load changes, so it is paused, never frozen.
+    pub fn set_skip_settled(&mut self, enabled: bool) {
+        unsafe { ffi::ext_stress_solver_set_skip_settled(self.handle, enabled as u8) }
+    }
+
+    /// Components in the live graph, and how many were skipped last update.
+    pub fn island_stats(&self) -> (u32, u32, u32) {
+        unsafe {
+            (
+                ffi::ext_stress_solver_island_count(self.handle),
+                ffi::ext_stress_solver_islands_total(self.handle),
+                ffi::ext_stress_solver_islands_skipped(self.handle),
+            )
         }
     }
 
@@ -497,6 +625,22 @@ fn to_ffi_settings(s: &SolverSettings) -> ffi::FfiExtStressSolverSettingsDesc {
 /// Stress limits moved from settings to a per-bond material table. This crate
 /// still exposes one global strength, so it builds a single-entry table and
 /// leaves every bond on material 0 — identical behavior to before the split.
+/// One authored material, in the C layout.
+///
+/// Crush fields stay at their defaults (`crush_cap_pressure == 0.0` disables
+/// crushing); they exist so the struct matches the C ABI byte for byte.
+fn material_from_limits(m: &StressLimits) -> ffi::FfiExtStressMaterialDesc {
+    ffi::FfiExtStressMaterialDesc {
+        compression_elastic_limit: m.compression_elastic_limit,
+        compression_fatal_limit: m.compression_fatal_limit,
+        tension_elastic_limit: m.tension_elastic_limit,
+        tension_fatal_limit: m.tension_fatal_limit,
+        shear_elastic_limit: m.shear_elastic_limit,
+        shear_fatal_limit: m.shear_fatal_limit,
+        ..ffi::FfiExtStressMaterialDesc::default()
+    }
+}
+
 fn to_ffi_materials(s: &SolverSettings) -> [ffi::FfiExtStressMaterialDesc; 1] {
     [ffi::FfiExtStressMaterialDesc {
         compression_elastic_limit: s.compression_elastic_limit,
@@ -505,5 +649,9 @@ fn to_ffi_materials(s: &SolverSettings) -> [ffi::FfiExtStressMaterialDesc; 1] {
         tension_fatal_limit: s.tension_fatal_limit,
         shear_elastic_limit: s.shear_elastic_limit,
         shear_fatal_limit: s.shear_fatal_limit,
+        // Crush stays off here: `crush_cap_pressure == 0.0` disables it. These
+        // fields exist so the struct matches the C ABI byte-for-byte; opting
+        // into crushing goes through `set_materials`, not `SolverSettings`.
+        ..ffi::FfiExtStressMaterialDesc::default()
     }]
 }

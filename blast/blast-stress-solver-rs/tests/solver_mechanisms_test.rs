@@ -21,7 +21,7 @@ fn cantilever() -> (Vec<NodeDesc>, Vec<BondDesc>) {
     }
     for i in 0..n - 1 {
         let (a, b) = (nodes[i as usize].centroid, nodes[(i + 1) as usize].centroid);
-        bonds.push(BondDesc { node0: i, node1: i + 1, centroid: (a + b) * 0.5, normal: Vec3::new(1.0, 0.0, 0.0), area: 0.5 });
+        bonds.push(BondDesc { node0: i, node1: i + 1, centroid: (a + b) * 0.5, normal: Vec3::new(1.0, 0.0, 0.0), area: 0.5, material: 0 });
     }
     (nodes, bonds)
 }
@@ -90,8 +90,7 @@ fn excess_force_reports_released_load() {
         NodeDesc { centroid: Vec3::new(0.0, 0.0, 0.0), mass: 10.0, volume: 1.0 },
     ];
     let bonds = vec![BondDesc {
-        centroid: Vec3::new(0.0, 0.5, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), area: 1.0, node0: 0, node1: 1,
-    }];
+        centroid: Vec3::new(0.0, 0.5, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), area: 1.0, node0: 0, node1: 1, material: 0 }];
     let settings = SolverSettings {
         compression_elastic_limit: 1.0, compression_fatal_limit: 2.0,
         tension_elastic_limit: 1.0, tension_fatal_limit: 2.0,

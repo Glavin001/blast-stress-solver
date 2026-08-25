@@ -44,8 +44,7 @@ fn wall_scenario() -> ScenarioDesc {
                 node1: n1,
                 centroid: (c0 + c1) * 0.5,
                 normal: Vec3::new(1.0, 0.0, 0.0),
-                area: bh * bd,
-            });
+                area: bh * bd, material: 0, });
         }
     }
 
@@ -61,8 +60,7 @@ fn wall_scenario() -> ScenarioDesc {
                 node1: n1,
                 centroid: (c0 + c1) * 0.5,
                 normal: Vec3::new(0.0, 1.0, 0.0),
-                area: bw * bd,
-            });
+                area: bw * bd, material: 0, });
         }
     }
 
@@ -110,8 +108,7 @@ fn dynamic_pair_scenario() -> ScenarioDesc {
             node1: 1,
             centroid: Vec3::new(0.0, 0.5, 0.0),
             normal: Vec3::new(1.0, 0.0, 0.0),
-            area: 0.25,
-        }],
+            area: 0.25, material: 0, }],
         node_sizes: vec![size, size],
         collider_shapes: Vec::new(),
     }
@@ -143,22 +140,19 @@ fn dynamic_triangle_scenario() -> ScenarioDesc {
                 node1: 1,
                 centroid: Vec3::new(0.0, 0.0, 0.0),
                 normal: Vec3::new(1.0, 0.0, 0.0),
-                area: 0.25,
-            },
+                area: 0.25, material: 0, },
             ScenarioBond {
                 node0: 0,
                 node1: 2,
                 centroid: Vec3::new(-0.25, 0.433, 0.0),
                 normal: Vec3::new(0.5, 0.866, 0.0),
-                area: 0.25,
-            },
+                area: 0.25, material: 0, },
             ScenarioBond {
                 node0: 1,
                 node1: 2,
                 centroid: Vec3::new(0.25, 0.433, 0.0),
                 normal: Vec3::new(-0.5, 0.866, 0.0),
-                area: 0.25,
-            },
+                area: 0.25, material: 0, },
         ],
         node_sizes: vec![size; 3],
         collider_shapes: Vec::new(),

@@ -135,6 +135,15 @@ pub struct BondDesc {
     pub area: f32,
     pub node0: u32,
     pub node1: u32,
+    /// Index into the material table given to the solver.
+    ///
+    /// Authored packs are genuinely multi-material -- a real district ships
+    /// reinforced-concrete columns, brittle infill and a very strong
+    /// foundation, and which bond is which is the whole load path. Collapsing
+    /// them to one material does not merely rescale strength: the foundation
+    /// bonds are strong *because* they carry the most load, so flattening the
+    /// table breaks exactly the bonds the author made strongest.
+    pub material: u32,
 }
 
 /// Settings for the extended stress solver.
@@ -371,6 +380,8 @@ pub struct ScenarioBond {
     pub centroid: Vec3,
     pub normal: Vec3,
     pub area: f32,
+    /// Index into the scenario's material table. 0 when unspecified.
+    pub material: u32,
 }
 
 /// Optional exact collider shape for a scenario node.
@@ -414,6 +425,7 @@ impl ScenarioDesc {
                 area: b.area,
                 node0: b.node0,
                 node1: b.node1,
+                material: b.material,
             })
             .collect();
         (nodes, bonds)
