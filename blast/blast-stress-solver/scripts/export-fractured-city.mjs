@@ -64,6 +64,77 @@ const SEED = Number(process.env.SEED ?? 7);
 /** Voronoi shards per wall panel, where a panel is one face of one floor. */
 const SHARDS_PER_PANEL = Number(process.env.SHARDS_PER_PANEL ?? 10);
 
+/**
+ * How many DISTINCT fracture patterns exist per panel class. 0 = unlimited,
+ * which is the original behaviour: every panel gets its own random seeds and
+ * therefore its own one-of-a-kind shards.
+ *
+ * Unlimited is what makes the city expensive to draw. A shard's shape is unique
+ * to its panel, so no two shards share geometry, so nothing can be instanced --
+ * downtown ends up with 7,160 distinct hulls and the renderer pays one draw
+ * range per shard. Bounding the pattern count is what gives the renderer
+ * something to instance, and it is a look-versus-cost dial rather than a
+ * correctness one: N patterns per class, stamped at random onto panels.
+ *
+ * The unit that must match for two panels to share shard geometry is the panel
+ * CLASS -- same span, same span height, same face axis. Shards are authored
+ * centroid-relative, so floor height and building position do not enter into
+ * it, and a pattern stamped on floor 1 of one tower yields byte-identical hulls
+ * on floor 9 of another.
+ *
+ * Downtown has 8 classes (4 footprints x 2 face axes), so distinct wall hulls
+ * come to roughly `8 * N * SHARDS_PER_PANEL`. Against 7,160 today: N=2 gives
+ * ~160, N=4 ~320, N=8 ~640.
+ */
+const SHARD_PATTERNS = Number(process.env.SHARD_PATTERNS ?? 0);
+
+/**
+ * Seed for the pattern library itself, kept apart from the city's own seed.
+ *
+ * The library must not depend on how many buildings were laid out before a
+ * panel asked for it, or the same pattern index would mean different shapes in
+ * two runs -- and worse, changing the row layout would silently re-fracture
+ * every wall in the city.
+ */
+const PATTERN_SEED = Number(process.env.PATTERN_SEED ?? 0x5eed);
+
+/**
+ * Normalised seed sets per panel class, built on first use.
+ *
+ * Seeds live in [0,1]^2 and are mapped onto the panel rect by the caller, so a
+ * class is identified by its rect dimensions rather than its position.
+ */
+const patternLibrary = new Map();
+
+export function panelPatternClass(axis, spanU, spanW) {
+  return `${axis}:${round(spanU)}:${round(spanW)}`;
+}
+
+/**
+ * The `index`-th fracture pattern for a panel class, as normalised seeds.
+ *
+ * Each class gets its own RNG stream seeded from the class key, so adding a new
+ * building width cannot shift the patterns of the widths already present.
+ */
+export function panelPattern(axis, spanU, spanW, index) {
+  const key = panelPatternClass(axis, spanU, spanW);
+  let patterns = patternLibrary.get(key);
+  if (!patterns) {
+    let hash = PATTERN_SEED;
+    for (let i = 0; i < key.length; i++) hash = (Math.imul(hash, 31) + key.charCodeAt(i)) | 0;
+    const rng = mulberry32(hash);
+    patterns = Array.from({ length: Math.max(1, SHARD_PATTERNS) }, () =>
+      Array.from({ length: SHARDS_PER_PANEL }, () => [rng(), rng()]));
+    patternLibrary.set(key, patterns);
+  }
+  return patterns[index % patterns.length];
+}
+
+/** Distinct panel classes seen, for the exporter's summary. */
+export function panelPatternStats() {
+  return { classes: patternLibrary.size, patternsPerClass: Math.max(1, SHARD_PATTERNS) };
+}
+
 const BAY = 4.0;
 export const FLOOR_HEIGHT = 3.0;
 const COL = Number(process.env.COL ?? 0.4);
@@ -440,9 +511,18 @@ export function buildBuilding({ width, floors, rng }) {
       // hanging off clips for its whole weight.
       const u0 = -face.spanU / 2, u1 = face.spanU / 2;
       const w0 = BASE_Y + f * FLOOR_HEIGHT, w1 = w0 + COL_CLEAR;
-      const seeds = Array.from({ length: SHARDS_PER_PANEL }, () => [
-        u0 + rng() * (u1 - u0), w0 + rng() * (w1 - w0),
-      ]);
+      // Everything downstream -- polygons, bond areas, masses, volumes, hull
+      // points -- is derived from these seeds, so bounding the pattern count
+      // changes WHICH fracture a panel gets and nothing about how it is built.
+      // That is the whole reason to do the pooling here rather than by
+      // substituting shapes at render time, where the shards stop tiling the
+      // panel and an intact wall reads as rubble.
+      const seeds = SHARD_PATTERNS > 0
+        ? panelPattern(face.axis, u1 - u0, w1 - w0, Math.floor(rng() * SHARD_PATTERNS))
+          .map(([su, sw]) => [u0 + su * (u1 - u0), w0 + sw * (w1 - w0)])
+        : Array.from({ length: SHARDS_PER_PANEL }, () => [
+          u0 + rng() * (u1 - u0), w0 + rng() * (w1 - w0),
+        ]);
       const polys = voronoiCells(seeds, u0, w0, u1, w1);
 
       // Panel plane: inner face flush with the frame's outer face at +/- half.
