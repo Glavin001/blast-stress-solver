@@ -243,6 +243,9 @@ struct ExtStressPhysXTelemetry
     uint64_t convexPointLimitRejections;
     uint64_t convexCookingFailures;
     uint64_t mappingValidationFailures;
+    /// Times the incrementally-maintained node lookups disagreed with a full
+    /// rebuild. Only counted under BLAST_LOOKUP_VALIDATE=1; must be 0.
+    uint64_t lookupTableDrifts;
     uint32_t bodyCount;
     uint32_t awakeDynamicBodyCount;
     uint32_t overstressedBondCount;

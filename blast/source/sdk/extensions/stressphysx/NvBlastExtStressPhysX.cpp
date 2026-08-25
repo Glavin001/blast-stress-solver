@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -124,6 +125,7 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , convexPointLimitRejections(0)
     , convexCookingFailures(0)
     , mappingValidationFailures(0)
+    , lookupTableDrifts(0)
     , bodyCount(0)
     , awakeDynamicBodyCount(0)
     , overstressedBondCount(0)
@@ -2113,8 +2115,20 @@ private:
         }
 
         NodeState& node = m_nodes[nodeIndex];
+        // Maintain the node lookups here, at the one place a node's shape is
+        // ever assigned. m_nodes is resized once at build and shapeId is handed
+        // out once per node, so both maps are invariant apart from this site and
+        // the crush/teardown paths -- which already erase from them. Rebuilding
+        // them wholesale on every fracture was 48,210 of the ~51,000 hash
+        // inserts in rebuildLookupTables, to update a body map of ~2,700.
+        if (node.shape != nullptr && node.shape != shape)
+        {
+            m_shapeToNode.erase(node.shape);
+        }
         node.shape = shape;
         node.convexMesh = convexMesh;
+        m_shapeToNode[shape] = nodeIndex;
+        m_shapeIdToNode[node.shapeId] = nodeIndex;
         return true;
     }
 
@@ -3260,16 +3274,69 @@ private:
         return true;
     }
 
+    /// Rebuilds only the map that actually changes when topology moves.
+    ///
+    /// This used to clear and refill all three on every fracturing tick:
+    /// 24,105 nodes x 2 plus ~2,700 bodies, so ~51,000 hash inserts -- each one
+    /// a node allocation, because clear() destroys the nodes even though it
+    /// keeps the bucket array. Measured at 2.79-3.95 ms, the largest single
+    /// item in the topology phase whenever that phase does anything.
+    ///
+    /// Only m_bodyToId genuinely churns: bodies are created and retired by
+    /// splits. The two node maps are keyed on things assigned once per node at
+    /// build and maintained at their mutation sites instead.
+    ///
+    /// BLAST_INCREMENTAL_LOOKUP=0 restores the full rebuild.
+    /// BLAST_LOOKUP_VALIDATE=1 rebuilds into scratch maps and compares, which
+    /// is how a missed mutation site would announce itself rather than becoming
+    /// a silent stale lookup.
     void rebuildLookupTables()
     {
-        m_shapeToNode.clear();
-        m_shapeIdToNode.clear();
-        m_bodyToId.clear();
-        for (uint32_t i = 0; i < m_nodes.size(); ++i)
+        static const bool incremental = [] {
+            const char* raw = std::getenv("BLAST_INCREMENTAL_LOOKUP");
+            return raw == nullptr || std::string(raw) != "0";
+        }();
+        static const bool validate =
+            std::getenv("BLAST_LOOKUP_VALIDATE") != nullptr
+            && std::string(std::getenv("BLAST_LOOKUP_VALIDATE")) != "0";
+
+        if (!incremental || validate)
         {
-            m_shapeToNode.emplace(m_nodes[i].shape, i);
-            m_shapeIdToNode.emplace(m_nodes[i].shapeId, i);
+            std::unordered_map<const PxShape*, uint32_t> shapeToNode;
+            std::unordered_map<ExtStressPhysXId, uint32_t> shapeIdToNode;
+            for (uint32_t i = 0; i < m_nodes.size(); ++i)
+            {
+                if (m_nodes[i].shape != nullptr)
+                {
+                    shapeToNode.emplace(m_nodes[i].shape, i);
+                }
+                shapeIdToNode.emplace(m_nodes[i].shapeId, i);
+            }
+            if (validate && incremental)
+            {
+                if (shapeToNode != m_shapeToNode || shapeIdToNode != m_shapeIdToNode)
+                {
+                    ++m_telemetry.lookupTableDrifts;
+                    // Loud on purpose. This path is opt-in diagnostic only, and
+                    // a stale lookup is otherwise silent -- it surfaces much
+                    // later as a contact routed to the wrong node.
+                    std::fprintf(
+                        stderr,
+                        "[blast] lookup drift #%llu: shapeToNode %zu vs %zu, "
+                        "shapeIdToNode %zu vs %zu\n",
+                        static_cast<unsigned long long>(m_telemetry.lookupTableDrifts),
+                        m_shapeToNode.size(), shapeToNode.size(),
+                        m_shapeIdToNode.size(), shapeIdToNode.size());
+                }
+            }
+            if (!incremental)
+            {
+                m_shapeToNode.swap(shapeToNode);
+                m_shapeIdToNode.swap(shapeIdToNode);
+            }
         }
+
+        m_bodyToId.clear();
         for (const auto& actorBody : m_actorBodies)
         {
             m_bodyToId.emplace(actorBody.second->body, actorBody.second->bodyId);
