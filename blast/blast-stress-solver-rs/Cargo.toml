@@ -32,6 +32,11 @@ bench-support = ["rapier", "scenarios"]
 # `wasm32-unknown-unknown` target and a wasi C++ toolchain
 # (e.g. `libc++-18-dev-wasm32`) to be installed on the host.
 wasm-smoke = []
+# Opt-in equivalence test for the CUDA stress solver's settled-island skipping.
+# Needs nvcc and a GPU, and shells out to
+# `source/sdk/extensions/stressgpu/test/build_and_run.sh` -- the .cu is compiled
+# by the consumer, not by this crate, so there is nothing to link here.
+cuda-stress-smoke = []
 # PhysX backend. Requires a PhysX 5 SDK: set PHYSX_ROOT (defaults to the usual
 # install location). Off by default so the crate still builds with nothing but
 # a C++ toolchain.

@@ -63,6 +63,19 @@ struct ExtStressGpuSolveParams
     // The damage kernel reads each bond's own material from the table given
     // to create(); there are no global limits.
     bool applyDamage{false};
+    /**
+     * Skip islands whose inputs are unchanged since their last solve.
+     *
+     * An island is a disconnected component: its solution depends only on its
+     * own nodes' velocities and its own warm-start impulses. If every dynamic
+     * node's velocity is identical to the last solve and that solve reached
+     * tolerance, re-solving reproduces the impulses it already holds, so the
+     * work is waste. The device keeps those impulses resident and untouched.
+     *
+     * This mirrors StressProcessor::solveIslandAware on the CPU path, down to
+     * the bit-exact velocity comparison -- see stress.cpp's angLin6Equal.
+     */
+    bool skipSettledIslands{false};
 };
 
 struct ExtStressGpuTelemetry
@@ -74,6 +87,12 @@ struct ExtStressGpuTelemetry
     std::uint64_t hostToDeviceBytes{0};
     std::uint64_t deviceToHostBytes{0};
     bool converged{false};
+    /// Disconnected components the solver partitions its bonds into. Fixed for
+    /// the solver's lifetime: topology changes go through a new solver.
+    std::uint32_t islandCount{0};
+    /// Of those, how many were settled and therefore not solved this call.
+    /// Always 0 unless ExtStressGpuSolveParams::skipSettledIslands is set.
+    std::uint32_t islandsSkipped{0};
 };
 
 /**
@@ -121,6 +140,36 @@ public:
         std::uint32_t& count) = 0;
 
     virtual bool readbackBondHealth(float* health, std::uint32_t capacity) = 0;
+
+    /**
+     * Bonds whose impulses the last solve could have changed, valid until the
+     * next solve or release().
+     *
+     * With skipSettledIslands off this is every bond, in index order. With it
+     * on it is exactly the bonds of the islands that were solved -- the rest
+     * were not read back at all, so a caller mirroring impulses host-side must
+     * consult this list rather than copying the whole array, or its per-frame
+     * cost stays proportional to total bonds and the saving is given straight
+     * back on the host side.
+     */
+    virtual const std::uint32_t* lastChangedBonds(std::uint32_t& count) const = 0;
+
+    /**
+     * Drop one bond, swap-with-last, mirroring the host solver's own
+     * replaceWithLast so the two arrays stay index-for-index identical.
+     *
+     * Exists because the alternative is destroying and rebuilding the solver,
+     * which is what the caller used to do on every fracture: at city scale a
+     * bond breaks on most ticks, so the device state -- topology, island
+     * partition, warm-start impulses and the settled baseline -- was thrown
+     * away and rebuilt every tick, and nothing could ever be carried forward.
+     *
+     * Topology is re-uploaded lazily on the next solve, together with a
+     * repartition and a warm-start reset. That reset is not a compromise: a
+     * rebuilt solver started cold too, so this is the same physics, arrived at
+     * without the allocation churn.
+     */
+    virtual bool removeBond(std::uint32_t bondIndex) = 0;
 
     virtual void resetWarmStart() = 0;
 

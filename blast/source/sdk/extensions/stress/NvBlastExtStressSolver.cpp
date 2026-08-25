@@ -47,6 +47,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #define USE_SCALAR_IMPL 0
@@ -64,6 +65,18 @@ namespace Blast
 {
 
 using namespace nvidia;
+
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+/// See the A/B branch in SupportGraphProcessor::removeBondIfExists.
+static bool gpuIncrementalRemovalEnabled()
+{
+    static const bool enabled =
+        std::getenv("BLAST_GPU_NO_INCREMENTAL_REMOVAL") == nullptr;
+    return enabled;
+}
+#else
+static bool gpuIncrementalRemovalEnabled() { return true; }
+#endif
 
 static_assert(sizeof(NvVec3) == sizeof(NvcVec3), "sizeof(NvVec3) must equal sizeof(NvcVec3).");
 static_assert(offsetof(NvVec3, x) == offsetof(NvcVec3, x) &&
@@ -208,8 +221,8 @@ public:
                 m_gpuCudaContext);
             m_gpuVelocities.resize(m_nodes.size());
             m_gpuImpulses.resize(m_bonds.size());
-            m_gpuLastVelocities.resize(m_nodes.size());
-            m_gpuLastInputValid = false;
+            m_gpuIslandsSkipped = 0;
+            m_gpuIslandsTotal = 0;
         }
 #endif
     }
@@ -351,6 +364,14 @@ public:
             m_impulses.resize(m_impulses.size() - 1);
         }
         m_stressProcessor.removeBond(bondIndex);
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        // The CUDA solver applies the same swap-with-last rather than being
+        // rebuilt. See the note in removeBondIfExists.
+        if (m_gpuSolver)
+        {
+            m_gpuSolver->removeBond(bondIndex);
+        }
+#endif
     }
 
     void reset(uint32_t nodeCount)
@@ -399,19 +420,6 @@ public:
                 m_gpuVelocities[i].linear =
                     {m_velocities[i].lin.x, m_velocities[i].lin.y, m_velocities[i].lin.z};
             }
-            const bool unchanged =
-                skipSettled
-                && m_gpuLastInputValid
-                && std::memcmp(
-                    m_gpuVelocities.data(),
-                    m_gpuLastVelocities.data(),
-                    sizeof(ExtStressGpuImpulse) * m_gpuVelocities.size()) == 0;
-            if (unchanged)
-            {
-                m_error_sq = {0.0f, 0.0f};
-                m_inputsChanged = false;
-                return;
-            }
             ExtStressGpuSolveParams gpuParams;
             // The GPU solver is island-aware: each disconnected component gets
             // its own conjugate-gradient scalars and its own convergence test,
@@ -428,14 +436,39 @@ public:
             gpuParams.maxIterations = iterationCount;
             gpuParams.tolerance = 0.001f;
             gpuParams.warmStart = warmStart && !m_forceColdStart;
+            // Settled-island skipping on the GPU, and it means the same thing
+            // it means on the CPU (stress.cpp solveIslandAware): an island
+            // whose dynamic nodes' velocities are bit-identical to its last
+            // solve, and whose last solve converged, keeps the impulses it
+            // already has. Its warm-start state stays resident on the device
+            // and is not even rescaled, so nothing about it drifts while it
+            // sits still.
+            //
+            // Without this the GPU uploaded and solved the whole graph every
+            // tick regardless -- correct, and the right trade when a solve was
+            // 2.4 ms over a few hundred islands, but not at city scale where
+            // nearly every island is a settled debris cluster.
+            gpuParams.skipSettledIslands = skipSettled && warmStart;
             if (m_gpuSolver->solveAndReadbackImpulses(
                     m_gpuVelocities.data(),
                     gpuParams,
                     m_gpuImpulses.data(),
                     static_cast<uint32_t>(m_gpuImpulses.size())))
             {
-                for (uint32_t i = 0; i < m_impulses.size(); ++i)
+                // Only the bonds the solver actually re-solved. Copying all of
+                // them would hand the saving straight back: at city scale this
+                // loop is tens of thousands of iterations of pure host work,
+                // and it is inside the "blast solve" phase.
+                uint32_t changedCount = 0;
+                const uint32_t* changed = m_gpuSolver->lastChangedBonds(changedCount);
+                const uint32_t impulseCount = static_cast<uint32_t>(m_impulses.size());
+                for (uint32_t k = 0; k < changedCount; ++k)
                 {
+                    const uint32_t i = changed[k];
+                    if (i >= impulseCount)
+                    {
+                        continue;
+                    }
                     m_impulses[i].ang = {
                         m_gpuImpulses[i].angular.x,
                         m_gpuImpulses[i].angular.y,
@@ -445,6 +478,8 @@ public:
                         m_gpuImpulses[i].linear.y,
                         m_gpuImpulses[i].linear.z};
                 }
+                m_gpuIslandsSkipped = m_gpuSolver->telemetry().islandsSkipped;
+                m_gpuIslandsTotal = m_gpuSolver->telemetry().islandCount;
                 m_converged = m_gpuSolver->telemetry().converged;
                 m_gpuFrameSolveMilliseconds =
                     m_gpuSolver->telemetry().solveMilliseconds;
@@ -452,8 +487,6 @@ public:
                     m_gpuSolver->telemetry().hostToDeviceBytes;
                 m_gpuFrameDeviceToHostBytes =
                     m_gpuSolver->telemetry().deviceToHostBytes;
-                m_gpuLastVelocities = m_gpuVelocities;
-                m_gpuLastInputValid = true;
                 m_error_sq = m_converged
                     ? AngLin6ErrorSq{0.0f, 0.0f}
                     : AngLin6ErrorSq{FLT_MAX, FLT_MAX};
@@ -475,8 +508,30 @@ public:
     }
 
     // Number of settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
-    uint32_t getIslandsSkipped() const { return m_stressProcessor.getLastIslandsSkipped(); }
-    uint32_t getIslandsTotal() const { return m_stressProcessor.getLastIslandsTotal(); }
+    // The GPU path keeps its own partition -- the same one, by the same rule -- so it reports
+    // its own count; reading the CPU processor's here is what made solver_islands_skipped
+    // permanently 0 on CUDA and hid that the GPU was re-solving a settled city every tick.
+    uint32_t getIslandsSkipped() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        if (m_gpuSolver)
+        {
+            return m_gpuIslandsSkipped;
+        }
+#endif
+        return m_stressProcessor.getLastIslandsSkipped();
+    }
+
+    uint32_t getIslandsTotal() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        if (m_gpuSolver)
+        {
+            return m_gpuIslandsTotal;
+        }
+#endif
+        return m_stressProcessor.getLastIslandsTotal();
+    }
 
     bool calcError(float& linear, float& angular) const
     {
@@ -509,8 +564,8 @@ private:
     std::vector<ExtStressGpuMaterial>   m_gpuMaterials;
     std::vector<ExtStressGpuImpulse>    m_gpuVelocities;
     std::vector<ExtStressGpuImpulse>    m_gpuImpulses;
-    std::vector<ExtStressGpuImpulse>    m_gpuLastVelocities;
-    bool                                m_gpuLastInputValid{false};
+    uint32_t                            m_gpuIslandsSkipped{0};
+    uint32_t                            m_gpuIslandsTotal{0};
     float                               m_gpuFrameSolveMilliseconds{0.0f};
     uint64_t                            m_gpuFrameHostToDeviceBytes{0};
     uint64_t                            m_gpuFrameDeviceToHostBytes{0};
@@ -672,7 +727,14 @@ public:
     // sync() on topology change. Static (mass<=0) nodes are cut points.
     uint32_t getIslandCount() const
     {
-        return m_islandCount;
+        // Report the partition the SOLVE actually ran over, when there is one.
+        // m_islandCount is recomputed only on a graph resync, and now that the
+        // CUDA solver survives fracture those are rare -- it went stale at 27
+        // next to 1063 islands skipped, which is worse than no number at all.
+        // Both paths' solver-side counts mean the same thing: connected
+        // components that contain at least one bond.
+        const uint32_t solverIslands = m_solver.getIslandsTotal();
+        return solverIslands ? solverIslands : m_islandCount;
     }
 
     // Settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
@@ -882,18 +944,30 @@ public:
                 // internal bond sadly requires graph resync (it never happens on reduction level '0')
                 m_nodesDirty = true;
             }
-            else if (!m_nodesDirty && m_solver.getGpuAccelerated())
+            else if (!m_nodesDirty && m_solver.getGpuAccelerated() && !gpuIncrementalRemovalEnabled())
             {
-                // CUDA topology and impulse ordering must exactly match the
-                // compacted host bond arrays. Defer to one full graph rebuild
-                // after this mutation batch instead of incrementally removing
-                // host-only bonds beneath a live GPU solver.
+                // A/B switch (BLAST_GPU_NO_INCREMENTAL_REMOVAL=1): restore the
+                // full graph rebuild a broken bond used to force whenever the
+                // CUDA solver was active, so the cost of the rebuild can be
+                // measured against the cost of not doing it on the same binary
+                // and the same scene.
                 m_nodesDirty = true;
             }
             else if (!m_nodesDirty)
             {
                 // otherwise it's external bond, we can remove it manually and keep graph synced
                 // we don't need to spend time there if (m_nodesDirty == true), graph will be resynced anyways
+                //
+                // This branch used to be unreachable whenever the CUDA solver
+                // was active: a broken bond forced a full graph resync, which
+                // destroyed and rebuilt the GPU solver. At city scale a bond
+                // breaks on most ticks, so the device's topology, island
+                // partition, warm-start impulses and settled baseline were
+                // discarded and rebuilt every tick -- which is why the GPU path
+                // could never carry anything forward and skipped nothing.
+                // ExtStressGpuSolver::removeBond now applies the same
+                // swap-with-last the host does, so the solver survives its own
+                // scene falling apart.
 
                 BondKey solverBondKey(solverNode0, solverNode1);
                 auto entry = m_solverBondsMap.find(solverBondKey);
