@@ -65,6 +65,37 @@ const SEED = Number(process.env.SEED ?? 7);
 const SHARDS_PER_PANEL = Number(process.env.SHARDS_PER_PANEL ?? 10);
 
 /**
+ * Voronoi shards per floor plate. 0 keeps the count the rectangular grid used
+ * (SLAB_CELLS^2), which is the default on purpose.
+ *
+ * The floor used to be a grid of cuboids -- structurally a 2D partition of a
+ * rectangle extruded by the slab thickness, which is exactly what a fractured
+ * wall panel is, only with square cells. Swapping the grid for a Voronoi
+ * changes how it LOOKS and makes it poolable, without changing how many bodies
+ * the server has to simulate. Raising it past the grid count is a separate
+ * decision with a real simulation cost, so it is opt-in.
+ */
+const SHARDS_PER_SLAB = Number(process.env.SHARDS_PER_SLAB ?? 0);
+
+/**
+ * Voronoi shards per column segment, splitting the 0.4 m section lengthwise.
+ *
+ * Every segment of one column stack uses the SAME pattern, so the shards line
+ * up floor to floor. That is not cosmetic: an aligned stack means a shard
+ * bears on the shard below across its own full cross-section, so the
+ * segment-to-segment bond area is just the shard's area and the frame's load
+ * path is unchanged by the fracture. Staggering the patterns would need a
+ * convex-convex intersection per pair and would quietly redistribute the
+ * column's load.
+ *
+ * 1 leaves columns whole (still emitted as hulls, not cuboids).
+ */
+const SHARDS_PER_COLUMN = Number(process.env.SHARDS_PER_COLUMN ?? 4);
+
+/** Voronoi shards per footing. Footings are supports (mass 0) and small. */
+const SHARDS_PER_FOUNDATION = Number(process.env.SHARDS_PER_FOUNDATION ?? 4);
+
+/**
  * How many DISTINCT fracture patterns exist per panel class. 0 = unlimited,
  * which is the original behaviour: every panel gets its own random seeds and
  * therefore its own one-of-a-kind shards.
@@ -99,6 +130,23 @@ const SHARD_PATTERNS = Number(process.env.SHARD_PATTERNS ?? 0);
 const PATTERN_SEED = Number(process.env.PATTERN_SEED ?? 0x5eed);
 
 /**
+ * Pattern count for FLOOR plates, which wants to be lower than the wall's.
+ *
+ * The two element types have opposite economics and one knob cannot serve
+ * both. Downtown has ~716 wall panels of 10 cells each, but only ~216 floor
+ * plates of 16-100 cells each. Reuse per shape is (plates of that class) /
+ * patterns, so at a shared N=8 a wall shape is used ~11 times and a floor
+ * shape only ~4 -- below the threshold worth instancing, which is how
+ * fracturing the floor made rendering SLOWER: gl.render 1.05 -> 2.63 ms,
+ * 640 shapes -> 2,352, because the extra shapes bought variety nobody could
+ * share.
+ *
+ * Rule of thumb from those counts: patterns <= plates / (classes * 8).
+ * Walls tolerate ~11, floors about 6.
+ */
+const SHARD_PATTERNS_SLAB = Number(process.env.SHARD_PATTERNS_SLAB ?? 0) || SHARD_PATTERNS;
+
+/**
  * Normalised seed sets per panel class, built on first use.
  *
  * Seeds live in [0,1]^2 and are mapped onto the panel rect by the caller, so a
@@ -116,15 +164,16 @@ export function panelPatternClass(axis, spanU, spanW) {
  * Each class gets its own RNG stream seeded from the class key, so adding a new
  * building width cannot shift the patterns of the widths already present.
  */
-export function panelPattern(axis, spanU, spanW, index) {
+export function panelPattern(axis, spanU, spanW, index, shardCount = SHARDS_PER_PANEL,
+  patternCount = SHARD_PATTERNS) {
   const key = panelPatternClass(axis, spanU, spanW);
   let patterns = patternLibrary.get(key);
   if (!patterns) {
     let hash = PATTERN_SEED;
     for (let i = 0; i < key.length; i++) hash = (Math.imul(hash, 31) + key.charCodeAt(i)) | 0;
     const rng = mulberry32(hash);
-    patterns = Array.from({ length: Math.max(1, SHARD_PATTERNS) }, () =>
-      Array.from({ length: SHARDS_PER_PANEL }, () => [rng(), rng()]));
+    patterns = Array.from({ length: Math.max(1, patternCount) }, () =>
+      Array.from({ length: shardCount }, () => [rng(), rng()]));
     patternLibrary.set(key, patterns);
   }
   return patterns[index % patterns.length];
@@ -305,13 +354,15 @@ function clipConvex(poly, nx, ny, d) {
   return out;
 }
 
-function polygonArea(poly) {
+function polygonArea(poly, signed = false) {
   let a = 0;
   for (let i = 0; i < poly.length; i++) {
     const p = poly[i], q = poly[(i + 1) % poly.length];
     a += p[0] * q[1] - q[0] * p[1];
   }
-  return Math.abs(a) / 2;
+  // Signed only where the WINDING matters (deriving outward edge normals);
+  // every existing caller wants a magnitude.
+  return signed ? a / 2 : Math.abs(a) / 2;
 }
 
 function polygonCentroid(poly) {
@@ -479,14 +530,10 @@ export function buildBuilding({ width, floors, rng }) {
   const SLAB_CELLS = BAYS * SLAB_SPLIT;
   const SLAB_HALF = FOOTPRINT / (2 * SLAB_CELLS);
 
-  const foundation = new Map(), columns = new Map(), slabs = new Map();
+  const foundation = new Map(), columns = new Map();
+  /** Per floor, the fractured plate's cells (null where a cell degenerated). */
+  const slabFloors = [];
   const key = (...p) => p.join(':');
-  const CELL_W = FOOTPRINT / SLAB_CELLS;
-  /** [low, high] extent of slab cell `i` along one axis, with perimeter overhang. */
-  const slabRange = (i) => [
-    -half + i * CELL_W - (i === 0 ? WALL_T : 0),
-    -half + (i + 1) * CELL_W + (i === SLAB_CELLS - 1 ? WALL_T : 0),
-  ];
 
   for (const x of lines) for (const z of lines) {
     // Sit the footing so its TOP is exactly BASE_Y. Centring it at FOUND_HALF
@@ -508,20 +555,57 @@ export function buildBuilding({ width, floors, rng }) {
       const y = BASE_Y + f * FLOOR_HEIGHT + (s + 0.5) * segH;
       columns.set(key(f, x, z, s), addBox('column', [x, y, z], [COL / 2, segH / 2, COL / 2], CONCRETE));
     }
+    // The floor plate, fractured. It spans the frame plus the bearing ledge on
+    // every side -- the same rectangle the old cell grid covered, since the
+    // outermost cells overhung by WALL_T. The ledge is load-bearing: without
+    // it the facade has no horizontal support and its whole weight goes
+    // through the vertical clip patches in shear, which measured a gravity
+    // safety factor below 1 on three facade classes.
     const slabY = BASE_Y + (f + 1) * FLOOR_HEIGHT - SLAB_T / 2;
-    for (let i = 0; i < SLAB_CELLS; i++) for (let j = 0; j < SLAB_CELLS; j++) {
-      // Perimeter cells overhang outward by the wall thickness so the slab
-      // edge forms a real bearing ledge under the cladding above it. Without
-      // the ledge the facade has no horizontal support at all and its entire
-      // weight has to go through the vertical clip patches in shear, which
-      // measured a gravity safety factor below 1 on three facade classes.
-      const [x0, x1] = slabRange(i), [z0, z1] = slabRange(j);
-      slabs.set(key(f, i, j), addBox(
-        'slab',
-        [(x0 + x1) / 2, slabY, (z0 + z1) / 2],
-        [(x1 - x0) / 2, SLAB_T / 2, (z1 - z0) / 2],
-        CONCRETE));
+    const p0 = -half - WALL_T, p1 = half + WALL_T;
+    const shardCount = SHARDS_PER_SLAB > 0 ? SHARDS_PER_SLAB : SLAB_CELLS * SLAB_CELLS;
+    const slabClass = panelPatternClass('y', p1 - p0, p1 - p0);
+    const slabPattern = SHARD_PATTERNS > 0 ? Math.floor(rng() * SHARD_PATTERNS_SLAB) : -1;
+    const slabSeeds = SHARD_PATTERNS > 0
+      ? panelPattern('y', p1 - p0, p1 - p0, slabPattern, shardCount, SHARD_PATTERNS_SLAB)
+        .map(([su, sw]) => [p0 + su * (p1 - p0), p0 + sw * (p1 - p0)])
+      : Array.from({ length: shardCount }, () => [
+        p0 + rng() * (p1 - p0), p0 + rng() * (p1 - p0),
+      ]);
+    const slabPolys = voronoiCells(slabSeeds, p0, p0, p1, p1);
+    const floorCells = [];
+    for (let c = 0; c < slabPolys.length; c++) {
+      const poly = slabPolys[c];
+      if (poly.length < 3) { floorCells.push(null); continue; }
+      const area = polygonArea(poly);
+      if (area < 1e-4) { floorCells.push(null); continue; }
+      const [cx, cz] = polygonCentroid(poly);
+      const volume = area * SLAB_T;
+      // Centroid-relative, matching the ScenePack convention for colliders.
+      const local = poly.map(([x, z]) => [x - cx, z - cz]);
+      // (u, w) are world x and z; the thickness axis is y.
+      const mesh = prismMesh(local, SLAB_T, (a, b, t) => [cx + a, slabY + t, cz + b],
+        [cx, slabY, cz]);
+      let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+      for (const [x, z] of poly) {
+        minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+        minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+      }
+      nodes.push({ centroid: v(cx, slabY, cz), mass: round(volume * CONCRETE), volume: round(volume) });
+      nodeTypes.push('slab');
+      nodeSizes.push(v(maxX - minX, SLAB_T, maxZ - minZ));
+      if (SHARD_PATTERNS > 0) {
+        const shapeId = shardShapeId(slabClass, slabPattern, c, mesh.positions);
+        nodeShapeIds.push(shapeId);
+        nodeColliders.push({ kind: 'shape', shape: shapeId });
+      } else {
+        nodeShapeIds.push(-1);
+        nodeColliders.push({ kind: 'convex_hull', points: mesh.positions });
+      }
+      nodeMeshes.push(mesh);
+      floorCells.push({ poly, node: nodes.length - 1, seed: slabSeeds[c] });
     }
+    slabFloors.push(floorCells);
   }
   // Frame bonds at exact section areas.
   const COL_AREA = COL * COL;
@@ -535,25 +619,39 @@ export function buildBuilding({ width, floors, rng }) {
         addBond(columns.get(key(f, x, z, s)), columns.get(key(f, x, z, s + 1)), COL_AREA, M_FRAME, UP);
       }
       const top = columns.get(key(f, x, z, COL_SEGMENTS - 1));
-      // A column on a bay line straddles two or four slab cells, so bonding
-      // only the cell containing its centre both omitted load paths and gave
-      // that one cell the column's whole section area. Split the contact by
-      // the real overlap of the column footprint with each cell.
-      for (let i = 0; i < SLAB_CELLS; i++) for (let j = 0; j < SLAB_CELLS; j++) {
-        const [cx0, cx1] = slabRange(i), [cz0, cz1] = slabRange(j);
-        const ox = Math.min(x + COL / 2, cx1) - Math.max(x - COL / 2, cx0);
-        const oz = Math.min(z + COL / 2, cz1) - Math.max(z - COL / 2, cz0);
-        if (ox <= 0 || oz <= 0) continue;
-        addBond(top, slabs.get(key(f, i, j)), ox * oz, M_FRAME, UP);
-        if (f + 1 < floors) addBond(slabs.get(key(f, i, j)), columns.get(key(f + 1, x, z, 0)), ox * oz, M_FRAME, UP);
+      // A column straddles however many shards its footprint covers, so the
+      // contact is split by the REAL overlap of that footprint with each
+      // shard. `polygonRectArea` is exact, and summed over the shards it comes
+      // back to the column's own section area -- the load path is conserved
+      // whatever the fracture happens to look like.
+      for (const cell of slabFloors[f]) {
+        if (!cell) continue;
+        const share = polygonRectArea(cell.poly, x - COL / 2, z - COL / 2, x + COL / 2, z + COL / 2);
+        if (!(share > 1e-9)) continue;
+        addBond(top, cell.node, share, M_FRAME, UP);
+        if (f + 1 < floors) addBond(cell.node, columns.get(key(f + 1, x, z, 0)), share, M_FRAME, UP);
       }
     }
-    for (let i = 0; i < SLAB_CELLS; i++) for (let j = 0; j < SLAB_CELLS; j++) {
-      // Cut area is the real shared face: the neighbour's extent along the
-      // other axis times slab thickness (perimeter cells are wider).
-      const [z0, z1] = slabRange(j), [x0, x1] = slabRange(i);
-      if (i + 1 < SLAB_CELLS) addBond(slabs.get(key(f, i, j)), slabs.get(key(f, i + 1, j)), (z1 - z0) * SLAB_T, M_SLAB, [1, 0, 0]);
-      if (j + 1 < SLAB_CELLS) addBond(slabs.get(key(f, i, j)), slabs.get(key(f, i, j + 1)), (x1 - x0) * SLAB_T, M_SLAB, [0, 0, 1]);
+    // Shard-to-shard seams inside the plate: exact shared Voronoi edge times
+    // slab thickness. Same construction the wall panels use, and the reason a
+    // fractured floor keeps the grid's load path rather than approximating it.
+    {
+      const cells = slabFloors[f];
+      for (let i = 0; i < cells.length; i++) {
+        if (!cells[i]) continue;
+        for (let j = i + 1; j < cells.length; j++) {
+          if (!cells[j]) continue;
+          const a = cells[i].seed, b = cells[j].seed;
+          const nx = b[0] - a[0], nz = b[1] - a[1];
+          const d = nx * (a[0] + b[0]) / 2 + nz * (a[1] + b[1]) / 2;
+          const edge = sharedEdgeLength(cells[i].poly, nx, nz, d);
+          if (edge > 1e-6) {
+            // Seam plane normal lies in the floor plane: panel u is world x,
+            // panel w is world z.
+            addBond(cells[i].node, cells[j].node, edge * SLAB_T, M_SLAB, [nx, 0, nz]);
+          }
+        }
+      }
     }
   }
 
@@ -686,7 +784,6 @@ export function buildBuilding({ width, floors, rng }) {
       // edge lying on w0, times the wall thickness. This is the load path that
       // actually carries the facade's weight, in compression.
       // SUSPENSION: its top edge meets the ledge above the same way.
-      const edgeIndex = face.sign < 0 ? 0 : SLAB_CELLS - 1;
       const bottom = sharedEdgeLength(cell.poly, 0, -1, -panel.w0) * WALL_T;
       const top = sharedEdgeLength(cell.poly, 0, 1, panel.w1) * WALL_T;
       const spanOf = (poly, w) => {
@@ -708,13 +805,21 @@ export function buildBuilding({ width, floors, rng }) {
           }
           continue;
         }
-        for (let k = 0; k < SLAB_CELLS; k++) {
-          const [c0, c1] = slabRange(k);
-          const share = Math.max(0, Math.min(range[1], c1) - Math.max(range[0], c0));
-          if (share > 1e-6) {
-            const node = slabs.get(face.axis === 'z' ? key(slabFloor, k, edgeIndex) : key(slabFloor, edgeIndex, k));
-            if (node !== undefined) addBond(cell.node, node, share * WALL_T, M_CLIP, UP);
-          }
+        // The wall's bearing footprint on the plate: a WALL_T-wide strip along
+        // the ledge, spanning the shard's own u-range. Intersecting it with
+        // each floor shard gives the exact shared area, and the sum over
+        // shards is the wall shard's full bearing area -- so re-pointing these
+        // bonds at a fractured plate conserves the load path exactly.
+        const inner = face.sign < 0 ? -half - WALL_T : half;
+        const [s0, s1] = [Math.min(inner, inner + WALL_T), Math.max(inner, inner + WALL_T)];
+        const [r0, r1] = [Math.min(range[0], range[1]), Math.max(range[0], range[1])];
+        const strip = face.axis === 'z'
+          ? [r0, s0, r1, s1]   // wall runs along x, bears on the z edge
+          : [s0, r0, s1, r1];  // wall runs along z, bears on the x edge
+        for (const other of slabFloors[slabFloor] ?? []) {
+          if (!other) continue;
+          const share = polygonRectArea(other.poly, strip[0], strip[1], strip[2], strip[3]);
+          if (share > 1e-9) addBond(cell.node, other.node, share, M_CLIP, UP);
         }
       }
     }
