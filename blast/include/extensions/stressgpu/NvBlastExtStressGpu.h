@@ -60,6 +60,17 @@ struct ExtStressGpuSolveParams
     std::uint32_t maxIterations{25};
     float tolerance{0.001f};
     bool warmStart{true};
+    /// Skip an input-stable island even when its last solve did NOT converge.
+    ///
+    /// A pristine downtown-scale island (~24k nodes) does not converge at any
+    /// practical per-tick budget -- measured: 350k+ cumulative CG iterations
+    /// without the converged flag latching, the iterate oscillating at the
+    /// tolerance floor. Requiring convergence to skip therefore re-solved
+    /// ~296k bonds every tick at rest, for an answer identical to the one
+    /// already held. Reusing a frozen non-converged iterate for unchanged
+    /// inputs is physics-equal to recomputing it; any bond damage its residual
+    /// implies accrues identically either way.
+    bool skipStableUnconverged{false};
     // The damage kernel reads each bond's own material from the table given
     // to create(); there are no global limits.
     bool applyDamage{false};

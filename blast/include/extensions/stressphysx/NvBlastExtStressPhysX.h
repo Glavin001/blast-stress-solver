@@ -188,6 +188,25 @@ struct ExtStressPhysXSettings
     // sanctioned lever for stack/contact robustness on a backend with no
     // sweep-based CCD -- more iterations distribute contact correction across
     // a pile instead of resolving it as a few violent pushes.
+    // Extra solver update batches per tick while the stress solve has NOT
+    // converged (each batch is maxSolverIterationsPerFrame iterations).
+    //
+    // A pristine downtown-scale structure is one ~24k-node island; 32 CG
+    // iterations cannot reach equilibrium on it, and an unconverged island can
+    // never earn the settled-island skip -- so a 4-structure city re-solved
+    // ~296k bonds EVERY tick at rest (measured 37-50 ms of GPU stress with
+    // zero awake bodies). Worse than the cost: the unconverged residual reads
+    // as bond stress, which broke 20 bonds on an untouched city and inflated
+    // utilisation to 8.97 at rest -- phantom damage, the exact failure the
+    // docs warn about for under-solving.
+    //
+    // Pursuing convergence is therefore a CORRECTNESS setting, not tuning: it
+    // finishes the equilibrium the quasi-static model is defined by. Bounded
+    // per tick so a fracturing frame cannot stall; a structure typically
+    // converges over the first second and then skips at ~zero cost.
+    // See ExtStressGpuSolveParams::skipStableUnconverged.
+    bool skipStableUnconverged;
+    uint32_t unconvergedExtraUpdates;
     uint32_t bodyPositionIterations;
     uint32_t bodyVelocityIterations;
     bool enableSpeculativeCcd;
@@ -233,6 +252,8 @@ struct ExtStressPhysXSettings
         , applyCrushResistance(true)
         , maximumBodies(0)
         , maximumFracturesPerActorPerTick(0)
+        , skipStableUnconverged(true)
+        , unconvergedExtraUpdates(0)
         , bodyPositionIterations(4)
         , bodyVelocityIterations(1)
         , enableSpeculativeCcd(true)
@@ -310,6 +331,10 @@ struct ExtStressPhysXTelemetry
     //! resistive impulses carried it.
     double crushResistanceJoules;
     uint64_t crushResistanceImpulses;
+    /// Extra solve batches spent pursuing convergence (see
+    /// unconvergedExtraUpdates), and ticks that ended still unconverged.
+    uint64_t extraSolveUpdates;
+    uint64_t unconvergedTicks;
     uint64_t resimulationCaptures;
     uint64_t resimulationRestores;
     uint64_t resimulationBodiesRestored;

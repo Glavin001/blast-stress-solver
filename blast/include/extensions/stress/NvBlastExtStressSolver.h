@@ -536,6 +536,9 @@ public:
     \param[in]  enabled     true to skip settled islands.
     */
     virtual void                            setSkipSettled(bool enabled) = 0;
+    /// See ExtStressGpuSolveParams::skipStableUnconverged. GPU path only; the
+    /// CPU island skip still requires convergence (documented divergence).
+    virtual void                            setSkipStableUnconverged(bool enabled) = 0;
 
     /**
     \return whether settled-island skipping is currently enabled.

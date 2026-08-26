@@ -1405,6 +1405,16 @@ ext_stress_solver_set_skip_settled(ExtStressSolverHandle* handlePtr, uint8_t ena
     }
 }
 
+extern "C" void
+ext_stress_solver_set_skip_stable_unconverged(ExtStressSolverHandle* handlePtr, uint8_t enabled)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setSkipStableUnconverged(enabled != 0);
+    }
+}
+
 extern "C" uint8_t
 ext_stress_solver_get_skip_settled(const ExtStressSolverHandle* handlePtr)
 {

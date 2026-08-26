@@ -348,6 +348,7 @@ uint8_t ext_stress_solver_get_island_aware(const ExtStressSolverHandle* handle);
 // Enable/disable skipping of settled islands (requires island-aware). islands_skipped reports the
 // number skipped in the last update.
 void ext_stress_solver_set_skip_settled(ExtStressSolverHandle* handle, uint8_t enabled);
+void ext_stress_solver_set_skip_stable_unconverged(ExtStressSolverHandle* handle, uint8_t enabled);
 uint8_t ext_stress_solver_get_skip_settled(const ExtStressSolverHandle* handle);
 uint32_t ext_stress_solver_islands_skipped(const ExtStressSolverHandle* handle);
 // Islands the last update partitioned the graph into for the per-island solve (islands_skipped <= this).

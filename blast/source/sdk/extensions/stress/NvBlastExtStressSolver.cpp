@@ -394,6 +394,7 @@ public:
         m_forceColdStart = true;
     }
 
+    void setSkipStableUnconverged(bool enabled) { m_skipStableUnconverged = enabled; }
     void solve(uint32_t iterationCount, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
@@ -449,6 +450,7 @@ public:
             // 2.4 ms over a few hundred islands, but not at city scale where
             // nearly every island is a settled debris cluster.
             gpuParams.skipSettledIslands = skipSettled && warmStart;
+            gpuParams.skipStableUnconverged = m_skipStableUnconverged;
             if (m_gpuSolver->solveAndReadbackImpulses(
                     m_gpuVelocities.data(),
                     gpuParams,
@@ -549,6 +551,7 @@ private:
     AngLin6ErrorSq              m_error_sq;
     bool                        m_converged;
     bool                        m_forceColdStart;
+    bool m_skipStableUnconverged = false;
     bool                        m_inputsChanged;
     // Borrowed from the owning solver: resolved material table for the GPU
     // damage-kernel seed. Not consumed by the CPU solve.
@@ -1013,6 +1016,11 @@ public:
     uint32_t getGraphReductionLevel() const
     {
         return m_graphReductionLevel;
+    }
+
+    void setSkipStableUnconverged(bool enabled)
+    {
+        m_solver.setSkipStableUnconverged(enabled);
     }
 
     void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false, bool skipSettled = false, float deltaTime = 0.0f)
@@ -2038,6 +2046,11 @@ public:
     virtual void                            setSkipSettled(bool enabled) override
     {
         m_skipSettled = enabled;
+    }
+
+    void setSkipStableUnconverged(bool enabled) override
+    {
+        m_graphProcessor->setSkipStableUnconverged(enabled);
     }
 
     virtual bool                            getSkipSettled() const override

@@ -924,6 +924,7 @@ public:
         ExtStressGpuImpulse* bondImpulses,
         std::uint32_t capacity) override
     {
+        m_skipStableUnconverged = params.skipStableUnconverged;
         ContextGuard context(m_cudaContext);
         if (!bondImpulses || capacity < m_bondCount
             || !enqueueSolve(nodeVelocities, params))
@@ -1236,7 +1237,8 @@ private:
         for (std::uint32_t k = 0; k < m_islandCount; ++k)
         {
             const bool skip =
-                haveBaseline && !m_islandDirty[k] && m_hostIslandConverged[k] != 0u;
+                haveBaseline && !m_islandDirty[k]
+                && (m_skipStableUnconverged || m_hostIslandConverged[k] != 0u);
             m_hostIslandSkip[k] = skip ? 1u : 0u;
             if (skip)
             {
@@ -2380,6 +2382,8 @@ private:
     std::uint32_t m_islandCapacity{1};
     /// Set by removeBond; consumed by applyTopologyChange on the next solve.
     bool m_topologyDirty{false};
+    /// See ExtStressGpuSolveParams::skipStableUnconverged.
+    bool m_skipStableUnconverged{false};
     /// Bonds grouped by island (CSR), built once: the partition is fixed for
     /// the solver's lifetime.
     std::vector<std::uint32_t> m_islandBondBegin;

@@ -154,6 +154,8 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , debrisBodiesSpawned(0)
     , crushResistanceJoules(0.0)
     , crushResistanceImpulses(0)
+    , extraSolveUpdates(0)
+    , unconvergedTicks(0)
     , resimulationCaptures(0)
     , resimulationRestores(0)
     , resimulationBodiesRestored(0)
@@ -383,6 +385,8 @@ public:
         }
         ext_stress_solver_set_island_aware(m_solver, m_settings.islandAware ? 1 : 0);
         ext_stress_solver_set_skip_settled(m_solver, m_settings.skipSettledIslands ? 1 : 0);
+        ext_stress_solver_set_skip_stable_unconverged(
+            m_solver, m_settings.skipStableUnconverged ? 1 : 0);
         if (m_settings.gpuStressSolver)
         {
             physx::PxCudaContextManager* cudaManager = m_scene.getCudaContextManager();
@@ -989,6 +993,21 @@ public:
         }
         const TelemetryClock::time_point phaseStart = TelemetryClock::now();
         ext_stress_solver_update(m_solver);
+        // Pursue equilibrium. See unconvergedExtraUpdates: an unconverged
+        // island cannot earn the settled skip AND its residual reads as bond
+        // stress, so under-solving costs every tick and breaks phantom bonds.
+        for (uint32_t extra = 0;
+             extra < m_settings.unconvergedExtraUpdates
+             && ext_stress_solver_converged(m_solver) == 0;
+             ++extra)
+        {
+            ext_stress_solver_update(m_solver);
+            ++m_telemetry.extraSolveUpdates;
+        }
+        if (ext_stress_solver_converged(m_solver) == 0)
+        {
+            ++m_telemetry.unconvergedTicks;
+        }
 
         m_telemetry.overstressedBondCount =
             ext_stress_solver_overstressed_bond_count(m_solver);
