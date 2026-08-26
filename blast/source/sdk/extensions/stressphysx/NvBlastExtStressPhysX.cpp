@@ -2160,6 +2160,12 @@ private:
         rigid->setAngularDamping(m_settings.angularDamping);
         // See the settings comment: creation is the only site that provably
         // covers a body's first simulation step.
+        if (m_settings.bodyPositionIterations > 0)
+        {
+            rigid->setSolverIterationCounts(
+                m_settings.bodyPositionIterations,
+                std::max(1u, m_settings.bodyVelocityIterations));
+        }
         if (m_settings.enableSpeculativeCcd)
         {
             rigid->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_SPECULATIVE_CCD, true);

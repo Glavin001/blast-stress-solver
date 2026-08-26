@@ -183,6 +183,13 @@ struct ExtStressPhysXSettings
     // >1000 m/s, through a 20 m ground slab in one tick. Measured: ~7 bodies
     // per heavy bombardment escaped below ground; the worst live case reached
     // y = -19.6 million metres and overflowed the GPU patch buffer.
+    // PhysX per-body solver iteration counts (positions, velocities).
+    // Defaults are the engine's own 4/1. Raising positions is the engine's
+    // sanctioned lever for stack/contact robustness on a backend with no
+    // sweep-based CCD -- more iterations distribute contact correction across
+    // a pile instead of resolving it as a few violent pushes.
+    uint32_t bodyPositionIterations;
+    uint32_t bodyVelocityIterations;
     bool enableSpeculativeCcd;
     // 0 = leave PhysX's (unbounded) default. Bounds only how fast the solver
     // corrects interpenetration, which is a numerical artifact of discrete
@@ -226,6 +233,8 @@ struct ExtStressPhysXSettings
         , applyCrushResistance(true)
         , maximumBodies(0)
         , maximumFracturesPerActorPerTick(0)
+        , bodyPositionIterations(4)
+        , bodyVelocityIterations(1)
         , enableSpeculativeCcd(true)
         , maxDepenetrationVelocity(1.0f)
         , idleSkip(true)
