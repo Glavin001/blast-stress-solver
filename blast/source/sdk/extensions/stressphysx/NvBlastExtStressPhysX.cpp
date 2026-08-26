@@ -2158,6 +2158,16 @@ private:
         }
         rigid->setLinearDamping(m_settings.linearDamping);
         rigid->setAngularDamping(m_settings.angularDamping);
+        // See the settings comment: creation is the only site that provably
+        // covers a body's first simulation step.
+        if (m_settings.enableSpeculativeCcd)
+        {
+            rigid->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_SPECULATIVE_CCD, true);
+        }
+        if (m_settings.maxDepenetrationVelocity > 0.0f)
+        {
+            rigid->setMaxDepenetrationVelocity(m_settings.maxDepenetrationVelocity);
+        }
         result->bodyId = m_nextBodyId++;
         result->actorIndex = actorIndex;
         result->body = rigid;

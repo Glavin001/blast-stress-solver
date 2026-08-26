@@ -176,6 +176,18 @@ struct ExtStressPhysXSettings
     // protection, impact-bond fatalization, and per-body velocity clamps as
     // compensations for authoring the solver could not yet express — see
     // PHYSICS_ENGINE_CONTRACT.md for the invariant that replaced them.
+    // Applied AT BODY CREATION, not by a host-side walk after the fact. The
+    // walk variant left every split child's FIRST step unprotected: the walk
+    // ran against a body cache refreshed before endTick created the children,
+    // so an overlapping child's first depenetration step was unbounded --
+    // >1000 m/s, through a 20 m ground slab in one tick. Measured: ~7 bodies
+    // per heavy bombardment escaped below ground; the worst live case reached
+    // y = -19.6 million metres and overflowed the GPU patch buffer.
+    bool enableSpeculativeCcd;
+    // 0 = leave PhysX's (unbounded) default. Bounds only how fast the solver
+    // corrects interpenetration, which is a numerical artifact of discrete
+    // stepping -- it never overrides a fracture verdict or caps a trajectory.
+    float maxDepenetrationVelocity;
     bool idleSkip;
     bool baseStepSleep;
     float settledLinearSpeed;
@@ -214,6 +226,8 @@ struct ExtStressPhysXSettings
         , applyCrushResistance(true)
         , maximumBodies(0)
         , maximumFracturesPerActorPerTick(0)
+        , enableSpeculativeCcd(true)
+        , maxDepenetrationVelocity(1.0f)
         , idleSkip(true)
         , baseStepSleep(false)
         , settledLinearSpeed(0.15f)
