@@ -94,10 +94,10 @@ const SHARDS_PER_SLAB = Number(process.env.SHARDS_PER_SLAB ?? 2);
  *
  * 1 leaves columns whole (still emitted as hulls, not cuboids).
  */
-const SHARDS_PER_COLUMN = Number(process.env.SHARDS_PER_COLUMN ?? 4);
+const SHARDS_PER_COLUMN = Number(process.env.SHARDS_PER_COLUMN ?? 2);
 
 /** Voronoi shards per footing. Footings are supports (mass 0) and small. */
-const SHARDS_PER_FOUNDATION = Number(process.env.SHARDS_PER_FOUNDATION ?? 4);
+const SHARDS_PER_FOUNDATION = Number(process.env.SHARDS_PER_FOUNDATION ?? 2);
 
 /**
  * How many DISTINCT fracture patterns exist per panel class. 0 = unlimited,
@@ -149,6 +149,16 @@ const PATTERN_SEED = Number(process.env.PATTERN_SEED ?? 0x5eed);
  * Walls tolerate ~11, floors about 6.
  */
 const SHARD_PATTERNS_SLAB = Number(process.env.SHARD_PATTERNS_SLAB ?? 4);
+
+/**
+ * Pattern counts for the frame. Fewer than the slab's, for the same reason the
+ * slab's is fewer than the wall's: reuse is (elements of that class) / patterns,
+ * and there are only `lines^2` column stacks and footings per building, all one
+ * class each. A handful of patterns is already more variety than anyone can
+ * see on a 0.4 m section.
+ */
+const SHARD_PATTERNS_COLUMN = Number(process.env.SHARD_PATTERNS_COLUMN ?? 3);
+const SHARD_PATTERNS_FOUNDATION = Number(process.env.SHARD_PATTERNS_FOUNDATION ?? 2);
 
 /**
  * Normalised seed sets per panel class, built on first use.
@@ -426,6 +436,30 @@ function sharedEdgeLength(poly, nx, ny, d) {
   return total;
 }
 
+/**
+ * Exact area of the intersection of two convex polygons.
+ *
+ * Clips `a` by every edge half-plane of `b` -- Sutherland-Hodgman again, exact
+ * for convex operands. Needed where two fractured parts bear on each other and
+ * neither contact is a rectangle: a column shard meeting a floor shard, where
+ * the old code could use the column's 0.4 m square section because the column
+ * was one piece.
+ */
+function convexIntersectArea(a, b) {
+  if (a.length < 3 || b.length < 3) return 0;
+  // Outward normals depend on winding, so take it from the signed area.
+  const sign = polygonArea(b, true) >= 0 ? 1 : -1;
+  let poly = a;
+  for (let i = 0; i < b.length && poly.length; i++) {
+    const p = b[i], q = b[(i + 1) % b.length];
+    // Edge p->q; outward normal for CCW winding is (dy, -dx).
+    const nx = (q[1] - p[1]) * sign;
+    const ny = -(q[0] - p[0]) * sign;
+    poly = clipConvex(poly, nx, ny, nx * p[0] + ny * p[1]);
+  }
+  return poly.length >= 3 ? polygonArea(poly) : 0;
+}
+
 /** Exact area of (convex polygon) ∩ (axis-aligned rect). */
 function polygonRectArea(poly, x0, y0, x1, y1) {
   let p = poly;
@@ -477,6 +511,90 @@ export function buildBuilding({ width, floors, rng }) {
   // Shape-library id per node, or -1 for a node that carries its own geometry
   // (every cuboid, and every shard when the pattern pool is off).
   const nodeShapeIds = [];
+
+  /**
+   * Fracture an axis-aligned XZ plate into convex prisms.
+   *
+   * Every remaining element is this shape -- a floor cell is a wide thin plate,
+   * a column segment a small tall one, a footing a small squat one -- so they
+   * share one implementation rather than three that can drift on the details
+   * that matter (centroid-relative points, exact volume, shape ids).
+   *
+   * Returns the cells, each carrying the polygon its bonds are derived from.
+   * `shardCount` of 1 emits the whole plate as a single hull, which is how an
+   * element opts out of fracturing without going back to being a cuboid.
+   */
+  function fracturePlate({ type, x0, z0, x1, z1, y, thickness, density, fixed = false,
+    shardCount, patternCount, stackKey }) {
+    const dx = x1 - x0, dz = z1 - z0;
+    const cls = panelPatternClass('y', dx, dz);
+    // `stackKey` pins one pattern for a whole vertical stack; see the column
+    // call site for why alignment is load-bearing rather than cosmetic.
+    let pattern = -1;
+    if (SHARD_PATTERNS > 0) {
+      if (stackKey === undefined) {
+        pattern = Math.floor(rng() * patternCount);
+      } else {
+        const remembered = stackPatterns.get(stackKey);
+        pattern = remembered ?? Math.floor(rng() * patternCount);
+        if (remembered === undefined) stackPatterns.set(stackKey, pattern);
+      }
+    }
+    const seeds = SHARD_PATTERNS > 0
+      ? panelPattern('y', dx, dz, pattern, shardCount, patternCount)
+        .map(([su, sw]) => [x0 + su * dx, z0 + sw * dz])
+      : Array.from({ length: shardCount }, () => [x0 + rng() * dx, z0 + rng() * dz]);
+    const polys = shardCount > 1
+      ? voronoiCells(seeds, x0, z0, x1, z1)
+      : [[[x0, z0], [x1, z0], [x1, z1], [x0, z1]]];
+    const cells = [];
+    for (let c = 0; c < polys.length; c++) {
+      const poly = polys[c];
+      if (poly.length < 3) continue;
+      const area = polygonArea(poly);
+      if (area < 1e-4) continue;
+      const [cx, cz] = polygonCentroid(poly);
+      const volume = area * thickness;
+      const local = poly.map(([px, pz]) => [px - cx, pz - cz]);
+      const mesh = prismMesh(local, thickness, (a, b, t) => [cx + a, y + t, cz + b], [cx, y, cz]);
+      let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+      for (const [px, pz] of poly) {
+        minX = Math.min(minX, px); maxX = Math.max(maxX, px);
+        minZ = Math.min(minZ, pz); maxZ = Math.max(maxZ, pz);
+      }
+      nodes.push({
+        centroid: v(cx, y, cz),
+        mass: fixed ? 0 : round(volume * density),
+        volume: round(volume),
+      });
+      nodeTypes.push(type);
+      nodeSizes.push(v(maxX - minX, thickness, maxZ - minZ));
+      if (SHARD_PATTERNS > 0) {
+        const shapeId = shardShapeId(cls, pattern, c, mesh.positions);
+        nodeShapeIds.push(shapeId);
+        nodeColliders.push({ kind: 'shape', shape: shapeId });
+      } else {
+        nodeShapeIds.push(-1);
+        nodeColliders.push({ kind: 'convex_hull', points: mesh.positions });
+      }
+      nodeMeshes.push(mesh);
+      cells.push({ poly, node: nodes.length - 1, seed: seeds[c], area });
+    }
+    return cells;
+  }
+
+  /** Seams between shards of one plate: exact shared Voronoi edge x thickness. */
+  function bondPlateSeams(cells, thickness, material) {
+    for (let i = 0; i < cells.length; i++) {
+      for (let j = i + 1; j < cells.length; j++) {
+        const a = cells[i].seed, b = cells[j].seed;
+        const nx = b[0] - a[0], nz = b[1] - a[1];
+        const d = nx * (a[0] + b[0]) / 2 + nz * (a[1] + b[1]) / 2;
+        const edge = sharedEdgeLength(cells[i].poly, nx, nz, d);
+        if (edge > 1e-6) addBond(cells[i].node, cells[j].node, edge * thickness, material, [nx, 0, nz]);
+      }
+    }
+  }
 
   function addBox(type, centre, half, density, fixed = false) {
     const volume = 8 * half[0] * half[1] * half[2];
@@ -535,6 +653,8 @@ export function buildBuilding({ width, floors, rng }) {
   const SLAB_HALF = FOOTPRINT / (2 * SLAB_CELLS);
 
   const foundation = new Map(), columns = new Map();
+  /** Stack key -> its chosen fracture pattern, so segments cut alike. */
+  const stackPatterns = new Map();
   /** Per floor, every floor shard: {poly, node, seed, gi, gj}. */
   const slabFloors = [];
   const CELL_W = FOOTPRINT / SLAB_CELLS;
@@ -556,7 +676,15 @@ export function buildBuilding({ width, floors, rng }) {
     // 0.001 + 2*FOUND_HALF, i.e. every column was bonded to its footing across
     // a 1 mm gap with no contact surface at all. NvBlast's own contact-based
     // bond generator finds zero column~foundation contacts in that layout.
-    foundation.set(key(x, z), addBox('foundation', [x, BASE_Y - FOUND_HALF, z], [FOUND_HALF, FOUND_HALF, FOUND_HALF], CONCRETE, true));
+    const cells = fracturePlate({
+      type: 'foundation',
+      x0: x - FOUND_HALF, z0: z - FOUND_HALF, x1: x + FOUND_HALF, z1: z + FOUND_HALF,
+      y: BASE_Y - FOUND_HALF, thickness: 2 * FOUND_HALF,
+      density: CONCRETE, fixed: true,
+      shardCount: SHARDS_PER_FOUNDATION, patternCount: SHARD_PATTERNS_FOUNDATION,
+    });
+    bondPlateSeams(cells, 2 * FOUND_HALF, M_ANCHOR);
+    foundation.set(key(x, z), cells);
   }
   // Columns stop at the slab soffit, not at the floor line: the slab occupies
   // the top SLAB_T of each storey. Running them the full storey height buried
@@ -568,7 +696,21 @@ export function buildBuilding({ width, floors, rng }) {
   for (let f = 0; f < floors; f++) {
     for (const x of lines) for (const z of lines) for (let s = 0; s < COL_SEGMENTS; s++) {
       const y = BASE_Y + f * FLOOR_HEIGHT + (s + 0.5) * segH;
-      columns.set(key(f, x, z, s), addBox('column', [x, y, z], [COL / 2, segH / 2, COL / 2], CONCRETE));
+      // Every segment of one stack reuses that stack's pattern, so the shards
+      // line up floor to floor. That is not cosmetic: aligned means a shard
+      // bears on the shard below across its own full cross-section, so the
+      // segment-to-segment bond is just its own area and the frame's load path
+      // is unchanged by the fracture. Staggered patterns would need a
+      // convex-convex intersection per pair AND would redistribute the load.
+      const cells = fracturePlate({
+        type: 'column',
+        x0: x - COL / 2, z0: z - COL / 2, x1: x + COL / 2, z1: z + COL / 2,
+        y, thickness: segH, density: CONCRETE,
+        shardCount: SHARDS_PER_COLUMN, patternCount: SHARD_PATTERNS_COLUMN,
+        stackKey: key(x, z),
+      });
+      bondPlateSeams(cells, segH, M_FRAME);
+      columns.set(key(f, x, z, s), cells);
     }
     // Each floor CELL breaks, the grid itself stays. Perimeter cells overhang
     // outward by the wall thickness so the slab edge forms the bearing ledge
@@ -627,12 +769,26 @@ export function buildBuilding({ width, floors, rng }) {
   const COL_AREA = COL * COL;
   const SLAB_CUT = (FOOTPRINT / SLAB_CELLS) * SLAB_T;
   for (const x of lines) for (const z of lines) {
-    addBond(foundation.get(key(x, z)), columns.get(key(0, x, z, 0)), COL_AREA, M_ANCHOR, UP);
+    // Footing shards and column shards are separate partitions of overlapping
+    // footprints, so neither contact is a rectangle: the share is the exact
+    // convex-convex overlap. Summed, it comes back to the column's section.
+    for (const foot of foundation.get(key(x, z))) {
+      for (const col of columns.get(key(0, x, z, 0))) {
+        const share = convexIntersectArea(col.poly, foot.poly);
+        if (share > 1e-9) addBond(foot.node, col.node, share, M_ANCHOR, UP);
+      }
+    }
   }
   for (let f = 0; f < floors; f++) {
     for (const x of lines) for (const z of lines) {
       for (let s = 0; s + 1 < COL_SEGMENTS; s++) {
-        addBond(columns.get(key(f, x, z, s)), columns.get(key(f, x, z, s + 1)), COL_AREA, M_FRAME, UP);
+        // Aligned by construction (one pattern per stack), so shard i bears on
+        // shard i across its own full cross-section.
+        const below = columns.get(key(f, x, z, s));
+        const above = columns.get(key(f, x, z, s + 1));
+        for (let i = 0; i < below.length && i < above.length; i++) {
+          addBond(below[i].node, above[i].node, below[i].area, M_FRAME, UP);
+        }
       }
       const top = columns.get(key(f, x, z, COL_SEGMENTS - 1));
       // A column straddles however many shards its footprint covers, so the
@@ -640,12 +796,18 @@ export function buildBuilding({ width, floors, rng }) {
       // shard. `polygonRectArea` is exact, and summed over the shards it comes
       // back to the column's own section area -- the load path is conserved
       // whatever the fracture happens to look like.
+      const nextBase = f + 1 < floors ? columns.get(key(f + 1, x, z, 0)) : null;
       for (const cell of slabFloors[f]) {
         if (!cell) continue;
-        const share = polygonRectArea(cell.poly, x - COL / 2, z - COL / 2, x + COL / 2, z + COL / 2);
-        if (!(share > 1e-9)) continue;
-        addBond(top, cell.node, share, M_FRAME, UP);
-        if (f + 1 < floors) addBond(cell.node, columns.get(key(f + 1, x, z, 0)), share, M_FRAME, UP);
+        for (const col of top) {
+          const share = convexIntersectArea(col.poly, cell.poly);
+          if (share > 1e-9) addBond(col.node, cell.node, share, M_FRAME, UP);
+        }
+        if (!nextBase) continue;
+        for (const col of nextBase) {
+          const share = convexIntersectArea(col.poly, cell.poly);
+          if (share > 1e-9) addBond(cell.node, col.node, share, M_FRAME, UP);
+        }
       }
     }
     // Floor seams, in two families.
@@ -826,13 +988,29 @@ export function buildBuilding({ width, floors, rng }) {
       if (!cell) continue;
       // Columns whose outer face is coplanar with this panel.
       for (const other of lines) {
-        const cu = face.axis === 'z' ? other : other;
         for (let s = 0; s < COL_SEGMENTS; s++) {
           const cy = BASE_Y + floor * FLOOR_HEIGHT + (s + 0.5) * segH;
-          const area = polygonRectArea(cell.poly, cu - COL / 2, cy - segH / 2, cu + COL / 2, cy + segH / 2);
-          if (area > 1e-6) {
-            const node = columns.get(face.axis === 'z' ? key(floor, other, perimeter, s) : key(floor, perimeter, other, s));
-            if (node !== undefined) addBond(cell.node, node, area, M_CLIP, face.axis === 'z' ? [0, 0, 1] : [1, 0, 0]);
+          const shards = columns.get(face.axis === 'z'
+            ? key(floor, other, perimeter, s)
+            : key(floor, perimeter, other, s));
+          if (shards === undefined) continue;
+          // The column's outer face is coplanar with the wall's inner face, at
+          // the perimeter line offset by half the section. Only shards with an
+          // edge ON that plane touch the cladding, and each touches across its
+          // own span there -- summed, that is the section width the whole
+          // column used to be charged.
+          const facePlane = perimeter + face.sign * (COL / 2);
+          const spanAxis = face.axis === 'z' ? 1 : 0;
+          for (const col of shards) {
+            const span = edgeSpan(col.poly, spanAxis, facePlane);
+            if (!span) continue;
+            const area = polygonRectArea(
+              cell.poly, span[0], cy - segH / 2, span[1], cy + segH / 2,
+            );
+            if (area > 1e-6) {
+              addBond(cell.node, col.node, area, M_CLIP,
+                face.axis === 'z' ? [0, 0, 1] : [1, 0, 0]);
+            }
           }
         }
       }
@@ -853,12 +1031,21 @@ export function buildBuilding({ width, floors, rng }) {
         const range = spanOf(cell.poly, w);
         if (!range) continue;
         if (slabFloor < 0) {
-          // Ground floor bears on the footings it actually sits over.
+          // Ground floor bears on the footings it actually sits over. Same
+          // footprint-strip intersection the slab bearing uses below, so a
+          // fractured footing splits the load exactly.
+          const inner0 = face.sign < 0 ? -half - WALL_T : half;
+          const strip0 = face.axis === 'z'
+            ? [Math.min(range[0], range[1]), Math.min(inner0, inner0 + WALL_T),
+              Math.max(range[0], range[1]), Math.max(inner0, inner0 + WALL_T)]
+            : [Math.min(inner0, inner0 + WALL_T), Math.min(range[0], range[1]),
+              Math.max(inner0, inner0 + WALL_T), Math.max(range[0], range[1])];
           for (const other of lines) {
-            const share = Math.max(0, Math.min(range[1], other + FOUND_HALF) - Math.max(range[0], other - FOUND_HALF));
-            if (share > 1e-6) {
-              const node = foundation.get(face.axis === 'z' ? key(other, perimeter) : key(perimeter, other));
-              if (node !== undefined) addBond(cell.node, node, share * WALL_T, M_CLIP, UP);
+            const shards = foundation.get(face.axis === 'z' ? key(other, perimeter) : key(perimeter, other));
+            if (shards === undefined) continue;
+            for (const foot of shards) {
+              const share = polygonRectArea(foot.poly, strip0[0], strip0[1], strip0[2], strip0[3]);
+              if (share > 1e-9) addBond(cell.node, foot.node, share, M_CLIP, UP);
             }
           }
           continue;
