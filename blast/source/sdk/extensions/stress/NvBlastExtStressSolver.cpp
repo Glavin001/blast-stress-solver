@@ -2662,8 +2662,23 @@ bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& co
 
             // deal with linear forces
             const ExtStressMaterial& bondMaterial = materialForBond(blastBondIndex);
-            const float excessCompression = bondData.stressNormal + bondMaterial.compressionFatalLimit;
-            const float excessTension = bondData.stressNormal - bondMaterial.tensionFatalLimit;
+            // Excess is DEMANDED load beyond the fatal limit -- and a joint can
+            // never transmit more force than its own breaking strength: demand
+            // beyond that was never carried through the joint, the joint failed
+            // instead. Unbounded, this injected the full demanded overshoot as
+            // impulse; utilisation spikes of 23-116x the elastic limit were
+            // measured live, so the same break sometimes read as a shrug and
+            // sometimes as an explosion, and the explosive tail seeded
+            // ground-tunnelling escape velocities. Each component is therefore
+            // bounded by that bond's OWN fatal limit: the material table that
+            // decides breaking also bounds the release. No tunable constant is
+            // involved, and typical (sub-fatal-overshoot) breaks are unchanged.
+            const float excessCompression = std::max(
+                bondData.stressNormal + bondMaterial.compressionFatalLimit,
+                -bondMaterial.compressionFatalLimit);
+            const float excessTension = std::min(
+                bondData.stressNormal - bondMaterial.tensionFatalLimit,
+                bondMaterial.tensionFatalLimit);
             if (excessCompression < 0.0f)
             {
                 nvLinearPressure += excessCompression * bondData.normal;
@@ -2674,7 +2689,9 @@ bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& co
                 nvLinearPressure += excessTension * bondData.normal;
             }
 
-            const float excessShear = bondData.stressShear - bondMaterial.shearFatalLimit;
+            const float excessShear = std::min(
+                bondData.stressShear - bondMaterial.shearFatalLimit,
+                bondMaterial.shearFatalLimit);
             if (excessShear > 0.0f)
             {
                 NvVec3 impulseLinear, impulseAngular;
