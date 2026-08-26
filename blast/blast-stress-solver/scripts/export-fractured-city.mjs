@@ -158,6 +158,13 @@ const SHARD_PATTERNS_SLAB = Number(process.env.SHARD_PATTERNS_SLAB ?? 4);
  * see on a 0.4 m section.
  */
 const SHARD_PATTERNS_COLUMN = Number(process.env.SHARD_PATTERNS_COLUMN ?? 3);
+
+/**
+ * How much stronger a floor cell's INTERNAL seam is than the structural grid
+ * seam between cells. 1 makes them identical, which is what shipping the
+ * fractured floor without this did.
+ */
+const SLAB_CORE_SCALE = Number(process.env.SLAB_CORE_SCALE ?? 3);
 const SHARD_PATTERNS_FOUNDATION = Number(process.env.SHARD_PATTERNS_FOUNDATION ?? 2);
 
 /**
@@ -329,13 +336,33 @@ export const MATERIALS = [
     shearElastic: 2.5e6 * FACADE_SCALE, shearFatal: 2.5e6 * FACADE_SCALE * FACADE_BAND,
   },
   {
+    // Seams INSIDE one floor cell -- the plane this exporter's own fracture
+    // introduced, which did not exist when a cell was a single cuboid.
+    //
+    // Stronger than `concrete-slab` on purpose. A floor should still part at
+    // the structural grid first, the way it did before the cell was cut; the
+    // internal seam is there so a cell can shatter under a real hit, not so it
+    // falls apart under its own weight. Authored as a material rather than by
+    // inflating the seam's area, because area is simultaneously the stress
+    // denominator and the damage pool -- padding it would corrupt the reported
+    // utilisation and scale toughness super-linearly. See SCENE_PACK_FORMAT.md,
+    // "Area is geometry. Material is strength."
+    name: 'slab-core',
+    compressionElastic: 12e6 * SLAB_SCALE * SLAB_CORE_SCALE,
+    compressionFatal: 12e6 * SLAB_SCALE * SLAB_CORE_SCALE * FRAME_BAND,
+    tensionElastic: 1.2e6 * SLAB_SCALE * SLAB_CORE_SCALE,
+    tensionFatal: 1.2e6 * SLAB_SCALE * SLAB_CORE_SCALE * FRAME_BAND,
+    shearElastic: 1.6e6 * SLAB_SCALE * SLAB_CORE_SCALE,
+    shearFatal: 1.6e6 * SLAB_SCALE * SLAB_CORE_SCALE * FRAME_BAND,
+  },
+  {
     name: 'footing-anchor',
     compressionElastic: 1.0e8 * ANCHOR_SCALE, compressionFatal: 1.0e8 * ANCHOR_SCALE * FRAME_BAND,
     tensionElastic: 1.3e7 * ANCHOR_SCALE, tensionFatal: 1.3e7 * ANCHOR_SCALE * FRAME_BAND,
     shearElastic: 5.0e7 * ANCHOR_SCALE, shearFatal: 5.0e7 * ANCHOR_SCALE * FRAME_BAND,
   },
 ];
-const [M_FRAME, M_SLAB, M_PANEL, M_CLIP, M_ANCHOR] = [0, 1, 2, 3, 4];
+const [M_FRAME, M_SLAB, M_PANEL, M_CLIP, M_SLAB_CORE, M_ANCHOR] = [0, 1, 2, 3, 4, 5];
 
 // ── Utilities ───────────────────────────────────────────────────────────────
 export function mulberry32(a) {
@@ -836,7 +863,10 @@ export function buildBuilding({ width, floors, rng }) {
             const d = nx * (sa[0] + sb[0]) / 2 + nz * (sa[1] + sb[1]) / 2;
             const edge = sharedEdgeLength(group[a].poly, nx, nz, d);
             if (edge > 1e-6) {
-              addBond(group[a].node, group[b].node, edge * SLAB_T, M_SLAB, [nx, 0, nz]);
+              // M_SLAB_CORE, not M_SLAB: this is the seam the fracture
+              // introduced inside what used to be one cuboid, so it holds
+              // harder than the structural grid joint between cells.
+              addBond(group[a].node, group[b].node, edge * SLAB_T, M_SLAB_CORE, [nx, 0, nz]);
             }
           }
         }
