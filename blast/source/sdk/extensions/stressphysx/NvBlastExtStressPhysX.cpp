@@ -1419,6 +1419,7 @@ public:
             target.linearVelocity = source.body->getLinearVelocity();
             target.angularVelocity = source.body->getAngularVelocity();
             target.nodeCount = static_cast<uint32_t>(source.nodes.size());
+            target.mass = source.cachedMass;
             // Same-tick row hint for consumeContactsFromSnapshot: stamped at
             // the one site that writes rows FROM body states, so it is fresh
             // by construction and costs nothing.
@@ -1928,6 +1929,8 @@ private:
 
     struct BodyState
     {
+        /// See ExtStressPhysXBodySnapshot::mass.
+        float cachedMass = 0.0f;
         /// Row this body occupied in the last getBodySnapshots output.
         /// Verified against bodyId before use; a stale hint is a map lookup,
         /// never a wrong answer.
@@ -2241,6 +2244,7 @@ private:
             rigid->setMaxDepenetrationVelocity(m_settings.maxDepenetrationVelocity);
         }
         result->bodyId = m_nextBodyId++;
+        result->cachedMass = rigid->getMass();
         result->actorIndex = actorIndex;
         result->body = rigid;
         ++m_telemetry.bodiesCreated;
@@ -2399,7 +2403,8 @@ private:
         body.body->setMass(std::max(combined.mass, MIN_MASS));
         body.body->setCMassLocalPose(PxTransform(centerOfMass, massFrame));
         body.body->setMassSpaceInertiaTensor(diagonal);
-    }
+        body.cachedMass = body.body != nullptr ? body.body->getMass() : 0.0f;
+}
 
     PxVec3 pointVelocity(const BodyState& body, const PxVec3& worldPoint) const
     {

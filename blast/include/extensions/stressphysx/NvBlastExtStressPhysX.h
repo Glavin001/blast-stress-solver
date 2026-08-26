@@ -333,6 +333,11 @@ struct ExtStressPhysXBodySnapshot
     physx::PxVec3 linearVelocity;
     physx::PxVec3 angularVelocity;
     uint32_t nodeCount;
+    /// Cached at mass-recompute time, not read live: consumers were issuing
+    /// two PxRigidDynamic::getMass calls per contact PAIR (~52k per tick at a
+    /// 7.9k-awake peak) for a value that only changes when a split recomputes
+    /// mass properties.
+    float mass;
     bool kinematic;
     bool sleeping;
 };
