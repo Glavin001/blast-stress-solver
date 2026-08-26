@@ -552,6 +552,28 @@ public:
             // single-chunk debris. nodeCount is already on the row.
             if (skipSingleton && snapshot.nodeCount <= 1)
             {
+                // The gravity walk is ALSO where awakeDynamicBodyCount and
+                // sleepingActorsSkipped are tallied. Skipping without
+                // preserving them silently un-counted every awake single-chunk
+                // debris body: damage held while "awake" read 8x low, and a
+                // whole bench comparison bucketed on that metric was garbage.
+                // Replicate the original counting exactly; the row carries
+                // everything the counters need.
+                if (!snapshot.kinematic)
+                {
+                    if (snapshot.sleeping)
+                    {
+                        if (m_contactedActors.find(snapshot.actorIndex) ==
+                            m_contactedActors.end())
+                        {
+                            ++m_telemetry.sleepingActorsSkipped;
+                        }
+                    }
+                    else
+                    {
+                        ++m_telemetry.awakeDynamicBodyCount;
+                    }
+                }
                 continue;
             }
             // Keyed by actorIndex: m_actorBodies is a map<actorIndex, BodyState>,
