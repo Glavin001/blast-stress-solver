@@ -440,7 +440,14 @@ std::vector<physx::PxVec3> reduceConvexPoints(
     return result;
 }
 
-SceneCollider parseCollider(const Json& json, const physx::PxVec3& size)
+// `library` holds the pack's shapeLibrary entries, empty when the pack has
+// none. A `kind: "shape"` collider is a reference into it: the fracturer stored
+// each distinct shard once and named it, so a consumer can share geometry
+// without comparing point arrays to work out which shards are alike.
+SceneCollider parseCollider(
+    const Json& json,
+    const physx::PxVec3& size,
+    const std::vector<const Json*>& library)
 {
     requireKind(json, Json::Kind::Object, "nodeColliders[]");
     SceneCollider result;
@@ -450,6 +457,21 @@ SceneCollider parseCollider(const Json& json, const physx::PxVec3& size)
         result.kind = SceneColliderKind::Cuboid;
         result.halfExtents = vec3(json.at("halfExtents"), "halfExtents");
         return result;
+    }
+    if (kind == "shape")
+    {
+        const std::size_t which = index(json.at("shape"), "shape");
+        if (which >= library.size())
+        {
+            throw std::runtime_error(
+                "scene collider references shape " + std::to_string(which)
+                + " but the library has only " + std::to_string(library.size())
+                + " entries");
+        }
+        // Resolve against the library entry, which is itself an ordinary hull.
+        // Recursing keeps one implementation of the point validation rather
+        // than a second copy that could drift from it.
+        return parseCollider(*library[which], size, {});
     }
     if (kind != "convex_hull")
     {
@@ -676,6 +698,19 @@ ScenePack loadScenePack(const std::string& path)
     const Json& bonds = scenario.at("bonds");
     const Json& sizes = scenario.at("nodeSizes");
     const Json& colliders = scenario.at("nodeColliders");
+    // Optional: only packs exported with a bounded fracture-pattern count carry
+    // one. Gathered up front so a dangling reference fails while loading rather
+    // than as a node silently colliding with some other node's shape.
+    std::vector<const Json*> shapeLibrary;
+    if (const Json* library = scenario.find("shapeLibrary"))
+    {
+        requireKind(*library, Json::Kind::Array, "shapeLibrary");
+        shapeLibrary.reserve(library->array.size());
+        for (const Json& entry : library->array)
+        {
+            shapeLibrary.push_back(&entry);
+        }
+    }
     requireKind(nodes, Json::Kind::Array, "nodes");
     requireKind(bonds, Json::Kind::Array, "bonds");
     requireKind(sizes, Json::Kind::Array, "nodeSizes");
@@ -714,7 +749,7 @@ ScenePack loadScenePack(const std::string& path)
             }
         }
         const physx::PxVec3 size = vec3(sizes.array[i], "nodeSizes[]");
-        node.collider = parseCollider(colliders.array[i], size);
+        node.collider = parseCollider(colliders.array[i], size, shapeLibrary);
         node.visualHalfExtents =
             node.collider.kind == SceneColliderKind::Cuboid ? node.collider.halfExtents : size * 0.5f;
         pack.nodes.push_back(std::move(node));

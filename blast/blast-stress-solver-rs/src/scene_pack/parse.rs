@@ -136,6 +136,14 @@ struct ScenarioJson {
     node_colliders: Vec<Option<ColliderJson>>,
     #[serde(default)]
     node_types: Vec<String>,
+    /// Distinct shard shapes, stored once and referenced by `kind: "shape"`.
+    ///
+    /// Present when the fracturer bounded its pattern count, which is what lets
+    /// a consumer instance every shard sharing an id without comparing
+    /// geometry. Absent on packs whose shards are all one-of-a-kind, where each
+    /// carries its own points.
+    #[serde(default)]
+    shape_library: Vec<ColliderJson>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +174,9 @@ struct ColliderJson {
     half_extents: Option<Vec3Json>,
     #[serde(default)]
     points: Vec<f32>,
+    /// Index into `shapeLibrary`, for `kind: "shape"`.
+    #[serde(default)]
+    shape: Option<u32>,
 }
 
 /// A negative tension or shear limit means "inherit compression".
@@ -363,6 +374,30 @@ pub fn parse_scene_pack(payload: &str) -> Result<ScenePack, ScenePackError> {
 
     let node_sizes: Vec<Vec3> = scenario.node_sizes.iter().map(Vec3::from).collect();
 
+    // Flatten the shape library once. A dangling reference must fail here
+    // rather than downstream, where the only symptom would be a node colliding
+    // as some other node's shape.
+    let mut library: Vec<Vec<Vec3>> = Vec::with_capacity(scenario.shape_library.len());
+    for (index, entry) in scenario.shape_library.iter().enumerate() {
+        match entry.kind.as_str() {
+            "convex_hull" | "convexHull" => {
+                let points = dedup_points(&entry.points);
+                if points.len() < 4 {
+                    return Err(ScenePackError::Invalid(format!(
+                        "shape {index}: convex hull has {} distinct points",
+                        points.len()
+                    )));
+                }
+                library.push(points);
+            }
+            other => {
+                return Err(ScenePackError::Invalid(format!(
+                    "shape {index}: library entries must be convex hulls, got {other:?}"
+                )))
+            }
+        }
+    }
+
     let node_colliders: Vec<SceneCollider> = scenario
         .node_colliders
         .iter()
@@ -393,6 +428,23 @@ pub fn parse_scene_pack(payload: &str) -> Result<ScenePack, ScenePackError> {
                         )));
                     }
                     Ok(SceneCollider::ConvexHull { points })
+                }
+                // A reference into the pack's shape library. Resolved here so
+                // nothing downstream has to know the difference between a shard
+                // that carries its own points and one that shares them.
+                "shape" => {
+                    let index = c.shape.ok_or_else(|| {
+                        ScenePackError::Invalid(format!("node {i}: shape collider without an index"))
+                    })? as usize;
+                    let entry = library.get(index).ok_or_else(|| {
+                        ScenePackError::Invalid(format!(
+                            "node {i}: references shape {index}, library has {}",
+                            library.len()
+                        ))
+                    })?;
+                    Ok(SceneCollider::ConvexHull {
+                        points: entry.clone(),
+                    })
                 }
                 other => Err(ScenePackError::Invalid(format!(
                     "node {i}: unknown collider kind {other:?}"
