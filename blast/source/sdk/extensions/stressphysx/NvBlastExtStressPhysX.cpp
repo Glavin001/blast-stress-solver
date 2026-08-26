@@ -154,7 +154,6 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , debrisBodiesSpawned(0)
     , crushResistanceJoules(0.0)
     , crushResistanceImpulses(0)
-    , excessImpulsesClamped(0)
     , resimulationCaptures(0)
     , resimulationRestores(0)
     , resimulationBodiesRestored(0)
@@ -3256,27 +3255,10 @@ private:
                         &excessTorque))
                 {
                     const float impulseScale = dt * m_settings.excessForceScale;
-                    PxVec3 worldForce =
+                    const PxVec3 worldForce =
                         m_worldTransform.q.rotate(fromStress(excessForce)) * impulseScale;
-                    PxVec3 worldTorque =
+                    const PxVec3 worldTorque =
                         m_worldTransform.q.rotate(fromStress(excessTorque)) * impulseScale;
-                    // Bound the delta-v. See maxExcessVelocityChange: the
-                    // released load is unbounded (utilisation spikes of 23-77x
-                    // measured), and the unbounded tail reads as a random
-                    // explosion and seeds tunnelling escape velocities.
-                    if (m_settings.maxExcessVelocityChange > 0.0f)
-                    {
-                        const float mass = PxMax(target.body->getMass(), 1.0e-6f);
-                        const float deltaV = worldForce.magnitude() / mass;
-                        if (deltaV > m_settings.maxExcessVelocityChange)
-                        {
-                            const float scale =
-                                m_settings.maxExcessVelocityChange / deltaV;
-                            worldForce *= scale;
-                            worldTorque *= scale;
-                            ++m_telemetry.excessImpulsesClamped;
-                        }
-                    }
                     target.body->addForce(worldForce, PxForceMode::eIMPULSE, true);
                     target.body->addTorque(worldTorque, PxForceMode::eIMPULSE, true);
                 }

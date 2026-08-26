@@ -188,18 +188,6 @@ struct ExtStressPhysXSettings
     // sanctioned lever for stack/contact robustness on a backend with no
     // sweep-based CCD -- more iterations distribute contact correction across
     // a pile instead of resolving it as a few violent pushes.
-    // Ceiling on the velocity change a single excess-force injection may give
-    // one body, in m/s. 0 disables the bound.
-    //
-    // The excess force is the RELEASED LOAD on broken bonds, and that load is
-    // unbounded: bond utilisation spikes of 23-77x the elastic limit were
-    // measured live, so the same break sometimes reads as a shrug and
-    // sometimes as an explosion -- and the explosive tail is a seed for
-    // ground-tunnelling escape velocities. Bounding delta-v (force and torque
-    // scaled together, direction preserved) keeps the mechanism's intent --
-    // detached chunks must not hang motionless in their cavities -- while
-    // cutting the unphysical tail. Clamps are counted in telemetry.
-    float maxExcessVelocityChange;
     uint32_t bodyPositionIterations;
     uint32_t bodyVelocityIterations;
     bool enableSpeculativeCcd;
@@ -245,7 +233,6 @@ struct ExtStressPhysXSettings
         , applyCrushResistance(true)
         , maximumBodies(0)
         , maximumFracturesPerActorPerTick(0)
-        , maxExcessVelocityChange(20.0f)
         , bodyPositionIterations(4)
         , bodyVelocityIterations(1)
         , enableSpeculativeCcd(true)
@@ -323,8 +310,6 @@ struct ExtStressPhysXTelemetry
     //! resistive impulses carried it.
     double crushResistanceJoules;
     uint64_t crushResistanceImpulses;
-    /// Excess-force injections whose delta-v hit maxExcessVelocityChange.
-    uint64_t excessImpulsesClamped;
     uint64_t resimulationCaptures;
     uint64_t resimulationRestores;
     uint64_t resimulationBodiesRestored;
