@@ -466,6 +466,7 @@ public:
             updateMassProperties(*body);
             m_scene.addActor(*body->body);
             m_actorBodies.emplace(body->actorIndex, std::move(body));
+        m_sortedBodiesValid = false;
         }
 
         rebuildLookupTables();
@@ -536,9 +537,23 @@ public:
         const ExtStressPhysXBodySnapshot* bodies,
         uint32_t bodyCount)
     {
+        static const bool skipSingleton = [] {
+            const char* raw = std::getenv("BLAST_GRAVITY_SKIP_SINGLETON");
+            return raw == nullptr || std::string(raw)[0] != '0';
+        }();
         for (uint32_t i = 0; i < bodyCount; ++i)
         {
             const ExtStressPhysXBodySnapshot& snapshot = bodies[i];
+            // A single-node body has no bond to load: addGravity and
+            // addCentrifugalAcceleration both return false untouched for
+            // graphNodeCount <= 1 (provably -- validateMappings asserts the
+            // node sets match). Skipping here saves the red-black-tree lookup
+            // below for the majority population of a demolished city, which is
+            // single-chunk debris. nodeCount is already on the row.
+            if (skipSingleton && snapshot.nodeCount <= 1)
+            {
+                continue;
+            }
             // Keyed by actorIndex: m_actorBodies is a map<actorIndex, BodyState>,
             // NOT by bodyId. Looking up by bodyId silently missed nearly every
             // body, so most of the structure got no gravity and it fractured
@@ -743,11 +758,36 @@ public:
         }
         m_contactedActors.clear();
 
-        m_snapshotByBodyId.clear();
-        for (uint32_t i = 0; i < bodyCount; ++i)
-        {
-            m_snapshotByBodyId[bodies[i].bodyId] = &bodies[i];
-        }
+        // Row hints replace the wholesale index: building m_snapshotByBodyId
+        // was a hash insert per BODY per tick (eleven thousand on a collapsing
+        // city) to answer per-CONTACT queries. The hint is stamped by
+        // getBodySnapshots itself, so it is fresh the tick the snapshot was
+        // produced; the bodyId verify makes a stale hint cost one map build,
+        // never a wrong answer. BLAST_SNAPSHOT_ROW_HINT=0 restores the index.
+        static const bool rowHint = [] {
+            const char* raw = std::getenv("BLAST_SNAPSHOT_ROW_HINT");
+            return raw == nullptr || std::string(raw)[0] != '0';
+        }();
+        bool indexBuilt = false;
+        auto snapshotFor =
+            [&](const BodyState& body) -> const ExtStressPhysXBodySnapshot* {
+            if (rowHint && body.snapshotRow < bodyCount
+                && bodies[body.snapshotRow].bodyId == body.bodyId)
+            {
+                return &bodies[body.snapshotRow];
+            }
+            if (!indexBuilt)
+            {
+                m_snapshotByBodyId.clear();
+                for (uint32_t i = 0; i < bodyCount; ++i)
+                {
+                    m_snapshotByBodyId[bodies[i].bodyId] = &bodies[i];
+                }
+                indexBuilt = true;
+            }
+            const auto found = m_snapshotByBodyId.find(body.bodyId);
+            return found == m_snapshotByBodyId.end() ? nullptr : found->second;
+        };
 
         m_contactNodeIndices.clear();
         m_contactLocalPositions.clear();
@@ -776,15 +816,15 @@ public:
             // rest down the solver sees a net upward load and reports
             // wrong-signed stress. addGravityFromSnapshot consults this.
             m_contactedActors.insert(body.actorIndex);
-            const auto found = m_snapshotByBodyId.find(body.bodyId);
-            if (found == m_snapshotByBodyId.end())
+            const ExtStressPhysXBodySnapshot* found = snapshotFor(body);
+            if (found == nullptr)
             {
                 // Counted, not silent: a contact whose body has no snapshot row
                 // would be lost damage, and contactsDropped is how that shows up.
                 ++m_telemetry.contactsDropped;
                 continue;
             }
-            const ExtStressPhysXBodySnapshot& snapshot = *found->second;
+            const ExtStressPhysXBodySnapshot& snapshot = *found;
 
             if (contact.wake && !snapshot.kinematic && snapshot.sleeping)
             {
@@ -1337,15 +1377,33 @@ public:
         {
             return 0;
         }
-        std::vector<const BodyState*> sorted;
-        sorted.reserve(m_actorBodies.size());
-        for (const auto& entry : m_actorBodies)
+        // Rebuilt only when the body set changes. Per call this was a heap
+        // allocation, a full red-black-tree walk and ~185k pointer-chasing
+        // comparisons at city scale, every tick, producing the identical order
+        // as the tick before. The size assertion turns a missed invalidation
+        // into a rebuild instead of a use-after-free.
+        static const bool sortCache = [] {
+            const char* raw = std::getenv("BLAST_SNAPSHOT_SORT_CACHE");
+            return raw == nullptr || std::string(raw)[0] != '0';
+        }();
+        if (!sortCache || !m_sortedBodiesValid
+            || m_sortedBodies.size() != m_actorBodies.size())
         {
-            sorted.push_back(entry.second.get());
+            m_sortedBodies.clear();
+            m_sortedBodies.reserve(m_actorBodies.size());
+            for (const auto& entry : m_actorBodies)
+            {
+                m_sortedBodies.push_back(entry.second.get());
+            }
+            std::sort(
+                m_sortedBodies.begin(),
+                m_sortedBodies.end(),
+                [](const BodyState* a, const BodyState* b) {
+                    return a->bodyId < b->bodyId;
+                });
+            m_sortedBodiesValid = true;
         }
-        std::sort(sorted.begin(), sorted.end(), [](const BodyState* a, const BodyState* b) {
-            return a->bodyId < b->bodyId;
-        });
+        const std::vector<const BodyState*>& sorted = m_sortedBodies;
 
         const uint32_t count =
             std::min(capacity, static_cast<uint32_t>(sorted.size()));
@@ -1361,6 +1419,10 @@ public:
             target.linearVelocity = source.body->getLinearVelocity();
             target.angularVelocity = source.body->getAngularVelocity();
             target.nodeCount = static_cast<uint32_t>(source.nodes.size());
+            // Same-tick row hint for consumeContactsFromSnapshot: stamped at
+            // the one site that writes rows FROM body states, so it is fresh
+            // by construction and costs nothing.
+            source.snapshotRow = i;
             target.kinematic = isKinematic(source);
             target.sleeping = !target.kinematic && source.body->isSleeping();
         }
@@ -1866,6 +1928,10 @@ private:
 
     struct BodyState
     {
+        /// Row this body occupied in the last getBodySnapshots output.
+        /// Verified against bodyId before use; a stale hint is a map lookup,
+        /// never a wrong answer.
+        mutable uint32_t snapshotRow = 0xffffffffu;
         ExtStressPhysXId bodyId{0};
         uint32_t actorIndex{INVALID_INDEX};
         PxRigidDynamic* body{nullptr};
@@ -2937,6 +3003,7 @@ private:
                     found->second->body = nullptr;
                 }
                 m_actorBodies.erase(found);
+        m_sortedBodiesValid = false;
                 ++m_telemetry.bodiesRecycled;
             }
         }
@@ -3035,6 +3102,7 @@ private:
         const ParentMotion& parent = parentMotionFound->second;
         std::unique_ptr<BodyState> parentBody = std::move(parentBodyFound->second);
         m_actorBodies.erase(parentBodyFound);
+        m_sortedBodiesValid = false;
 
         std::unordered_set<uint32_t> parentNodes(
             parentBody->nodes.begin(),
@@ -3285,6 +3353,7 @@ private:
         for (AssignedChild& child : assigned)
         {
             m_actorBodies.emplace(child.body->actorIndex, std::move(child.body));
+        m_sortedBodiesValid = false;
         }
         ++m_telemetry.splits;
         return true;
@@ -3401,6 +3470,7 @@ private:
                 }
             }
             m_actorBodies.clear();
+        m_sortedBodiesValid = false;
         }
 
         for (NodeState& node : m_nodes)
@@ -3451,6 +3521,10 @@ private:
     std::vector<ExtStressFractureCommands> m_fractureLimited;
     std::vector<ExtStressBondFracture> m_fractureBonds;
     std::map<uint32_t, std::unique_ptr<BodyState>> m_actorBodies;
+    /// getBodySnapshots' sorted view, invalidated on every m_actorBodies
+    /// mutation. Mutable: the snapshot read is const.
+    mutable std::vector<const BodyState*> m_sortedBodies;
+    mutable bool m_sortedBodiesValid = false;
     std::unordered_map<const PxShape*, uint32_t> m_shapeToNode;
     std::unordered_map<ExtStressPhysXId, uint32_t> m_shapeIdToNode;
     std::unordered_map<const PxRigidDynamic*, ExtStressPhysXId> m_bodyToId;
