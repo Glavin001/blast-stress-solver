@@ -32,6 +32,18 @@ constexpr std::uint32_t kBlockSize = 256;
 /// indistinguishable from the aggregate telemetry.
 const bool s_debug = std::getenv("BLAST_GPU_SKIP_DEBUG") != nullptr;
 
+/// BLAST_GPU_WHOLE_RESET_ON_TOPOLOGY=1 restores the pre-incremental behaviour:
+/// full warm-start memset + whole-baseline drop on every topology change and
+/// every break. Value-checked kill switch for the incremental path below.
+static bool wholeResetOnTopology()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_GPU_WHOLE_RESET_ON_TOPOLOGY");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return enabled;
+}
+
 struct alignas(16) Vec4
 {
     float x;
@@ -1008,6 +1020,14 @@ public:
         // different bond -- a silent, physics-shaped corruption rather than an
         // error.
         const std::uint32_t last = m_bondCount - 1;
+        // The removed bond's island must re-solve: its frozen impulses no
+        // longer describe the post-break topology. Nodes are the stable key --
+        // island ids get remapped by the repartition this removal triggers.
+        m_forceDirtyNodes.push_back(m_hostNode0[bondIndex]);
+        m_forceDirtyNodes.push_back(m_hostNode1[bondIndex]);
+        // Device impulses must follow the same permutation as the host arrays;
+        // replayed in order in applyTopologyChange.
+        m_pendingImpulseSwaps.emplace_back(bondIndex, last);
         swapWithLast(m_hostNode0, bondIndex, last);
         swapWithLast(m_hostNode1, bondIndex, last);
         swapWithLast(m_hostOffset0, bondIndex, last);
@@ -1232,6 +1252,22 @@ private:
             }
         }
 
+        // Nodes whose bonds broke or were removed since the last solve: their
+        // islands must re-solve regardless of the velocity compare, because
+        // frozen impulses no longer describe the changed topology.
+        for (const std::uint32_t node : m_forceDirtyNodes)
+        {
+            if (node < m_nodeCount)
+            {
+                const std::uint32_t id = m_hostNodeIsland[node];
+                if (id != kNoIsland)
+                {
+                    m_islandDirty[id] = 1;
+                }
+            }
+        }
+        m_forceDirtyNodes.clear();
+
         m_changedBonds.clear();
         std::uint32_t skipped = 0;
         for (std::uint32_t k = 0; k < m_islandCount; ++k)
@@ -1396,7 +1432,38 @@ private:
             }
         }
         m_settledBaselineValid = true;
-        if (*m_hostBrokenCount != 0u)
+        if (*m_hostBrokenCount != 0u && !wholeResetOnTopology())
+        {
+            // Per-island invalidation: only the islands whose own bonds broke
+            // lose their baseline. The removal path force-dirties the same
+            // nodes; this covers damage-driven breaks the adapter has not yet
+            // converted to removeBond calls, closing the window the
+            // equivalence harness caught (a settled island taking damage from
+            // frozen stress and never re-solving after its own bond failed --
+            // 322 broken against 287).
+            const std::uint32_t count =
+                std::min(*m_hostBrokenCount, m_bondCount);
+            std::vector<std::uint32_t> broken(count);
+            if (count > 0)
+            {
+                checkCuda(
+                    cudaMemcpy(
+                        broken.data(),
+                        m_brokenBonds,
+                        sizeof(std::uint32_t) * count,
+                        cudaMemcpyDeviceToHost),
+                    "read broken bonds for invalidation");
+            }
+            for (const std::uint32_t bond : broken)
+            {
+                if (bond < m_bondCount)
+                {
+                    m_forceDirtyNodes.push_back(m_hostNode0[bond]);
+                    m_forceDirtyNodes.push_back(m_hostNode1[bond]);
+                }
+            }
+        }
+        else if (*m_hostBrokenCount != 0u)
         {
             // A bond crossed zero health somewhere, so at least one island's
             // effective topology changed and its frozen impulses no longer
@@ -1451,16 +1518,50 @@ private:
             checkCuda(cudaGraphDestroy(m_graph), "destroy solver graph");
             m_graph = nullptr;
         }
-        checkCuda(
-            cudaMemset(m_impulses, 0, sizeof(AngLin) * m_bondCount),
-            "reset warm start after topology change");
-        m_hasWarmStart = false;
+        if (wholeResetOnTopology())
+        {
+            checkCuda(
+                cudaMemset(m_impulses, 0, sizeof(AngLin) * m_bondCount),
+                "reset warm start after topology change");
+            m_hasWarmStart = false;
+            m_settledBaselineValid = false;
+            m_pendingImpulseSwaps.clear();
+        }
+        else
+        {
+            // Incremental: a removal only permutes the bond arrays. Every
+            // OTHER island is a disconnected component whose inputs and
+            // topology are untouched -- its warm-start impulses and settled
+            // baseline stay exactly valid, so a fracture tick no longer
+            // cold-starts the whole city (the memset above did, every time a
+            // bond broke anywhere). The device impulse array replays the same
+            // swap-with-last permutation the host arrays already applied; the
+            // affected islands re-solve via the force-dirty nodes recorded in
+            // removeBond.
+            for (const auto& swap : m_pendingImpulseSwaps)
+            {
+                if (swap.first != swap.second)
+                {
+                    checkCuda(
+                        cudaMemcpy(
+                            m_impulses + swap.first,
+                            m_impulses + swap.second,
+                            sizeof(AngLin),
+                            cudaMemcpyDeviceToDevice),
+                        "replay impulse swap");
+                }
+            }
+            m_pendingImpulseSwaps.clear();
+        }
+        // Island ids were remapped by the repartition either way; converged
+        // flags are keyed by id and must not survive it. Under
+        // skipStableUnconverged this does not block skipping; under
+        // converged-required semantics it conservatively forces a re-solve.
         m_hostIslandConverged.assign(m_islandCapacity, 0u);
         std::fill(m_hostIslandSkip, m_hostIslandSkip + m_islandCapacity, 0u);
         checkCuda(
             cudaMemset(m_islandConverged, 0, sizeof(std::uint32_t) * m_islandCapacity),
             "clear island converged flags");
-        m_settledBaselineValid = false;
     }
 
     /// Forget that anything is settled. Used whenever the impulses the
@@ -2384,6 +2485,11 @@ private:
     bool m_topologyDirty{false};
     /// See ExtStressGpuSolveParams::skipStableUnconverged.
     bool m_skipStableUnconverged{false};
+    /// Device-impulse permutations recorded by removeBond, replayed at the
+    /// next applyTopologyChange so device and host bond order stay identical.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> m_pendingImpulseSwaps;
+    /// Nodes whose bonds broke or were removed; consumed by planSettledSkip.
+    std::vector<std::uint32_t> m_forceDirtyNodes;
     /// Bonds grouped by island (CSR), built once: the partition is fixed for
     /// the solver's lifetime.
     std::vector<std::uint32_t> m_islandBondBegin;
