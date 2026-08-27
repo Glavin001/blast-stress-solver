@@ -195,16 +195,24 @@ __global__ void initializeSolve(
     const std::uint32_t* nodeIsland,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
-    std::uint32_t nodeCount,
-    std::uint32_t bondCount,
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeBonds,
+    const std::uint32_t* activeCounts,
     float reciprocalLengthScale,
     float reciprocalLinearImpulseScale,
     float reciprocalAngularImpulseScale,
     bool warmStart)
 {
-    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < nodeCount && !nodeSettled(islandSkip, nodeIsland[index]))
+    // Threads walk the compacted active lists, not the raw arrays: a settled
+    // city launches what moved, not what exists. The settled guards below are
+    // kept even though the lists pre-filter -- they are what make this kernel
+    // bit-identical to the full launch, list or no list.
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot < activeCounts[1])
     {
+        const std::uint32_t index = activeNodes[slot];
+        if (!nodeSettled(islandSkip, nodeIsland[index]))
+        {
         const Inertia value = inertia[index];
         const ExtStressGpuImpulse velocity = input[index];
         AngLin b{};
@@ -220,13 +228,17 @@ __global__ void initializeSolve(
             -reciprocalLengthScale * velocity.linear.z / linearDenominator);
         rhs[index] = b;
         residual[index] = b;
+        }
     }
     // A settled island's impulses are the output the caller is still holding.
     // They must not even be rescaled: impulse*(1/s) followed by impulse*s is
     // not the identity in float, so re-entering the solve at all would walk a
     // frozen island's stress by an ulp per tick for as long as it sits there.
-    if (index < bondCount && !bondSettled(islandSkip, bondIsland[index]))
+    if (slot < activeCounts[0])
     {
+        const std::uint32_t index = activeBonds[slot];
+        if (!bondSettled(islandSkip, bondIsland[index]))
+        {
         if (warmStart)
         {
             impulses[index].angular =
@@ -237,6 +249,7 @@ __global__ void initializeSolve(
         else
         {
             impulses[index] = {};
+        }
         }
     }
 }
@@ -251,10 +264,16 @@ __global__ void couplingRightMultiply(
     const float* health,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
-    std::uint32_t bondCount)
+    const std::uint32_t* activeBonds,
+    const std::uint32_t* activeCounts)
 {
-    const std::uint32_t bond = blockIdx.x * blockDim.x + threadIdx.x;
-    if (bond >= bondCount || health[bond] <= 0.0f)
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[0])
+    {
+        return;
+    }
+    const std::uint32_t bond = activeBonds[slot];
+    if (health[bond] <= 0.0f)
     {
         return;
     }
@@ -279,11 +298,13 @@ __global__ void couplingRightMultiply(
 __global__ void scaleNodes(
     AngLin* nodes,
     const Inertia* inertia,
-    std::uint32_t nodeCount)
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeCounts)
 {
-    const std::uint32_t node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node < nodeCount)
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot < activeCounts[1])
     {
+        const std::uint32_t node = activeNodes[slot];
         nodes[node].angular = mul(nodes[node].angular, inertia[node].angular);
         nodes[node].linear = mul(nodes[node].linear, inertia[node].linear);
     }
@@ -292,11 +313,13 @@ __global__ void scaleNodes(
 __global__ void subtractResidual(
     AngLin* residual,
     const AngLin* value,
-    std::uint32_t count)
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeCounts)
 {
-    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < count)
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot < activeCounts[1])
     {
+        const std::uint32_t index = activeNodes[slot];
         residual[index].angular =
             sub(residual[index].angular, value[index].angular);
         residual[index].linear =
@@ -315,13 +338,15 @@ __global__ void couplingLeftMultiply(
     const float* health,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
-    std::uint32_t bondCount)
+    const std::uint32_t* activeBonds,
+    const std::uint32_t* activeCounts)
 {
-    const std::uint32_t bond = blockIdx.x * blockDim.x + threadIdx.x;
-    if (bond >= bondCount)
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[0])
     {
         return;
     }
+    const std::uint32_t bond = activeBonds[slot];
     if (bondSettled(islandSkip, bondIsland[bond]))
     {
         return;     // gradient for a settled island is never read
@@ -427,13 +452,16 @@ __global__ void accumulateSquaredByIsland(
     const std::uint32_t* island,
     const std::uint32_t* islandSkip,
     float* perIsland,
-    std::uint32_t count)
+    const std::uint32_t* activeList,
+    const std::uint32_t* activeCounts,
+    std::uint32_t whichCount)
 {
-    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= count)
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[whichCount])
     {
         return;
     }
+    const std::uint32_t index = activeList[slot];
     const std::uint32_t id = island[index];
     if (id == kNoIsland)
     {
@@ -526,14 +554,16 @@ __global__ void updateDirectionPerIsland(
     const float* previousGradientSquared,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandActive,
-    std::uint32_t count,
+    const std::uint32_t* activeBonds,
+    const std::uint32_t* activeCounts,
     std::uint32_t iteration)
 {
-    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= count)
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[0])
     {
         return;
     }
+    const std::uint32_t index = activeBonds[slot];
     const std::uint32_t id = bondIsland[index];
     if (id == kNoIsland || !islandActive[id])
     {
@@ -577,12 +607,14 @@ __global__ void updateSolutionAndResidualPerIsland(
     std::uint32_t* islandActive,
     const std::uint32_t* bondIsland,
     const std::uint32_t* nodeIsland,
-    std::uint32_t bondCount,
-    std::uint32_t nodeCount)
+    const std::uint32_t* activeBonds,
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeCounts)
 {
-    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < bondCount)
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot < activeCounts[0])
     {
+        const std::uint32_t index = activeBonds[slot];
         const std::uint32_t id = bondIsland[index];
         if (id != kNoIsland && islandActive[id])
         {
@@ -597,8 +629,9 @@ __global__ void updateSolutionAndResidualPerIsland(
             }
         }
     }
-    if (index < nodeCount)
+    if (slot < activeCounts[1])
     {
+        const std::uint32_t index = activeNodes[slot];
         const std::uint32_t id = nodeIsland[index];
         if (id != kNoIsland && islandActive[id])
         {
@@ -638,12 +671,18 @@ __global__ void unscaleImpulses(
     AngLin* impulses,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
-    std::uint32_t bondCount,
+    const std::uint32_t* activeBonds,
+    const std::uint32_t* activeCounts,
     float linearScale,
     float angularScale)
 {
-    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < bondCount && !bondSettled(islandSkip, bondIsland[index]))
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[0])
+    {
+        return;
+    }
+    const std::uint32_t index = activeBonds[slot];
+    if (!bondSettled(islandSkip, bondIsland[index]))
     {
         impulses[index].angular = mul(impulses[index].angular, angularScale);
         impulses[index].linear = mul(impulses[index].linear, linearScale);
@@ -679,6 +718,41 @@ __global__ void scatterVelocities(
     {
         input[indices[index]] = values[index];
     }
+}
+
+/// Build the compacted index lists the solve kernels walk. One pass over the
+/// raw arrays per REBUILD (skip-set or topology change), instead of one pass
+/// per kernel per iteration per tick. The predicates are bondSettled /
+/// nodeSettled themselves, so the lists cannot disagree with the guards.
+/// Order within a list is arbitrary (atomic append); no kernel depends on it.
+__global__ void compactActiveBonds(
+    const std::uint32_t* bondIsland,
+    const std::uint32_t* islandSkip,
+    std::uint32_t bondCount,
+    std::uint32_t* activeBonds,
+    std::uint32_t* activeCounts)
+{
+    const std::uint32_t bond = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bond >= bondCount || bondSettled(islandSkip, bondIsland[bond]))
+    {
+        return;
+    }
+    activeBonds[atomicAdd(&activeCounts[0], 1u)] = bond;
+}
+
+__global__ void compactActiveNodes(
+    const std::uint32_t* nodeIsland,
+    const std::uint32_t* islandSkip,
+    std::uint32_t nodeCount,
+    std::uint32_t* activeNodes,
+    std::uint32_t* activeCounts)
+{
+    const std::uint32_t node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= nodeCount || nodeSettled(islandSkip, nodeIsland[node]))
+    {
+        return;
+    }
+    activeNodes[atomicAdd(&activeCounts[1], 1u)] = node;
 }
 
 __global__ void applyStressDamage(
@@ -847,6 +921,10 @@ public:
         cudaFreeHost(m_hostScatterIndices);
         cudaFreeHost(m_hostScatterValues);
         cudaFreeHost(m_hostGatherIndices);
+        cudaFreeHost(m_hostActiveCounts);
+        cudaFree(m_activeCounts);
+        cudaFree(m_activeNodes);
+        cudaFree(m_activeBonds);
         cudaFree(m_gatherOutput);
         cudaFree(m_gatherIndices);
         cudaFree(m_scatterValues);
@@ -1182,6 +1260,10 @@ private:
         }
         checkCuda(cudaEventRecord(m_uploadStop, m_stream), "record upload stop");
 
+        // After the mask upload (compaction reads it), before the graph
+        // launch (the kernels read the lists).
+        refreshActiveLists(skipping);
+
         checkCuda(cudaEventRecord(m_solveStart, m_stream), "record solve start");
         executeSolve(params);
         checkCuda(cudaEventRecord(m_solveStop, m_stream), "record solve stop");
@@ -1218,6 +1300,64 @@ private:
             + sizeof(std::uint32_t) * static_cast<std::uint64_t>(m_islandCount);
         checkCuda(cudaEventRecord(m_statusReady, m_stream), "record status ready");
         return true;
+    }
+
+    /**
+     * Rebuild the compacted active lists when the skip set they encode has
+     * changed. One kernel pass per array plus an 8-byte synchronous readback
+     * of the counts -- the sync is what lets executeSolve know, on the host,
+     * whether the baked launch capacity still covers the lists. In a settled
+     * scene the skip set is stable and this runs never; during demolition it
+     * runs at most once per tick.
+     */
+    void refreshActiveLists(bool skipping)
+    {
+        const std::uint32_t* mask = skipping ? m_islandSkip : nullptr;
+        const bool maskChanged = skipping
+            && (m_prevIslandSkip.size() != m_islandCount
+                || std::memcmp(
+                       m_prevIslandSkip.data(),
+                       m_hostIslandSkip,
+                       sizeof(std::uint32_t) * m_islandCount)
+                       != 0);
+        if (!m_activeListsDirty && m_prevListsSkipping == skipping && !maskChanged)
+        {
+            return;
+        }
+        checkCuda(
+            cudaMemsetAsync(m_activeCounts, 0, sizeof(std::uint32_t) * 2, m_stream),
+            "clear active counts");
+        compactActiveBonds<<<
+            (m_bondCount + kBlockSize - 1) / kBlockSize,
+            kBlockSize,
+            0,
+            m_stream>>>(m_bondIsland, mask, m_bondCount, m_activeBonds, m_activeCounts);
+        compactActiveNodes<<<
+            (m_nodeCount + kBlockSize - 1) / kBlockSize,
+            kBlockSize,
+            0,
+            m_stream>>>(m_nodeIsland, mask, m_nodeCount, m_activeNodes, m_activeCounts);
+        checkCuda(
+            cudaMemcpyAsync(
+                m_hostActiveCounts,
+                m_activeCounts,
+                sizeof(std::uint32_t) * 2,
+                cudaMemcpyDeviceToHost,
+                m_stream),
+            "read active counts");
+        checkCuda(cudaStreamSynchronize(m_stream), "sync active counts");
+        m_activeBondCount = m_hostActiveCounts[0];
+        m_activeNodeCount = m_hostActiveCounts[1];
+        if (skipping)
+        {
+            m_prevIslandSkip.assign(m_hostIslandSkip, m_hostIslandSkip + m_islandCount);
+        }
+        else
+        {
+            m_prevIslandSkip.clear();
+        }
+        m_prevListsSkipping = skipping;
+        m_activeListsDirty = false;
     }
 
     /**
@@ -1502,6 +1642,9 @@ private:
     void applyTopologyChange()
     {
         m_topologyDirty = false;
+        // The island partition is about to be remapped; the compacted lists
+        // index into the OLD partition and must be rebuilt before next solve.
+        m_activeListsDirty = true;
         computeIslands();
         groupBondsByIsland();
         uploadTopology();
@@ -1846,6 +1989,12 @@ private:
         allocateDevice(m_gatherIndices, m_bondCount, "allocate gather indices");
         allocateDevice(m_gatherOutput, m_bondCount, "allocate gather output");
         allocateDevice(m_status, 1, "allocate solve status");
+        allocateDevice(m_activeBonds, m_bondCount, "allocate active bond list");
+        allocateDevice(m_activeNodes, m_nodeCount, "allocate active node list");
+        allocateDevice(m_activeCounts, 2, "allocate active counts");
+        allocateHost(m_hostActiveCounts, 2, "allocate pinned active counts");
+        m_hostActiveCounts[0] = 0u;
+        m_hostActiveCounts[1] = 0u;
         allocateHost(m_hostInput, m_nodeCount, "allocate pinned stress input");
         allocateHost(m_hostImpulses, m_bondCount, "allocate pinned stress impulses");
         allocateHost(m_hostStatus, 1, "allocate pinned stress status");
@@ -2134,14 +2283,16 @@ private:
         const AngLin* values,
         const std::uint32_t* island,
         const std::uint32_t* islandSkip,
-        std::uint32_t count,
+        const std::uint32_t* activeList,
+        std::uint32_t whichCount,
+        std::uint32_t launchCap,
         float* result)
     {
         checkCuda(
             cudaMemsetAsync(result, 0, sizeof(float) * m_islandCount, m_stream),
             "clear per-island reduction");
         accumulateSquaredByIsland<<<
-            (count + kBlockSize - 1) / kBlockSize,
+            (launchCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
             m_stream>>>(
@@ -2149,7 +2300,9 @@ private:
             island,
             islandSkip,
             result,
-            count);
+            activeList,
+            m_activeCounts,
+            whichCount);
     }
 
     void rightMultiply(const AngLin* bonds, AngLin* nodes, const std::uint32_t* islandSkip)
@@ -2162,7 +2315,7 @@ private:
                 m_stream),
             "clear node product");
         couplingRightMultiply<<<
-            (m_bondCount + kBlockSize - 1) / kBlockSize,
+            (m_graphBondCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
             m_stream>>>(
@@ -2175,15 +2328,17 @@ private:
             m_health,
             m_bondIsland,
             islandSkip,
-            m_bondCount);
+            m_activeBonds,
+            m_activeCounts);
         scaleNodes<<<
-            (m_nodeCount + kBlockSize - 1) / kBlockSize,
+            (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
             m_stream>>>(
             nodes,
             m_inertia,
-            m_nodeCount);
+            m_activeNodes,
+            m_activeCounts);
     }
 
     void launchSolve(const ExtStressGpuSolveParams& params)
@@ -2195,7 +2350,7 @@ private:
             reciprocalLengthScale * reciprocalMassScale;
         const float reciprocalAngularImpulseScale =
             reciprocalLengthScale * reciprocalLinearImpulseScale;
-        const std::uint32_t maxCount = std::max(m_nodeCount, m_bondCount);
+        const std::uint32_t maxCap = std::max(m_graphNodeCap, m_graphBondCap);
         // Null when the feature is off, so every skip test below compiles down
         // to one comparison against a register and the pre-skip behaviour is
         // restored exactly rather than approximately. It is a capture-time
@@ -2205,7 +2360,7 @@ private:
             (params.skipSettledIslands && warmStart) ? m_islandSkip : nullptr;
 
         initializeSolve<<<
-            (maxCount + kBlockSize - 1) / kBlockSize,
+            (maxCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
             m_stream>>>(
@@ -2217,8 +2372,9 @@ private:
             m_nodeIsland,
             m_bondIsland,
             islandSkip,
-            m_nodeCount,
-            m_bondCount,
+            m_activeNodes,
+            m_activeBonds,
+            m_activeCounts,
             reciprocalLengthScale,
             reciprocalLinearImpulseScale,
             reciprocalAngularImpulseScale,
@@ -2227,16 +2383,19 @@ private:
         {
             rightMultiply(m_impulses, m_projectedDirection, islandSkip);
             subtractResidual<<<
-                (m_nodeCount + kBlockSize - 1) / kBlockSize,
+                (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
                 0,
-                m_stream>>>(m_residual, m_projectedDirection, m_nodeCount);
+                m_stream>>>(
+                m_residual, m_projectedDirection, m_activeNodes, m_activeCounts);
         }
 
         // Tolerance is relative to each island's own load, not the whole
         // graph's: a small island next to a heavily loaded one would otherwise
         // inherit a threshold it can never meaningfully meet.
-        reduceByIsland(m_rhs, m_nodeIsland, islandSkip, m_nodeCount, m_gradientSquared);
+        reduceByIsland(
+            m_rhs, m_nodeIsland, islandSkip, m_activeNodes, 1u, m_graphNodeCap,
+            m_gradientSquared);
         setTolerancePerIsland<<<
             (m_islandCount + kBlockSize - 1) / kBlockSize,
             kBlockSize,
@@ -2254,7 +2413,7 @@ private:
         for (std::uint32_t iteration = 0; iteration < params.maxIterations; ++iteration)
         {
             couplingLeftMultiply<<<
-                (m_bondCount + kBlockSize - 1) / kBlockSize,
+                (m_graphBondCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
                 0,
                 m_stream>>>(
@@ -2268,11 +2427,13 @@ private:
                 m_health,
                 m_bondIsland,
                 islandSkip,
-                m_bondCount);
+                m_activeBonds,
+                m_activeCounts);
             const std::uint32_t islandBlocks =
                 (m_islandCount + kBlockSize - 1) / kBlockSize;
             reduceByIsland(
-                m_gradient, m_bondIsland, islandSkip, m_bondCount, m_gradientSquared);
+                m_gradient, m_bondIsland, islandSkip, m_activeBonds, 0u,
+                m_graphBondCap, m_gradientSquared);
             checkConvergencePerIsland<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_islandActive,
                 m_islandConverged,
@@ -2285,7 +2446,7 @@ private:
                 m_islandCount,
                 iteration);
             updateDirectionPerIsland<<<
-                (m_bondCount + kBlockSize - 1) / kBlockSize,
+                (m_graphBondCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
                 0,
                 m_stream>>>(
@@ -2295,7 +2456,8 @@ private:
                 m_previousGradientSquared,
                 m_bondIsland,
                 m_islandActive,
-                m_bondCount,
+                m_activeBonds,
+                m_activeCounts,
                 iteration);
             saveGradientSquaredPerIsland<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_previousGradientSquared,
@@ -2308,14 +2470,16 @@ private:
                 m_projectedDirection,
                 m_nodeIsland,
                 islandSkip,
-                m_nodeCount,
+                m_activeNodes,
+                1u,
+                m_graphNodeCap,
                 m_projectedDirectionSquared);
             retireDegenerateIslands<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_islandActive,
                 m_projectedDirectionSquared,
                 m_islandCount);
             updateSolutionAndResidualPerIsland<<<
-                (maxCount + kBlockSize - 1) / kBlockSize,
+                (maxCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
                 0,
                 m_stream>>>(
@@ -2328,21 +2492,23 @@ private:
                 m_islandActive,
                 m_bondIsland,
                 m_nodeIsland,
-                m_bondCount,
-                m_nodeCount);
+                m_activeBonds,
+                m_activeNodes,
+                m_activeCounts);
         }
 
         const float linearScale = m_lengthScale * m_massScale;
         const float angularScale = m_lengthScale * linearScale;
         unscaleImpulses<<<
-            (m_bondCount + kBlockSize - 1) / kBlockSize,
+            (m_graphBondCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
             m_stream>>>(
             m_impulses,
             m_bondIsland,
             islandSkip,
-            m_bondCount,
+            m_activeBonds,
+            m_activeCounts,
             linearScale,
             angularScale);
         checkCuda(
@@ -2379,6 +2545,25 @@ private:
         }
     }
 
+    /// Smallest power-of-two launch size covering `active`, with one bucket
+    /// of headroom so a few more islands waking does not recapture the graph.
+    /// Never below 1024 (recaptures at that scale cost more than the waste)
+    /// and never above the raw array size.
+    static std::uint32_t launchCapacity(std::uint32_t active, std::uint32_t full)
+    {
+        if (active >= full)
+        {
+            return full;
+        }
+        std::uint32_t cap = 1024u;
+        while (cap < active)
+        {
+            cap <<= 1u;
+        }
+        cap <<= 1u;
+        return std::min(cap, full);
+    }
+
     bool graphMatches(const ExtStressGpuSolveParams& params, bool warmStart) const
     {
         return m_graphExec
@@ -2389,7 +2574,17 @@ private:
             // Capture-time: it selects whether the kernels are handed the skip
             // mask at all. The mask's CONTENTS change every frame and are read
             // from device memory, so a settling scene never recaptures.
-            && m_graphParams.skipSettledIslands == params.skipSettledIslands;
+            && m_graphParams.skipSettledIslands == params.skipSettledIslands
+            // The active lists' CONTENTS are device-side and free to change;
+            // the launch dimensions that must cover them are baked. Recapture
+            // when the lists outgrow the baked caps (mandatory -- threads past
+            // the cap simply do not exist) or shrank far below them (waste).
+            && m_graphBondCap >= m_activeBondCount
+            && m_graphNodeCap >= m_activeNodeCount
+            && m_graphBondCap <= 4u * std::max(
+                   launchCapacity(m_activeBondCount, m_bondCount), 1024u)
+            && m_graphNodeCap <= 4u * std::max(
+                   launchCapacity(m_activeNodeCount, m_nodeCount), 1024u);
     }
 
     void executeSolve(const ExtStressGpuSolveParams& params)
@@ -2397,6 +2592,8 @@ private:
         const bool warmStart = params.warmStart && m_hasWarmStart;
         if (!graphMatches(params, warmStart))
         {
+            m_graphBondCap = launchCapacity(m_activeBondCount, m_bondCount);
+            m_graphNodeCap = launchCapacity(m_activeNodeCount, m_nodeCount);
             if (m_graphExec)
             {
                 checkCuda(cudaGraphExecDestroy(m_graphExec), "destroy old solver graph exec");
@@ -2543,6 +2740,23 @@ private:
     cudaGraphExec_t m_graphExec{};
     ExtStressGpuSolveParams m_graphParams{};
     bool m_graphWarmStart{false};
+    // Active-set state: the solve kernels walk these compacted lists so a
+    // tick costs what is moving, not what exists. Rebuilt (one device pass)
+    // only when the skip set or the topology changes; counts live at
+    // m_activeCounts[0]=bonds / [1]=nodes and are read by the kernels from
+    // device memory, so their CONTENTS never force a graph recapture -- only
+    // outgrowing the baked launch capacity does (executeSolve).
+    std::uint32_t* m_activeBonds{nullptr};
+    std::uint32_t* m_activeNodes{nullptr};
+    std::uint32_t* m_activeCounts{nullptr};
+    std::uint32_t* m_hostActiveCounts{nullptr};
+    std::uint32_t m_activeBondCount{0};
+    std::uint32_t m_activeNodeCount{0};
+    std::uint32_t m_graphBondCap{0};
+    std::uint32_t m_graphNodeCap{0};
+    std::vector<std::uint32_t> m_prevIslandSkip;
+    bool m_prevListsSkipping{false};
+    bool m_activeListsDirty{true};
 };
 
 } // namespace
