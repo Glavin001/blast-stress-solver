@@ -416,6 +416,20 @@ struct ExtStressPhysXContact
     // itself wakes the body.
     bool wake;
 
+    /**
+    Pre-resolved support-graph node, from nodeForShape() on the SAME
+    destructible within the same tick. When set, queueContact skips its
+    shapeId/shape map lookup entirely -- the point of the field: a PhysX
+    manifold's points all share one shape, so the host can resolve the node
+    once per manifold instead of paying the hash find per point. UINT32_MAX
+    (the default) means unresolved; queueContact then falls back to the
+    shapeId/shape paths, so leaving shape set alongside an unresolved
+    nodeIndex is always safe and behaves exactly as before this field
+    existed. Never carry a value across a tick boundary: fracture moves
+    shapes between nodes at endTick.
+    */
+    uint32_t nodeIndex;
+
     ExtStressPhysXContact()
         : shapeId(0)
         , shape(nullptr)
@@ -424,6 +438,7 @@ struct ExtStressPhysXContact
         , worldRelativeVelocity(0.0f)
         , otherActor(nullptr)
         , wake(true)
+        , nodeIndex(0xFFFFFFFFu)
     {
     }
 };
@@ -619,6 +634,14 @@ public:
         const physx::PxShape& shape,
         const physx::PxVec3& worldPosition,
         const physx::PxVec3& worldImpulse) = 0;
+    /**
+     * Resolve a shape to its support-graph node for ExtStressPhysXContact::
+     * nodeIndex. Exactly the lookup queueContact performs per contact, exposed
+     * so a host queuing a whole manifold pays it once. Returns UINT32_MAX for
+     * a shape this destructible does not own. Valid only until the next
+     * endTick(), which may re-map shapes to nodes.
+     */
+    virtual uint32_t nodeForShape(const physx::PxShape* shape) const = 0;
     /**
      * Three-phase tick API for batching independent destructibles. beginTick()
      * and endTick() access PhysX and must run serially after fetchResults().

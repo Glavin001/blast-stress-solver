@@ -486,7 +486,14 @@ public:
     bool queueContact(const ExtStressPhysXContact& contact) override
     {
         uint32_t nodeIndex = INVALID_INDEX;
-        if (contact.shapeId != 0)
+        if (contact.nodeIndex != INVALID_INDEX)
+        {
+            // Host pre-resolved via nodeForShape this tick; the map lookup
+            // below is exactly what produced it, so skipping is value-
+            // identical.
+            nodeIndex = contact.nodeIndex;
+        }
+        else if (contact.shapeId != 0)
         {
             const auto found = m_shapeIdToNode.find(contact.shapeId);
             if (found != m_shapeIdToNode.end())
@@ -521,6 +528,16 @@ public:
         m_contacts.push_back(queued);
         ++m_telemetry.contactsQueued;
         return true;
+    }
+
+    uint32_t nodeForShape(const PxShape* shape) const override
+    {
+        if (shape == nullptr)
+        {
+            return INVALID_INDEX;
+        }
+        const auto found = m_shapeToNode.find(shape);
+        return found == m_shapeToNode.end() ? INVALID_INDEX : found->second;
     }
 
     bool queueContact(
