@@ -3,6 +3,8 @@
 #include "NvBlastExtStressGpu.h"
 
 #include <cub/device/device_reduce.cuh>
+#include <cub/device/device_select.cuh>
+#include <cub/iterator/counting_input_iterator.cuh>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -720,39 +722,42 @@ __global__ void scatterVelocities(
     }
 }
 
-/// Build the compacted index lists the solve kernels walk. One pass over the
+/// Flag the entries the compacted index lists should keep. One pass over the
 /// raw arrays per REBUILD (skip-set or topology change), instead of one pass
 /// per kernel per iteration per tick. The predicates are bondSettled /
 /// nodeSettled themselves, so the lists cannot disagree with the guards.
-/// Order within a list is arbitrary (atomic append); no kernel depends on it.
-__global__ void compactActiveBonds(
+///
+/// The flags feed cub::DeviceSelect::Flagged rather than an atomicAdd append:
+/// select preserves index order, so a compacted list walks memory in the same
+/// ascending order the underlying bond/node arrays are laid out in. With the
+/// atomic append the order was whatever the scheduler raced out, and every CG
+/// kernel's global loads through the list were uncoalesced -- invisible while
+/// most islands skip, ~2x kernel time when nothing skips (fresh whole-map
+/// cascade, the regime the solver exists for).
+__global__ void flagActiveBonds(
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     std::uint32_t bondCount,
-    std::uint32_t* activeBonds,
-    std::uint32_t* activeCounts)
+    std::uint32_t* flags)
 {
     const std::uint32_t bond = blockIdx.x * blockDim.x + threadIdx.x;
-    if (bond >= bondCount || bondSettled(islandSkip, bondIsland[bond]))
+    if (bond < bondCount)
     {
-        return;
+        flags[bond] = bondSettled(islandSkip, bondIsland[bond]) ? 0u : 1u;
     }
-    activeBonds[atomicAdd(&activeCounts[0], 1u)] = bond;
 }
 
-__global__ void compactActiveNodes(
+__global__ void flagActiveNodes(
     const std::uint32_t* nodeIsland,
     const std::uint32_t* islandSkip,
     std::uint32_t nodeCount,
-    std::uint32_t* activeNodes,
-    std::uint32_t* activeCounts)
+    std::uint32_t* flags)
 {
     const std::uint32_t node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= nodeCount || nodeSettled(islandSkip, nodeIsland[node]))
+    if (node < nodeCount)
     {
-        return;
+        flags[node] = nodeSettled(islandSkip, nodeIsland[node]) ? 0u : 1u;
     }
-    activeNodes[atomicAdd(&activeCounts[1], 1u)] = node;
 }
 
 __global__ void applyStressDamage(
@@ -922,6 +927,8 @@ public:
         cudaFreeHost(m_hostScatterValues);
         cudaFreeHost(m_hostGatherIndices);
         cudaFreeHost(m_hostActiveCounts);
+        cudaFree(m_selectScratch);
+        cudaFree(m_activeFlags);
         cudaFree(m_activeCounts);
         cudaFree(m_activeNodes);
         cudaFree(m_activeBonds);
@@ -1324,19 +1331,44 @@ private:
         {
             return;
         }
-        checkCuda(
-            cudaMemsetAsync(m_activeCounts, 0, sizeof(std::uint32_t) * 2, m_stream),
-            "clear active counts");
-        compactActiveBonds<<<
+        // Flag, then order-preserving select. The flag buffer is shared by the
+        // two selects; the stream orders bond-select before node-flag, so the
+        // reuse cannot race. DeviceSelect writes each count straight into its
+        // m_activeCounts slot, which is why the memset the atomic append
+        // needed is gone.
+        cub::CountingInputIterator<std::uint32_t> identity(0u);
+        flagActiveBonds<<<
             (m_bondCount + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
-            m_stream>>>(m_bondIsland, mask, m_bondCount, m_activeBonds, m_activeCounts);
-        compactActiveNodes<<<
+            m_stream>>>(m_bondIsland, mask, m_bondCount, m_activeFlags);
+        checkCuda(
+            cub::DeviceSelect::Flagged(
+                m_selectScratch,
+                m_selectScratchBytes,
+                identity,
+                m_activeFlags,
+                m_activeBonds,
+                m_activeCounts,
+                static_cast<int>(m_bondCount),
+                m_stream),
+            "select active bonds");
+        flagActiveNodes<<<
             (m_nodeCount + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
-            m_stream>>>(m_nodeIsland, mask, m_nodeCount, m_activeNodes, m_activeCounts);
+            m_stream>>>(m_nodeIsland, mask, m_nodeCount, m_activeFlags);
+        checkCuda(
+            cub::DeviceSelect::Flagged(
+                m_selectScratch,
+                m_selectScratchBytes,
+                identity,
+                m_activeFlags,
+                m_activeNodes,
+                m_activeCounts + 1,
+                static_cast<int>(m_nodeCount),
+                m_stream),
+            "select active nodes");
         checkCuda(
             cudaMemcpyAsync(
                 m_hostActiveCounts,
@@ -1992,6 +2024,35 @@ private:
         allocateDevice(m_activeBonds, m_bondCount, "allocate active bond list");
         allocateDevice(m_activeNodes, m_nodeCount, "allocate active node list");
         allocateDevice(m_activeCounts, 2, "allocate active counts");
+        allocateDevice(
+            m_activeFlags, std::max(m_bondCount, m_nodeCount), "allocate active flags");
+        {
+            // Scratch for the order-preserving selects; sized for the larger
+            // of the two so one buffer serves both.
+            cub::CountingInputIterator<std::uint32_t> identity(0u);
+            std::size_t bondSelectBytes = 0;
+            std::size_t nodeSelectBytes = 0;
+            cub::DeviceSelect::Flagged(
+                nullptr,
+                bondSelectBytes,
+                identity,
+                m_activeFlags,
+                m_activeBonds,
+                m_activeCounts,
+                static_cast<int>(m_bondCount));
+            cub::DeviceSelect::Flagged(
+                nullptr,
+                nodeSelectBytes,
+                identity,
+                m_activeFlags,
+                m_activeNodes,
+                m_activeCounts + 1,
+                static_cast<int>(m_nodeCount));
+            m_selectScratchBytes = std::max(bondSelectBytes, nodeSelectBytes);
+            checkCuda(
+                cudaMalloc(&m_selectScratch, m_selectScratchBytes),
+                "allocate select scratch");
+        }
         allocateHost(m_hostActiveCounts, 2, "allocate pinned active counts");
         m_hostActiveCounts[0] = 0u;
         m_hostActiveCounts[1] = 0u;
@@ -2749,6 +2810,11 @@ private:
     std::uint32_t* m_activeBonds{nullptr};
     std::uint32_t* m_activeNodes{nullptr};
     std::uint32_t* m_activeCounts{nullptr};
+    /// Shared 0/1 flag buffer for the two DeviceSelect compactions, sized
+    /// max(bonds, nodes); stream order serializes the reuse.
+    std::uint32_t* m_activeFlags{nullptr};
+    void* m_selectScratch{nullptr};
+    std::size_t m_selectScratchBytes{0};
     std::uint32_t* m_hostActiveCounts{nullptr};
     std::uint32_t m_activeBondCount{0};
     std::uint32_t m_activeNodeCount{0};
