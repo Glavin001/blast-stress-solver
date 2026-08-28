@@ -45,6 +45,7 @@ const MAX_CHUNK_VOLUME = {
   // Foundations are underground and are supports; they never move, so their
   // size is invisible and splitting them buys nothing.
   'footing-anchor': 12.0,
+  'white-stone': 2.0,
 };
 
 export function maxChunkVolume(materialName) {
@@ -62,6 +63,7 @@ const RULES = {
   // Brick courses into many small pieces -- it is the finest of the solids.
   brick: { cellArea: 0.35, min: 3, max: 24 },
   // Stone is chunkier: bigger blocks, fewer of them.
+  'white-stone': { cellArea: 0.50, min: 3, max: 16 },
   stone: { cellArea: 0.50, min: 3, max: 16 },
   // Steel is ductile (band 12): it bends and tears rather than shattering, so
   // it gets the fewest pieces of any solid despite being the strongest.

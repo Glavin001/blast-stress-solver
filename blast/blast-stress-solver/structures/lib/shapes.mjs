@@ -100,3 +100,64 @@ function signedArea(poly) {
 export const gablePoly = (halfWidth, wallTop, ridge) => [
   [-halfWidth, 0], [halfWidth, 0], [halfWidth, wallTop], [0, ridge], [-halfWidth, wallTop],
 ];
+
+// ── radial: concentric rings ────────────────────────────────────────────────
+//
+// A ring wall is the one shape the format is least able to express. There is no
+// rotation, so curvature has to be baked into vertices; and a cross-section is
+// capped at MAX_POLY_VERTS = 10, so an arc can never be one polygon. The
+// established answer, from Petronas, is one convex quad per angular segment,
+// extruded vertically -- these helpers just stop every caller rewriting it.
+
+/** A point on a circle, in the (x, z) plane an `axis: 'y'` piece uses. */
+export const ringPoint = (cx, cz, r, t) => [cx + r * Math.cos(t), cz + r * Math.sin(t)];
+
+/**
+ * An annulus, as one convex quad per segment.
+ *
+ * Angles run counter-clockwise from `from` to `to` (default: a full turn).
+ * Each quad is [inner(t0), outer(t0), outer(t1), inner(t1)], so consecutive
+ * segments share their radial face EXACTLY -- same two vertices, same floats --
+ * which is what makes them bond to each other instead of merely touching.
+ *
+ * `skip(i, t0, t1)` omits a segment, for a gateway or a road passing through.
+ *
+ * Segment count is a real decision, not a detail. Petronas notes that twelve
+ * "reads as round from any distance you would look at a tower from", and picks
+ * boundaries that land on the features below so no segment straddles one. Hold
+ * the chord near a constant length as the radius shrinks rather than keeping
+ * the count fixed, or the inner rings cost segments they do not need.
+ */
+export function ringSegments({ cx = 0, cz = 0, rInner, rOuter, segments,
+                               from = 0, to = Math.PI * 2, skip = null }) {
+  if (!(rOuter > rInner)) throw new Error(`ringSegments: rOuter ${rOuter} <= rInner ${rInner}`);
+  const out = [];
+  for (let i = 0; i < segments; i += 1) {
+    const t0 = from + ((to - from) * i) / segments;
+    const t1 = from + ((to - from) * (i + 1)) / segments;
+    if (skip && skip(i, t0, t1)) continue;
+    out.push({
+      i,
+      t0,
+      t1,
+      tMid: (t0 + t1) / 2,
+      poly: [
+        ringPoint(cx, cz, rInner, t0), ringPoint(cx, cz, rOuter, t0),
+        ringPoint(cx, cz, rOuter, t1), ringPoint(cx, cz, rInner, t1),
+      ],
+    });
+  }
+  return out;
+}
+
+/**
+ * Segment count that holds a chord near `chord` metres at this radius.
+ *
+ * Rounded to a multiple of 4 so the cardinal directions always fall on a
+ * segment boundary -- gates, the spur and the roads are all placed on axes, and
+ * a segment straddling one cannot be cleanly skipped for an opening.
+ */
+export function segmentsForChord(radius, chord = 15, min = 8) {
+  const raw = Math.ceil((Math.PI * 2 * radius) / chord);
+  return Math.max(min, Math.round(raw / 4) * 4);
+}

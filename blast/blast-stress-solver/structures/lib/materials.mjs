@@ -33,6 +33,7 @@ export const DENSITY = {
   'facade-clip': 2000,
   'glazing-clip': 2500,
   'footing-anchor': 2400,
+  'white-stone': 2600,
 };
 
 /**
@@ -94,6 +95,13 @@ const SPEC = [
   // AWAY whole before it cracks up, and cracks up when it lands.
   ['facade-clip',            8e6,    1.2,  0.13,       0.21],
   ['footing-anchor',        1.0e8,  10,    0.13,       0.50],
+  // The White City's masonry. Structurally the same as `stone` -- this exists
+  // for its LOOK. `stone` resolves to the `stone_wall_02` texture, whose mean
+  // albedo is 0.11 linear; base colour multiplies the sampled texture and so
+  // can only darken it, which left Minas Tirith a dark brown mound whatever
+  // colour it was given. `white-concrete` is the palest wall set baked
+  // (painted plaster, 0.41) and is the only way to get white stone today.
+  ['white-stone',           20e6,    3,    0.04,       0.10],
 ];
 
 /** Appearance. `textureKey` resolves to a layer in the client's city texture array. */
@@ -124,6 +132,7 @@ const LOOK = {
   'facade-panel':        { color: '#e4e2dd', textureKey: 'white-concrete', roughness: 0.88, metalness: 0.0 },
   'facade-clip':         { color: '#e4e2dd', textureKey: 'white-concrete', roughness: 0.88, metalness: 0.0 },
   'footing-anchor':      { color: '#8d8a86', textureKey: 'concrete-wall', roughness: 0.95, metalness: 0.0 },
+  'white-stone':         { color: '#f2efe8', textureKey: 'white-concrete', roughness: 0.88, metalness: 0.0 },
 };
 
 function entry(name, elastic, band, tensionFrac, shearFrac) {

@@ -76,34 +76,115 @@ function aabb(pack, i) {
  *
  * @returns a report of what changed, for the build log.
  */
-export async function applyAutoBonds(pack, { minArea = 8e-3 } = {}) {
+export async function applyAutoBonds(pack, { minArea = 8e-3, batch = 9000 } = {}) {
   const s = pack.scenario;
-  const chunks = s.nodes.map((_, i) => ({ geometry: chunkGeometry(pack, i) }));
-  const auto = await generateAutoBondsFromChunks(chunks, { mode: 'exact' });
-  if (!auto) throw new Error('auto-bonding returned nothing (is the WASM runtime built?)');
+  const boxes0 = s.nodes.map((_, i) => aabb(pack, i));
+  const groups = s.nodeGroups ?? [];
 
-  // Multiple contact patches between one pair are one bond.
+  // Bond each logical unit, then bond the units to each other.
+  //
+  // Running the generator over a whole scene at once does not scale: the WASM
+  // build is 32-bit and its heap tops out at 2 GB, which 37,200 hulls spread
+  // over 240 m of city ran straight into. It is also the wrong shape of work.
+  // A bond only ever forms between chunks that touch, so almost all of them
+  // are INSIDE something -- a wall panel, a house -- and only a thin skin of
+  // chunks per unit can reach anything outside it.
+  //
+  // So: one pass per unit over its own chunks, then a single pass over just
+  // the chunks that lie within reach of a different unit. The second set is a
+  // small fraction of the scene, which is what makes the whole thing cheap.
+  // Two chunks can only bond if they touch, so "near a different unit" is a
+  // matter of centimetres. Sizing this off the largest chunk in the scene (the
+  // terrain, at 13 m) instead swept nearly every chunk into the skin and gave
+  // back the whole-scene pass this exists to avoid.
+  const margin = 0.5;
+
   const autoArea = new Map();
   const autoBond = new Map();
-  for (const b of auto) {
-    const k = keyOf(b.node0, b.node1);
-    autoArea.set(k, (autoArea.get(k) ?? 0) + b.area);
-    if (!autoBond.has(k)) autoBond.set(k, b);
+  const report = { remeasured: 0, shrunk: 0, grew: 0, kept: 0, dropped: 0, added: 0,
+    areaBefore: 0, areaAfter: 0, units: 0, interfaceChunks: 0 };
+
+  const measure = async (members, label) => {
+    if (members.length < 2) return;
+    const auto = await generateAutoBondsFromChunks(
+      members.map((i) => ({ geometry: chunkGeometry(pack, i) })), { mode: 'exact' },
+    );
+    if (!auto) {
+      throw new Error(`auto-bonding returned nothing for ${label} ` +
+        `(${members.length} chunks) — is the WASM runtime built?`);
+    }
+    for (const bond of auto) {
+      const n0 = members[bond.node0], n1 = members[bond.node1];
+      const k = keyOf(n0, n1);
+      if (autoBond.has(k)) continue;
+      autoArea.set(k, bond.area);
+      autoBond.set(k, { ...bond, node0: n0, node1: n1 });
+    }
+  };
+
+  // Pass 1: inside each unit.
+  const byGroup = new Map();
+  for (let i = 0; i < s.nodes.length; i += 1) {
+    const g = groups[i] ?? 'scene';
+    const list = byGroup.get(g) ?? [];
+    list.push(i);
+    byGroup.set(g, list);
+  }
+  for (const [name, members] of byGroup) {
+    report.units += 1;
+    await measure(members, `unit ${name}`);
+  }
+
+  // Pass 2: the skin. A chunk is on it if anything from another unit comes
+  // within `margin` of it -- so every cross-unit contact has both sides here.
+  const skin = [];
+  for (let i = 0; i < s.nodes.length; i += 1) {
+    const [li, hi_] = boxes0[i];
+    const gi = groups[i] ?? 'scene';
+    let touching = false;
+    for (let j = 0; j < s.nodes.length && !touching; j += 1) {
+      if ((groups[j] ?? 'scene') === gi) continue;
+      const [lj, hj] = boxes0[j];
+      touching = hj[0] >= li[0] - margin && lj[0] <= hi_[0] + margin
+        && hj[1] >= li[1] - margin && lj[1] <= hi_[1] + margin
+        && hj[2] >= li[2] - margin && lj[2] <= hi_[2] + margin;
+    }
+    if (touching) skin.push(i);
+  }
+  report.interfaceChunks = skin.length;
+  // The skin can still be large on a scene whose units all abut, so it goes
+  // through the same size cap the units do.
+  const CAP = 9000;
+  if (skin.length <= CAP) {
+    await measure(skin, 'interfaces');
+  } else {
+    const cells = Math.ceil(skin.length / CAP);
+    const sorted = skin.slice().sort((a, c) => boxes0[a][0][0] - boxes0[c][0][0]);
+    const per = Math.ceil(sorted.length / cells);
+    for (let c = 0; c < cells; c += 1) {
+      const lo = c * per;
+      const slab = sorted.slice(lo, lo + per);
+      if (!slab.length) continue;
+      // Overlap by the margin so a contact on a slab edge is seen whole.
+      const x0 = boxes0[slab[0]][0][0] - margin;
+      const x1 = boxes0[slab[slab.length - 1]][1][0] + margin;
+      await measure(sorted.filter((i) => boxes0[i][1][0] >= x0 && boxes0[i][0][0] <= x1),
+        `interfaces ${c + 1}/${cells}`);
+    }
   }
 
   // The generator can report several contact patches for one pair, and summing
-  // them can exceed what the pieces could possibly share — patches that overlap,
-  // or a coincident face counted from both sides. Clamp to the same physical
-  // bound verify.mjs enforces: the largest planar cross-section of the smaller
-  // piece. Without this, 12 bonds in the skyline claim more contact than the
-  // chunk has area.
+  // them can exceed what the pieces could possibly share -- patches that
+  // overlap, or a coincident face counted from both sides. Clamp to the same
+  // physical bound verify.mjs enforces: the largest planar cross-section of
+  // the smaller piece.
   const crossSection = (i) => {
     const z = s.nodeSizes[i];
     return Math.max(z.x * Math.hypot(z.y, z.z), z.y * Math.hypot(z.x, z.z), z.z * Math.hypot(z.x, z.y));
   };
   const bound = (a, b) => Math.min(crossSection(a), crossSection(b));
 
-  const boxes = s.nodes.map((_, i) => aabb(pack, i));
+  const boxes = boxes0;
   const gap = (a, b) => {
     let g = 0;
     for (let d = 0; d < 3; d += 1) {
@@ -112,7 +193,6 @@ export async function applyAutoBonds(pack, { minArea = 8e-3 } = {}) {
     return g;
   };
 
-  const report = { remeasured: 0, shrunk: 0, grew: 0, kept: 0, dropped: 0, added: 0, areaBefore: 0, areaAfter: 0 };
   const seen = new Set();
   const out = [];
 
