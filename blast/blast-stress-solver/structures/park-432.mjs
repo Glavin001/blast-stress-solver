@@ -28,6 +28,12 @@ export const PARK_432 = {
   baysPerSide: 6,          // windows per facade per floor
   pierWidth: 1.35,         // the deep white piers between windows
   spandrelDepth: 1.1,      // the band between one floor's windows and the next
+  // Structural spandrel: the reinforced band directly UNDER each plate,
+  // spanning pier to pier. This is what makes the facade a TUBE rather than a
+  // row of columns -- and without it the stress card said what the plate edge
+  // thought of spanning 4.67 m bays alone: slab seams at 2.5x mid-bay, every
+  // storey. The real tower's grid is exactly this: pier, spandrel, window.
+  spandrelBeamDepth: 0.8,
   glassThickness: 0.07,
   columnSize: 1.1,         // perimeter columns are the piers themselves
   coreSide: 9.4,
@@ -64,12 +70,30 @@ export function buildPark432(cfg = {}) {
   const clamp = (v) => Math.max(-h + cs, Math.min(h - cs, v));
   const pierAt = Array.from({ length: C.baysPerSide + 1 }, (_, i) => clamp(-h + i * bayW));
 
-  // ── footings ─────────────────────────────────────────────────────────────
-  for (const x of pierAt) {
-    for (const z of pierAt) {
-      if (Math.abs(x) < h - 1e-6 && Math.abs(z) < h - 1e-6) continue;   // perimeter only
+  // ── footings: a continuous strip under the perimeter pier line ───────────
+  //
+  // These were isolated pads, one under each pier, and the stress card said
+  // exactly what that costs: the podium plate's edge strip has to SPAN from
+  // pad to pad carrying the pier line and the ground-storey facade, and its
+  // bottom face mid-bay read 2.5x its tension limit standing still -- the
+  // hottest joints in the whole tower, at (-7, 0, -11) and its mirrors,
+  // midway between pads at -4.67 and -9.33. Fifteen of the tower's thirty
+  // over-limit joints were this one detail.
+  //
+  // A strip footing is how real perimeter foundations solve it: continuous
+  // bearing under the line, so the plate edge stops being a beam. Four
+  // strips, the two in Z shortened so the corners are not doubly owned.
+  {
+    const ring = h - cs;                 // the pier line the strips run under
+    const sw = cs + 0.25;                // half-width: pier face plus a margin
+    for (const sign of [-1, 1]) {
       b.box({ type: 'foundation', material: 'footing-anchor',
-        min: [x - cs, -C.footingDepth, z - cs], max: [x + cs, 0, z + cs],
+        min: [-h, -C.footingDepth, sign * ring - sw],
+        max: [h, 0, sign * ring + sw],
+        fixed: true, fracture: false });
+      b.box({ type: 'foundation', material: 'footing-anchor',
+        min: [sign * ring - sw, -C.footingDepth, -ring + sw],
+        max: [sign * ring + sw, 0, ring - sw],
         fixed: true, fracture: false });
     }
   }
@@ -153,6 +177,34 @@ export function buildPark432(cfg = {}) {
           min: [x - cs, slabTop(k - 1), z - cs], max: [x + cs, slabBase(k), z + cs] });
       }
     }
+    // The structural spandrel ring: reinforced, full pier depth, butted
+    // against the piers either side, carrying each plate edge continuously.
+    // Emitted for EVERY storey, before the mechanical-floor skip below: the
+    // skip is about infill, and when this beam lived inside the infill loop
+    // the mechanical floors kept spanning bare and stayed the hottest joints
+    // in the tower.
+    {
+      const bTop = slabBase(k);
+      const bBot = bTop - C.spandrelBeamDepth;
+      for (const [axis, sign] of [['z', 1], ['z', -1], ['x', 1], ['x', -1]]) {
+        for (let i = 0; i < C.baysPerSide; i += 1) {
+          const limit = h - C.columnSize;
+          const a0 = Math.max(pierAt[i] + cs, -limit);
+          const a1 = Math.min(pierAt[i + 1] - cs, limit);
+          if (!(a1 - a0 > 0.2)) continue;
+          const sLo = Math.min(sign * (h - C.columnSize), sign * h);
+          const sHi = Math.max(sign * (h - C.columnSize), sign * h);
+          b.piece({
+            type: 'beam', material: 'reinforced-concrete', axis,
+            lo: sLo, hi: sHi,
+            poly: axis === 'z'
+              ? [[a0, bBot], [a1, bBot], [a1, bTop], [a0, bTop]]
+              : [[bBot, a0], [bBot, a1], [bTop, a1], [bTop, a0]],
+          });
+        }
+      }
+    }
+
     if (isMechanical(k)) continue;   // open floor: piers only, no infill
 
     // Facade infill for THIS storey — the same band the piers of storey k
@@ -164,7 +216,7 @@ export function buildPark432(cfg = {}) {
     // rests ON the glass, and the static walk duly routes a storey's weight
     // through a glazing clip. Real curtain wall hangs off one slab and carries
     // only itself.
-    const head = y1 - 0.02;
+    const head = y1 - C.spandrelBeamDepth - 0.02;
     for (const [axis, sign] of [['z', 1], ['z', -1], ['x', 1], ['x', -1]]) {
       const at = sign * (h - C.glassThickness);
       for (let i = 0; i < C.baysPerSide; i += 1) {
