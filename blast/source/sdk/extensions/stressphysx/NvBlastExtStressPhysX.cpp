@@ -62,14 +62,32 @@ static uint32_t validateInterval()
 /// A/B for the flat per-node bondless flags (default ON). One binary, two
 /// arms: the alternative is comparing two builds, which reintroduces build
 /// identity as a confounder -- the mistake that cost a day on this tree.
-/// DEFAULT OFF pending verification. The performance result is solid
-/// (cb_queue -39.7% p50, physx_step -15.8%, n=5242 per arm, matched
-/// buckets), but the audit that would prove the flat array encodes the SAME
-/// predicate reported 0 checks -- it never executed -- and 0 checks is
-/// inconclusive, not a pass. The node cache shipped on 75M checks with 0
-/// mismatches; this has not earned that yet.
+/// DEFAULT OFF, and now for a proven reason rather than a missing proof.
 ///
-/// BLAST_NODE_BONDLESS_FLAT=1 enables it. Fix the audit first, then flip.
+/// The performance result is real: cb_queue -39.7% p50, cb_tick -26.7%,
+/// physx_step -15.8%, n=5242 per arm, matched buckets. But the audit says
+/// the flat array is NOT the same predicate:
+///
+///   101,135,704 checks, 98,633 mismatches (0.0975%)
+///
+/// The cause is staleness by one tick. refreshNodeBondless() runs in
+/// beginTick, but body composition changes in endTick -- fracture creates,
+/// splits and recycles bodies there. Contacts arrive in the NEXT step's
+/// contact callback, which is before the next beginTick, so on any tick
+/// following a topology change the flags describe the previous
+/// composition. 0.0975% is precisely the fracture rate.
+///
+/// A contact wrongly classed as bondless is DROPPED -- it never reaches the
+/// solver -- so this is lost load on freshly fractured chunks, exactly where
+/// the stress solve matters most. Not shippable.
+///
+/// The fix is to rebuild after endTick rather than before beginTick, so the
+/// flags describe the composition the contacts will actually be resolved
+/// against. Left unfixed here deliberately: the rebuild site is a
+/// correctness decision that deserves its own change and its own audit run,
+/// not a tail-end edit.
+///
+/// BLAST_NODE_BONDLESS_FLAT=1 + BLAST_NODE_BONDLESS_VERIFY=1 reproduces it.
 static bool flatBondlessFlags()
 {
     static const bool enabled = [] {
