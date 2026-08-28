@@ -865,12 +865,30 @@ public:
             : bend * 2.0f / nodeDist;
     }
 
-    /// Whether bending is scaled by a section modulus (see above). Read once.
+    /// Whether bending is scaled by a section modulus (see above).
+    ///
+    /// OFF by default, and that is a calibration statement rather than a
+    /// correctness one. The scaling is the more physical of the two -- a
+    /// section modulus is what turns a moment into a fibre stress, and the
+    /// node spacing it replaces was never a section dimension -- but it raises
+    /// bending stress on real structures by roughly an order of magnitude, and
+    /// the material table has not been recalibrated to absorb that.
+    ///
+    /// Measured on the shipping city (all seven authored buildings, 56,595
+    /// chunks, ten seconds of gravity and nothing else):
+    ///
+    ///     baseline                 10 bonds broken
+    ///     fibre split only          7
+    ///     fibre split + this    2,016 and still climbing, 493 loose bodies
+    ///
+    /// Every building stands on its own under it; the city does not. So it
+    /// waits for the per-material calibration pass that earns it, and until
+    /// then BLAST_BEND_SECTION_MODULUS=1 opts in for that work.
     static bool sectionModulusBending()
     {
         static const bool enabled = []() {
             const char* value = std::getenv("BLAST_BEND_SECTION_MODULUS");
-            return value == nullptr || value[0] != '0';
+            return value != nullptr && value[0] != '0';
         }();
         return enabled;
     }
