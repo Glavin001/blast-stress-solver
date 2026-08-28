@@ -1134,6 +1134,10 @@ public:
         {
             ext_stress_solver_update(m_solver);
             ++m_telemetry.extraSolveUpdates;
+            m_telemetry.gpuStressHostWorkMilliseconds +=
+                ext_stress_solver_gpu_host_work_milliseconds(m_solver);
+            m_telemetry.gpuStressHostBlockedMilliseconds +=
+                ext_stress_solver_gpu_host_blocked_milliseconds(m_solver);
         }
         if (ext_stress_solver_converged(m_solver) == 0)
         {
@@ -1146,6 +1150,10 @@ public:
         m_telemetry.solverIslandsSkipped = ext_stress_solver_islands_skipped(m_solver);
         m_telemetry.gpuStressSolveMilliseconds +=
             ext_stress_solver_gpu_solve_milliseconds(m_solver);
+        m_telemetry.gpuStressHostWorkMilliseconds +=
+            ext_stress_solver_gpu_host_work_milliseconds(m_solver);
+        m_telemetry.gpuStressHostBlockedMilliseconds +=
+            ext_stress_solver_gpu_host_blocked_milliseconds(m_solver);
         m_telemetry.gpuStressHostToDeviceBytes +=
             ext_stress_solver_gpu_host_to_device_bytes(m_solver);
         m_telemetry.gpuStressDeviceToHostBytes +=

@@ -105,6 +105,15 @@ export class ScenePackBuilder {
     this.rng = mulberry32(seed);
     /** How many panels of each class have been cut, to cycle the variants. */
     this.patternCounts = new Map();
+    /**
+     * The logical unit pieces are currently being added to -- a house, a wall
+     * ring, one tier's rock. Auto-bonding uses it to work unit by unit rather
+     * than over the whole scene at once, which is both far cheaper and a more
+     * honest description of the structure: a house's chunks bond to each other,
+     * and separately the house bonds to the street.
+     */
+    this.currentGroup = 'scene';
+    this.nodeGroups = [];
     this.pieces = [];
     /** Populated by build(). */
     this.nodes = []; this.nodeTypes = []; this.nodeMaterials = [];
@@ -113,6 +122,19 @@ export class ScenePackBuilder {
     /** Contacts formed through slight overlap rather than a clean face. */
     this.penetratingContacts = 0;
     this.built = false;
+  }
+
+  /**
+   * Everything authored inside `fn` belongs to the named logical unit.
+   *
+   * Units are what auto-bonding works over: a house's chunks are bonded among
+   * themselves, and separately the house is bonded to the street it stands on.
+   * Nesting is allowed and the previous unit is restored on the way out.
+   */
+  group(name, fn) {
+    const previous = this.currentGroup;
+    this.currentGroup = name;
+    try { return fn(); } finally { this.currentGroup = previous; }
   }
 
   /**
@@ -126,24 +148,40 @@ export class ScenePackBuilder {
    * @param type      structural role, for scenario.nodeTypes
    * @param fixed     mass 0 -- pinned to the world. Foundations only.
    * @param fracture  false leaves the piece whole (one hull)
+   * @param cellVolume  overrides the material's subdivision cell size, in m^3.
+   *
+   * `cellVolume` exists for terrain. The cap a material carries is chosen so
+   * that a BUILDING made of it breaks up convincingly, and the subdivision
+   * grid applies whether or not the piece fractures -- so a pinned mountain
+   * shell authored in stone dices into 2 m^3 cells and costs thousands of
+   * nodes that can never move. Raising it for a fixed piece is the same
+   * argument `footing-anchor` already makes at 12 m^3: a support never breaks,
+   * so its size is invisible and splitting it buys nothing.
    */
-  piece({ type, material: matName, axis, poly, lo, hi, fixed = false, fracture = true }) {
+  piece({ type, material: matName, axis, poly, lo, hi,
+          fixed = false, fracture = true, cellVolume = null }) {
     if (!FRAME[axis]) throw new Error(`bad axis "${axis}"`);
     if (!(hi > lo)) throw new Error(`${type}/${matName}: empty extent ${lo}..${hi} on ${axis}`);
     if (poly.length > MAX_POLY_VERTS) {
       throw new Error(`${type}/${matName}: ${poly.length}-vertex cross-section exceeds ` +
         `${MAX_POLY_VERTS} (prismMesh emits 6 verts/edge, PhysX GPU cooks at most ${MAX_HULL_POINTS})`);
     }
+    if (cellVolume !== null && !(cellVolume > 0)) {
+      throw new Error(`${type}/${matName}: cellVolume must be positive, got ${cellVolume}`);
+    }
     material(matName); // validates the name
-    this.pieces.push({ type, material: matName, axis, poly, lo, hi, fixed, fracture, shards: [] });
+    this.pieces.push({
+      type, material: matName, axis, poly, lo, hi, fixed, fracture, cellVolume,
+      group: this.currentGroup, shards: [],
+    });
     return this.pieces.length - 1;
   }
 
   /** Convenience: an axis-aligned box, given world-space min/max corners. */
-  box({ type, material, min, max, axis = 'y', fixed = false, fracture = true }) {
+  box({ type, material, min, max, axis = 'y', fixed = false, fracture = true, cellVolume = null }) {
     const f = FRAME[axis];
     return this.piece({
-      type, material, axis, fixed, fracture,
+      type, material, axis, fixed, fracture, cellVolume,
       poly: rect(min[f.u], min[f.w], max[f.u], max[f.w]),
       lo: min[f.t], hi: max[f.t],
     });
@@ -183,6 +221,7 @@ export class ScenePackBuilder {
     this.nodeTypes.push(type);
     this.nodeMaterials.push(matName);
     this.nodePieces.push(piece);
+    this.nodeGroups.push(this.pieces[piece]?.group ?? 'scene');
     this.nodeSizes.push(v(Math.abs(size[0]), Math.abs(size[1]), Math.abs(size[2])));
 
     if (isAxisRect(poly)) {
@@ -263,7 +302,7 @@ export class ScenePackBuilder {
     // bounding box. A curved facade band is a thin strip whose box is several
     // times its own volume, and sizing the grid off the box cut it into dozens
     // of slivers.
-    const cellVolume = cellVolumeFor(matName, fracture);
+    const cellVolume = p.cellVolume ?? cellVolumeFor(matName, fracture);
     const cellsWanted = Math.max(1, Math.ceil((area * thickness) / cellVolume));
 
     // Split greedily, always halving whichever dimension currently has the
@@ -512,6 +551,9 @@ export class ScenePackBuilder {
         // exactly but their bounding boxes overlap, so they would otherwise read
         // as false positives.
         nodePieces: this.nodePieces,
+        // Which logical unit each node belongs to. Authoring information, kept
+        // so a consumer can tell "two shards of one house" from "two houses".
+        nodeGroups: this.nodeGroups,
         nodes: this.nodes,
         bonds: this.bonds,
         nodeSizes: this.nodeSizes,

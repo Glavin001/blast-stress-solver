@@ -23,15 +23,31 @@ byte-identical output.
 
 | Structure | Chunks | What it is for |
 |---|---|---|
-| `algedra-tower` | 6.4k | Curved balcony bands; the organic-facade case |
-| `house-1story` | 312 | Brick on a wood frame; load-bearing masonry |
-| `house-2story` | 568 | Stone base over brick; two materials, one frame |
-| `villa-savoye` | 540 | Pilotis. The clearest load path in the set — one column drops a corner |
-| `park-432` | 6.6k | Slender tube. The only one that TOPPLES rather than pancaking |
-| `parking-garage` | 694 | Flat plates, no walls. The only one that PANCAKES |
-| `petronas` | 12.8k | Two towers COUPLED by a skybridge; damage travels between them |
-| `neighbourhood` | 7.3k | Algedra and both houses in one scene |
-| `skyline` | 27.9k | All seven, strung along the spawn axis |
+| `algedra-tower` | 7.9k | Curved balcony bands; the organic-facade case |
+| `house-1story` | 329 | Brick on a wood frame; load-bearing masonry |
+| `house-2story` | 610 | Stone base over brick; two materials, one frame |
+| `villa-savoye` | 1.0k | Pilotis. The clearest load path in the set — one column drops a corner |
+| `park-432` | 19.7k | Slender tube. The only one that TOPPLES rather than pancaking |
+| `parking-garage` | 3.4k | Flat plates, no walls. The only one that PANCAKES |
+| `petronas` | 23.6k | Two towers COUPLED by a skybridge; damage travels between them |
+| `minas-tirith` | 47.6k | A walled city on a mountain. The only one that is TERRAIN, and the only one built to be walked through |
+| `neighbourhood` | 8.8k | Algedra and both houses in one scene |
+| `skyline` | 56.5k | All seven towers and houses, clustered at the origin |
+
+Counts are from the emitted JSON. They had drifted badly — every figure in this
+table was between half and a third of the truth — so read them from the packs
+rather than trusting the table if it looks stale again.
+
+`minas-tirith` is the odd one out and worth reading before authoring anything
+like it. It is the first structure that is mostly *pinned terrain* rather than
+building, the first with no rectilinear geometry anywhere, and the first sized
+against the player capsule rather than against what looks right: 1.6 m of
+clearance everywhere because crouching does not shrink it, road steps under the
+0.35 m a bot will climb, and parapets above the 1.05 m a player can jump.
+
+It is also the one that does not yet stand. It verifies clean and its peak rest
+utilisation is 7.6%, but it sheds pieces in the solver that cascade down the
+terraces. `every_structure_stands_under_its_own_weight` fails for it.
 
 Multi-storey structures have stairs between floors: an open dog-leg flight in
 the houses and Villa Savoye, an enclosed core that also braces the frame in the

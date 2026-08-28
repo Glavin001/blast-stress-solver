@@ -25,6 +25,7 @@ import { buildVillaSavoye } from './villa-savoye.mjs';
 import { buildPark432 } from './park-432.mjs';
 import { buildParkingGarage } from './parking-garage.mjs';
 import { buildPetronas } from './petronas.mjs';
+import { buildMinasTirith } from './minas-tirith.mjs';
 import { buildNeighbourhood, buildSkyline } from './neighbourhood.mjs';
 import {
   buildRigCantilever, buildRigColumn, buildRigGarage, buildRigPane,
@@ -45,6 +46,7 @@ const STRUCTURES = {
   'park-432': buildPark432,
   'parking-garage': buildParkingGarage,
   petronas: buildPetronas,
+  'minas-tirith': buildMinasTirith,
   // All three in one scene, for looking at or playing in.
   neighbourhood: buildNeighbourhood,
   skyline: buildSkyline,

@@ -277,6 +277,24 @@ public:
 #endif
     }
 
+    float getGpuHostWorkMilliseconds() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        return m_gpuFrameHostWorkMilliseconds;
+#else
+        return 0.0f;
+#endif
+    }
+
+    float getGpuHostBlockedMilliseconds() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        return m_gpuFrameHostBlockedMilliseconds;
+#else
+        return 0.0f;
+#endif
+    }
+
     uint64_t getGpuHostToDeviceBytes() const
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
@@ -400,6 +418,8 @@ public:
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
         m_gpuFrameSolveMilliseconds = 0.0f;
+        m_gpuFrameHostWorkMilliseconds = 0.0f;
+        m_gpuFrameHostBlockedMilliseconds = 0.0f;
         m_gpuFrameHostToDeviceBytes = 0;
         m_gpuFrameDeviceToHostBytes = 0;
 #endif
@@ -486,6 +506,16 @@ public:
                 m_converged = m_gpuSolver->telemetry().converged;
                 m_gpuFrameSolveMilliseconds =
                     m_gpuSolver->telemetry().solveMilliseconds;
+                // Host wall inside solve(), split into working and blocked.
+                // The bench says the wrapper is almost entirely blocked; the
+                // live gap is 3.8 ms against a 1.2 ms kernel, which the bench
+                // cannot reproduce, so the split has to be measured where the
+                // gap actually is.
+                m_gpuFrameHostWorkMilliseconds =
+                    m_gpuSolver->telemetry().hostPlanMilliseconds
+                    + m_gpuSolver->telemetry().hostFinishMilliseconds;
+                m_gpuFrameHostBlockedMilliseconds =
+                    m_gpuSolver->telemetry().hostSyncMilliseconds;
                 m_gpuFrameHostToDeviceBytes =
                     m_gpuSolver->telemetry().hostToDeviceBytes;
                 m_gpuFrameDeviceToHostBytes =
@@ -571,6 +601,8 @@ private:
     uint32_t                            m_gpuIslandsSkipped{0};
     uint32_t                            m_gpuIslandsTotal{0};
     float                               m_gpuFrameSolveMilliseconds{0.0f};
+    float                               m_gpuFrameHostWorkMilliseconds{0.0f};
+    float                               m_gpuFrameHostBlockedMilliseconds{0.0f};
     uint64_t                            m_gpuFrameHostToDeviceBytes{0};
     uint64_t                            m_gpuFrameDeviceToHostBytes{0};
 #endif
@@ -793,6 +825,8 @@ public:
 
     bool getGpuAccelerated() const { return m_solver.getGpuAccelerated(); }
     float getGpuSolveMilliseconds() const { return m_solver.getGpuSolveMilliseconds(); }
+    float getGpuHostWorkMilliseconds() const { return m_solver.getGpuHostWorkMilliseconds(); }
+    float getGpuHostBlockedMilliseconds() const { return m_solver.getGpuHostBlockedMilliseconds(); }
     uint64_t getGpuHostToDeviceBytes() const { return m_solver.getGpuHostToDeviceBytes(); }
     uint64_t getGpuDeviceToHostBytes() const { return m_solver.getGpuDeviceToHostBytes(); }
 
@@ -2259,6 +2293,16 @@ public:
     virtual float                           getGpuSolveMilliseconds() const override
     {
         return m_graphProcessor->getGpuSolveMilliseconds();
+    }
+
+    virtual float                           getGpuHostWorkMilliseconds() const override
+    {
+        return m_graphProcessor->getGpuHostWorkMilliseconds();
+    }
+
+    virtual float                           getGpuHostBlockedMilliseconds() const override
+    {
+        return m_graphProcessor->getGpuHostBlockedMilliseconds();
     }
 
     virtual uint64_t                        getGpuHostToDeviceBytes() const override

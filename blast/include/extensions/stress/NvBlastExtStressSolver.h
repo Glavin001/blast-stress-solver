@@ -583,6 +583,11 @@ public:
     virtual void                            setGpuMinimumBondCount(uint32_t bondCount) = 0;
     virtual bool                            getGpuAccelerated() const = 0;
     virtual float                           getGpuSolveMilliseconds() const = 0;
+
+    /// Host wall time inside the GPU solve, split into work and waiting.
+    /// Only the first is reclaimable by faster host code.
+    virtual float                           getGpuHostWorkMilliseconds() const = 0;
+    virtual float                           getGpuHostBlockedMilliseconds() const = 0;
     virtual uint64_t                        getGpuHostToDeviceBytes() const = 0;
     virtual uint64_t                        getGpuDeviceToHostBytes() const = 0;
 

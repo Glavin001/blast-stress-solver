@@ -104,6 +104,19 @@ struct ExtStressGpuTelemetry
     /// Of those, how many were settled and therefore not solved this call.
     /// Always 0 unless ExtStressGpuSolveParams::skipSettledIslands is set.
     std::uint32_t islandsSkipped{0};
+    /// Host-side wall time inside solve(), split into work and waiting.
+    ///
+    /// solve_ms minus solveMilliseconds ran 3.84 ms against a 1.24 ms kernel,
+    /// and "the host wrapper is expensive" and "the host is blocked on the
+    /// GPU" are different problems with different fixes. Only the first is
+    /// reclaimable by making host code faster, so the split is the ceiling on
+    /// every host optimization and is measured rather than assumed.
+    float hostPlanMilliseconds{0.0f};
+    float hostSyncMilliseconds{0.0f};
+    float hostFinishMilliseconds{0.0f};
+    /// Extra full solve passes spent chasing convergence. Each is another
+    /// enqueue/sync/finish cycle, so it multiplies everything above.
+    std::uint32_t extraPasses{0};
 };
 
 /**

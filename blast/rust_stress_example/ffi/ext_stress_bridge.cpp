@@ -1512,6 +1512,20 @@ ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
     return (handle && handle->solver) ? handle->solver->getGpuSolveMilliseconds() : 0.0f;
 }
 
+extern "C" float
+ext_stress_solver_gpu_host_work_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuHostWorkMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_gpu_host_blocked_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuHostBlockedMilliseconds() : 0.0f;
+}
+
 extern "C" uint64_t
 ext_stress_solver_gpu_host_to_device_bytes(const ExtStressSolverHandle* handlePtr)
 {

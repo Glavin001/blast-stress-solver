@@ -232,6 +232,7 @@ function verify(pack, name) {
     glass: 0.6, brick: 0.6, stone: 2.0, steel: 2.5, 'wood-frame': 1.2,
     'reinforced-concrete': 3.5, 'concrete-slab': 3.5, 'facade-panel': 1.2,
     'facade-clip': 1.2, 'glazing-clip': 0.6, 'footing-anchor': 12.0,
+    'white-stone': 2.0,
   };
   {
     const chunksPerPiece = new Map();
@@ -247,6 +248,12 @@ function verify(pack, name) {
     const monoliths = [];
     let worstVol = 0, worstAt = -1;
     for (let i = 0; i < N; i += 1) {
+      // Pinned nodes are exempt. The rule exists so a BUILDING does not topple
+      // as a few intact slabs; a mass-0 node never breaks and never moves, so
+      // its size is invisible. This is the same argument `footing-anchor`
+      // already makes by carrying a 12 m^3 cap, generalised — terrain authored
+      // with a raised `cellVolume` would otherwise fail here.
+      if (s.nodes[i].mass === 0) continue;
       const cap = (capOf[s.nodeMaterials?.[i]] ?? Infinity) * MONOLITH;
       if (s.nodes[i].volume > cap) {
         monoliths.push(i);

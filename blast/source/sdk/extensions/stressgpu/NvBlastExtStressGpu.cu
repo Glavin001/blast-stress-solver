@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1374,16 +1375,33 @@ uploadIslands();
         const ExtStressGpuSolveParams& params) override
     {
         ContextGuard context(m_cudaContext);
+        using HostClock = std::chrono::steady_clock;
+        const auto hostMs = [](HostClock::time_point from) {
+            return std::chrono::duration<float, std::milli>(HostClock::now() - from)
+                .count();
+        };
+        const auto planStart = HostClock::now();
         if (!enqueueSolve(nodeVelocities, params))
         {
             return false;
         }
+        // enqueueSolve contains the mid-solve stall in refreshActiveLists, so
+        // its own sync time is subtracted out below rather than counted as
+        // planning work.
+        m_telemetry.hostPlanMilliseconds =
+            hostMs(planStart) - m_activeListSyncMilliseconds;
+        m_telemetry.hostSyncMilliseconds = m_activeListSyncMilliseconds;
+        m_activeListSyncMilliseconds = 0.0f;
         if (m_solveWasNoOp)
         {
             return true;
         }
+        const auto waitStart = HostClock::now();
         checkCuda(cudaEventSynchronize(m_statusReady), "wait for stress solve");
+        m_telemetry.hostSyncMilliseconds += hostMs(waitStart);
+        const auto finishStart = HostClock::now();
         finishSolve();
+        m_telemetry.hostFinishMilliseconds = hostMs(finishStart);
         return true;
     }
 
@@ -1417,11 +1435,25 @@ uploadIslands();
     {
         m_skipStableUnconverged = params.skipStableUnconverged;
         ContextGuard context(m_cudaContext);
+        // Instrumented here as well as in solve(), because THIS is the entry
+        // point production uses -- the adapter calls
+        // solveAndReadbackImpulses, and a host split measured only in solve()
+        // reported a clean 0.00 ms live while the real path went unmeasured.
+        using HostClock = std::chrono::steady_clock;
+        const auto hostMs = [](HostClock::time_point from) {
+            return std::chrono::duration<float, std::milli>(HostClock::now() - from)
+                .count();
+        };
+        const auto planStart = HostClock::now();
         if (!bondImpulses || capacity < m_bondCount
             || !enqueueSolve(nodeVelocities, params))
         {
             return false;
         }
+        m_telemetry.hostPlanMilliseconds =
+            hostMs(planStart) - m_activeListSyncMilliseconds;
+        m_telemetry.hostSyncMilliseconds = m_activeListSyncMilliseconds;
+        m_activeListSyncMilliseconds = 0.0f;
         if (m_solveWasNoOp)
         {
             // Every island settled: the impulses on the device are the ones
@@ -1432,10 +1464,16 @@ uploadIslands();
         // The status and impulse copies share one stream. Waiting for the
         // latter completes the upload, solve, status, and impulse readback.
         const bool compacted = m_changedBonds.size() < m_bondCount;
+        const auto enqueueStart = HostClock::now();
         enqueueImpulseReadback(compacted);
+        m_telemetry.hostPlanMilliseconds += hostMs(enqueueStart);
+        const auto waitStart = HostClock::now();
         checkCuda(cudaEventSynchronize(m_downloadStop), "wait for stress solve and readback");
+        m_telemetry.hostSyncMilliseconds += hostMs(waitStart);
+        const auto finishStart = HostClock::now();
         finishSolve();
         finishImpulseReadback(bondImpulses, compacted);
+        m_telemetry.hostFinishMilliseconds = hostMs(finishStart);
         return true;
     }
 
@@ -1771,7 +1809,16 @@ private:
                 cudaMemcpyDeviceToHost,
                 m_stream),
             "read active counts");
-        checkCuda(cudaStreamSynchronize(m_stream), "sync active counts");
+        {
+            // Priced separately: this is the host BLOCKED, not the host
+            // working, and only the latter is reclaimable by faster host code.
+            const auto syncStart = std::chrono::steady_clock::now();
+            checkCuda(cudaStreamSynchronize(m_stream), "sync active counts");
+            m_activeListSyncMilliseconds +=
+                std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - syncStart)
+                    .count();
+        }
         m_activeBondCount = m_hostActiveCounts[0];
         m_activeNodeCount = m_hostActiveCounts[1];
         if (skipping)
@@ -3305,6 +3352,9 @@ uploadIslands();
     /// Set when a solve() call found nothing to do at all, so the caller can
     /// skip its own post-solve work too.
     bool m_solveWasNoOp{false};
+    /// Time spent BLOCKED inside refreshActiveLists this solve, kept apart
+    /// from planning work so the host split means something.
+    float m_activeListSyncMilliseconds{0.0f};
     std::uint32_t m_debugSolves{0};
     std::uint32_t* m_scatterIndices{nullptr};
     ExtStressGpuImpulse* m_scatterValues{nullptr};

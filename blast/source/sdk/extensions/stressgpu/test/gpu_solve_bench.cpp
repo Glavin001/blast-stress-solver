@@ -200,6 +200,9 @@ int main()
     }
 
     double solveMsTotal = 0.0;
+    double planMsTotal = 0.0;
+    double syncMsTotal = 0.0;
+    double finishMsTotal = 0.0;
     std::uint32_t iterationTotal = 0;
     std::uint32_t skippedTotal = 0;
     const auto wallStart = std::chrono::steady_clock::now();
@@ -214,6 +217,9 @@ int main()
         }
         const ExtStressGpuTelemetry& telemetry = solver->telemetry();
         solveMsTotal += telemetry.solveMilliseconds;
+        planMsTotal += telemetry.hostPlanMilliseconds;
+        syncMsTotal += telemetry.hostSyncMilliseconds;
+        finishMsTotal += telemetry.hostFinishMilliseconds;
         iterationTotal += telemetry.iterations;
         skippedTotal += telemetry.islandsSkipped;
     }
@@ -236,6 +242,14 @@ int main()
         (solveMsTotal / solves) / std::max(1.0, static_cast<double>(iterationTotal) / solves),
         scene.bonds.size(),
         islands);
+
+    std::printf(
+        "host split: plan %.3f ms, blocked %.3f ms, finish %.3f ms per solve "
+        "(device %.3f)\n",
+        planMsTotal / solves,
+        syncMsTotal / solves,
+        finishMsTotal / solves,
+        solveMsTotal / solves);
 
     solver->release();
     return 0;

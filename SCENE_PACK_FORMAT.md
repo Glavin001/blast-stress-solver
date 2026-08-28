@@ -222,6 +222,8 @@ Two optional parallel arrays close that gap without touching solver behaviour:
 scenario.nodeMaterials  [String]   material NAMES, parallel to nodes
 scenario.nodePieces     [u32]      which authored piece a node was fractured
                                    from, parallel to nodes
+scenario.nodeGroups     [String]   which logical unit a node belongs to — a
+                                   house, a wall ring — parallel to nodes
 nodes[].m               u32        material index — the same field v3 defines
 ```
 
@@ -233,7 +235,15 @@ which is the difference between a meaningful interpenetration check and a
 hundred false positives — shards of one piece tile exactly yet their bounding
 boxes overlap.
 
-A loader that ignores all three is still conformant. Nothing here changes how a
+`nodeGroups` is a coarser grouping than `nodePieces`: a piece is one authored
+wall panel, a group is the whole house that panel belongs to. It exists because
+bond generation does not scale as one pass over a scene — a contact only ever
+forms between chunks that touch, so almost every bond is *inside* some unit and
+only a thin skin of each can reach anything outside it. Bonding unit by unit and
+then once over the skin is both far cheaper and the reason a 37,000-chunk city
+can be bonded at all: run flat, it exhausts a 32-bit WASM heap.
+
+A loader that ignores all four is still conformant. Nothing here changes how a
 bond behaves.
 
 ### Rules for v2 loaders
@@ -454,7 +464,7 @@ concept of, but must not misinterpret one.
 | `camera`, `projectile` | demo-only | demo-only | demo-only |
 | `nodeMeshes` | render only | render only | ignored (boxes/hulls from colliders) |
 | `nodes[].m`, `materials[].crush` (v3) | ignored | ignored | yes |
-| `nodeMaterials`, `nodePieces`, `materials[].color/opacity/textureKey` | ignored | ignored | ignored |
+| `nodeMaterials`, `nodePieces`, `nodeGroups`, `materials[].color/opacity/textureKey` | ignored | ignored | ignored |
 
 The presentation fields and per-node material are honored by no solver at
 all — they are read by renderers. vibe-land-2's standalone structure viewer
