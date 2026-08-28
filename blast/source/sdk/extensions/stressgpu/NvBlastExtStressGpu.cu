@@ -727,27 +727,62 @@ __global__ void accumulateSquaredByIsland(
 /// island that stops here stops costing iterations, which is what makes
 /// solving to a residual tolerance affordable instead of running a fixed
 /// budget for the whole graph.
+/// Convergence test AND the active tally, fused.
+///
+/// They were two launches over the same island grid, back to back, reading
+/// the same array. At ~3 us of launch latency per kernel -- which is what
+/// every small kernel in this solve costs, measured -- a launch that does one
+/// comparison per island is nearly all overhead. Fusing removes one launch
+/// per iteration and the separate counter reset with it.
+///
+/// The tally writes ONE partial per block instead of accumulating into a
+/// shared counter: with ~8 blocks at city scale the final sum is trivial for
+/// the latch kernel, it needs no reset beforehand, and it is exact and
+/// order-independent by construction rather than by argument.
 __global__ void checkConvergencePerIsland(
     std::uint32_t* islandActive,
     std::uint32_t* islandConverged,
     const float* residualSquared,
     const float* deltaSquared,
+    std::uint32_t* blockActiveCounts,
     std::uint32_t islandCount)
 {
-    const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id >= islandCount || !islandActive[id])
+    __shared__ std::uint32_t partial[kBlockSize];
+    const std::uint32_t tid = threadIdx.x;
+    const std::uint32_t id = blockIdx.x * blockDim.x + tid;
+
+    std::uint32_t active = 0;
+    if (id < islandCount && islandActive[id])
     {
-        return;
+        if (residualSquared[id] <= deltaSquared[id])
+        {
+            islandActive[id] = 0;
+            // Reaching tolerance is what earns the right to be skipped later,
+            // and it is recorded separately from `active` because retiring a
+            // degenerate island also clears `active` -- freezing an island
+            // that gave up rather than converged would preserve stale,
+            // inflated stress and keep breaking bonds off it.
+            islandConverged[id] = 1;
+        }
+        else
+        {
+            active = 1;
+        }
     }
-    if (residualSquared[id] <= deltaSquared[id])
+
+    partial[tid] = active;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
     {
-        islandActive[id] = 0;
-        // Reaching tolerance is what earns the right to be skipped later, and
-        // it is recorded separately from `active` because retiring a
-        // degenerate island also clears `active` -- freezing an island that
-        // gave up rather than converged would preserve stale, inflated stress
-        // and keep breaking bonds off it.
-        islandConverged[id] = 1;
+        if (tid < stride)
+        {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0)
+    {
+        blockActiveCounts[blockIdx.x] = partial[0];
     }
 }
 
@@ -947,20 +982,56 @@ __global__ void updateSolutionAndResidualPerIsland(
 
 /// Retire islands whose step is degenerate. Separate pass so the update above
 /// stays branch-simple and every island sees a consistent active flag.
+/// Retire degenerate islands, roll the gradient norm forward, and latch
+/// convergence -- three island-grid launches fused into one.
+///
+/// The ordering that makes this legal: saveGradientSquared must run after
+/// updateDirection has READ previousGradientSquared, and by this point in the
+/// iteration it has. Latching needs the completed active tally from
+/// checkConvergencePerIsland, and that kernel finished earlier on the same
+/// stream. Every read here is of a value already final.
 __global__ void retireDegenerateIslands(
     std::uint32_t* islandActive,
     const float* projectedDirectionSquared,
+    float* previousGradientSquared,
+    const float* gradientSquared,
+    SolveStatus* status,
+    const std::uint32_t* blockActiveCounts,
+    std::uint32_t blockCount,
+    std::uint32_t iteration,
     std::uint32_t islandCount)
 {
     const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id >= islandCount || !islandActive[id])
+    if (id < islandCount)
     {
-        return;
+        if (islandActive[id])
+        {
+            const float denominator = projectedDirectionSquared[id];
+            if (!(denominator > 0.0f) || !isfinite(denominator))
+            {
+                islandActive[id] = 0;
+            }
+            // Fold of saveGradientSquaredPerIsland: an island that is not
+            // active never reads this again, so rolling it forward only for
+            // active islands preserves every value the split kernels
+            // produced. (The original guarded on islandActive too.)
+            previousGradientSquared[id] = gradientSquared[id];
+        }
     }
-    const float denominator = projectedDirectionSquared[id];
-    if (!(denominator > 0.0f) || !isfinite(denominator))
+
+    if (blockIdx.x == 0 && threadIdx.x == 0)
     {
-        islandActive[id] = 0;
+        std::uint32_t active = 0;
+        for (std::uint32_t i = 0; i < blockCount; ++i)
+        {
+            active += blockActiveCounts[i];
+        }
+        status->active = active;
+        if (active == 0 && !status->converged)
+        {
+            status->converged = 1;
+            status->iterations = iteration;
+        }
     }
 }
 
@@ -1240,6 +1311,7 @@ uploadIslands();
         cudaFree(m_previousGradientSquared);
         cudaFree(m_deltaSquared);
         cudaFree(m_islandActive);
+        cudaFree(m_blockActiveCounts);
         cudaFree(m_nodeBondBegin);
         cudaFree(m_nodeBondRef);
         cudaFree(m_bondIsland);
@@ -2325,6 +2397,10 @@ uploadIslands();
         allocateDevice(m_islandActive, m_islandCapacity, "allocate island active flags");
         allocateDevice(m_islandConverged, m_islandCapacity, "allocate island converged flags");
         allocateDevice(m_islandSkip, m_islandCapacity, "allocate island skip mask");
+        allocateDevice(
+            m_blockActiveCounts,
+            (m_islandCapacity + kBlockSize - 1) / kBlockSize + 1,
+            "allocate island block tallies");
         allocateDevice(m_nodeBondBegin, m_nodeCount + 1, "allocate node-bond csr offsets");
         allocateDevice(m_nodeBondRef, m_bondCount * 2 + 1, "allocate node-bond csr refs");
         allocateDevice(m_bondIsland, m_bondCount, "allocate bond island ids");
@@ -2918,20 +2994,8 @@ uploadIslands();
                 m_islandConverged,
                 m_gradientSquared,
                 m_deltaSquared,
+                m_blockActiveCounts,
                 m_islandCount);
-            m_kernelProfile.end(m_stream);
-            m_kernelProfile.begin("resetActiveCount", m_stream);
-            resetActiveCount<<<1, 1, 0, m_stream>>>(m_status);
-            m_kernelProfile.end(m_stream);
-            m_kernelProfile.begin("summarizeIslands", m_stream);
-            summarizeIslands<<<islandBlocks, kBlockSize, 0, m_stream>>>(
-                m_status,
-                m_islandActive,
-                m_islandCount,
-                iteration);
-            m_kernelProfile.end(m_stream);
-            m_kernelProfile.begin("latchConvergence", m_stream);
-            latchConvergence<<<1, 1, 0, m_stream>>>(m_status, iteration);
             m_kernelProfile.end(m_stream);
             m_kernelProfile.begin("updateDirectionPerIsland", m_stream);
             updateDirectionPerIsland<<<
@@ -2949,13 +3013,6 @@ uploadIslands();
                 m_activeCounts,
                 iteration);
             m_kernelProfile.end(m_stream);
-            m_kernelProfile.begin("saveGradientSquaredPerIsland", m_stream);
-            saveGradientSquaredPerIsland<<<islandBlocks, kBlockSize, 0, m_stream>>>(
-                m_previousGradientSquared,
-                m_gradientSquared,
-                m_islandActive,
-                m_islandCount);
-            m_kernelProfile.end(m_stream);
 
             rightMultiply(m_direction, m_projectedDirection, islandSkip);
             reduceByIsland(
@@ -2970,6 +3027,12 @@ uploadIslands();
             retireDegenerateIslands<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_islandActive,
                 m_projectedDirectionSquared,
+                m_previousGradientSquared,
+                m_gradientSquared,
+                m_status,
+                m_blockActiveCounts,
+                islandBlocks,
+                iteration,
                 m_islandCount);
             m_kernelProfile.end(m_stream);
             m_kernelProfile.begin("updateSolutionAndResidualPerIsland", m_stream);
@@ -3192,6 +3255,7 @@ uploadIslands();
     std::uint32_t* m_islandSkip{nullptr};
     KernelProfile m_kernelProfile;
     std::uint32_t m_profiledSolves{0};
+    std::uint32_t* m_blockActiveCounts{nullptr};
     std::uint32_t* m_nodeBondBegin{nullptr};
     std::uint32_t* m_nodeBondRef{nullptr};
     std::uint32_t* m_bondIsland{nullptr};
