@@ -1510,6 +1510,13 @@ ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handleP
 }
 
 extern "C" float
+ext_stress_solver_graph_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGraphSolveMilliseconds() : 0.0f;
+}
+
+extern "C" float
 ext_stress_solver_initialize_milliseconds(const ExtStressSolverHandle* handlePtr)
 {
     const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);

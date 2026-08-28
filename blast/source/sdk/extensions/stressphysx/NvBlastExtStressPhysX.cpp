@@ -1259,6 +1259,8 @@ public:
             ext_stress_solver_gpu_host_work_milliseconds(m_solver);
         m_telemetry.stressImpulseCopyMilliseconds +=
             ext_stress_solver_impulse_copy_milliseconds(m_solver);
+        m_telemetry.stressGraphSolveMilliseconds +=
+            ext_stress_solver_graph_solve_milliseconds(m_solver);
         m_telemetry.stressInitializeMilliseconds +=
             ext_stress_solver_initialize_milliseconds(m_solver);
         m_telemetry.stressCalcErrorMilliseconds +=
@@ -1269,7 +1271,12 @@ public:
             ext_stress_solver_gpu_host_to_device_bytes(m_solver);
         m_telemetry.gpuStressDeviceToHostBytes +=
             ext_stress_solver_gpu_device_to_host_bytes(m_solver);
+        // The last untimed block inside solveTick. Named because solve's
+        // remainder was 48.4% and every named candidate so far came back
+        // negligible; a remainder that large has to be SOMETHING.
+        const TelemetryClock::time_point drainStart = TelemetryClock::now();
         drainCrushedNodes();
+        m_telemetry.stressDrainMilliseconds += elapsedMilliseconds(drainStart);
         m_telemetry.stressSolveMilliseconds += elapsedMilliseconds(phaseStart);
         m_tickPhase = TickPhase::Solved;
         return true;

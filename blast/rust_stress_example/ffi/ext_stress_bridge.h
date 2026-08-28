@@ -360,6 +360,7 @@ void ext_stress_solver_set_gpu_minimum_bond_count(ExtStressSolverHandle* handle,
 uint8_t ext_stress_solver_get_gpu_accelerated(const ExtStressSolverHandle* handle);
 float ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handle);
+float ext_stress_solver_graph_solve_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_initialize_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_calc_error_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_gpu_host_work_milliseconds(const ExtStressSolverHandle* handle);

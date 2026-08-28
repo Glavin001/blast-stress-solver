@@ -341,6 +341,10 @@ struct ExtStressPhysXTelemetry
     double gpuStressHostWorkMilliseconds;
     /// Host walls around the GPU solve inside solveTick.
     double stressImpulseCopyMilliseconds;
+    /// The graph-solve call itself, and the crushed-node drain: the two
+    /// blocks inside solveTick that had no timer.
+    double stressGraphSolveMilliseconds;
+    double stressDrainMilliseconds;
     /// Audit of the flat bondless flags against the two-deref predicate they
     /// replace. Mismatches must be zero.
     /// Default-initialised explicitly: this struct is declared as a plain
