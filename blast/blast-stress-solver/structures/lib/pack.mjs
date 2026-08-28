@@ -30,6 +30,7 @@ import {
 } from '../../scripts/export-fractured-city.mjs';
 import { MATERIALS, MATERIAL_INDEX, materialTable, bondMaterialName, material } from './materials.mjs';
 import { shardsFor, maxChunkVolume, cellVolumeFor } from './fracture.mjs';
+import { resolveBackend, unavailable } from './fracture-backends.mjs';
 import { prismContact } from './contact.mjs';
 
 /**
@@ -168,7 +169,8 @@ export class ScenePackBuilder {
    * so its size is invisible and splitting it buys nothing.
    */
   piece({ type, material: matName, axis, poly, lo, hi,
-          fixed = false, fracture = true, cellVolume = null }) {
+          fixed = false, fracture = true, cellVolume = null,
+          fractureBackend = undefined }) {
     if (!FRAME[axis]) throw new Error(`bad axis "${axis}"`);
     if (!(hi > lo)) throw new Error(`${type}/${matName}: empty extent ${lo}..${hi} on ${axis}`);
     if (poly.length > MAX_POLY_VERTS) {
@@ -181,16 +183,17 @@ export class ScenePackBuilder {
     material(matName); // validates the name
     this.pieces.push({
       type, material: matName, axis, poly, lo, hi, fixed, fracture, cellVolume,
-      group: this.currentGroup, shards: [],
+      fractureBackend, group: this.currentGroup, shards: [],
     });
     return this.pieces.length - 1;
   }
 
   /** Convenience: an axis-aligned box, given world-space min/max corners. */
-  box({ type, material, min, max, axis = 'y', fixed = false, fracture = true, cellVolume = null }) {
+  box({ type, material, min, max, axis = 'y', fixed = false, fracture = true, cellVolume = null,
+        fractureBackend = undefined }) {
     const f = FRAME[axis];
     return this.piece({
-      type, material, axis, fixed, fracture, cellVolume,
+      type, material, axis, fixed, fracture, cellVolume, fractureBackend,
       poly: rect(min[f.u], min[f.w], max[f.u], max[f.w]),
       lo: min[f.t], hi: max[f.t],
     });
@@ -372,8 +375,12 @@ export class ScenePackBuilder {
     return mulberry32(h);
   }
 
-  /** Voronoi-fracture one cell of a piece. */
+  /** Fracture one cell of a piece, with whichever backend it selected. */
   #fractureCell(p, pieceId, poly, lo, hi, cell) {
+    // Resolved per piece, so one structure can be cut two ways while the
+    // backends are being compared rather than the choice being global-only.
+    const backend = resolveBackend(p.fractureBackend);
+    if (backend !== 'voronoi-2d') unavailable(backend);
     const { axis, material: matName, type, fixed } = p;
     const [u0, w0, u1, w1] = polyBounds(poly);
     const faceArea = polygonArea(poly);
