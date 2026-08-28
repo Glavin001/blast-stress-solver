@@ -404,6 +404,8 @@ public:
         m_converged = false;
         m_forceColdStart = true;
         m_inputsChanged = true;
+        m_solutionSteadyFrames = 0;
+        m_lastImpulses.resize(0);
     }
 
     void clearBonds()
@@ -414,6 +416,64 @@ public:
     }
 
     void setSkipStableUnconverged(bool enabled) { m_skipStableUnconverged = enabled; }
+    /// Count a frame as steady when it converged and the impulses it produced
+    /// are the ones the previous frame produced.
+    ///
+    /// Compared relative to the largest impulse in play, so the test means the
+    /// same thing for a garden wall and for a tower: a small structure's
+    /// absolute impulses are tiny and an absolute epsilon would call every
+    /// frame steady.
+    void updateSolutionSteadiness()
+    {
+        const uint32_t count = m_impulses.size();
+        if (!m_converged || count == 0)
+        {
+            m_solutionSteadyFrames = 0;
+            m_lastImpulses.resize(count);
+            for (uint32_t i = 0; i < count; ++i) m_lastImpulses[i] = m_impulses[i];
+            return;
+        }
+        bool comparable = (m_lastImpulses.size() == count);
+        float worstDelta = 0.0f;
+        float scale = 0.0f;
+        if (comparable)
+        {
+            const auto len = [](float x, float y, float z) {
+                return std::sqrt(x * x + y * y + z * z);
+            };
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const AngLin6& now = m_impulses[i];
+                const AngLin6& before = m_lastImpulses[i];
+                worstDelta = std::max(worstDelta, len(now.ang.x - before.ang.x,
+                                                     now.ang.y - before.ang.y,
+                                                     now.ang.z - before.ang.z));
+                worstDelta = std::max(worstDelta, len(now.lin.x - before.lin.x,
+                                                     now.lin.y - before.lin.y,
+                                                     now.lin.z - before.lin.z));
+                scale = std::max(scale, len(now.ang.x, now.ang.y, now.ang.z));
+                scale = std::max(scale, len(now.lin.x, now.lin.y, now.lin.z));
+            }
+        }
+        const bool steady = comparable
+            && worstDelta <= STEADY_IMPULSE_TOLERANCE * std::max(scale, 1.0e-6f);
+        m_solutionSteadyFrames = steady ? m_solutionSteadyFrames + 1 : 0;
+        m_lastImpulses.resize(count);
+        for (uint32_t i = 0; i < count; ++i) m_lastImpulses[i] = m_impulses[i];
+    }
+
+    /// Frames the answer must hold still before the whole solve may be skipped.
+    ///
+    /// The garage above needed ~18 to reach equilibrium; this is not a timer
+    /// for that, it is a guard against calling a moving answer settled. Four
+    /// consecutive frames within tolerance costs a few frames of solving on a
+    /// static structure and nothing after that.
+    static constexpr uint32_t STEADY_FRAMES_BEFORE_SKIP = 4;
+
+    /// Relative movement below which two consecutive solves count as the same
+    /// answer.
+    static constexpr float STEADY_IMPULSE_TOLERANCE = 1.0e-3f;
+
     void solve(uint32_t iterationCount, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
@@ -423,9 +483,37 @@ public:
         m_gpuFrameHostToDeviceBytes = 0;
         m_gpuFrameDeviceToHostBytes = 0;
 #endif
+        // Skipping the whole solve is only sound once the ANSWER has stopped
+        // moving, which is not the same as this frame reporting converged.
+        //
+        // The solve is warm-started and capped at a handful of iterations per
+        // frame, so it walks toward equilibrium over many frames. `converged`
+        // means "the residual is under tolerance for the system as posed this
+        // frame"; a supported structure has near-zero node velocities from the
+        // very first tick, so that can be true long before the impulses have
+        // finished growing. Skipping on it freezes a partial answer forever.
+        //
+        // Measured on a five-storey parking garage, peak bond utilisation by
+        // tick, with the two behaviours side by side:
+        //
+        //   skipping on `converged`   0.076 0.077 0.077 0.077 ... 0.077 forever
+        //   always solving            0.076 0.083 0.152 0.272 ... 0.463 rising
+        //
+        // The frozen value is six times too low and never recovers. Downstream
+        // that means a building cannot notice it is overloaded: cut 60% of that
+        // garage's columns and it reported zero stress, zero damage and did not
+        // move, which is not strength -- it is a structure that stopped being
+        // solved on its second tick.
+        //
+        // So the early-out now needs a run of consecutive converged frames
+        // during which the impulses barely changed. A genuinely static
+        // structure reaches that in a few frames and is skipped from then on,
+        // which is the whole point of the optimisation; one still settling
+        // keeps solving until it has actually settled.
         if (skipSettled
             && warmStart
             && m_converged
+            && m_solutionSteadyFrames >= STEADY_FRAMES_BEFORE_SKIP
             && !m_forceColdStart
             && !m_inputsChanged)
         {
@@ -470,7 +558,14 @@ public:
             // tick regardless -- correct, and the right trade when a solve was
             // 2.4 ms over a few hundred islands, but not at city scale where
             // nearly every island is a settled debris cluster.
-            gpuParams.skipSettledIslands = skipSettled && warmStart;
+            // Same condition as the whole-solve early-out, and for the same
+            // reason: the device's own settled-island skip returns the
+            // previous impulses untouched, so letting it run before the answer
+            // has steadied both freezes the answer AND makes the steadiness
+            // test above see no change and agree. The two have to be gated
+            // together or the cheaper one quietly re-creates the bug.
+            gpuParams.skipSettledIslands = skipSettled && warmStart
+                && m_solutionSteadyFrames >= STEADY_FRAMES_BEFORE_SKIP;
             gpuParams.skipStableUnconverged = m_skipStableUnconverged;
             if (m_gpuSolver->solveAndReadbackImpulses(
                     m_gpuVelocities.data(),
@@ -523,6 +618,7 @@ public:
                 m_error_sq = m_converged
                     ? AngLin6ErrorSq{0.0f, 0.0f}
                     : AngLin6ErrorSq{FLT_MAX, FLT_MAX};
+                updateSolutionSteadiness();
                 m_forceColdStart = false;
                 m_inputsChanged = false;
                 return;
@@ -536,6 +632,7 @@ public:
         params.islandAware = islandAware;
         params.skipSettled = skipSettled;
         m_converged = (m_stressProcessor.solve(m_impulses.data(), m_velocities.data(), params, &m_error_sq) >= 0);
+        updateSolutionSteadiness();
         m_forceColdStart = false;
         m_inputsChanged = false;
     }
@@ -584,6 +681,15 @@ private:
     bool                        m_forceColdStart;
     bool m_skipStableUnconverged = false;
     bool                        m_inputsChanged;
+    /// Consecutive frames whose solve converged AND barely moved the impulses.
+    /// See the early-out in solve() for why converged alone is not enough.
+    uint32_t                    m_solutionSteadyFrames = 0;
+    /// Impulses as of the previous solve, for measuring that movement.
+    ///
+    /// POD_Buffer, matching m_impulses: AngLin6 carries 16-byte-aligned
+    /// members and a generic Array does not honour that, which is a segfault
+    /// the first time the SIMD path touches it.
+    POD_Buffer<AngLin6>         m_lastImpulses;
     // Borrowed from the owning solver: resolved material table for the GPU
     // damage-kernel seed. Not consumed by the CPU solve.
     const ExtStressMaterial*    m_materials{nullptr};
