@@ -39,6 +39,15 @@ import { prismContact } from './contact.mjs';
  * matches the mesh that is drawn.
  */
 export const MAX_HULL_POINTS = 64;
+/**
+ * Lloyd relaxation passes applied to the fracture seeds before cutting.
+ *
+ * 0 restores the un-relaxed jittered grid. Two is where the seam widths stop
+ * improving much on the structures in this repo; more mostly makes the cells
+ * rounder without removing more hairlines.
+ */
+const LLOYD_PASSES = Number(process.env.BLAST_LLOYD_PASSES ?? 2);
+
 const MAX_POLY_VERTS = Math.floor(MAX_HULL_POINTS / 6);
 
 /**
@@ -398,6 +407,35 @@ export class ScenePackBuilder {
         const ju = (a + 0.25 + rng() * 0.5) / gu;
         const jw = (b + 0.25 + rng() * 0.5) / gw;
         seeds.push([u0 + ju * (u1 - u0), w0 + jw * (w1 - w0)]);
+      }
+    }
+    // Lloyd relaxation before cutting.
+    //
+    // A jittered grid keeps cell SIZES even, which is what it was chosen for.
+    // It does not keep cell ADJACENCIES sane: two seeds that land near each
+    // other still produce neighbours meeting along a hairline, and the bond
+    // between them is that hairline times the wall thickness. Measured on a
+    // 47,631-chunk masonry structure, 23% of all seams came out under 5 cm
+    // wide, the narrowest at 1 mm, between shards a metre across. Stress is
+    // force over area, so those seams read as failing under ordinary load,
+    // crack, and hand their share to their neighbours -- which is what a
+    // building slowly falling apart on its own looks like from outside.
+    //
+    // Moving each seed to the centre of its own cell and re-cutting pushes
+    // seeds apart where they crowded. A few rounds is the standard cure and
+    // costs nothing here: the cut is half-plane clipping over a handful of
+    // seeds, run once per panel class at build time.
+    //
+    // Determinism is preserved -- relaxation is a pure function of the seeds,
+    // which are already drawn from the panel class's own stream, so identical
+    // panels still produce identical shards and still share one upload.
+    for (let pass = 0; pass < LLOYD_PASSES; pass += 1) {
+      const relaxing = voronoiCells(seeds, u0, w0, u1, w1);
+      for (let i = 0; i < seeds.length; i += 1) {
+        const cellPoly = relaxing[i];
+        if (!cellPoly || cellPoly.length < 3) continue;
+        const c = polygonCentroid(cellPoly);
+        if (Number.isFinite(c[0]) && Number.isFinite(c[1])) seeds[i] = c;
       }
     }
     const cells = voronoiCells(seeds, u0, w0, u1, w1);
