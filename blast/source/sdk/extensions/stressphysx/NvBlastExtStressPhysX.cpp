@@ -1221,37 +1221,10 @@ public:
         return true;
     }
 
-    bool solveTick() override
+    /// Telemetry pulled after a solve completes. Shared by the monolithic and
+    /// split paths so the two cannot report different things.
+    void collectSolveTelemetry()
     {
-        if (m_tickPhase != TickPhase::Prepared)
-        {
-            return fail(
-                ExtStressPhysXError::InvalidDescriptor,
-                INVALID_INDEX,
-                "solveTick requires a successful beginTick.");
-        }
-        const TelemetryClock::time_point phaseStart = TelemetryClock::now();
-        ext_stress_solver_update(m_solver);
-        // Pursue equilibrium. See unconvergedExtraUpdates: an unconverged
-        // island cannot earn the settled skip AND its residual reads as bond
-        // stress, so under-solving costs every tick and breaks phantom bonds.
-        for (uint32_t extra = 0;
-             extra < m_settings.unconvergedExtraUpdates
-             && ext_stress_solver_converged(m_solver) == 0;
-             ++extra)
-        {
-            ext_stress_solver_update(m_solver);
-            ++m_telemetry.extraSolveUpdates;
-            m_telemetry.gpuStressHostWorkMilliseconds +=
-                ext_stress_solver_gpu_host_work_milliseconds(m_solver);
-            m_telemetry.gpuStressHostBlockedMilliseconds +=
-                ext_stress_solver_gpu_host_blocked_milliseconds(m_solver);
-        }
-        if (ext_stress_solver_converged(m_solver) == 0)
-        {
-            ++m_telemetry.unconvergedTicks;
-        }
-
         m_telemetry.overstressedBondCount =
             ext_stress_solver_overstressed_bond_count(m_solver);
         m_telemetry.solverIslandCount = ext_stress_solver_island_count(m_solver);
@@ -1288,6 +1261,97 @@ public:
             ext_stress_solver_gpu_host_to_device_bytes(m_solver);
         m_telemetry.gpuStressDeviceToHostBytes +=
             ext_stress_solver_gpu_device_to_host_bytes(m_solver);
+    }
+
+    /// Split solveTick, for callers that want to fan the bond-stress strips
+    /// of EVERY structure out in one flat dispatch instead of one per
+    /// structure. solveTickBeginSplit runs the CG solve and stops; the caller
+    /// then drives bondStressStrip(i) for i in [0, stripCount) and calls
+    /// solveTickFinishSplit.
+    ///
+    /// Refuses when unconvergedExtraUpdates > 0. That loop re-runs the whole
+    /// update -- CG solve AND bond stress -- until convergence, so a split
+    /// that hoists bond stress out of it would silently change how many times
+    /// each half runs. Production sets 0 and takes the split; anything else
+    /// falls back to the monolithic path rather than quietly meaning
+    /// something different.
+    bool supportsSplitSolve() const override
+    {
+        return m_settings.unconvergedExtraUpdates == 0;
+    }
+
+    uint32_t bondStressStripCount() const override
+    {
+        return ext_stress_solver_bond_stress_strip_count(m_solver);
+    }
+
+    bool solveTickBeginSplit() override
+    {
+        if (!supportsSplitSolve())
+        {
+            return false;
+        }
+        if (m_tickPhase != TickPhase::Prepared)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "solveTickBeginSplit requires a successful beginTick.");
+        }
+        m_splitPhaseStart = TelemetryClock::now();
+        ext_stress_solver_set_defer_bond_stress(m_solver, 1);
+        ext_stress_solver_update(m_solver);
+        return true;
+    }
+
+    void bondStressStrip(uint32_t stripIdx) override
+    {
+        ext_stress_solver_bond_stress_strip(m_solver, stripIdx);
+    }
+
+    bool solveTickFinishSplit() override
+    {
+        ext_stress_solver_bond_stress_complete(m_solver);
+        ext_stress_solver_set_defer_bond_stress(m_solver, 0);
+        collectSolveTelemetry();
+        drainCrushedNodes();
+        m_telemetry.stressSolveMilliseconds += elapsedMilliseconds(m_splitPhaseStart);
+        m_tickPhase = TickPhase::Solved;
+        return true;
+    }
+
+    bool solveTick() override
+    {
+        if (m_tickPhase != TickPhase::Prepared)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "solveTick requires a successful beginTick.");
+        }
+        const TelemetryClock::time_point phaseStart = TelemetryClock::now();
+        ext_stress_solver_update(m_solver);
+        // Pursue equilibrium. See unconvergedExtraUpdates: an unconverged
+        // island cannot earn the settled skip AND its residual reads as bond
+        // stress, so under-solving costs every tick and breaks phantom bonds.
+        for (uint32_t extra = 0;
+             extra < m_settings.unconvergedExtraUpdates
+             && ext_stress_solver_converged(m_solver) == 0;
+             ++extra)
+        {
+            ext_stress_solver_update(m_solver);
+            ++m_telemetry.extraSolveUpdates;
+            m_telemetry.gpuStressHostWorkMilliseconds +=
+                ext_stress_solver_gpu_host_work_milliseconds(m_solver);
+            m_telemetry.gpuStressHostBlockedMilliseconds +=
+                ext_stress_solver_gpu_host_blocked_milliseconds(m_solver);
+        }
+        if (ext_stress_solver_converged(m_solver) == 0)
+        {
+            ++m_telemetry.unconvergedTicks;
+        }
+
+        collectSolveTelemetry();
         // The last untimed block inside solveTick. Named because solve's
         // remainder was 48.4% and every named candidate so far came back
         // negligible; a remainder that large has to be SOMETHING.
@@ -4107,6 +4171,7 @@ private:
     ExtStressPhysXId m_nextBodyId{1};
     ExtStressPhysXId m_nextShapeId{1};
     uint64_t m_splitSequence{0};
+    TelemetryClock::time_point m_splitPhaseStart{};
     TickPhase m_tickPhase{TickPhase::Idle};
     float m_tickDt{0.0f};
     mutable uint64_t m_shapeSnapshotGeneration{0};

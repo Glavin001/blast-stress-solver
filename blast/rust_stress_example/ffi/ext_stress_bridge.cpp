@@ -1509,6 +1509,43 @@ ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handleP
     return (handle && handle->solver) ? handle->solver->getGpuImpulseCopyMilliseconds() : 0.0f;
 }
 
+extern "C" void
+ext_stress_solver_set_defer_bond_stress(ExtStressSolverHandle* handlePtr, uint8_t defer)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setDeferBondStress(defer != 0);
+    }
+}
+
+extern "C" void
+ext_stress_solver_bond_stress_strip(ExtStressSolverHandle* handlePtr, uint32_t stripIdx)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->bondStressStrip(stripIdx);
+    }
+}
+
+extern "C" void
+ext_stress_solver_bond_stress_complete(ExtStressSolverHandle* handlePtr)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->bondStressComplete();
+    }
+}
+
+extern "C" uint32_t
+ext_stress_solver_bond_stress_strip_count(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressStripCount() : 0U;
+}
+
 extern "C" uint64_t
 ext_stress_solver_bond_stress_groups_skipped(const ExtStressSolverHandle* handlePtr)
 {

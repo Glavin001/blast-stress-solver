@@ -731,6 +731,17 @@ public:
         uint32_t wakeCapacity,
         uint32_t* outWakeCount) = 0;
     virtual bool solveTick() = 0;
+
+    /// Split solve, for callers that fan the bond-stress strips of every
+    /// structure out in ONE flat dispatch instead of one per structure.
+    /// supportsSplitSolve() is false when unconvergedExtraUpdates > 0, whose
+    /// retry loop re-runs solve AND bond stress together; callers must fall
+    /// back to solveTick() then.
+    virtual bool supportsSplitSolve() const = 0;
+    virtual uint32_t bondStressStripCount() const = 0;
+    virtual bool solveTickBeginSplit() = 0;
+    virtual void bondStressStrip(uint32_t stripIdx) = 0;
+    virtual bool solveTickFinishSplit() = 0;
     virtual bool endTick() = 0;
     virtual bool tick(float dt, const physx::PxVec3& worldGravity) = 0;
 

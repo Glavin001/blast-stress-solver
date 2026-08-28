@@ -1165,6 +1165,17 @@ public:
         m_hostResetMilliseconds = walkMs(outStart);
 
         const auto bondStart = SolveClock::now();
+        // Deferred: the CALLER drives bondStressBegin / N x bondStressStrip /
+        // bondStressFinish, so the strips of every structure can be fanned out
+        // in one flat top-level dispatch instead of one dispatch per slot.
+        if (m_deferBondStress)
+        {
+            bondStressBegin(bondHealth, bonds);
+            m_deferredBonds = bonds;
+            m_deferredBondHealth = bondHealth;
+            m_hostBondStressMilliseconds = walkMs(bondStart);
+            return;
+        }
         updateBondStress(bondHealth, bonds);
         m_hostBondStressMilliseconds = walkMs(bondStart);
 
@@ -1247,6 +1258,9 @@ public:
     const std::vector<uint8_t>* m_bsDirtyPtr{nullptr};
     bool m_bsHaveDirty{false};
     uint32_t m_bsGroupCount{0};
+    bool m_deferBondStress{false};
+    const NvBlastBond* m_deferredBonds{nullptr};
+    const float* m_deferredBondHealth{nullptr};
     /// Reused across ticks so the strip vectors keep their capacity.
     std::vector<BondStressStrip> m_bondStressStrips;
     /// Verify-mode scratch and audit counters. Mismatches must be zero.
@@ -1621,6 +1635,7 @@ private:
     counts per tick and caught a 0.0975% divergence in the flat-bondless
     change that every other gate passed.
     */
+public:
     /// Phase 1 of the bond-stress walk: reset outputs, stash the inputs the
     /// strip phase needs. Split so the CALLER can fan strips out flatly over
     /// (slot x strip) in ONE top-level dispatch. The per-slot dispatch that
@@ -1881,6 +1896,18 @@ private:
             }
     }
 
+    void setDeferBondStress(bool defer) { m_deferBondStress = defer; }
+    uint32_t bondStressStripCount() const { return kBondStressStrips; }
+
+    /// Completion for the deferred path: merge the strips the caller drove,
+    /// then run the per-node stress the solve() tail skipped. calcError is
+    /// unaffected -- it reads solver state, not bond stress.
+    void bondStressComplete(float deltaTime)
+    {
+        bondStressFinish();
+        updateNodeStress(m_deferredBondHealth, deltaTime);
+    }
+
     /// Serial entry point: the same three phases the flat fan-out drives.
     /// One shared body on purpose -- two copies would drift, and a drift here
     /// is a physics divergence.
@@ -1893,6 +1920,8 @@ private:
         }
         bondStressFinish();
     }
+
+private:
 
 
     void sync(const NvBlastBond* bonds, bool islandAware)
@@ -2542,6 +2571,26 @@ public:
     virtual uint64_t                        getBondStressGroupsSkipped() const override
     {
         return m_graphProcessor->getBondStressGroupsSkipped();
+    }
+
+    virtual void                            setDeferBondStress(bool defer) override
+    {
+        m_graphProcessor->setDeferBondStress(defer);
+    }
+
+    virtual void                            bondStressStrip(uint32_t stripIdx) override
+    {
+        m_graphProcessor->bondStressStrip(stripIdx);
+    }
+
+    virtual void                            bondStressComplete() override
+    {
+        m_graphProcessor->bondStressComplete(m_deltaTime);
+    }
+
+    virtual uint32_t                        getBondStressStripCount() const override
+    {
+        return m_graphProcessor->bondStressStripCount();
     }
 
     virtual uint64_t                        getBondStressParallelChecks() const override

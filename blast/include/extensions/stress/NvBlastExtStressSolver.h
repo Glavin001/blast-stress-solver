@@ -607,6 +607,17 @@ public:
     /// MUST be non-zero when the skip is enabled, or the A/B is measuring
     /// nothing and cannot tell "no win" from "never ran".
     virtual uint64_t                        getBondStressGroupsSkipped() const = 0;
+
+    /// Deferred bond-stress driving. With defer set, update() runs the CG
+    /// solve and leaves the per-bond stress walk to the caller, which can then
+    /// fan every structure's strips out in ONE flat dispatch rather than one
+    /// dispatch per structure. Call: setDeferBondStress(true) -> update() ->
+    /// bondStressStrip(i) for i in [0, getBondStressStripCount())
+    /// -> bondStressComplete().
+    virtual void                            setDeferBondStress(bool defer) = 0;
+    virtual void                            bondStressStrip(uint32_t stripIdx) = 0;
+    virtual void                            bondStressComplete() = 0;
+    virtual uint32_t                        getBondStressStripCount() const = 0;
     /// Verify-mode audit of the parallel bond-stress walk: group comparisons
     /// performed, and orderings that disagreed. Mismatches must be zero; zero
     /// CHECKS means the audit never ran and is inconclusive, not a pass.
