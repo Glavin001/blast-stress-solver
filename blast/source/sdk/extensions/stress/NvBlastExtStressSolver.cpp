@@ -65,6 +65,21 @@ namespace Nv
 {
 namespace Blast
 {
+static ExtStressParallelFor s_parallelFor = nullptr;
+static void*                s_parallelForCtx = nullptr;
+
+void NvBlastExtStressSetParallelFor(ExtStressParallelFor fn, void* ctx)
+{
+    s_parallelFor = fn;
+    s_parallelForCtx = ctx;
+}
+
+void getExtStressParallelFor(ExtStressParallelFor& fn, void*& ctx)
+{
+    fn = s_parallelFor;
+    ctx = s_parallelForCtx;
+}
+
 
 using namespace nvidia;
 
@@ -1208,6 +1223,16 @@ public:
     uint64_t m_bondStressGroupsSkipped{0};
     uint64_t m_bsTotal{0}, m_bsDirty{0}, m_bsOverstressBlocked{0};
     uint64_t m_bsTicks{0}, m_bsSkipMark{0};
+    /// Per-strip accumulators for the parallel bond-stress walk. Only these
+    /// two outputs need isolating: stressNormal/stressShear are disjoint per
+    /// group, and m_nodeOverstressed is set-to-1 so concurrent writes agree.
+    struct BondStressStrip
+    {
+        Array<uint32_t>::type remove;
+        uint32_t count = 0;
+    };
+    /// Reused across ticks so the strip vectors keep their capacity.
+    std::vector<BondStressStrip> m_bondStressStrips;
     float m_hostWalkInMilliseconds{0.0f};
     float m_hostResetMilliseconds{0.0f};
     float m_hostBondStressMilliseconds{0.0f};
@@ -1632,7 +1657,7 @@ private:
         const std::vector<uint8_t>& dirty = m_solver.bondDirty();
         const bool haveDirty = skipUnchangedBondStress()
             && dirty.size() == m_solverBondsData.size();
-        for (uint32_t i = 0; i < m_solverBondsData.size(); ++i)
+        auto processGroup = [&](uint32_t i, BondStressStrip& ctx)
         {
             ++m_bsTotal;
             if (haveDirty)
@@ -1649,7 +1674,7 @@ private:
             if (haveDirty && dirty[i] == 0u && m_groupOverstressed[i] == 0u)
             {
                 ++m_bondStressGroupsSkipped;
-                continue;
+                return;
             }
             m_groupOverstressed[i] = 0u;
             // calculate the total area of all bonds involved so pressure can be calculated
@@ -1695,13 +1720,13 @@ private:
                 else
                 {
                     // if the bond is broken, try to remove it after processing is complete
-                    bondIndicesToRemove.pushBack(blastBondIndex);
+                    ctx.remove.pushBack(blastBondIndex);
                 }
             }
 
             if (totalArea == 0.0f)
             {
-                continue;
+                return;
             }
 
             // normalized the aggregate normal now that all contributing bonds have been combined
@@ -1734,7 +1759,7 @@ private:
                         || stressNormal > material.tensionElasticLimit
                         || stressShear > material.shearElasticLimit)
                     {
-                        ++m_overstressedBondCount;
+                        ++ctx.count;
                         // Latch the group as overstressed so next tick cannot
                         // skip it: its health will change even if its impulse
                         // does not.
@@ -1759,6 +1784,79 @@ private:
                     // store the bond centroid
                     bond.centroid = bondCentroid;
                 }
+            }
+        };
+
+        // The fan-out above this is over STRUCTURES, of which a city has
+        // four; measured 2.21x concurrency on a 32-core box, so most of the
+        // machine idles through the largest cost in the tick. This splits the
+        // group walk itself.
+        //
+        // Bit-exactness rests on the merge order. Per-strip removal lists are
+        // concatenated in STRIP order and each strip covers a contiguous
+        // ascending range, so the concatenation is the same sequence the
+        // serial walk produced -- and removal order feeds back into topology,
+        // so "same set" would not be enough. Same discipline as
+        // resolve_support_loads, whose parallel classify is followed by a
+        // serial ingest in original pair order.
+        const uint32_t groupCount = static_cast<uint32_t>(m_solverBondsData.size());
+        ExtStressParallelFor dispatch = nullptr;
+        void* dispatchCtx = nullptr;
+        getExtStressParallelFor(dispatch, dispatchCtx);
+        // Below this the fan-out costs more than the walk, matching the
+        // crossover measured for the supporter classify.
+        const uint32_t kParallelFloor = 4096;
+        if (dispatch != nullptr && groupCount >= kParallelFloor)
+        {
+            const uint32_t strips = 16;
+            const uint32_t stripLen = (groupCount + strips - 1) / strips;
+            m_bondStressStrips.resize(strips);
+            for (uint32_t sIdx = 0; sIdx < strips; ++sIdx)
+            {
+                m_bondStressStrips[sIdx].remove.clear();
+                m_bondStressStrips[sIdx].count = 0;
+            }
+            struct StripJob
+            {
+                decltype(processGroup)* fn;
+                std::vector<BondStressStrip>* strips;
+                uint32_t stripLen;
+                uint32_t groupCount;
+            } job{&processGroup, &m_bondStressStrips, stripLen, groupCount};
+            dispatch(dispatchCtx, strips,
+                     [](void* raw, uint32_t sIdx) {
+                         StripJob* j = static_cast<StripJob*>(raw);
+                         const uint32_t begin = sIdx * j->stripLen;
+                         const uint32_t end =
+                             std::min(j->groupCount, begin + j->stripLen);
+                         for (uint32_t i = begin; i < end; ++i)
+                         {
+                             (*j->fn)(i, (*j->strips)[sIdx]);
+                         }
+                     },
+                     &job);
+            for (const BondStressStrip& strip : m_bondStressStrips)
+            {
+                m_overstressedBondCount += strip.count;
+                for (uint32_t b : strip.remove)
+                {
+                    bondIndicesToRemove.pushBack(b);
+                }
+            }
+        }
+        else
+        {
+            m_bondStressStrips.resize(1);
+            m_bondStressStrips[0].remove.clear();
+            m_bondStressStrips[0].count = 0;
+            for (uint32_t i = 0; i < groupCount; ++i)
+            {
+                processGroup(i, m_bondStressStrips[0]);
+            }
+            m_overstressedBondCount += m_bondStressStrips[0].count;
+            for (uint32_t b : m_bondStressStrips[0].remove)
+            {
+                bondIndicesToRemove.pushBack(b);
             }
         }
 

@@ -41,6 +41,27 @@ namespace Blast
 {
 
 /**
+Process-wide parallel-for hook.
+
+This library has no thread pool; the caller owns one. Rather than thread a
+dispatcher through three constructors, the caller installs it once and the
+solver uses it where a walk is large enough to be worth splitting. Free
+function plus a file static, because the pool it wraps is process-wide too.
+
+`body` is invoked with (userData, index) for index in [0, count). The call
+must not return until every index has run.
+*/
+typedef void (*ExtStressParallelForBody)(void* userData, uint32_t index);
+typedef void (*ExtStressParallelFor)(void* ctx,
+                                     uint32_t count,
+                                     ExtStressParallelForBody body,
+                                     void* bodyUserData);
+
+NV_C_API void NvBlastExtStressSetParallelFor(ExtStressParallelFor fn, void* ctx);
+NV_C_API void getExtStressParallelFor(ExtStressParallelFor& fn, void*& ctx);
+
+
+/**
 Stress Solver Settings
 
 Stress on every bond is calculated with these components:
