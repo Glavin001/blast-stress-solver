@@ -341,6 +341,14 @@ struct ExtStressPhysXTelemetry
     double gpuStressHostWorkMilliseconds;
     /// Host walls around the GPU solve inside solveTick.
     double stressImpulseCopyMilliseconds;
+    /// Audit of the flat bondless flags against the two-deref predicate they
+    /// replace. Mismatches must be zero.
+    /// Default-initialised explicitly: this struct is declared as a plain
+    /// member with no initialiser, so a field without one starts
+    /// indeterminate and `++` on it reads garbage. The first run of this
+    /// audit reported 4.5e18 checks and "MISMATCH" for exactly that reason.
+    uint64_t bondlessVerifyChecks{0};
+    uint64_t bondlessVerifyMismatches{0};
     double stressInitializeMilliseconds;
     double stressCalcErrorMilliseconds;
     double gpuStressHostBlockedMilliseconds;

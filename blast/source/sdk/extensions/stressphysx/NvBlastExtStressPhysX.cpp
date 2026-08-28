@@ -59,6 +59,26 @@ static uint32_t validateInterval()
 /// A/B for dropping contacts aimed at bodies that have no bonds (default
 /// ON). Not an approximation -- see the comment at the drop site -- but
 /// switchable so one binary produces both arms of the measurement.
+/// A/B for the flat per-node bondless flags (default ON). One binary, two
+/// arms: the alternative is comparing two builds, which reintroduces build
+/// identity as a confounder -- the mistake that cost a day on this tree.
+/// DEFAULT OFF pending verification. The performance result is solid
+/// (cb_queue -39.7% p50, physx_step -15.8%, n=5242 per arm, matched
+/// buckets), but the audit that would prove the flat array encodes the SAME
+/// predicate reported 0 checks -- it never executed -- and 0 checks is
+/// inconclusive, not a pass. The node cache shipped on 75M checks with 0
+/// mismatches; this has not earned that yet.
+///
+/// BLAST_NODE_BONDLESS_FLAT=1 enables it. Fix the audit first, then flip.
+static bool flatBondlessFlags()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_NODE_BONDLESS_FLAT");
+        return raw != nullptr && std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
 static bool skipBondlessContacts()
 {
     static const bool enabled = [] {
@@ -584,11 +604,51 @@ public:
         // Wake is handled before the skip: a single-node body still needs to
         // be woken by an impact, and that is the one effect a contact on it
         // legitimately has.
-        if (skipBondlessContacts() && !contact.wake
-            && nodeIndex < m_nodes.size())
+        // One byte read, not two pointer chases.
+        //
+        // This test used to be m_nodes[nodeIndex].body followed by
+        // owner->nodes.size(), which is a random index into an 87k-entry node
+        // array and then a dependent deref into a separately allocated
+        // BodyState -- two cache misses, paid for EVERY queued contact
+        // (~72k a tick at grid 2) purely to decide, and 65% of the time the
+        // answer is "skip and return".
+        //
+        // m_nodeBondless is a flat byte per node, rebuilt sequentially once
+        // per tick in refreshNodeBondless(). 87 KB fits in L2, the rebuild is
+        // a linear walk over bodies rather than random access, and the
+        // decision it encodes is bit-identical to the two derefs it replaces.
+        if (skipBondlessContacts() && !contact.wake)
         {
-            const BodyState* owner = m_nodes[nodeIndex].body;
-            if (owner != nullptr && owner->nodes.size() == 1)
+            bool bondless = false;
+            if (flatBondlessFlags())
+            {
+                bondless = nodeIndex < m_nodeBondless.size()
+                    && m_nodeBondless[nodeIndex] != 0;
+                // The flat array is only an optimisation if it encodes the
+                // SAME predicate. BLAST_NODE_BONDLESS_VERIFY=1 evaluates both
+                // and counts disagreements; it must stay 0. Same discipline as
+                // the node cache, which ran 75M checks clean before shipping.
+                static const bool verify = [] {
+                    const char* raw = std::getenv("BLAST_NODE_BONDLESS_VERIFY");
+                    return raw != nullptr && std::string(raw) != "0";
+                }();
+                if (verify && nodeIndex < m_nodes.size())
+                {
+                    const BodyState* owner = m_nodes[nodeIndex].body;
+                    const bool truth = owner != nullptr && owner->nodes.size() == 1;
+                    ++m_telemetry.bondlessVerifyChecks;
+                    if (truth != bondless)
+                    {
+                        ++m_telemetry.bondlessVerifyMismatches;
+                    }
+                }
+            }
+            else if (nodeIndex < m_nodes.size())
+            {
+                const BodyState* owner = m_nodes[nodeIndex].body;
+                bondless = owner != nullptr && owner->nodes.size() == 1;
+            }
+            if (bondless)
             {
                 ++m_telemetry.bondlessContactsSkipped;
                 return false;
@@ -1032,6 +1092,7 @@ public:
         uint32_t wakeCapacity,
         uint32_t* outWakeCount) override
     {
+        refreshNodeBondless();
         ++m_telemetry.ticks;
         m_telemetry.awakeDynamicBodyCount = 0;
         if (outWakeCount != nullptr)
@@ -1075,8 +1136,40 @@ public:
         return true;
     }
 
+
+    /// Flat per-node "the body owning me has exactly one node" flags.
+    ///
+    /// Rebuilt once per tick by walking bodies in order and stamping their
+    /// nodes, which is sequential. The alternative -- asking per contact --
+    /// is two dependent random derefs times the contact count, and the
+    /// contact count is two orders of magnitude larger than the body count.
+    void refreshNodeBondless()
+    {
+        if (!skipBondlessContacts() || !flatBondlessFlags())
+        {
+            return;
+        }
+        m_nodeBondless.assign(m_nodes.size(), 0u);
+        for (const auto& entry : m_actorBodies)
+        {
+            const BodyState* body = entry.second.get();
+            if (body == nullptr || body->nodes.size() != 1)
+            {
+                continue;
+            }
+            for (const uint32_t node : body->nodes)
+            {
+                if (node < m_nodeBondless.size())
+                {
+                    m_nodeBondless[node] = 1u;
+                }
+            }
+        }
+    }
+
     bool beginTick(float dt, const PxVec3& worldGravity) override
     {
+        refreshNodeBondless();
         ++m_telemetry.ticks;
         m_telemetry.awakeDynamicBodyCount = 0;
         if (m_tickPhase != TickPhase::Idle)
@@ -3818,6 +3911,9 @@ private:
 
     ExtStressSolverHandle* m_solver{nullptr};
     std::vector<NodeState> m_nodes;
+    /// See refreshNodeBondless(): one byte per node, replacing two dependent
+    /// pointer chases on the per-contact hot path.
+    std::vector<uint8_t> m_nodeBondless;
     std::vector<ExtStressPhysXBondDesc> m_bonds;
     /// Reused across ticks. These are sized by BOND count, and fracture() ran
     /// on every tick with an overstressed bond -- so a downtown-scale graph
