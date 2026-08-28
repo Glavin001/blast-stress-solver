@@ -858,11 +858,47 @@ public:
         // that the proxy has stopped being one.
         //
         // BLAST_BEND_SECTION_MODULUS=0 restores the old scaling for A/B.
-        constexpr float MAX_BEND_AMPLIFICATION = 10.0f;
         stressBend = sectionModulusBending()
-            ? bend * std::min(MAX_BEND_AMPLIFICATION,
+            ? bend * std::min(maxBendAmplification(),
                               6.0f / std::sqrt(std::max(bondArea, 1e-6f)))
             : bend * 2.0f / nodeDist;
+    }
+
+    /// Ceiling on the section-modulus gain, tunable with BLAST_BEND_MAX_GAIN.
+    ///
+    /// 6/sqrt(area) is the right shape for the gain and the wrong magnitude at
+    /// a small joint, because part of what it amplifies there is the
+    /// discretisation's own moments rather than the structure's. A chunk-to-
+    /// chunk seam in a wall carries a moment that the wall, as a wall, does
+    /// not.
+    ///
+    /// Measured over ten seconds of gravity and nothing else on a 47,631-chunk
+    /// masonry structure -- concentric stone ring walls, which should stand in
+    /// almost pure compression, and whose stone yields in tension at 0.8 MPa:
+    ///
+    ///     gain 10   2,423 bonds broken and climbing
+    ///     gain  5      28
+    ///     gain  3       0
+    ///     gain  2       1
+    ///
+    /// 3 is where it stops cracking itself apart, and costs nothing measurable
+    /// elsewhere: the cantilever ladder behaves identically from 1.5 to 10 on
+    /// the CUDA solver, so nothing in the set is relying on the higher gain.
+    static float maxBendAmplification()
+    {
+        static const float gain = []() {
+            const char* raw = std::getenv("BLAST_BEND_MAX_GAIN");
+            if (raw != nullptr)
+            {
+                const float parsed = static_cast<float>(std::atof(raw));
+                if (parsed > 0.0f)
+                {
+                    return parsed;
+                }
+            }
+            return 3.0f;
+        }();
+        return gain;
     }
 
     /// Whether bending is scaled by a section modulus (see above).
