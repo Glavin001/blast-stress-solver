@@ -33,6 +33,29 @@ namespace
 
 constexpr uint32_t INVALID_INDEX = std::numeric_limits<uint32_t>::max();
 
+/// E2: how often fracture() runs the full mapping audit (validateMappings).
+/// The audit is a pure bug DETECTOR — it changes nothing, it only reports —
+/// and it is O(all nodes + all bodies) with a heap allocation and a sort per
+/// body, measured at 1.1–1.7 ms per fracturing tick at city scale. Running
+/// it every Nth fracturing tick still catches a corrupted mapping loudly
+/// within N fracture ticks (~a quarter second), for ~1/N of the cost.
+/// Default 16; 1 = every tick (old behaviour); 0 = never. Create-time
+/// validation is unconditional regardless — a bad build must not survive
+/// construction.
+static uint32_t validateInterval()
+{
+    static const uint32_t interval = [] {
+        const char* raw = std::getenv("BLAST_VALIDATE_INTERVAL");
+        if (raw == nullptr)
+        {
+            return 16u;
+        }
+        const long parsed = std::atol(raw);
+        return parsed < 0 ? 16u : static_cast<uint32_t>(parsed);
+    }();
+    return interval;
+}
+
 /// A/B for dropping contacts aimed at bodies that have no bonds (default
 /// ON). Not an approximation -- see the comment at the drop site -- but
 /// switchable so one binary produces both arms of the measurement.
@@ -1403,25 +1426,47 @@ public:
         m_telemetry.bodyCount = static_cast<uint32_t>(m_actorBodies.size());
         // Bodies with no internal bonds: nothing in them can break, so the
         // contacts routed into them and their share of the solve cannot
-        // change anything. Sized before anything is built on it.
-        uint32_t singleNode = 0;
-        uint32_t singleNodeAwake = 0;
-        for (const auto& entry : m_actorBodies)
-        {
-            if (entry.second && entry.second->nodes.size() == 1)
+        // change anything.
+        //
+        // E4: sampled, not per-tick. The first version of this census walked
+        // every body EVERY tick calling getRigidBodyFlags()+isSleeping() —
+        // PhysX scene reads, ~15k of them, inside the serial endTick, even
+        // when nothing fractured. That is the same class of per-body scene
+        // read that forced beginTick into beginTickFromSnapshot, and it was
+        // added as instrumentation: the thermometer was heating the patient.
+        // It is telemetry — ≤16 ticks of staleness changes nothing — so it
+        // now runs one tick in BLAST_SINGLE_NODE_CENSUS_INTERVAL (default
+        // 16, 1 = every tick, 0 = never) and holds the last values between.
+        static const uint32_t censusInterval = [] {
+            const char* raw = std::getenv("BLAST_SINGLE_NODE_CENSUS_INTERVAL");
+            if (raw == nullptr)
             {
-                ++singleNode;
-                const PxRigidDynamic* actor = entry.second->body;
-                if (actor != nullptr
-                    && !actor->getRigidBodyFlags().isSet(PxRigidBodyFlag::eKINEMATIC)
-                    && !actor->isSleeping())
+                return 16u;
+            }
+            const long parsed = std::atol(raw);
+            return parsed < 0 ? 16u : static_cast<uint32_t>(parsed);
+        }();
+        if (censusInterval != 0 && (m_censusTick++ % censusInterval) == 0)
+        {
+            uint32_t singleNode = 0;
+            uint32_t singleNodeAwake = 0;
+            for (const auto& entry : m_actorBodies)
+            {
+                if (entry.second && entry.second->nodes.size() == 1)
                 {
-                    ++singleNodeAwake;
+                    ++singleNode;
+                    const PxRigidDynamic* actor = entry.second->body;
+                    if (actor != nullptr
+                        && !actor->getRigidBodyFlags().isSet(PxRigidBodyFlag::eKINEMATIC)
+                        && !actor->isSleeping())
+                    {
+                        ++singleNodeAwake;
+                    }
                 }
             }
+            m_telemetry.singleNodeBodyCount = singleNode;
+            m_telemetry.singleNodeAwakeBodies = singleNodeAwake;
         }
-        m_telemetry.singleNodeBodyCount = singleNode;
-        m_telemetry.singleNodeAwakeBodies = singleNodeAwake;
         m_tickPhase = TickPhase::Idle;
         return true;
     }
@@ -2769,6 +2814,23 @@ private:
             applyCrushedNodes();
         }
         rebuildLookupTables();
+        return validateMappingsSampled();
+    }
+
+    /// E2: the per-fracture-tick audit, sampled. See validateInterval().
+    /// A skipped audit returns true — no audit, no verdict — which matches
+    /// what every non-fracturing tick has always done.
+    bool validateMappingsSampled()
+    {
+        const uint32_t interval = validateInterval();
+        if (interval == 0)
+        {
+            return true;
+        }
+        if ((m_validateTick++ % interval) != 0)
+        {
+            return true;
+        }
         return validateMappings();
     }
 
@@ -2973,7 +3035,7 @@ private:
         phase = TelemetryClock::now();
         rebuildLookupTables();
         m_telemetry.fractureRebuildMilliseconds += elapsedMilliseconds(phase);
-        return validateMappings();
+        return validateMappingsSampled();
     }
 
     /**
@@ -3801,6 +3863,10 @@ private:
     float m_tickDt{0.0f};
     mutable uint64_t m_shapeSnapshotGeneration{0};
     uint64_t m_contactGeneration{0};
+    /// E4: which tick the single-node census last ran (sampled telemetry).
+    uint64_t m_censusTick{0};
+    /// E2: fracturing ticks since creation, for the sampled audit.
+    uint64_t m_validateTick{0};
 };
 
 ExtStressPhysXDestructible* ExtStressPhysXDestructible::create(
