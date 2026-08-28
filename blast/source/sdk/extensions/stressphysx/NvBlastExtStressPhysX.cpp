@@ -62,37 +62,42 @@ static uint32_t validateInterval()
 /// A/B for the flat per-node bondless flags (default ON). One binary, two
 /// arms: the alternative is comparing two builds, which reintroduces build
 /// identity as a confounder -- the mistake that cost a day on this tree.
-/// DEFAULT OFF, and now for a proven reason rather than a missing proof.
+/// DEFAULT ON, audited.
 ///
-/// The performance result is real: cb_queue -39.7% p50, cb_tick -26.7%,
-/// physx_step -15.8%, n=5242 per arm, matched buckets. But the audit says
-/// the flat array is NOT the same predicate:
+/// queueContact's hot path used to do m_nodes[nodeIndex].body followed by
+/// owner->nodes.size() -- a random index into an 87k-entry array then a
+/// dependent deref into a separately allocated BodyState. Two cache misses
+/// per queued contact, ~72k a tick at grid 2, paid purely to DECIDE, with
+/// "skip" the answer 65% of the time. This is one byte from a flat array
+/// that fits in L2.
 ///
-///   101,135,704 checks, 98,633 mismatches (0.0975%)
+/// It shipped default-off for two rounds because the audit caught a real
+/// bug: refreshNodeBondless() ran in beginTick, while body composition
+/// changes in endTick, and the contacts that consult the flags arrive in
+/// the NEXT step's callback -- before that beginTick. So on every tick
+/// after a fracture the flags described the previous composition:
 ///
-/// The cause is staleness by one tick. refreshNodeBondless() runs in
-/// beginTick, but body composition changes in endTick -- fracture creates,
-/// splits and recycles bodies there. Contacts arrive in the NEXT step's
-/// contact callback, which is before the next beginTick, so on any tick
-/// following a topology change the flags describe the previous
-/// composition. 0.0975% is precisely the fracture rate.
+///   101,135,704 checks, 98,633 mismatches (0.0975%, the fracture rate)
 ///
-/// A contact wrongly classed as bondless is DROPPED -- it never reaches the
-/// solver -- so this is lost load on freshly fractured chunks, exactly where
-/// the stress solve matters most. Not shippable.
+/// and a contact wrongly classed as bondless is DROPPED before the solver
+/// sees it, i.e. lost load on freshly fractured chunks. Rebuilding after
+/// endTick instead, so the flags describe the composition the contacts will
+/// actually be resolved against:
 ///
-/// The fix is to rebuild after endTick rather than before beginTick, so the
-/// flags describe the composition the contacts will actually be resolved
-/// against. Left unfixed here deliberately: the rebuild site is a
-/// correctness decision that deserves its own change and its own audit run,
-/// not a tail-end edit.
+///   152,193,650 checks, 0 mismatches
 ///
-/// BLAST_NODE_BONDLESS_FLAT=1 + BLAST_NODE_BONDLESS_VERIFY=1 reproduces it.
+/// Measured win, matched buckets, n=5242 per arm: cb_queue -39.7% p50,
+/// cb_tick -26.7%, physx_step -15.8%. That last one is the interesting
+/// number -- the contact callback runs on the host thread INSIDE
+/// fetchResults, so a figure labelled "PhysX" has always contained our code.
+///
+/// BLAST_NODE_BONDLESS_FLAT=0 restores the two derefs;
+/// BLAST_NODE_BONDLESS_VERIFY=1 re-runs the audit.
 static bool flatBondlessFlags()
 {
     static const bool enabled = [] {
         const char* raw = std::getenv("BLAST_NODE_BONDLESS_FLAT");
-        return raw != nullptr && std::string(raw) != "0";
+        return raw == nullptr || std::string(raw) != "0";
     }();
     return enabled;
 }
@@ -1110,7 +1115,6 @@ public:
         uint32_t wakeCapacity,
         uint32_t* outWakeCount) override
     {
-        refreshNodeBondless();
         ++m_telemetry.ticks;
         m_telemetry.awakeDynamicBodyCount = 0;
         if (outWakeCount != nullptr)
@@ -1187,7 +1191,6 @@ public:
 
     bool beginTick(float dt, const PxVec3& worldGravity) override
     {
-        refreshNodeBondless();
         ++m_telemetry.ticks;
         m_telemetry.awakeDynamicBodyCount = 0;
         if (m_tickPhase != TickPhase::Idle)
@@ -1563,6 +1566,19 @@ public:
             m_telemetry.fractureTopologyMilliseconds += elapsedMilliseconds(phaseStart);
             if (!fractured)
             {
+        // Rebuild AFTER topology settles, not before the next beginTick.
+        //
+        // Fracture creates, splits and recycles bodies here in endTick. The
+        // contacts that consult these flags arrive in the NEXT step's contact
+        // callback -- which happens before the next beginTick. Rebuilding in
+        // beginTick therefore left the flags describing the previous
+        // composition on every tick after a topology change, and the audit
+        // measured exactly that: 98,633 mismatches in 101,135,704 checks,
+        // 0.0975%, which is the fracture rate.
+        //
+        // A contact wrongly classed as bondless is DROPPED before the solver
+        // sees it, so the failure was lost load on freshly fractured chunks.
+        refreshNodeBondless();
                 m_tickPhase = TickPhase::Idle;
                 return false;
             }
@@ -1612,6 +1628,19 @@ public:
             m_telemetry.singleNodeBodyCount = singleNode;
             m_telemetry.singleNodeAwakeBodies = singleNodeAwake;
         }
+        // Rebuild AFTER topology settles, not before the next beginTick.
+        //
+        // Fracture creates, splits and recycles bodies here in endTick. The
+        // contacts that consult these flags arrive in the NEXT step's contact
+        // callback -- which happens before the next beginTick. Rebuilding in
+        // beginTick therefore left the flags describing the previous
+        // composition on every tick after a topology change, and the audit
+        // measured exactly that: 98,633 mismatches in 101,135,704 checks,
+        // 0.0975%, which is the fracture rate.
+        //
+        // A contact wrongly classed as bondless is DROPPED before the solver
+        // sees it, so the failure was lost load on freshly fractured chunks.
+        refreshNodeBondless();
         m_tickPhase = TickPhase::Idle;
         return true;
     }
