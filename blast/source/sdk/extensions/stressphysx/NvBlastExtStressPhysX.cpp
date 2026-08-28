@@ -1264,6 +1264,10 @@ public:
             ext_stress_solver_impulse_copy_milliseconds(m_solver);
         m_telemetry.bondStressGroupsSkipped =
             ext_stress_solver_bond_stress_groups_skipped(m_solver);
+        m_telemetry.bondStressParallelChecks =
+            ext_stress_solver_bond_stress_parallel_checks(m_solver);
+        m_telemetry.bondStressParallelMismatches =
+            ext_stress_solver_bond_stress_parallel_mismatches(m_solver);
         m_telemetry.stressHostWalkInMilliseconds +=
             ext_stress_solver_host_walk_in_milliseconds(m_solver);
         m_telemetry.stressHostResetMilliseconds +=

@@ -361,6 +361,8 @@ uint8_t ext_stress_solver_get_gpu_accelerated(const ExtStressSolverHandle* handl
 float ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handle);
 uint64_t ext_stress_solver_bond_stress_groups_skipped(const ExtStressSolverHandle* handle);
+uint64_t ext_stress_solver_bond_stress_parallel_checks(const ExtStressSolverHandle* handle);
+uint64_t ext_stress_solver_bond_stress_parallel_mismatches(const ExtStressSolverHandle* handle);
 float ext_stress_solver_host_walk_in_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_host_reset_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_host_bond_stress_milliseconds(const ExtStressSolverHandle* handle);

@@ -347,6 +347,10 @@ struct ExtStressPhysXTelemetry
     /// The three host walks inside the graph solve.
     /// Cumulative bond groups skipped by the unchanged-stress short circuit.
     uint64_t bondStressGroupsSkipped{0};
+    /// Parallel-walk order audit; default-initialised so a build that never
+    /// runs verify publishes zeros rather than garbage.
+    uint64_t bondStressParallelChecks{0};
+    uint64_t bondStressParallelMismatches{0};
     double stressHostWalkInMilliseconds;
     double stressHostResetMilliseconds;
     double stressHostBondStressMilliseconds;

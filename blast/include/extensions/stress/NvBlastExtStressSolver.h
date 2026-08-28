@@ -607,6 +607,11 @@ public:
     /// MUST be non-zero when the skip is enabled, or the A/B is measuring
     /// nothing and cannot tell "no win" from "never ran".
     virtual uint64_t                        getBondStressGroupsSkipped() const = 0;
+    /// Verify-mode audit of the parallel bond-stress walk: group comparisons
+    /// performed, and orderings that disagreed. Mismatches must be zero; zero
+    /// CHECKS means the audit never ran and is inconclusive, not a pass.
+    virtual uint64_t                        getBondStressParallelChecks() const = 0;
+    virtual uint64_t                        getBondStressParallelMismatches() const = 0;
     virtual uint32_t                        getGpuImpulseCopyCount() const = 0;
     virtual float                           getGpuHostWorkMilliseconds() const = 0;
     virtual float                           getGpuHostBlockedMilliseconds() const = 0;

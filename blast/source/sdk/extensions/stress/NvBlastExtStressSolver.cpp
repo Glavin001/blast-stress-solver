@@ -1205,6 +1205,8 @@ public:
     }
 
     uint64_t getBondStressGroupsSkipped() const { return m_bondStressGroupsSkipped; }
+    uint64_t getBondStressParallelChecks() const { return m_bsParChecks; }
+    uint64_t getBondStressParallelMismatches() const { return m_bsParMismatches; }
 
     bool calcError(float& linear, float& angular) const
     {
@@ -1233,6 +1235,10 @@ public:
     };
     /// Reused across ticks so the strip vectors keep their capacity.
     std::vector<BondStressStrip> m_bondStressStrips;
+    /// Verify-mode scratch and audit counters. Mismatches must be zero.
+    BondStressStrip m_verifySerialStrip;
+    uint64_t m_bsParChecks{0};
+    uint64_t m_bsParMismatches{0};
     float m_hostWalkInMilliseconds{0.0f};
     float m_hostResetMilliseconds{0.0f};
     float m_hostBondStressMilliseconds{0.0f};
@@ -1806,7 +1812,18 @@ private:
         // Below this the fan-out costs more than the walk, matching the
         // crossover measured for the supporter classify.
         const uint32_t kParallelFloor = 4096;
-        if (dispatch != nullptr && groupCount >= kParallelFloor)
+        const bool canParallel = dispatch != nullptr && groupCount >= kParallelFloor;
+
+        auto runSerial = [&](BondStressStrip& out)
+        {
+            out.remove.clear();
+            out.count = 0;
+            for (uint32_t i = 0; i < groupCount; ++i)
+            {
+                processGroup(i, out);
+            }
+        };
+        auto runParallel = [&]()
         {
             const uint32_t strips = 16;
             const uint32_t stripLen = (groupCount + strips - 1) / strips;
@@ -1835,6 +1852,98 @@ private:
                          }
                      },
                      &job);
+        };
+
+        // Order audit for the parallel walk. The bit-exactness argument --
+        // contiguous ascending strips merged in strip order reproduce the
+        // serial sequence -- must be a measurement before the default flips;
+        // the flat-bondless flags had an equally convincing argument and a
+        // 0.0975% divergence that only a purpose-built audit caught.
+        //
+        // Verify mode runs BOTH paths on identical inputs and compares every
+        // order-sensitive output, then adopts the serial result so the mode is
+        // observationally serial. Legal to double-run because the per-group
+        // stress writes are pure functions of inputs this loop never mutates;
+        // the only cross-group state (m_groupOverstressed, the m_bs*
+        // counters) is snapshotted and rewound between the two runs.
+        static const bool verifyParallel = [] {
+            const char* raw = std::getenv("BLAST_BOND_STRESS_PARALLEL_VERIFY");
+            return raw != nullptr && std::string(raw) != "0";
+        }();
+        if (canParallel && verifyParallel)
+        {
+            const std::vector<uint8_t> overstressPre = m_groupOverstressed;
+            const uint64_t preTotal = m_bsTotal;
+            const uint64_t preDirty = m_bsDirty;
+            const uint64_t preBlocked = m_bsOverstressBlocked;
+            const uint64_t preSkipped = m_bondStressGroupsSkipped;
+
+            runSerial(m_verifySerialStrip);
+            const std::vector<uint8_t> overstressSerial = m_groupOverstressed;
+            const uint64_t serialTotal = m_bsTotal;
+            const uint64_t serialDirty = m_bsDirty;
+            const uint64_t serialBlocked = m_bsOverstressBlocked;
+            const uint64_t serialSkipped = m_bondStressGroupsSkipped;
+
+            m_groupOverstressed = overstressPre;
+            m_bsTotal = preTotal;
+            m_bsDirty = preDirty;
+            m_bsOverstressBlocked = preBlocked;
+            m_bondStressGroupsSkipped = preSkipped;
+            runParallel();
+
+            uint32_t parallelCount = 0;
+            uint32_t parallelRemoveSize = 0;
+            for (const BondStressStrip& strip : m_bondStressStrips)
+            {
+                parallelCount += strip.count;
+                parallelRemoveSize += strip.remove.size();
+            }
+            bool mismatch = parallelCount != m_verifySerialStrip.count
+                || parallelRemoveSize != m_verifySerialStrip.remove.size()
+                || m_groupOverstressed != overstressSerial;
+            if (!mismatch)
+            {
+                // Element-by-element, in merge order: removal ORDER feeds back
+                // into topology, so "same set" would not be enough.
+                uint32_t cursor = 0;
+                for (const BondStressStrip& strip : m_bondStressStrips)
+                {
+                    for (uint32_t b : strip.remove)
+                    {
+                        if (m_verifySerialStrip.remove[cursor++] != b)
+                        {
+                            mismatch = true;
+                            break;
+                        }
+                    }
+                    if (mismatch)
+                    {
+                        break;
+                    }
+                }
+            }
+            m_bsParChecks += groupCount;
+            if (mismatch)
+            {
+                ++m_bsParMismatches;
+            }
+
+            // Adopt the serial result: verify mode must not change behaviour.
+            m_groupOverstressed = overstressSerial;
+            m_bsTotal = serialTotal;
+            m_bsDirty = serialDirty;
+            m_bsOverstressBlocked = serialBlocked;
+            m_bondStressGroupsSkipped = serialSkipped;
+            m_overstressedBondCount += m_verifySerialStrip.count;
+            for (uint32_t b : m_verifySerialStrip.remove)
+            {
+                bondIndicesToRemove.pushBack(b);
+            }
+        }
+        else if (canParallel)
+        {
+            runParallel();
             for (const BondStressStrip& strip : m_bondStressStrips)
             {
                 m_overstressedBondCount += strip.count;
@@ -1847,12 +1956,7 @@ private:
         else
         {
             m_bondStressStrips.resize(1);
-            m_bondStressStrips[0].remove.clear();
-            m_bondStressStrips[0].count = 0;
-            for (uint32_t i = 0; i < groupCount; ++i)
-            {
-                processGroup(i, m_bondStressStrips[0]);
-            }
+            runSerial(m_bondStressStrips[0]);
             m_overstressedBondCount += m_bondStressStrips[0].count;
             for (uint32_t b : m_bondStressStrips[0].remove)
             {
@@ -2514,6 +2618,16 @@ public:
     virtual uint64_t                        getBondStressGroupsSkipped() const override
     {
         return m_graphProcessor->getBondStressGroupsSkipped();
+    }
+
+    virtual uint64_t                        getBondStressParallelChecks() const override
+    {
+        return m_graphProcessor->getBondStressParallelChecks();
+    }
+
+    virtual uint64_t                        getBondStressParallelMismatches() const override
+    {
+        return m_graphProcessor->getBondStressParallelMismatches();
     }
 
     virtual uint32_t                        getGpuImpulseCopyCount() const override
