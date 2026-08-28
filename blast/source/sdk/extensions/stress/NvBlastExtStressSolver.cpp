@@ -1238,6 +1238,15 @@ public:
         Array<uint32_t>::type remove;
         uint32_t count = 0;
     };
+    /// Fixed strip width, so a flat (slot x strip) dispatch has a stable
+    /// shape and the merge order is deterministic regardless of dispatcher.
+    static const uint32_t kBondStressStrips = 16;
+    /// Inputs stashed by bondStressBegin for the strip phase.
+    const float* m_bsBondHealth{nullptr};
+    const NvBlastBond* m_bsBonds{nullptr};
+    const std::vector<uint8_t>* m_bsDirtyPtr{nullptr};
+    bool m_bsHaveDirty{false};
+    uint32_t m_bsGroupCount{0};
     /// Reused across ticks so the strip vectors keep their capacity.
     std::vector<BondStressStrip> m_bondStressStrips;
     /// Verify-mode scratch and audit counters. Mismatches must be zero.
@@ -1612,7 +1621,12 @@ private:
     counts per tick and caught a 0.0975% divergence in the flat-bondless
     change that every other gate passed.
     */
-    void updateBondStress(const float* bondHealth, const NvBlastBond* bonds)
+    /// Phase 1 of the bond-stress walk: reset outputs, stash the inputs the
+    /// strip phase needs. Split so the CALLER can fan strips out flatly over
+    /// (slot x strip) in ONE top-level dispatch. The per-slot dispatch that
+    /// preceded this measured ~2x worse at rest -- mutex serialisation plus
+    /// 2:1 thread oversubscription from a second pool.
+    void bondStressBegin(const float* bondHealth, const NvBlastBond* bonds)
     {
         m_overstressedBondCount = 0;
         // E1: reset alongside the count so mask and count always describe the
@@ -1665,11 +1679,80 @@ private:
         // New groups start latched overstressed (1u), so a group that has
         // never been evaluated is never skipped.
         m_groupOverstressed.resize(m_solverBondsData.size(), 1u);
-        const std::vector<uint8_t>& dirty = m_solver.bondDirty();
-        const bool haveDirty = skipUnchangedBondStress()
-            && dirty.size() == m_solverBondsData.size();
-        auto processGroup = [&](uint32_t i, BondStressStrip& ctx)
+        m_bsBondHealth = bondHealth;
+        m_bsBonds = bonds;
+        m_bsDirtyPtr = &m_solver.bondDirty();
+        m_bsHaveDirty = skipUnchangedBondStress()
+            && m_bsDirtyPtr->size() == m_solverBondsData.size();
+        m_bsGroupCount = static_cast<uint32_t>(m_solverBondsData.size());
+        m_bondStressStrips.resize(kBondStressStrips);
+        for (uint32_t sIdx = 0; sIdx < kBondStressStrips; ++sIdx)
         {
+            m_bondStressStrips[sIdx].remove.clear();
+            m_bondStressStrips[sIdx].count = 0;
+        }
+    }
+
+    /// Phase 2: one contiguous ascending range of groups into its own strip.
+    /// Pure with respect to other strips -- per-group stress writes are
+    /// disjoint, m_nodeOverstressed is set-to-1 so concurrent writes agree,
+    /// and counts/removals accumulate per strip.
+    void bondStressStrip(uint32_t stripIdx)
+    {
+        if (stripIdx >= kBondStressStrips || m_bsGroupCount == 0)
+        {
+            return;
+        }
+        const uint32_t stripLen =
+            (m_bsGroupCount + kBondStressStrips - 1) / kBondStressStrips;
+        const uint32_t begin = stripIdx * stripLen;
+        if (begin >= m_bsGroupCount)
+        {
+            return;
+        }
+        const uint32_t end = std::min(m_bsGroupCount, begin + stripLen);
+        BondStressStrip& ctx = m_bondStressStrips[stripIdx];
+        for (uint32_t i = begin; i < end; ++i)
+        {
+            processBondGroup(i, ctx);
+        }
+    }
+
+    /// Phase 3: merge in STRIP ORDER, then apply removals. Strip order is
+    /// serial order because the ranges are contiguous and ascending -- the
+    /// property the 222M-check audit verified element by element, and the one
+    /// that matters because removal order feeds back into topology.
+    void bondStressFinish()
+    {
+        Array<uint32_t>::type& bondIndicesToRemove = m_bondIndicesToRemove;
+        for (const BondStressStrip& strip : m_bondStressStrips)
+        {
+            m_overstressedBondCount += strip.count;
+            for (uint32_t removed : strip.remove)
+            {
+                bondIndicesToRemove.pushBack(removed);
+            }
+        }
+
+        // now that processing is done, remove any dead bonds
+        for (uint32_t bondIndex : bondIndicesToRemove)
+        {
+            removeBondIfExists(bondIndex);
+        }
+    }
+
+    /// One group. Was a lambda inside updateBondStress; promoted to a member
+    /// so the three phases share it without re-capturing state.
+    void processBondGroup(uint32_t i, BondStressStrip& ctx)
+    {
+        const float* bondHealth = m_bsBondHealth;
+        const NvBlastBond* bonds = m_bsBonds;
+        const std::vector<uint8_t>& dirty = *m_bsDirtyPtr;
+        const bool haveDirty = m_bsHaveDirty;
+        (void)bondHealth;
+        (void)bonds;
+        (void)dirty;
+        (void)haveDirty;
             ++m_bsTotal;
             if (haveDirty)
             {
@@ -1796,185 +1879,21 @@ private:
                     bond.centroid = bondCentroid;
                 }
             }
-        };
-
-        // The fan-out above this is over STRUCTURES, of which a city has
-        // four; measured 2.21x concurrency on a 32-core box, so most of the
-        // machine idles through the largest cost in the tick. This splits the
-        // group walk itself.
-        //
-        // Bit-exactness rests on the merge order. Per-strip removal lists are
-        // concatenated in STRIP order and each strip covers a contiguous
-        // ascending range, so the concatenation is the same sequence the
-        // serial walk produced -- and removal order feeds back into topology,
-        // so "same set" would not be enough. Same discipline as
-        // resolve_support_loads, whose parallel classify is followed by a
-        // serial ingest in original pair order.
-        const uint32_t groupCount = static_cast<uint32_t>(m_solverBondsData.size());
-        ExtStressParallelFor dispatch = nullptr;
-        void* dispatchCtx = nullptr;
-        getExtStressParallelFor(dispatch, dispatchCtx);
-        // Below this the fan-out costs more than the walk, matching the
-        // crossover measured for the supporter classify.
-        const uint32_t kParallelFloor = 4096;
-        const bool canParallel = dispatch != nullptr && groupCount >= kParallelFloor;
-
-        auto runSerial = [&](BondStressStrip& out)
-        {
-            out.remove.clear();
-            out.count = 0;
-            for (uint32_t i = 0; i < groupCount; ++i)
-            {
-                processGroup(i, out);
-            }
-        };
-        auto runParallel = [&]()
-        {
-            const uint32_t strips = 16;
-            const uint32_t stripLen = (groupCount + strips - 1) / strips;
-            m_bondStressStrips.resize(strips);
-            for (uint32_t sIdx = 0; sIdx < strips; ++sIdx)
-            {
-                m_bondStressStrips[sIdx].remove.clear();
-                m_bondStressStrips[sIdx].count = 0;
-            }
-            struct StripJob
-            {
-                decltype(processGroup)* fn;
-                std::vector<BondStressStrip>* strips;
-                uint32_t stripLen;
-                uint32_t groupCount;
-            } job{&processGroup, &m_bondStressStrips, stripLen, groupCount};
-            dispatch(dispatchCtx, strips,
-                     [](void* raw, uint32_t sIdx) {
-                         StripJob* j = static_cast<StripJob*>(raw);
-                         const uint32_t begin = sIdx * j->stripLen;
-                         const uint32_t end =
-                             std::min(j->groupCount, begin + j->stripLen);
-                         for (uint32_t i = begin; i < end; ++i)
-                         {
-                             (*j->fn)(i, (*j->strips)[sIdx]);
-                         }
-                     },
-                     &job);
-        };
-
-        // Order audit for the parallel walk. The bit-exactness argument --
-        // contiguous ascending strips merged in strip order reproduce the
-        // serial sequence -- must be a measurement before the default flips;
-        // the flat-bondless flags had an equally convincing argument and a
-        // 0.0975% divergence that only a purpose-built audit caught.
-        //
-        // Verify mode runs BOTH paths on identical inputs and compares every
-        // order-sensitive output, then adopts the serial result so the mode is
-        // observationally serial. Legal to double-run because the per-group
-        // stress writes are pure functions of inputs this loop never mutates;
-        // the only cross-group state (m_groupOverstressed, the m_bs*
-        // counters) is snapshotted and rewound between the two runs.
-        static const bool verifyParallel = [] {
-            const char* raw = std::getenv("BLAST_BOND_STRESS_PARALLEL_VERIFY");
-            return raw != nullptr && std::string(raw) != "0";
-        }();
-        if (canParallel && verifyParallel)
-        {
-            const std::vector<uint8_t> overstressPre = m_groupOverstressed;
-            const uint64_t preTotal = m_bsTotal;
-            const uint64_t preDirty = m_bsDirty;
-            const uint64_t preBlocked = m_bsOverstressBlocked;
-            const uint64_t preSkipped = m_bondStressGroupsSkipped;
-
-            runSerial(m_verifySerialStrip);
-            const std::vector<uint8_t> overstressSerial = m_groupOverstressed;
-            const uint64_t serialTotal = m_bsTotal;
-            const uint64_t serialDirty = m_bsDirty;
-            const uint64_t serialBlocked = m_bsOverstressBlocked;
-            const uint64_t serialSkipped = m_bondStressGroupsSkipped;
-
-            m_groupOverstressed = overstressPre;
-            m_bsTotal = preTotal;
-            m_bsDirty = preDirty;
-            m_bsOverstressBlocked = preBlocked;
-            m_bondStressGroupsSkipped = preSkipped;
-            runParallel();
-
-            uint32_t parallelCount = 0;
-            uint32_t parallelRemoveSize = 0;
-            for (const BondStressStrip& strip : m_bondStressStrips)
-            {
-                parallelCount += strip.count;
-                parallelRemoveSize += strip.remove.size();
-            }
-            bool mismatch = parallelCount != m_verifySerialStrip.count
-                || parallelRemoveSize != m_verifySerialStrip.remove.size()
-                || m_groupOverstressed != overstressSerial;
-            if (!mismatch)
-            {
-                // Element-by-element, in merge order: removal ORDER feeds back
-                // into topology, so "same set" would not be enough.
-                uint32_t cursor = 0;
-                for (const BondStressStrip& strip : m_bondStressStrips)
-                {
-                    for (uint32_t b : strip.remove)
-                    {
-                        if (m_verifySerialStrip.remove[cursor++] != b)
-                        {
-                            mismatch = true;
-                            break;
-                        }
-                    }
-                    if (mismatch)
-                    {
-                        break;
-                    }
-                }
-            }
-            m_bsParChecks += groupCount;
-            if (mismatch)
-            {
-                ++m_bsParMismatches;
-            }
-
-            // Adopt the serial result: verify mode must not change behaviour.
-            m_groupOverstressed = overstressSerial;
-            m_bsTotal = serialTotal;
-            m_bsDirty = serialDirty;
-            m_bsOverstressBlocked = serialBlocked;
-            m_bondStressGroupsSkipped = serialSkipped;
-            m_overstressedBondCount += m_verifySerialStrip.count;
-            for (uint32_t b : m_verifySerialStrip.remove)
-            {
-                bondIndicesToRemove.pushBack(b);
-            }
-        }
-        else if (canParallel)
-        {
-            runParallel();
-            for (const BondStressStrip& strip : m_bondStressStrips)
-            {
-                m_overstressedBondCount += strip.count;
-                for (uint32_t b : strip.remove)
-                {
-                    bondIndicesToRemove.pushBack(b);
-                }
-            }
-        }
-        else
-        {
-            m_bondStressStrips.resize(1);
-            runSerial(m_bondStressStrips[0]);
-            m_overstressedBondCount += m_bondStressStrips[0].count;
-            for (uint32_t b : m_bondStressStrips[0].remove)
-            {
-                bondIndicesToRemove.pushBack(b);
-            }
-        }
-
-        // now that processing is done, remove any dead bonds
-        for (uint32_t bondIndex : bondIndicesToRemove)
-        {
-            removeBondIfExists(bondIndex);
-        }
     }
+
+    /// Serial entry point: the same three phases the flat fan-out drives.
+    /// One shared body on purpose -- two copies would drift, and a drift here
+    /// is a physics divergence.
+    void updateBondStress(const float* bondHealth, const NvBlastBond* bonds)
+    {
+        bondStressBegin(bondHealth, bonds);
+        for (uint32_t sIdx = 0; sIdx < kBondStressStrips; ++sIdx)
+        {
+            bondStressStrip(sIdx);
+        }
+        bondStressFinish();
+    }
+
 
     void sync(const NvBlastBond* bonds, bool islandAware)
     {
