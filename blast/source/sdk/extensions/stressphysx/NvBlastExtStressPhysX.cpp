@@ -1146,6 +1146,12 @@ public:
             ext_stress_solver_gpu_solve_milliseconds(m_solver);
         m_telemetry.gpuStressHostWorkMilliseconds +=
             ext_stress_solver_gpu_host_work_milliseconds(m_solver);
+        m_telemetry.stressImpulseCopyMilliseconds +=
+            ext_stress_solver_impulse_copy_milliseconds(m_solver);
+        m_telemetry.stressInitializeMilliseconds +=
+            ext_stress_solver_initialize_milliseconds(m_solver);
+        m_telemetry.stressCalcErrorMilliseconds +=
+            ext_stress_solver_calc_error_milliseconds(m_solver);
         m_telemetry.gpuStressHostBlockedMilliseconds +=
             ext_stress_solver_gpu_host_blocked_milliseconds(m_solver);
         m_telemetry.gpuStressHostToDeviceBytes +=

@@ -25,6 +25,7 @@
 // Copyright (c) 2016-2024 NVIDIA Corporation. All rights reserved.
 
 
+#include <chrono>
 #include "NvBlastExtStressSolver.h"
 #include "NvBlast.h"
 #include "NvBlastGlobals.h"
@@ -277,6 +278,24 @@ public:
 #endif
     }
 
+    float getGpuImpulseCopyMilliseconds() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        return m_gpuImpulseCopyMilliseconds;
+#else
+        return 0.0f;
+#endif
+    }
+
+    uint32_t getGpuImpulseCopyCount() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        return m_gpuImpulseCopyCount;
+#else
+        return 0;
+#endif
+    }
+
     float getGpuHostWorkMilliseconds() const
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
@@ -419,6 +438,8 @@ public:
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
         m_gpuFrameSolveMilliseconds = 0.0f;
         m_gpuFrameHostWorkMilliseconds = 0.0f;
+        m_gpuImpulseCopyMilliseconds = 0.0f;
+        m_gpuImpulseCopyCount = 0;
         m_gpuFrameHostBlockedMilliseconds = 0.0f;
         m_gpuFrameHostToDeviceBytes = 0;
         m_gpuFrameDeviceToHostBytes = 0;
@@ -482,6 +503,11 @@ public:
                 // them would hand the saving straight back: at city scale this
                 // loop is tens of thousands of iterations of pure host work,
                 // and it is inside the "blast solve" phase.
+                // Timed: solve_ms minus the kernel, host work and blocking
+                // left 32% unnamed, and it is not initialize or calcError
+                // (0.05 and 0.00 ms). This loop is the remaining candidate --
+                // a per-bond host copy inside the solve phase.
+                const auto copyStart = std::chrono::steady_clock::now();
                 uint32_t changedCount = 0;
                 const uint32_t* changed = m_gpuSolver->lastChangedBonds(changedCount);
                 const uint32_t impulseCount = static_cast<uint32_t>(m_impulses.size());
@@ -501,6 +527,10 @@ public:
                         m_gpuImpulses[i].linear.y,
                         m_gpuImpulses[i].linear.z};
                 }
+                m_gpuImpulseCopyMilliseconds =
+                    std::chrono::duration<float, std::milli>(
+                        std::chrono::steady_clock::now() - copyStart).count();
+                m_gpuImpulseCopyCount = changedCount;
                 m_gpuIslandsSkipped = m_gpuSolver->telemetry().islandsSkipped;
                 m_gpuIslandsTotal = m_gpuSolver->telemetry().islandCount;
                 m_converged = m_gpuSolver->telemetry().converged;
@@ -602,6 +632,9 @@ private:
     uint32_t                            m_gpuIslandsTotal{0};
     float                               m_gpuFrameSolveMilliseconds{0.0f};
     float                               m_gpuFrameHostWorkMilliseconds{0.0f};
+    /// Per-bond host copy of solved impulses, and how many bonds it touched.
+    float                               m_gpuImpulseCopyMilliseconds{0.0f};
+    uint32_t                            m_gpuImpulseCopyCount{0};
     float                               m_gpuFrameHostBlockedMilliseconds{0.0f};
     uint64_t                            m_gpuFrameHostToDeviceBytes{0};
     uint64_t                            m_gpuFrameDeviceToHostBytes{0};
@@ -817,6 +850,8 @@ public:
     bool getGpuAccelerated() const { return m_solver.getGpuAccelerated(); }
     float getGpuSolveMilliseconds() const { return m_solver.getGpuSolveMilliseconds(); }
     float getGpuHostWorkMilliseconds() const { return m_solver.getGpuHostWorkMilliseconds(); }
+    float getGpuImpulseCopyMilliseconds() const { return m_solver.getGpuImpulseCopyMilliseconds(); }
+    uint32_t getGpuImpulseCopyCount() const { return m_solver.getGpuImpulseCopyCount(); }
     float getGpuHostBlockedMilliseconds() const { return m_solver.getGpuHostBlockedMilliseconds(); }
     uint64_t getGpuHostToDeviceBytes() const { return m_solver.getGpuHostToDeviceBytes(); }
     uint64_t getGpuDeviceToHostBytes() const { return m_solver.getGpuDeviceToHostBytes(); }
@@ -2157,6 +2192,31 @@ public:
         return m_graphProcessor->getGpuSolveMilliseconds();
     }
 
+    virtual float                           getInitializeMilliseconds() const override
+    {
+        return m_initializeMilliseconds;
+    }
+
+    virtual float                           getGraphSolveMilliseconds() const override
+    {
+        return m_graphSolveMilliseconds;
+    }
+
+    virtual float                           getCalcErrorMilliseconds() const override
+    {
+        return m_calcErrorMilliseconds;
+    }
+
+    virtual float                           getGpuImpulseCopyMilliseconds() const override
+    {
+        return m_graphProcessor->getGpuImpulseCopyMilliseconds();
+    }
+
+    virtual uint32_t                        getGpuImpulseCopyCount() const override
+    {
+        return m_graphProcessor->getGpuImpulseCopyCount();
+    }
+
     virtual float                           getGpuHostWorkMilliseconds() const override
     {
         return m_graphProcessor->getGpuHostWorkMilliseconds();
@@ -2528,6 +2588,11 @@ private:
     bool                                                                m_islandAware;
     bool                                                                m_skipSettled;
     uint32_t                                                            m_framesCount;
+    /// Host walls around the GPU solve, previously only visible as solve_ms's
+    /// 30.4% remainder.
+    float                                                               m_initializeMilliseconds{0.0f};
+    float                                                               m_graphSolveMilliseconds{0.0f};
+    float                                                               m_calcErrorMilliseconds{0.0f};
     bool                                                                m_crushReductionWarned{false};
     Array<NvBlastBondFractureData>::type                                m_bondFractureBuffer;
     Array<NvBlastChunkFractureData>::type                               m_chunkFractureBuffer;
@@ -2979,7 +3044,14 @@ bool ExtStressSolverImpl::addCentrifugalAcceleration(const NvBlastActor& actor, 
 
 void ExtStressSolverImpl::update()
 {
+    // solve_ms minus (kernel + host work + blocked) left 30.4% unnamed. It is
+    // not in the GPU solver at all -- these two walks sit around it and had no
+    // timer, so the only way to see them was a subtraction nobody performed.
+    const auto initStart = std::chrono::steady_clock::now();
     initialize();
+    m_initializeMilliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - initStart).count();
 
     solve();
 
@@ -2990,10 +3062,18 @@ void ExtStressSolverImpl::solve()
 {
     NV_SIMD_GUARD;
 
+    const auto graphStart = std::chrono::steady_clock::now();
     m_graphProcessor->solve(m_settings, m_bondHealths, m_bonds, WARM_START && !m_reset, m_islandAware, m_skipSettled, m_deltaTime);
     m_reset = false;
+    m_graphSolveMilliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - graphStart).count();
 
+    const auto errStart = std::chrono::steady_clock::now();
     m_converged = m_graphProcessor->calcError(m_errorLinear, m_errorAngular);
+    m_calcErrorMilliseconds =
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - errStart).count();
 }
 
 

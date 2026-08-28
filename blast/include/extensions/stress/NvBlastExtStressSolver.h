@@ -570,6 +570,14 @@ public:
 
     /// Host wall time inside the GPU solve, split into work and waiting.
     /// Only the first is reclaimable by faster host code.
+    /// Host walls around the GPU solve: the pre-solve initialize, the graph
+    /// solve call itself, and the post-solve error walk.
+    virtual float                           getInitializeMilliseconds() const = 0;
+    virtual float                           getGraphSolveMilliseconds() const = 0;
+    virtual float                           getCalcErrorMilliseconds() const = 0;
+    /// Per-bond host copy of solved impulses out of the GPU buffer.
+    virtual float                           getGpuImpulseCopyMilliseconds() const = 0;
+    virtual uint32_t                        getGpuImpulseCopyCount() const = 0;
     virtual float                           getGpuHostWorkMilliseconds() const = 0;
     virtual float                           getGpuHostBlockedMilliseconds() const = 0;
     virtual uint64_t                        getGpuHostToDeviceBytes() const = 0;

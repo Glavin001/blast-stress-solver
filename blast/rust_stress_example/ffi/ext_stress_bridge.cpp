@@ -1503,6 +1503,27 @@ ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
 }
 
 extern "C" float
+ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuImpulseCopyMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_initialize_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getInitializeMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_calc_error_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getCalcErrorMilliseconds() : 0.0f;
+}
+
+extern "C" float
 ext_stress_solver_gpu_host_work_milliseconds(const ExtStressSolverHandle* handlePtr)
 {
     const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);

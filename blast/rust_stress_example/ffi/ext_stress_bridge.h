@@ -359,6 +359,9 @@ void ext_stress_solver_set_gpu_cuda_context(ExtStressSolverHandle* handle, void*
 void ext_stress_solver_set_gpu_minimum_bond_count(ExtStressSolverHandle* handle, uint32_t bond_count);
 uint8_t ext_stress_solver_get_gpu_accelerated(const ExtStressSolverHandle* handle);
 float ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handle);
+float ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handle);
+float ext_stress_solver_initialize_milliseconds(const ExtStressSolverHandle* handle);
+float ext_stress_solver_calc_error_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_gpu_host_work_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_gpu_host_blocked_milliseconds(const ExtStressSolverHandle* handle);
 uint64_t ext_stress_solver_gpu_host_to_device_bytes(const ExtStressSolverHandle* handle);

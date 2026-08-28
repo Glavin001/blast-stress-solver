@@ -339,6 +339,10 @@ struct ExtStressPhysXTelemetry
     /// device. Only the first can be reclaimed by faster host code, so the
     /// split is the ceiling on every host-side optimization of this path.
     double gpuStressHostWorkMilliseconds;
+    /// Host walls around the GPU solve inside solveTick.
+    double stressImpulseCopyMilliseconds;
+    double stressInitializeMilliseconds;
+    double stressCalcErrorMilliseconds;
     double gpuStressHostBlockedMilliseconds;
     uint64_t gpuStressHostToDeviceBytes;
     uint64_t gpuStressDeviceToHostBytes;
