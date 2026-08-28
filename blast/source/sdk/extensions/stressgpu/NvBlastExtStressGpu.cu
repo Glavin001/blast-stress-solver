@@ -37,6 +37,30 @@ const bool s_debug = std::getenv("BLAST_GPU_SKIP_DEBUG") != nullptr;
 /// BLAST_GPU_WHOLE_RESET_ON_TOPOLOGY=1 restores the pre-incremental behaviour:
 /// full warm-start memset + whole-baseline drop on every topology change and
 /// every break. Value-checked kill switch for the incremental path below.
+/// G1: gather instead of scatter in the right-multiply (default ON, =0
+/// restores the atomic scatter).
+///
+/// The scatter wrote each bond's contribution into its two nodes with
+/// atomicAdd -- 3 floats x 2 vectors x 2 nodes = 12 global float atomics per
+/// bond, every iteration. That is the dominant cost of the solve (the code
+/// said so itself) and it is also why the solve is not reproducible: float
+/// addition is not associative and the atomic order is not deterministic, so
+/// the same scene gives slightly different impulses every run, which is why
+/// every experiment on this tree needs n>=2 arms and a noise floor.
+///
+/// The gather visits the same bonds and computes the same terms; only the
+/// summation moves. Each node loops over its own incident bonds in a fixed
+/// CSR order and writes its slot once, exclusively. No atomics, and the
+/// per-node sum order is fixed by the topology, so it is reproducible.
+static bool gatherRightMultiplyEnabled()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_GPU_GATHER");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
 static bool wholeResetOnTopology()
 {
     static const bool enabled = [] {
@@ -295,6 +319,76 @@ __global__ void couplingRightMultiply(
     atomicAddVec(nodes[node0[bond]].linear, impulse.linear);
     atomicAddVec(nodes[node1[bond]].angular, node1Angular);
     atomicAddVec(nodes[node1[bond]].linear, mul(impulse.linear, -1.0f));
+}
+
+/// The transpose of couplingRightMultiply: one thread per ACTIVE NODE, summing
+/// its own incident bonds instead of every bond racing to add into its nodes.
+///
+/// The CSR is node -> refs, each ref packing (bondIndex, endpoint) so the
+/// thread knows which of the two sign conventions to apply. The two branches
+/// below are exactly couplingRightMultiply's two halves, unchanged; what is
+/// gone is the atomicAdd and the memset that had to precede it, because this
+/// kernel writes every active node's slot unconditionally.
+///
+/// The scale by inverse inertia is folded in here, which also retires the
+/// separate scaleNodes launch on this path.
+__global__ void gatherRightMultiply(
+    AngLin* nodes,
+    const AngLin* bonds,
+    const std::uint32_t* nodeBondBegin,
+    const std::uint32_t* nodeBondRef,
+    const Vec4* offset0,
+    const Vec4* offset1,
+    const float* health,
+    const std::uint32_t* bondIsland,
+    const std::uint32_t* islandSkip,
+    const Inertia* inertia,
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeCounts)
+{
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[1])
+    {
+        return;
+    }
+    const std::uint32_t node = activeNodes[slot];
+
+    Vec4 angular{0.0f, 0.0f, 0.0f, 0.0f};
+    Vec4 linear{0.0f, 0.0f, 0.0f, 0.0f};
+
+    const std::uint32_t begin = nodeBondBegin[node];
+    const std::uint32_t end = nodeBondBegin[node + 1];
+    for (std::uint32_t i = begin; i < end; ++i)
+    {
+        const std::uint32_t ref = nodeBondRef[i];
+        const std::uint32_t bond = ref & 0x7FFFFFFFu;
+        const bool isSecond = (ref & 0x80000000u) != 0u;
+        if (health[bond] <= 0.0f)
+        {
+            continue;
+        }
+        if (bondSettled(islandSkip, bondIsland[bond]))
+        {
+            continue;
+        }
+        const AngLin impulse = bonds[bond];
+        if (!isSecond)
+        {
+            angular = add(angular, sub(impulse.angular, cross(offset0[bond], impulse.linear)));
+            linear = add(linear, impulse.linear);
+        }
+        else
+        {
+            angular = add(angular, sub(cross(offset1[bond], impulse.linear), impulse.angular));
+            linear = add(linear, mul(impulse.linear, -1.0f));
+        }
+    }
+
+    // Exclusive write, and the inverse-inertia scale folded in: a static node
+    // has zero inertia, so its slot lands at zero exactly as the memset +
+    // scaleNodes pair produced before.
+    nodes[node].angular = mul(angular, inertia[node].angular);
+    nodes[node].linear = mul(linear, inertia[node].linear);
 }
 
 __global__ void scaleNodes(
@@ -882,11 +976,13 @@ public:
         m_materialCount = static_cast<std::uint32_t>(m_hostMaterials.size());
         ContextGuard context(m_cudaContext);
         prepare(nodes, bonds);
-        computeIslands();
+computeIslands();
+        buildNodeBondCsr();
         groupBondsByIsland();
         allocate();
         uploadTopology();
-        uploadIslands();
+uploadIslands();
+        uploadNodeBondCsr();
         if (s_debug)
         {
             std::fprintf(
@@ -943,6 +1039,8 @@ public:
         cudaFree(m_previousGradientSquared);
         cudaFree(m_deltaSquared);
         cudaFree(m_islandActive);
+        cudaFree(m_nodeBondBegin);
+        cudaFree(m_nodeBondRef);
         cudaFree(m_bondIsland);
         cudaFree(m_nodeIsland);
         cudaFree(m_projectedDirectionSquared);
@@ -1677,10 +1775,12 @@ private:
         // The island partition is about to be remapped; the compacted lists
         // index into the OLD partition and must be rebuilt before next solve.
         m_activeListsDirty = true;
-        computeIslands();
+computeIslands();
+        buildNodeBondCsr();
         groupBondsByIsland();
         uploadTopology();
-        uploadIslands();
+uploadIslands();
+        uploadNodeBondCsr();
         // Grid sizes and the per-island memset lengths are baked into the
         // captured graph, and both just changed.
         if (m_graphExec)
@@ -2014,6 +2114,8 @@ private:
         allocateDevice(m_islandActive, m_islandCapacity, "allocate island active flags");
         allocateDevice(m_islandConverged, m_islandCapacity, "allocate island converged flags");
         allocateDevice(m_islandSkip, m_islandCapacity, "allocate island skip mask");
+        allocateDevice(m_nodeBondBegin, m_nodeCount + 1, "allocate node-bond csr offsets");
+        allocateDevice(m_nodeBondRef, m_bondCount * 2 + 1, "allocate node-bond csr refs");
         allocateDevice(m_bondIsland, m_bondCount, "allocate bond island ids");
         allocateDevice(m_nodeIsland, m_nodeCount, "allocate node island ids");
         allocateDevice(m_scatterIndices, m_nodeCount, "allocate scatter indices");
@@ -2237,6 +2339,67 @@ private:
         }
     }
 
+    /// Build the node -> incident-bond CSR the gather right-multiply walks.
+    ///
+    /// Pure host work over mirrors that already exist, done wherever topology
+    /// is (re)built, so the per-iteration kernel never has to discover which
+    /// bonds touch a node. Each ref packs the bond index with the endpoint
+    /// bit (bit 31) that selects the sign convention -- a bond appears in
+    /// both of its nodes' lists, once per side.
+    ///
+    /// A kNoIsland bond (static-static) is included: the kernel skips it via
+    /// bondSettled exactly as the scatter did, and excluding it here would
+    /// make the CSR disagree with the scatter path under BLAST_GPU_GATHER=0.
+    void buildNodeBondCsr()
+    {
+        m_hostNodeBondBegin.assign(m_nodeCount + 1, 0u);
+        for (std::uint32_t bond = 0; bond < m_bondCount; ++bond)
+        {
+            ++m_hostNodeBondBegin[m_hostNode0[bond] + 1];
+            ++m_hostNodeBondBegin[m_hostNode1[bond] + 1];
+        }
+        for (std::uint32_t node = 0; node < m_nodeCount; ++node)
+        {
+            m_hostNodeBondBegin[node + 1] += m_hostNodeBondBegin[node];
+        }
+        m_hostNodeBondRef.assign(m_hostNodeBondBegin[m_nodeCount], 0u);
+        std::vector<std::uint32_t> cursor(
+            m_hostNodeBondBegin.begin(), m_hostNodeBondBegin.end());
+        // Ascending bond order within each node's list: the sum order is then
+        // a pure function of topology, which is what makes the gather
+        // reproducible run to run.
+        for (std::uint32_t bond = 0; bond < m_bondCount; ++bond)
+        {
+            m_hostNodeBondRef[cursor[m_hostNode0[bond]]++] = bond;
+            m_hostNodeBondRef[cursor[m_hostNode1[bond]]++] = bond | 0x80000000u;
+        }
+    }
+
+    void uploadNodeBondCsr()
+    {
+        if (m_hostNodeBondBegin.empty())
+        {
+            return;
+        }
+        checkCuda(
+            cudaMemcpy(
+                m_nodeBondBegin,
+                m_hostNodeBondBegin.data(),
+                sizeof(std::uint32_t) * m_hostNodeBondBegin.size(),
+                cudaMemcpyHostToDevice),
+            "upload node-bond csr offsets");
+        if (!m_hostNodeBondRef.empty())
+        {
+            checkCuda(
+                cudaMemcpy(
+                    m_nodeBondRef,
+                    m_hostNodeBondRef.data(),
+                    sizeof(std::uint32_t) * m_hostNodeBondRef.size(),
+                    cudaMemcpyHostToDevice),
+                "upload node-bond csr refs");
+        }
+    }
+
     void uploadIslands()
     {
         checkCuda(
@@ -2368,6 +2531,31 @@ private:
 
     void rightMultiply(const AngLin* bonds, AngLin* nodes, const std::uint32_t* islandSkip)
     {
+        if (gatherRightMultiplyEnabled())
+        {
+            // No memset: every active node writes its own slot. No scaleNodes
+            // either: the inverse-inertia scale is folded into the write. Two
+            // graph nodes become one, and twelve global float atomics per
+            // bond become zero.
+            gatherRightMultiply<<<
+                (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
+                kBlockSize,
+                0,
+                m_stream>>>(
+                nodes,
+                bonds,
+                m_nodeBondBegin,
+                m_nodeBondRef,
+                m_offset0,
+                m_offset1,
+                m_health,
+                m_bondIsland,
+                islandSkip,
+                m_inertia,
+                m_activeNodes,
+                m_activeCounts);
+            return;
+        }
         checkCuda(
             cudaMemsetAsync(
                 nodes,
@@ -2735,6 +2923,8 @@ private:
     /// This frame's decision, one entry per island, uploaded before the graph
     /// runs. 1 = settled, do not touch.
     std::uint32_t* m_islandSkip{nullptr};
+    std::uint32_t* m_nodeBondBegin{nullptr};
+    std::uint32_t* m_nodeBondRef{nullptr};
     std::uint32_t* m_bondIsland{nullptr};
     std::uint32_t* m_nodeIsland{nullptr};
     std::uint32_t m_islandCount{1};
@@ -2770,6 +2960,10 @@ private:
     AngLin* m_gatherOutput{nullptr};
     std::vector<std::uint32_t> m_hostParent;
     std::vector<std::uint32_t> m_hostRootIsland;
+    /// G1: node -> incident-bond CSR (offsets, and refs packing bond index +
+    /// endpoint bit). Host-built at every topology change, uploaded once.
+    std::vector<std::uint32_t> m_hostNodeBondBegin;
+    std::vector<std::uint32_t> m_hostNodeBondRef;
     std::vector<std::uint32_t> m_hostBondIsland;
     std::vector<std::uint32_t> m_hostNodeIsland;
     float* m_projectedDirectionSquared{nullptr};
