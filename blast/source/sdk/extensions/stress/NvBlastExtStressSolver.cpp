@@ -1195,6 +1195,11 @@ public:
     }
 
     /// A/B for the unchanged-bond-stress skip (default OFF until audited).
+    /// Permanently default OFF, decided on measurement (2026-08-28): on top
+    /// of the parallel walk this saves 6.4% of a 1.1 ms cost -- 0.07 ms.
+    /// During demolition 41-98% of groups genuinely re-solve, so the settled
+    /// fraction is smallest exactly when the walk costs most; this cannot
+    /// grow into a win. Exact and audited (357/357/357), kept for re-test.
     static bool skipUnchangedBondStress()
     {
         static const bool enabled = [] {
