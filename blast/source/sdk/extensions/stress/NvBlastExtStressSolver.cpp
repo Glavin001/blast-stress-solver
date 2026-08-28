@@ -599,6 +599,15 @@ public:
         // linear stresses
         float    stressNormal;  // negative values represent compression pressure, positive represent tension
         float    stressShear;
+        // Bending, as an equivalent pressure, always >= 0.
+        //
+        // Kept apart from stressNormal rather than folded into it because
+        // bending is not axial load: it puts one face of the joint in tension
+        // and the opposite face in compression at the same time. Only the
+        // extreme fibres decide whether the joint fails, and which limit they
+        // are checked against depends on their sign -- so the two have to
+        // survive as separate numbers this far.
+        float    stressBend;
 
         // The normal used to compute stress values
         // Can be different than the bond normal if graph reduction is used
@@ -789,11 +798,11 @@ public:
 
     void calcSolverBondStresses(
         uint32_t bondIdx, float bondArea, float nodeDist, const nvidia::NvVec3& bondNormal,
-        float& stressNormal, float& stressShear) const
+        float& stressNormal, float& stressShear, float& stressBend) const
     {
         if (!canTakeDamage(bondArea))
         {
-            stressNormal = stressShear = 0.0f;
+            stressNormal = stressShear = stressBend = 0.0f;
             return;
         }
 
@@ -818,8 +827,87 @@ public:
         // dividing by nodeDist for scaling
         const float twistContribution = twist * 2.0f / nodeDist;
         stressShear += twistContribution;
-        const float bendContribution = bend * 2.0f / nodeDist;
-        stressNormal += std::copysign(bendContribution, stressNormal);
+
+        // Bending, as the peak fibre pressure it actually causes.
+        //
+        // `bend` at this point is moment/area. Turning that into the stress at
+        // the extreme fibre is what a section modulus does: for a roughly
+        // square patch of side a = sqrt(area), sigma = M*c/I = 6*M/a^3, and
+        // since bend = M/area = M/a^2 that is 6*bend/sqrt(area).
+        //
+        // The original scaling divided by the distance between the two chunk
+        // CENTROIDS instead -- a couple of metres where a section dimension of
+        // tens of centimetres belongs, understating bending on a slab joint by
+        // roughly an order of magnitude. Combined with the sign handling below
+        // it is why a twelve-metre concrete plate cantilevered off a column
+        // grid reported two thirds of its elastic limit and stood there
+        // indefinitely.
+        //
+        // The amplification is BOUNDED, because 6/sqrt(area) runs away as the
+        // joint gets small: a 0.02 m^2 patch between a floor slab and a timber
+        // post amplifies by 43, and what it amplifies at that scale is mostly
+        // the solve's own discretisation noise rather than a real moment. Two
+        // houses started shedding bonds under their own weight at that gain.
+        //
+        // The cap is where the formula stops describing the joint: sqrt(area)
+        // assumes a square patch, and a real one is flatter than it is square,
+        // so past a point the number says more about the mesh than the
+        // structure. 10 leaves every joint that carries a building in this set
+        // untouched -- a 0.36 m^2 slab seam sits exactly at it, a 0.6 m^2
+        // cantilever root below it -- and only bites on joints small enough
+        // that the proxy has stopped being one.
+        //
+        // BLAST_BEND_SECTION_MODULUS=0 restores the old scaling for A/B.
+        constexpr float MAX_BEND_AMPLIFICATION = 10.0f;
+        stressBend = sectionModulusBending()
+            ? bend * std::min(MAX_BEND_AMPLIFICATION,
+                              6.0f / std::sqrt(std::max(bondArea, 1e-6f)))
+            : bend * 2.0f / nodeDist;
+    }
+
+    /// Whether bending is scaled by a section modulus (see above). Read once.
+    static bool sectionModulusBending()
+    {
+        static const bool enabled = []() {
+            const char* value = std::getenv("BLAST_BEND_SECTION_MODULUS");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    /// Whether bending resolves into separate tension and compression fibres
+    /// rather than being added to the axial stress with its sign.
+    static bool fibreBending()
+    {
+        static const bool enabled = []() {
+            const char* value = std::getenv("BLAST_BEND_FIBER");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    /// Peak fibre stresses of a bond: axial, plus and minus bending.
+    ///
+    /// A joint under a bending moment has one face pulled apart while the
+    /// other is squeezed, so it can be in tension and compression at once and
+    /// must be checked against both limits. That distinction matters enormously
+    /// here because concrete's limits are not symmetric: 48 MPa in compression
+    /// against 6 MPa in tension. Folding bending into the axial sign -- the old
+    /// behaviour -- meant a compressed joint under a huge moment was checked
+    /// against the limit eight times too generous, and cantilevers never failed.
+    static void fibreStresses(float stressNormal, float stressBend,
+                              float& compression, float& tension)
+    {
+        if (!fibreBending())
+        {
+            // Legacy: bend amplifies whatever the axial sign already is.
+            const float combined = stressNormal + std::copysign(stressBend, stressNormal);
+            compression = combined <= 0.0f ? -combined : 0.0f;
+            tension = combined > 0.0f ? combined : 0.0f;
+            return;
+        }
+        tension = std::max(0.0f, stressNormal + stressBend);
+        compression = std::max(0.0f, stressBend - stressNormal);
     }
 
     float mapStressToRange(float stress, float elasticLimit, float fatalLimit) const
@@ -1065,20 +1153,13 @@ public:
             return false;
         }
 
-        // compression and tension are mutually exclusive since they operate in opposite directions
-        // they both measure stress parallel to the bond normal direction
-        // compression is the force resisting two nodes being pushed together (it pushes them apart)
-        // tension is the force resisting two nodes being pulled apart (it pulls them together)
-        if (m_bondsData[bondIndex].stressNormal <= 0.0f)
-        {
-            compression = -m_bondsData[bondIndex].stressNormal;
-            tension = 0.0f;
-        }
-        else
-        {
-            compression = 0.0f;
-            tension = m_bondsData[bondIndex].stressNormal;
-        }
+        // Axial load is one or the other -- compression resists two nodes being
+        // pushed together, tension resists them being pulled apart -- but a
+        // bending moment produces both at once, on opposite faces of the joint.
+        // These are therefore the two extreme fibres, and either can be the one
+        // that fails.
+        fibreStresses(m_bondsData[bondIndex].stressNormal,
+                      m_bondsData[bondIndex].stressBend, compression, tension);
 
         // shear is independent and can co-exist with compression and tension
         shear = m_bondsData[bondIndex].stressShear;         // the force perpendicular to the bond normal direction
@@ -1461,9 +1542,12 @@ private:
             // (one constraint, one sigma over the summed area) — but each
             // member fails against its OWN material limits, so overstress is
             // counted per member rather than per group.
-            float stressNormal, stressShear;
-            calcSolverBondStresses(i, totalArea, averageNodeDisp.magnitude(), bondNormal, stressNormal, stressShear);
-            NVBLAST_ASSERT(!std::isnan(stressNormal) && !std::isnan(stressShear));
+            float stressNormal, stressShear, stressBend;
+            calcSolverBondStresses(i, totalArea, averageNodeDisp.magnitude(), bondNormal, stressNormal,
+                                   stressShear, stressBend);
+            NVBLAST_ASSERT(!std::isnan(stressNormal) && !std::isnan(stressShear) && !std::isnan(stressBend));
+            float fibreCompression, fibreTension;
+            fibreStresses(stressNormal, stressBend, fibreCompression, fibreTension);
 
             // store the stress values for all the bonds involved
             for (auto blastBondIndex : blastBondIndices)
@@ -1473,8 +1557,8 @@ private:
                 {
                     const ExtStressMaterial& material = materialForBlastBond(blastBondIndex);
                     BondData& bond = m_bondsData[bondIndex];
-                    if (-stressNormal > material.compressionElasticLimit
-                        || stressNormal > material.tensionElasticLimit
+                    if (fibreCompression > material.compressionElasticLimit
+                        || fibreTension > material.tensionElasticLimit
                         || stressShear > material.shearElasticLimit)
                     {
                         ++m_overstressedBondCount;
@@ -1491,6 +1575,7 @@ private:
 
                     bond.stressNormal = stressNormal;
                     bond.stressShear = stressShear;
+                    bond.stressBend = stressBend;
 
                     // store the normal used to calc stresses so it can be used later to determine forces
                     bond.normal = bondNormal;
@@ -1730,6 +1815,7 @@ private:
             // reset stress, bond structure changed and internal bonds stress won't be updated during updateBondStress()
             bond.stressNormal = 0.0f;
             bond.stressShear = 0.0f;
+            bond.stressBend = 0.0f;
 
             // initialize normal and centroid using blast values
             bond.normal = *(NvVec3*)bonds[bond.blastBondIndex].normal;
@@ -2231,6 +2317,11 @@ public:
             m_nodeMaterials[node] = material < materialCount ? material : 0;
         }
         pushMaterialTables();
+    }
+
+    virtual void                            setDeltaTime(float deltaTime) override
+    {
+        m_deltaTime = deltaTime > 0.0f ? deltaTime : 0.0f;
     }
 
     virtual void                            setNodeStrainRates(const float* strainRates, uint32_t nodeCount, float deltaTime) override
@@ -2958,29 +3049,71 @@ void ExtStressSolverImpl::solve()
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // check if this bond is over stressed in any way and generate a fracture command if it is
+/**
+How fast a bond past its elastic limit loses section, per second of being held
+there, per unit of overstress.
+
+This governs only the SUB-FATAL band: a joint held between its elastic and
+fatal limits loses health * multiplier * this per second, where the multiplier
+is how far into that band it sits. A joint at or past fatal fails immediately
+regardless of this value, because that is a different mechanism (see
+generateStressDamage).
+
+So a joint 20% into the band is gone in 1/(0.2 * rate) seconds. At 0.5 that is
+ten seconds; at the top of the band it is two. That spread is the point --
+something barely overloaded should visibly strain for a while, something badly
+overloaded should go almost at once, and the difference between them is what
+makes a delayed collapse read as a structure losing a fight rather than a timer
+expiring.
+
+Measured on the cantilever ladder at 2.0: a 10 m overhang lets go at 4 s and a
+12 m one at 3 s, both having visibly held first, while a parking deck with one
+whole side of columns cut sags and comes down over roughly twenty seconds. BLAST_DAMAGE_RATE overrides.
+*/
+static float damageRatePerSecond()
+{
+    static const float rate = []() {
+        const char* raw = std::getenv("BLAST_DAMAGE_RATE");
+        if (raw != nullptr)
+        {
+            const float parsed = static_cast<float>(std::atof(raw));
+            if (parsed > 0.0f)
+            {
+                return parsed;
+            }
+        }
+        return 2.0f;
+    }();
+    return rate;
+}
+
 bool ExtStressSolverImpl::generateStressDamage(const NvBlastActor& actor, uint32_t bondIndex, uint32_t node0, uint32_t node1)
 {
     const float bondHealth = m_bondHealths[bondIndex];
     float stressCompression, stressTension, stressShear;
     if (bondHealth > 0.0f && m_graphProcessor->getBondStress(bondIndex, stressCompression, stressTension, stressShear))
     {
-        // compression and tension are mutually exclusive, only one can be positive at a time since they act in opposite directions
+        // Compression and tension are opposite directions of AXIAL load, but a
+        // bending moment produces both at once on opposite faces, so both are
+        // checked. They are combined with max() rather than added: it is one
+        // cross-section failing, and summing would count the same failure twice.
         const ExtStressMaterial& material = materialForBond(bondIndex);
         float stressMultiplier = 0.0f;
+        float axialMultiplier = 0.0f;
         if (stressCompression > material.compressionElasticLimit)
         {
             const float excessStress = stressCompression - material.compressionElasticLimit;
             const float compressionDenom = material.compressionFatalLimit - material.compressionElasticLimit;
-            const float compressionMultiplier = excessStress / (compressionDenom > 0.0f ? compressionDenom : 1.0f);
-            stressMultiplier += compressionMultiplier;
+            axialMultiplier = excessStress / (compressionDenom > 0.0f ? compressionDenom : 1.0f);
         }
-        else if (stressTension > material.tensionElasticLimit)
+        if (stressTension > material.tensionElasticLimit)
         {
             const float excessStress = stressTension - material.tensionElasticLimit;
             const float tensionDenom = material.tensionFatalLimit - material.tensionElasticLimit;
             const float tensionMultiplier = excessStress / (tensionDenom > 0.0f ? tensionDenom : 1.0f);
-            stressMultiplier += tensionMultiplier;
+            axialMultiplier = std::max(axialMultiplier, tensionMultiplier);
         }
+        stressMultiplier += axialMultiplier;
 
         // shear can co-exist with either compression or tension so must be accounted for independently of them
         if (stressShear > material.shearElasticLimit)
@@ -2993,8 +3126,47 @@ bool ExtStressSolverImpl::generateStressDamage(const NvBlastActor& actor, uint32
 
         if (stressMultiplier > 0.0f)
         {
-            // bond health/area is reduced by excess pressure to approximate micro bonds in the material breaking
-            const float bondDamage = bondHealth * stressMultiplier;
+            // Bond health/area is reduced by excess pressure, approximating
+            // micro bonds in the material breaking.
+            //
+            // Two DIFFERENT failure mechanisms live in this one number, and
+            // they are separated here:
+            //
+            //   at or past the fatal limit (multiplier >= 1) the joint is
+            //   overloaded outright and fails now, in this tick, however
+            //   briefly the load was applied. This is what a blast or an
+            //   impact does: microseconds of enormous stress, and the thing
+            //   breaks.
+            //
+            //   between elastic and fatal it does not fail, it DAMAGES, at a
+            //   rate -- losing section for as long as it is held there. This
+            //   is what an overloaded cantilever does: holds, creaks, and lets
+            //   go some seconds later.
+            //
+            // Scaling both by the timestep, as a single rate, cannot serve
+            // both: slow enough for a floor to strain visibly before it goes
+            // is slow enough that a rocket deposits under a percent of a
+            // bond's health in its one tick and nothing breaks at all. Slow
+            // enough for a rocket is a floor that vanishes the instant it is
+            // overloaded. They are separate mechanisms and the model now says
+            // so.
+            //
+            // m_deltaTime of 0 means nobody told us the timestep, which is the
+            // offline case: fall back to per-tick, unchanged.
+            float bondDamage;
+            if (stressMultiplier >= 1.0f)
+            {
+                bondDamage = bondHealth;
+            }
+            else if (m_deltaTime > 0.0f)
+            {
+                bondDamage = bondHealth * std::min(
+                    1.0f, stressMultiplier * m_deltaTime * damageRatePerSecond());
+            }
+            else
+            {
+                bondDamage = bondHealth * stressMultiplier;
+            }
             const NvBlastBondFractureData data = {
                 0,
                 node0,

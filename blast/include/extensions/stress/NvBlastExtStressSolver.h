@@ -332,6 +332,22 @@ public:
     virtual void                            setNodeStrainRates(const float* strainRates, uint32_t nodeCount, float deltaTime) = 0;
 
     /**
+    Set the timestep the next update() advances by, in seconds.
+
+    Bond damage is a RATE. A joint held past its elastic limit loses section
+    over time, so how much it loses depends on how much time passed -- and
+    without this the solver has no clock, so it charged damage per TICK and the
+    same overload ate a bond twice as fast at 120 Hz as at 60 Hz. Ductility was
+    therefore not a property of the material but of the frame rate.
+
+    Leaving this unset (or zero) keeps the legacy per-tick behaviour, which is
+    what offline callers that step once per notional frame want.
+
+    \param[in] deltaTime    Timestep (s), or 0 for per-tick damage.
+    */
+    virtual void                            setDeltaTime(float deltaTime) = 0;
+
+    /**
     Read back per-node accumulated crush damage in [0, 1], indexed by graph
     node index. 1 means the chunk pulverized. Nodes on a material without
     crush enabled always read 0.

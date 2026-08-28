@@ -1071,6 +1071,9 @@ public:
         addGravityFromSnapshot(worldGravity, bodies, bodyCount);
         m_telemetry.gravityMilliseconds += elapsedMilliseconds(phaseStart);
         m_tickDt = dt;
+        // The solver charges bond damage per second of overload, so it needs
+        // to know how long this tick is.
+        ext_stress_solver_set_delta_time(m_solver, dt);
         m_tickPhase = TickPhase::Prepared;
         return true;
     }
@@ -1103,6 +1106,9 @@ public:
         addGravity(worldGravity);
         m_telemetry.gravityMilliseconds += elapsedMilliseconds(phaseStart);
         m_tickDt = dt;
+        // The solver charges bond damage per second of overload, so it needs
+        // to know how long this tick is.
+        ext_stress_solver_set_delta_time(m_solver, dt);
         m_tickPhase = TickPhase::Prepared;
         return true;
     }

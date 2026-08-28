@@ -347,6 +347,11 @@ uint8_t ext_stress_solver_get_island_aware(const ExtStressSolverHandle* handle);
 
 // Enable/disable skipping of settled islands (requires island-aware). islands_skipped reports the
 // number skipped in the last update.
+// Timestep (s) the next update() advances by. Bond damage is a rate, so without
+// this the solver charges damage per tick and ductility becomes a property of
+// the frame rate rather than of the material. 0 keeps the legacy per-tick path.
+void ext_stress_solver_set_delta_time(ExtStressSolverHandle* handle, float delta_time);
+
 void ext_stress_solver_set_skip_settled(ExtStressSolverHandle* handle, uint8_t enabled);
 void ext_stress_solver_set_skip_stable_unconverged(ExtStressSolverHandle* handle, uint8_t enabled);
 uint8_t ext_stress_solver_get_skip_settled(const ExtStressSolverHandle* handle);

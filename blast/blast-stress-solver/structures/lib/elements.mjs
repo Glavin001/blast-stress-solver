@@ -451,3 +451,142 @@ export function slabWithOpening(builder, {
   panel(o.x0, z0 + inset, o.x1, o.z0);                       // in front of it
   panel(o.x0, o.z1, o.x1, z1 - inset);                       // behind it
 }
+
+// ── frames: columns, beams and plates ───────────────────────────────────────
+//
+// Every structure here builds its frame out of raw `box()` calls inside nested
+// loops over hand-computed level arithmetic, and that arithmetic is where the
+// bugs live: a column that stops a millimetre short of the slab above it does
+// not bond, and an unbonded column is a decorative post holding nothing. The
+// failure is silent in the geometry and loud only in the statics.
+//
+// These take the frame as what it is — lines of columns, decks at heights —
+// and derive the extents from one description, so a beam cannot disagree with
+// the column it lands on about where they meet.
+
+/**
+ * Evenly spaced grid lines spanning `[lo, hi]`, inset from each end.
+ *
+ * @param inset  keep lines this far inside the extent, so perimeter columns do
+ *               not stand in the same space as a barrier or facade.
+ */
+export function gridLines(lo, hi, bays, inset = 0) {
+  const clamp = (v) => Math.max(lo + inset, Math.min(hi - inset, v));
+  return Array.from({ length: bays + 1 }, (_, i) => clamp(lo + ((hi - lo) * i) / bays));
+}
+
+/**
+ * A grid of columns from `y0` to `y1`.
+ *
+ * Returns the ids of the pieces it made, so a caller can tie a scenario to
+ * "these columns" without re-deriving where they were put.
+ *
+ * @param xs,zs   column centre lines
+ * @param size    column side length (square section)
+ * @param omit    (x, z, ix, iz) => true to leave a position empty — ramps,
+ *                voids, or a scenario that wants a column already missing
+ */
+export function columnGrid(builder, {
+  type = 'column', material, xs, zs, y0, y1, size, omit = null,
+}) {
+  const half = size / 2;
+  const ids = [];
+  xs.forEach((x, ix) => {
+    zs.forEach((z, iz) => {
+      if (omit && omit(x, z, ix, iz)) return;
+      ids.push(builder.box({
+        type, material,
+        min: [x - half, y0, z - half],
+        max: [x + half, y1, z + half],
+      }));
+    });
+  });
+  return ids;
+}
+
+/**
+ * A flat plate spanning a rectangle, with its TOP at `y`.
+ *
+ * Top-referenced rather than bottom-referenced on purpose: a deck level is the
+ * surface you stand on, and the slab hangs below it. Every structure that got
+ * this backwards ended up with its columns one slab thickness too long.
+ */
+export function floorPlate(builder, {
+  type = 'slab', material, min, max, y, thickness,
+}) {
+  return builder.box({
+    type, material,
+    min: [min[0], y - thickness, min[1]],
+    max: [max[0], y, max[1]],
+  });
+}
+
+/**
+ * Beams running along `axis` over each grid line of the other axis, with their
+ * tops at `y`.
+ *
+ * @param axis    'x' or 'z' — the direction the beams span
+ * @param lines   centre lines on the perpendicular axis
+ * @param from,to span extent along `axis`
+ */
+export function beamsBetween(builder, {
+  type = 'beam', material, axis, lines, from, to, y, depth, width,
+}) {
+  const half = width / 2;
+  return lines.map((line) => builder.box({
+    type, material,
+    min: axis === 'x' ? [from, y - depth, line - half] : [line - half, y - depth, from],
+    max: axis === 'x' ? [to, y, line + half] : [line + half, y, to],
+  }));
+}
+
+/**
+ * A whole post-and-slab frame: footings, ground slab, and `levels` of columns
+ * carrying a deck each.
+ *
+ * This is the parking-garage skeleton — flat plates on a sparse column grid —
+ * which is also the shape every "does it stand when I take the columns out"
+ * question is asked about. Returns the column ids per level so a scenario can
+ * name them.
+ *
+ * Columns run from the deck below to the UNDERSIDE of the deck above, which is
+ * what makes the load path continuous: column bears on slab bears on column.
+ */
+export function frame(builder, {
+  material = 'reinforced-concrete',
+  footingMaterial = 'footing-anchor',
+  xs, zs, levels, storyHeight, columnSize, slabThickness,
+  min, max, footingDepth = 1.0, omit = null,
+}) {
+  const columns = [];
+  const decks = [];
+  const half = columnSize / 2;
+
+  for (const x of xs) {
+    for (const z of zs) {
+      if (omit && omit(x, z)) continue;
+      builder.box({
+        type: 'foundation', material: footingMaterial,
+        min: [x - half - 0.15, -footingDepth, z - half - 0.15],
+        max: [x + half + 0.15, 0, z + half + 0.15],
+        fixed: true, fracture: false,
+      });
+    }
+  }
+  decks.push(floorPlate(builder, {
+    material, min, max, y: slabThickness, thickness: slabThickness,
+  }));
+
+  for (let level = 1; level <= levels; level += 1) {
+    const deckTop = slabThickness + level * storyHeight;
+    columns.push(columnGrid(builder, {
+      material, xs, zs, size: columnSize, omit,
+      y0: slabThickness + (level - 1) * storyHeight,
+      y1: deckTop - slabThickness,
+    }));
+    decks.push(floorPlate(builder, {
+      material, min, max, y: deckTop, thickness: slabThickness,
+    }));
+  }
+  return { columns, decks, topY: slabThickness + levels * storyHeight };
+}

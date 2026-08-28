@@ -26,6 +26,10 @@ import { buildPark432 } from './park-432.mjs';
 import { buildParkingGarage } from './parking-garage.mjs';
 import { buildPetronas } from './petronas.mjs';
 import { buildNeighbourhood, buildSkyline } from './neighbourhood.mjs';
+import {
+  buildRigCantilever, buildRigColumn, buildRigGarage, buildRigPane,
+  buildRigPortal, buildRigToppled, buildRigWall,
+} from './rigs.mjs';
 import { shardHistogram } from './lib/fracture.mjs';
 import { verifyPack } from './verify.mjs';
 import { applyAutoBonds } from './lib/autobond.mjs';
@@ -44,6 +48,15 @@ const STRUCTURES = {
   // All three in one scene, for looking at or playing in.
   neighbourhood: buildNeighbourhood,
   skyline: buildSkyline,
+  // Test rigs: small structures that each answer one structural question, so
+  // a scenario suite can run in minutes instead of hours. See rigs.mjs.
+  'rig-column': buildRigColumn,
+  'rig-portal': buildRigPortal,
+  'rig-cantilever': buildRigCantilever,
+  'rig-garage': buildRigGarage,
+  'rig-pane': buildRigPane,
+  'rig-wall': buildRigWall,
+  'rig-toppled': buildRigToppled,
 };
 
 const argv = process.argv.slice(2);

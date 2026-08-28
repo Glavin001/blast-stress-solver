@@ -1416,6 +1416,16 @@ ext_stress_solver_get_island_aware(const ExtStressSolverHandle* handlePtr)
 }
 
 extern "C" void
+ext_stress_solver_set_delta_time(ExtStressSolverHandle* handlePtr, float delta_time)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setDeltaTime(delta_time);
+    }
+}
+
+extern "C" void
 ext_stress_solver_set_skip_settled(ExtStressSolverHandle* handlePtr, uint8_t enabled)
 {
     auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
