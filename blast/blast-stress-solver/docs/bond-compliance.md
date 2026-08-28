@@ -112,3 +112,37 @@ checked by arithmetic rather than by comparison.
 
 Two of the three non-physical knobs in the system, removed by modelling the
 thing they stand in for.
+
+## Confirmed against the buildings
+
+The structural audit (`destruction/tests/structural_audit.rs`) was run over the
+authored set at 32 iterations. Two buildings never reach equilibrium, and both
+fail the same way:
+
+| building | settles | peak | over yield | worst joint |
+|---|---|---:|---:|---|
+| house-1story | 0.15 s | 0.45 | 0 | — |
+| house-2story | 0.17 s | 0.55 | 0 | — |
+| villa-savoye | 0.30 s | 0.98 | 0 | — |
+| parking-garage | 1.17 s | 1.16 | 1 | column→slab, 0.040 m² |
+| algedra-tower | never | 2.48 | 27 | slab→beam, 0.120 m² |
+| park-432 | never | 2.52 | 53 | slab→slab, 0.067 m² |
+
+Every overloaded joint named is a SMALL one — 0.015 to 0.14 m² — in buildings
+whose hottest joint class averages 0.02 to 0.10. The load is not high; it is
+landing in the wrong places, which is this document's subject.
+
+### The authoring lever was tried, and is not enough
+
+If small joints are the problem, coarser fracture makes bigger ones. Tested on
+the tower by raising concrete cell area 2.5x and the chunk cap 2.3x:
+
+    peak 2.48 -> 2.36,  joints over yield 27 -> 15
+
+An improvement, and nowhere near sufficient — it still never settles, and the
+pack now fails its own monolith check, because chunks that big are no longer a
+fractured building. Reverted.
+
+That is the useful negative result: this cannot be authored around. The two
+failing buildings need the solve to stop handing small joints a full share of
+the load, which is the fix above.
