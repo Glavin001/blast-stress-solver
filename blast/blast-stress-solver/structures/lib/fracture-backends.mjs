@@ -37,14 +37,54 @@
  * share to its neighbours. That is a building slowly failing under its own
  * weight, and no material change fixes it.
  *
+ * ## Measured: a 3D cutter does NOT fix this
+ *
+ * The obvious inference from that table is that the grid is the problem and a
+ * 3D cut, needing no grid, would remove the hairlines. That inference is
+ * wrong, and it is worth writing down so nobody spends a week on it.
+ *
+ * Cutting one 4 x 2.5 x 0.8 m wall into 12 shards, both fracturers, bond areas
+ * measured by NvBlast's own EXACT auto-bonder so neither is scored by its own
+ * arithmetic (experiments/fracture-backends.mjs):
+ *
+ *                          ours (2D+extrude)   three-pinata (3D voronoi)
+ *     seam width p10             4.3 cm                1.0 cm
+ *     seam width median         25.3 cm               16.7 cm
+ *     seams under 5 cm            13%                   33%
+ *     volume recovered           100%                  100%
+ *     vertices per piece         36-60                72-225
+ *
+ * The 3D cutter produces MORE hairlines, not fewer -- which makes sense once
+ * seen: cells in three dimensions have more neighbours than cells in two, and
+ * every extra adjacency is another chance for two of them to meet at almost
+ * nothing. Hairline seams are a property of Voronoi adjacency itself, not of
+ * our grid.
+ *
+ * Both tile the volume exactly, so neither has an interpenetration problem.
+ * But three-pinata's pieces carry 72-225 vertices against a 64-point collider
+ * budget, so they would need hull simplification before they could be used at
+ * all.
+ *
+ * The conclusion that follows: the fix for hairline seams is to handle sliver
+ * CONTACTS explicitly -- merge them into a neighbour, or give a bond a
+ * minimum effective area for stress -- rather than to change fracturer.
+ *
  * ## nvblast-3d (not wired)
  *
- * NvBlast's own `FractureTool` cuts in three dimensions, so one diagram covers
- * a whole piece and every seam is a real bisector — the grid, and with it the
- * hairlines, stops being necessary. It also offers noisy fracture surfaces and
- * cutout fracture, neither of which we can express at all today.
+ * NvBlast's own `FractureTool` cuts in three dimensions. On the evidence above
+ * that will NOT by itself fix the hairlines -- a 3D cut has more adjacencies,
+ * not fewer -- so it should not be sold as the cure for them. What it does
+ * offer that nothing else here does is noisy fracture surfaces and cutout
+ * fracture: shards with rough faces instead of flat planes, which is a real
+ * fidelity gain and the actual reason to want it.
  *
- * The two things that disqualified three-pinata do not apply to it:
+ * Note that one of the two things that disqualified three-pinata no longer
+ * applies to three-pinata either: v2 takes a `seed` and explicit Voronoi
+ * `seedPoints`, and produces byte-identical fragments from the same seed
+ * (verified, not taken from the docs). The determinism objection is history.
+ * What rules it out now is the measurement above, which is a better reason.
+ *
+ * For NvBlast specifically:
  * `voronoiFracturing` accepts explicit cell points, so determinism stays ours;
  * and `bondsFromPrefractured` in EXACT mode gives true contact areas — we
  * already use it to audit this backend's bonds, and it agrees to 0.0% mean
@@ -60,8 +100,10 @@
  *   2. So it needs new C ABI entry points around `FractureTool` /
  *      `VoronoiSitesGenerator`, in the shape of the existing `ext_stress_*`
  *      and `authoring_*` ones.
- *   3. And a WASM rebuild, which needs emscripten — not currently installed on
- *      this machine.
+ *   3. A build. Emscripten is present (/root/emsdk) if a WASM path is wanted,
+ *      but the authoring library is C++ and this pipeline is offline Node, so
+ *      a native binary called as a subprocess -- as the rest-report tool is --
+ *      is the simpler target and needs no emscripten at all.
  *   4. Its chunks are general convex hulls rather than extruded prisms, so the
  *      collider path, the shape library and the interpenetration check all
  *      need to be looked at rather than assumed.
@@ -102,11 +144,13 @@ export function unavailable(name) {
   }
   throw new Error(
     'fracture backend "nvblast-3d" is not wired up yet.\n'
-    + '  NvBlast\'s FractureTool cuts in 3D, which is what removes the hairline\n'
-    + '  seams the 2D backend produces where its grid cells meet. To enable it:\n'
+    + '  What it buys is noisy fracture surfaces and cutout fracture, NOT an end\n'
+    + '  to hairline seams -- a 3D cut measured worse on those, see this file.\n'
+    + '  To enable it:\n'
     + '    1. add C ABI entry points around FractureTool / VoronoiSitesGenerator\n'
     + '       (mirror the existing ext_stress_* and authoring_* exports),\n'
-    + '    2. rebuild the WASM with emscripten (not installed here),\n'
+    + '    2. build it -- native subprocess is simpler than WASM for an offline\n'
+    + '       pipeline, and needs no emscripten,\n'
     + '    3. check colliders, the shape library and the interpenetration test\n'
     + '       against general convex hulls rather than extruded prisms.\n'
     + '  Until then: BLAST_FRACTURE_BACKEND=voronoi-2d (the default).',
