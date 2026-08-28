@@ -203,8 +203,13 @@ static bool kernelProfileEnabled()
 static bool gatherRightMultiplyEnabled()
 {
     static const bool enabled = [] {
+        // Default ON. This was default-off for one commit after the gather
+        // measured SLOWER than the scatter it replaces; that measurement was
+        // real but its cause was the static-node degree walk inside the kernel
+        // (see gatherRightMultiply), not the gather itself. With that removed
+        // the gather wins at load and ties at rest, so it is the path.
         const char* raw = std::getenv("BLAST_GPU_GATHER");
-        return raw != nullptr && std::string(raw) != "0";
+        return raw == nullptr || std::string(raw) != "0";
     }();
     return enabled;
 }
@@ -503,6 +508,20 @@ __global__ void gatherRightMultiply(
 
     Vec4 angular{0.0f, 0.0f, 0.0f, 0.0f};
     Vec4 linear{0.0f, 0.0f, 0.0f, 0.0f};
+
+    // A static node's sum is multiplied by a zero inverse inertia below, so the
+    // whole accumulation is discarded -- and static nodes are exactly the
+    // high-degree ones. The city's terrain is a single node shared by every
+    // building, so ONE thread was walking thousands of scattered bonds while
+    // its warpmates sat idle, to produce a value that is defined to be zero.
+    // Measured: dropping this loop took the kernel from 200 us to 4 us.
+    const Inertia inv = inertia[node];
+    if (inv.angular == 0.0f && inv.linear == 0.0f)
+    {
+        nodes[node].angular = angular;
+        nodes[node].linear = linear;
+        return;
+    }
 
     const std::uint32_t begin = nodeBondBegin[node];
     const std::uint32_t end = nodeBondBegin[node + 1];
