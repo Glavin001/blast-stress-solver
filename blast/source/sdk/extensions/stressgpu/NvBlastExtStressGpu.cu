@@ -52,11 +52,40 @@ const bool s_debug = std::getenv("BLAST_GPU_SKIP_DEBUG") != nullptr;
 /// summation moves. Each node loops over its own incident bonds in a fixed
 /// CSR order and writes its slot once, exclusively. No atomics, and the
 /// per-node sum order is fixed by the topology, so it is reproducible.
+///
+/// MEASURED, AND IT DOES NOT PAY -- DEFAULT OFF. City-scale A/B, one binary,
+/// alternating arms, n=2, in the `stress` bracket (medians, ms):
+///
+///                       at rest        under load (>800 awake)
+///   scatter (atomics)   3.24  3.27     6.87  7.77
+///   gather              3.95  3.56     7.12  7.90
+///
+/// Within-arm spread at rest is 0.03 ms, so +0.5 ms at rest is real, and the
+/// load case is a wash inside its own 0.9 ms spread. The premise -- that the
+/// twelve atomics per bond dominated -- was not supported: at 230k bonds the
+/// atomic traffic spreads across thousands of distinct node addresses and
+/// does not serialize the way a single hot address would.
+///
+/// Why it LOSES at rest: the scatter iterates the compacted ACTIVE BOND list,
+/// which is nearly empty once islands settle, so it costs almost nothing.
+/// The gather iterates active NODES, and a static node is never settled by
+/// design (nodeSettled keeps kNoIsland nodes always live, because they are
+/// boundaries shared by every island), so the gather walks the full adjacency
+/// of every support node every iteration just to find that all of its bonds
+/// are skipped.
+///
+/// Kept, off by default, for two reasons: it is proven correct (the
+/// equivalence harness passes all eight checks, including identical
+/// broken-bond counts on every tick), and it is the only atomics-free
+/// formulation available if the determinism work resumes -- the reproducible
+/// solve needs this half. Turning it on requires first making the active-node
+/// list exclude nodes with no active bonds, which is what would restore the
+/// compaction the scatter gets for free.
 static bool gatherRightMultiplyEnabled()
 {
     static const bool enabled = [] {
         const char* raw = std::getenv("BLAST_GPU_GATHER");
-        return raw == nullptr || std::string(raw) != "0";
+        return raw != nullptr && std::string(raw) != "0";
     }();
     return enabled;
 }
