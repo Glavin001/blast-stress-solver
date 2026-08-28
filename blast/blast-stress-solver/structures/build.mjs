@@ -34,6 +34,7 @@ import {
 import { shardHistogram } from './lib/fracture.mjs';
 import { verifyPack } from './verify.mjs';
 import { applyAutoBonds } from './lib/autobond.mjs';
+import { cullSliverBonds } from './lib/sliver.mjs';
 import { buildShapeLibrary } from './lib/colliders.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -131,6 +132,17 @@ for (const name of selected) {
     console.log(`  autobond  ${ab.remeasured} re-measured (${ab.shrunk} shrunk)  ` +
       `${ab.kept} flush kept  ${ab.dropped} dropped  ${ab.added} added  ` +
       `-> ${s.bonds.length} bonds, ${ab.areaBefore.toFixed(0)} -> ${ab.areaAfter.toFixed(0)} m^2`);
+  }
+
+  // After auto-bonding, because that is when contact areas are final: it
+  // re-measures every one and adds contacts the closed-form pass missed, so
+  // culling before it just gets the slivers put back.
+  const cull = cullSliverBonds(result);
+  if (cull.dropped > 0) {
+    console.log(`  slivers   ${cull.dropped} contacts below `
+      + `${(100 * 0.02).toFixed(0)}% of their smaller chunk's face dropped `
+      + `-> ${cull.kept} bonds`
+      + (cull.rescued > 0 ? `  (${cull.rescued} kept to avoid orphaning a chunk)` : ''));
   }
 
   // After bonding, before verifying: the validators resolve references, so the

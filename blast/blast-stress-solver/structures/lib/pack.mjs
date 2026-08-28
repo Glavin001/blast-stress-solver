@@ -64,6 +64,7 @@ const MAX_POLY_VERTS = Math.floor(MAX_HULL_POINTS / 6);
  * 250 cm^2 Villa Savoye's ribbon walls come loose.
  */
 const MIN_BOND_AREA = 8e-3;
+
 /** Two surfaces this close count as touching (1 mm). */
 const TOUCH_EPS = 1e-3;
 
