@@ -89,7 +89,13 @@ export function buildAlgedra(cfg = {}) {
   // clear of the glazing plane (bx below) so the two never share space.
   const perimeterX = hx - 1.6;
   const perimeterZ = hz - 1.4;
-  const colX = [-perimeterX, -hx * 0.36, 0, hx * 0.36, perimeterX];
+  // Evenly spaced, which the 0.36 factor was not: it put the inner columns at
+  // +/-8.3 m inside a perimeter at +/-21.4 m, so the bays ran 13.1, 8.3, 8.3,
+  // 13.1 m. Plate bending goes as span squared, so the two long bays carried
+  // 2.5x the moment of the short ones and slab-to-slab plus slab-to-beam were
+  // the top two joint classes by time spent overloaded. Halving the perimeter
+  // gives 10.7 m bays throughout and takes a third off the worst moment.
+  const colX = [-perimeterX, -perimeterX / 2, 0, perimeterX / 2, perimeterX];
   const colZ = [-perimeterZ, 0, perimeterZ];
 
   const bw = C.beamWidth / 2;
