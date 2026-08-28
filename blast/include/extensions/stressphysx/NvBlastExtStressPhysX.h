@@ -291,6 +291,15 @@ struct ExtStressPhysXTelemetry
     /// rebuild. Only counted under BLAST_LOOKUP_VALIDATE=1; must be 0.
     uint64_t lookupTableDrifts;
     uint32_t bodyCount;
+    /// Bodies made of exactly ONE node. Such a body has no internal bonds, so
+    /// there is nothing in it that can break: the stress solve cannot produce
+    /// a fracture there, and every contact routed into it is work whose only
+    /// possible outcome is zero. Counted to size that waste before anything
+    /// is built on the assumption.
+    uint32_t singleNodeBodyCount;
+    /// Contacts queued this tick whose target node belongs to a single-node
+    /// body — the directly skippable share of the contact stream.
+    uint32_t singleNodeContacts;
     uint32_t awakeDynamicBodyCount;
     uint32_t overstressedBondCount;
     uint32_t solverIslandCount;

@@ -844,6 +844,7 @@ public:
             return found == m_snapshotByBodyId.end() ? nullptr : found->second;
         };
 
+        uint32_t singleNodeContacts = 0;
         m_contactNodeIndices.clear();
         m_contactLocalPositions.clear();
         m_contactLocalForces.clear();
@@ -865,6 +866,12 @@ public:
                 continue;
             }
             BodyState& body = *node.body;
+            // A single-node body has no internal bonds, so no contact routed
+            // into it can ever produce a fracture. Counted to size that.
+            if (body.nodes.size() == 1)
+            {
+                ++singleNodeContacts;
+            }
             // A body carrying contact load must also carry its weight this
             // tick, even if PhysX has it asleep: the contact pushes its
             // support nodes up, and without the matching gravity pulling the
@@ -924,6 +931,7 @@ public:
                 m_contactLocalForces.end(),
                 {localForce.x, localForce.y, localForce.z});
         }
+        m_telemetry.singleNodeContacts = singleNodeContacts;
         if (!m_contactNodeIndices.empty())
         {
             m_telemetry.contactsProcessed += ext_stress_solver_add_all_forces(
@@ -1346,6 +1354,18 @@ public:
         }
 
         m_telemetry.bodyCount = static_cast<uint32_t>(m_actorBodies.size());
+        // Bodies with no internal bonds: nothing in them can break, so the
+        // contacts routed into them and their share of the solve cannot
+        // change anything. Sized before anything is built on it.
+        uint32_t singleNode = 0;
+        for (const auto& entry : m_actorBodies)
+        {
+            if (entry.second && entry.second->nodes.size() == 1)
+            {
+                ++singleNode;
+            }
+        }
+        m_telemetry.singleNodeBodyCount = singleNode;
         m_tickPhase = TickPhase::Idle;
         return true;
     }
