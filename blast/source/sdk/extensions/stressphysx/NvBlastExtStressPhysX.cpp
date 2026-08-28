@@ -516,6 +516,9 @@ public:
             setBodyKinematic(*body, containsSupport(body->nodes));
             updateMassProperties(*body);
             m_scene.addActor(*body->body);
+            // E3: m_bodyToId is maintained here, at the mutation site, not by
+            // the whole-map rebuild in rebuildLookupTables (see there).
+            m_bodyToId.emplace(body->body, body->bodyId);
             m_actorBodies.emplace(body->actorIndex, std::move(body));
         m_sortedBodiesValid = false;
         }
@@ -3234,6 +3237,9 @@ private:
                     // keep small.
                     m_scene.removeActor(*retiring);
                     m_retiredBodies.push_back(retiring);
+                    // E3: the pointer key leaves the map when the body leaves
+                    // the world — erase BEFORE nulling, while we still have it.
+                    m_bodyToId.erase(retiring);
                     found->second->body = nullptr;
                 }
                 m_actorBodies.erase(found);
@@ -3336,6 +3342,13 @@ private:
         const ParentMotion& parent = parentMotionFound->second;
         std::unique_ptr<BodyState> parentBody = std::move(parentBodyFound->second);
         m_actorBodies.erase(parentBodyFound);
+        // E3: the parent's PxRigidDynamic may be reused by a child below with
+        // a different bodyId, so its stale entry must go now; every child —
+        // reused pointer included — re-registers at the emplace site.
+        if (parentBody && parentBody->body)
+        {
+            m_bodyToId.erase(parentBody->body);
+        }
         m_sortedBodiesValid = false;
 
         std::unordered_set<uint32_t> parentNodes(
@@ -3586,6 +3599,11 @@ private:
 
         for (AssignedChild& child : assigned)
         {
+            // E3: see the create site — mutation-site maintenance of bodyToId.
+            if (child.body->body)
+            {
+                m_bodyToId[child.body->body] = child.body->bodyId;
+            }
             m_actorBodies.emplace(child.body->actorIndex, std::move(child.body));
         m_sortedBodiesValid = false;
         }
@@ -3655,10 +3673,33 @@ private:
             }
         }
 
-        m_bodyToId.clear();
-        for (const auto& actorBody : m_actorBodies)
+        // E3: m_bodyToId is now maintained at its four mutation sites (create,
+        // crush-retire, split-parent erase, split-children emplace), like the
+        // node maps above. The full O(bodies) clear+refill — ~18k hash
+        // emplaces per fracturing tick, each a node allocation, for a churn
+        // of tens — runs only on the non-incremental path, and as a scratch
+        // comparison under BLAST_LOOKUP_VALIDATE so a missed mutation site
+        // announces itself instead of going silently stale.
+        if (!incremental || validate)
         {
-            m_bodyToId.emplace(actorBody.second->body, actorBody.second->bodyId);
+            std::unordered_map<const PxRigidDynamic*, ExtStressPhysXId> bodyToId;
+            for (const auto& actorBody : m_actorBodies)
+            {
+                bodyToId.emplace(actorBody.second->body, actorBody.second->bodyId);
+            }
+            if (validate && incremental && bodyToId != m_bodyToId)
+            {
+                ++m_telemetry.lookupTableDrifts;
+                std::fprintf(
+                    stderr,
+                    "[blast] lookup drift #%llu: bodyToId %zu vs %zu\n",
+                    static_cast<unsigned long long>(m_telemetry.lookupTableDrifts),
+                    m_bodyToId.size(), bodyToId.size());
+            }
+            if (!incremental)
+            {
+                m_bodyToId.swap(bodyToId);
+            }
         }
     }
 
