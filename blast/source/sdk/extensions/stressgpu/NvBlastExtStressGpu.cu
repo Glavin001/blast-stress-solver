@@ -16,6 +16,7 @@
 #include <cstring>
 #include <new>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,124 @@ const bool s_debug = std::getenv("BLAST_GPU_SKIP_DEBUG") != nullptr;
 /// solve needs this half. Turning it on requires first making the active-node
 /// list exclude nodes with no active bonds, which is what would restore the
 /// compaction the scatter gets for free.
+/// Per-kernel timing for the solve, because the external profiler is not
+/// available here: ncu needs GPU performance counters, and the driver refuses
+/// them without a host-level modprobe setting this container cannot change
+/// (ERR_NVGPUCTRPERM). Rather than reason about the kernel mix from source, we
+/// measure it.
+///
+/// BLAST_GPU_KERNEL_PROFILE=1 bypasses the captured graph and launches the
+/// same kernels eagerly with a CUDA event around each, accumulating per-name
+/// totals. Bypassing the graph is itself informative: the difference between
+/// the graph total and the sum of the kernels IS the launch overhead the graph
+/// exists to remove.
+struct KernelProfile
+{
+    static constexpr std::size_t kMaxSlots = 512;
+    struct Slot
+    {
+        const char* name{nullptr};
+        cudaEvent_t start{nullptr};
+        cudaEvent_t stop{nullptr};
+    };
+    std::vector<Slot> slots;
+    std::size_t used{0};
+    std::map<std::string, std::pair<double, std::uint32_t>> totals;
+    bool active{false};
+
+    void ensure()
+    {
+        if (slots.empty())
+        {
+            slots.resize(kMaxSlots);
+            for (Slot& slot : slots)
+            {
+                cudaEventCreate(&slot.start);
+                cudaEventCreate(&slot.stop);
+            }
+        }
+    }
+
+    void begin(const char* name, cudaStream_t stream)
+    {
+        if (!active || used >= kMaxSlots)
+        {
+            return;
+        }
+        ensure();
+        slots[used].name = name;
+        cudaEventRecord(slots[used].start, stream);
+    }
+
+    void end(cudaStream_t stream)
+    {
+        if (!active || used >= kMaxSlots)
+        {
+            return;
+        }
+        cudaEventRecord(slots[used].stop, stream);
+        ++used;
+    }
+
+    /// Drain after a synchronize: event elapsed time is only valid once the
+    /// stream has caught up.
+    void harvest()
+    {
+        for (std::size_t i = 0; i < used; ++i)
+        {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, slots[i].start, slots[i].stop) == cudaSuccess)
+            {
+                auto& entry = totals[slots[i].name];
+                entry.first += static_cast<double>(ms);
+                entry.second += 1;
+            }
+        }
+        used = 0;
+    }
+
+    void dump(const char* label, std::uint32_t solves) const
+    {
+        double grand = 0.0;
+        for (const auto& entry : totals)
+        {
+            grand += entry.second.first;
+        }
+        std::fprintf(stderr, "\n=== kernel profile (%s), %u solves ===\n", label, solves);
+        std::fprintf(
+            stderr, "%-34s %10s %9s %10s %7s\n",
+            "kernel", "ms/solve", "launches", "us/launch", "share");
+        std::vector<std::pair<std::string, std::pair<double, std::uint32_t>>> rows(
+            totals.begin(), totals.end());
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+            return a.second.first > b.second.first;
+        });
+        for (const auto& row : rows)
+        {
+            const double msPerSolve = row.second.first / std::max(1u, solves);
+            const double launchesPerSolve =
+                static_cast<double>(row.second.second) / std::max(1u, solves);
+            std::fprintf(
+                stderr, "%-34s %10.4f %9.1f %10.2f %6.1f%%\n",
+                row.first.c_str(), msPerSolve, launchesPerSolve,
+                row.second.first * 1000.0 / std::max(1u, row.second.second),
+                100.0 * row.second.first / std::max(grand, 1e-9));
+        }
+        std::fprintf(
+            stderr, "%-34s %10.4f\n", "TOTAL (sum of kernels)",
+            grand / std::max(1u, solves));
+    }
+};
+
+static bool kernelProfileEnabled()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_GPU_KERNEL_PROFILE");
+        return raw != nullptr && std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
 static bool gatherRightMultiplyEnabled()
 {
     static const bool enabled = [] {
@@ -633,26 +752,79 @@ __global__ void checkConvergencePerIsland(
 }
 
 /// Roll the per-island flags up into the single status the host reads.
+/// Zero the active counter before the parallel tally below accumulates into it.
+///
+/// Split from the tally so the tally can be a grid-wide reduction: a kernel
+/// that both clears and accumulates a shared counter would race itself across
+/// blocks.
+__global__ void resetActiveCount(SolveStatus* status)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+    {
+        status->active = 0;
+    }
+}
+
+/// Count active islands in parallel and latch convergence.
+///
+/// MEASURED, and this was the single biggest cost in the whole solve. The
+/// previous version ran <<<1,1>>> -- one thread walking every island, every
+/// iteration. Per-kernel event timing at city scale (24k nodes, 34k bonds,
+/// 2000 islands, 32 iterations):
+///
+///   summarizeIslands            0.7932 ms/solve   24.79 us/launch   34.8%
+///   couplingRightMultiply       0.3846 ms/solve   11.66 us/launch   16.9%
+///   accumulateSquaredByIsland   0.2506 ms/solve    3.86 us/launch   11.0%
+///   ...every other kernel        2.8-4.2 us/launch
+///
+/// 2000 serial iterations on one CUDA core is ~24 us, which is exactly what
+/// it measured -- real serial work, not launch overhead, and it stalled the
+/// pipeline between the two halves of every CG iteration. One thread was
+/// doing what 16,384 could.
+///
+/// Block-level reduction in shared memory, then one integer atomicAdd per
+/// block. Integer atomics are exact and order-independent, so the result is
+/// identical to the serial sum, not merely close -- the same count, every
+/// run.
 __global__ void summarizeIslands(
     SolveStatus* status,
     const std::uint32_t* islandActive,
     std::uint32_t islandCount,
     std::uint32_t iteration)
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0)
+    __shared__ std::uint32_t partial[kBlockSize];
+    const std::uint32_t tid = threadIdx.x;
+    const std::uint32_t index = blockIdx.x * blockDim.x + tid;
+    partial[tid] = (index < islandCount && islandActive[index] != 0u) ? 1u : 0u;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
     {
-        return;
+        if (tid < stride)
+        {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
     }
-    std::uint32_t active = 0;
-    for (std::uint32_t i = 0; i < islandCount; ++i)
+    if (tid == 0 && partial[0] != 0u)
     {
-        active += islandActive[i] ? 1u : 0u;
+        atomicAdd(&status->active, partial[0]);
     }
-    status->active = active;
-    if (active == 0 && !status->converged)
+}
+
+/// Latch convergence once the tally above is complete.
+///
+/// Separate launch because the decision needs the FINAL count, and a block
+/// cannot know whether it was the last to contribute without another
+/// synchronisation. One thread is correct here: the work is O(1).
+__global__ void latchConvergence(SolveStatus* status, std::uint32_t iteration)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0)
     {
-        status->converged = 1;
-        status->iterations = iteration;
+        if (status->active == 0 && !status->converged)
+        {
+            status->converged = 1;
+            status->iterations = iteration;
+        }
     }
 }
 
@@ -1099,6 +1271,10 @@ uploadIslands();
 
     void release() override
     {
+        if (m_kernelProfile.active && m_profiledSolves > 0)
+        {
+            m_kernelProfile.dump("eager launches, no CUDA graph", m_profiledSolves);
+        }
         delete this;
     }
 
@@ -1703,6 +1879,12 @@ private:
 
     void finishSolve()
     {
+        if (m_kernelProfile.active)
+        {
+            // Elapsed time is only readable once the stream has caught up,
+            // and finishSolve is where the caller has already synchronized.
+            m_kernelProfile.harvest();
+        }
         checkCuda(cudaGetLastError(), "execute stress kernels");
         checkCuda(
             cudaEventElapsedTime(
@@ -2544,6 +2726,7 @@ uploadIslands();
         checkCuda(
             cudaMemsetAsync(result, 0, sizeof(float) * m_islandCount, m_stream),
             "clear per-island reduction");
+        m_kernelProfile.begin("accumulateSquaredByIsland", m_stream);
         accumulateSquaredByIsland<<<
             (launchCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
@@ -2556,6 +2739,7 @@ uploadIslands();
             activeList,
             m_activeCounts,
             whichCount);
+        m_kernelProfile.end(m_stream);
     }
 
     void rightMultiply(const AngLin* bonds, AngLin* nodes, const std::uint32_t* islandSkip)
@@ -2566,6 +2750,7 @@ uploadIslands();
             // either: the inverse-inertia scale is folded into the write. Two
             // graph nodes become one, and twelve global float atomics per
             // bond become zero.
+            m_kernelProfile.begin("gatherRightMultiply", m_stream);
             gatherRightMultiply<<<
                 (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
@@ -2583,6 +2768,7 @@ uploadIslands();
                 m_inertia,
                 m_activeNodes,
                 m_activeCounts);
+            m_kernelProfile.end(m_stream);
             return;
         }
         checkCuda(
@@ -2592,6 +2778,7 @@ uploadIslands();
                 sizeof(AngLin) * m_nodeCount,
                 m_stream),
             "clear node product");
+        m_kernelProfile.begin("couplingRightMultiply", m_stream);
         couplingRightMultiply<<<
             (m_graphBondCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
@@ -2608,6 +2795,8 @@ uploadIslands();
             islandSkip,
             m_activeBonds,
             m_activeCounts);
+        m_kernelProfile.end(m_stream);
+        m_kernelProfile.begin("scaleNodes", m_stream);
         scaleNodes<<<
             (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
@@ -2617,6 +2806,7 @@ uploadIslands();
             m_inertia,
             m_activeNodes,
             m_activeCounts);
+        m_kernelProfile.end(m_stream);
     }
 
     void launchSolve(const ExtStressGpuSolveParams& params)
@@ -2637,6 +2827,7 @@ uploadIslands();
         const std::uint32_t* islandSkip =
             (params.skipSettledIslands && warmStart) ? m_islandSkip : nullptr;
 
+        m_kernelProfile.begin("initializeSolve", m_stream);
         initializeSolve<<<
             (maxCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
@@ -2657,15 +2848,18 @@ uploadIslands();
             reciprocalLinearImpulseScale,
             reciprocalAngularImpulseScale,
             warmStart);
+        m_kernelProfile.end(m_stream);
         if (warmStart)
         {
             rightMultiply(m_impulses, m_projectedDirection, islandSkip);
+            m_kernelProfile.begin("subtractResidual", m_stream);
             subtractResidual<<<
                 (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
                 0,
                 m_stream>>>(
                 m_residual, m_projectedDirection, m_activeNodes, m_activeCounts);
+            m_kernelProfile.end(m_stream);
         }
 
         // Tolerance is relative to each island's own load, not the whole
@@ -2674,6 +2868,7 @@ uploadIslands();
         reduceByIsland(
             m_rhs, m_nodeIsland, islandSkip, m_activeNodes, 1u, m_graphNodeCap,
             m_gradientSquared);
+        m_kernelProfile.begin("setTolerancePerIsland", m_stream);
         setTolerancePerIsland<<<
             (m_islandCount + kBlockSize - 1) / kBlockSize,
             kBlockSize,
@@ -2686,10 +2881,14 @@ uploadIslands();
             m_gradientSquared,
             params.tolerance,
             m_islandCount);
+        m_kernelProfile.end(m_stream);
+        m_kernelProfile.begin("initializeStatus", m_stream);
         initializeStatus<<<1, 1, 0, m_stream>>>(m_status, params.maxIterations);
+        m_kernelProfile.end(m_stream);
 
         for (std::uint32_t iteration = 0; iteration < params.maxIterations; ++iteration)
         {
+            m_kernelProfile.begin("couplingLeftMultiply", m_stream);
             couplingLeftMultiply<<<
                 (m_graphBondCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
@@ -2707,22 +2906,34 @@ uploadIslands();
                 islandSkip,
                 m_activeBonds,
                 m_activeCounts);
+            m_kernelProfile.end(m_stream);
             const std::uint32_t islandBlocks =
                 (m_islandCount + kBlockSize - 1) / kBlockSize;
             reduceByIsland(
                 m_gradient, m_bondIsland, islandSkip, m_activeBonds, 0u,
                 m_graphBondCap, m_gradientSquared);
+            m_kernelProfile.begin("checkConvergencePerIsland", m_stream);
             checkConvergencePerIsland<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_islandActive,
                 m_islandConverged,
                 m_gradientSquared,
                 m_deltaSquared,
                 m_islandCount);
-            summarizeIslands<<<1, 1, 0, m_stream>>>(
+            m_kernelProfile.end(m_stream);
+            m_kernelProfile.begin("resetActiveCount", m_stream);
+            resetActiveCount<<<1, 1, 0, m_stream>>>(m_status);
+            m_kernelProfile.end(m_stream);
+            m_kernelProfile.begin("summarizeIslands", m_stream);
+            summarizeIslands<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_status,
                 m_islandActive,
                 m_islandCount,
                 iteration);
+            m_kernelProfile.end(m_stream);
+            m_kernelProfile.begin("latchConvergence", m_stream);
+            latchConvergence<<<1, 1, 0, m_stream>>>(m_status, iteration);
+            m_kernelProfile.end(m_stream);
+            m_kernelProfile.begin("updateDirectionPerIsland", m_stream);
             updateDirectionPerIsland<<<
                 (m_graphBondCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
@@ -2737,11 +2948,14 @@ uploadIslands();
                 m_activeBonds,
                 m_activeCounts,
                 iteration);
+            m_kernelProfile.end(m_stream);
+            m_kernelProfile.begin("saveGradientSquaredPerIsland", m_stream);
             saveGradientSquaredPerIsland<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_previousGradientSquared,
                 m_gradientSquared,
                 m_islandActive,
                 m_islandCount);
+            m_kernelProfile.end(m_stream);
 
             rightMultiply(m_direction, m_projectedDirection, islandSkip);
             reduceByIsland(
@@ -2752,10 +2966,13 @@ uploadIslands();
                 1u,
                 m_graphNodeCap,
                 m_projectedDirectionSquared);
+            m_kernelProfile.begin("retireDegenerateIslands", m_stream);
             retireDegenerateIslands<<<islandBlocks, kBlockSize, 0, m_stream>>>(
                 m_islandActive,
                 m_projectedDirectionSquared,
                 m_islandCount);
+            m_kernelProfile.end(m_stream);
+            m_kernelProfile.begin("updateSolutionAndResidualPerIsland", m_stream);
             updateSolutionAndResidualPerIsland<<<
                 (maxCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
@@ -2773,10 +2990,12 @@ uploadIslands();
                 m_activeBonds,
                 m_activeNodes,
                 m_activeCounts);
+            m_kernelProfile.end(m_stream);
         }
 
         const float linearScale = m_lengthScale * m_massScale;
         const float angularScale = m_lengthScale * linearScale;
+        m_kernelProfile.begin("unscaleImpulses", m_stream);
         unscaleImpulses<<<
             (m_graphBondCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
@@ -2789,6 +3008,7 @@ uploadIslands();
             m_activeCounts,
             linearScale,
             angularScale);
+        m_kernelProfile.end(m_stream);
         checkCuda(
             cudaMemsetAsync(
                 m_brokenCount,
@@ -2804,6 +3024,7 @@ uploadIslands();
         // not the island was skipped.
         if (params.applyDamage)
         {
+            m_kernelProfile.begin("applyStressDamage", m_stream);
             applyStressDamage<<<
                 (m_bondCount + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
@@ -2820,6 +3041,7 @@ uploadIslands();
                 m_brokenBonds,
                 m_brokenCount,
                 m_bondCount);
+            m_kernelProfile.end(m_stream);
         }
     }
 
@@ -2868,6 +3090,22 @@ uploadIslands();
     void executeSolve(const ExtStressGpuSolveParams& params)
     {
         const bool warmStart = params.warmStart && m_hasWarmStart;
+        if (kernelProfileEnabled())
+        {
+            // Eager launches, one event pair per kernel. The graph is bypassed
+            // on purpose: comparing this total against the graph-replay total
+            // prices the launch overhead the graph removes, which is the one
+            // number source-reading cannot supply.
+            m_kernelProfile.active = true;
+            // The launch caps are normally computed in the capture branch
+            // below; the eager path skips it, so they must be set here or
+            // every grid is sized from a stale (or zero) cap.
+            m_graphBondCap = launchCapacity(m_activeBondCount, m_bondCount);
+            m_graphNodeCap = launchCapacity(m_activeNodeCount, m_nodeCount);
+            launchSolve(params);
+            ++m_profiledSolves;
+            return;
+        }
         if (!graphMatches(params, warmStart))
         {
             m_graphBondCap = launchCapacity(m_activeBondCount, m_bondCount);
@@ -2952,6 +3190,8 @@ uploadIslands();
     /// This frame's decision, one entry per island, uploaded before the graph
     /// runs. 1 = settled, do not touch.
     std::uint32_t* m_islandSkip{nullptr};
+    KernelProfile m_kernelProfile;
+    std::uint32_t m_profiledSolves{0};
     std::uint32_t* m_nodeBondBegin{nullptr};
     std::uint32_t* m_nodeBondRef{nullptr};
     std::uint32_t* m_bondIsland{nullptr};
