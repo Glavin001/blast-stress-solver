@@ -49,6 +49,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #define USE_SCALAR_IMPL 0
 #define WARM_START 1
@@ -726,6 +727,14 @@ public:
         return m_overstressedBondCount;
     }
 
+    /// E1: may this node's adjacency contain an overstressed bond? TRUE when
+    /// the mask is missing (pre-first-update), so callers degrade to the full
+    /// walk rather than silently skipping real work.
+    bool isNodeOverstressed(uint32_t node) const
+    {
+        return node >= m_nodeOverstressed.size() || m_nodeOverstressed[node] != 0;
+    }
+
     // Number of connected components (islands) in the solver graph, computed in
     // sync() on topology change. Static (mass<=0) nodes are cut points.
     uint32_t getIslandCount() const
@@ -1370,6 +1379,13 @@ private:
     void updateBondStress(const float* bondHealth, const NvBlastBond* bonds)
     {
         m_overstressedBondCount = 0;
+        // E1: reset alongside the count so mask and count always describe the
+        // same update. resize is a no-op after the first call.
+        m_nodeOverstressed.resize(m_nodesData.size());
+        if (!m_nodeOverstressed.empty())
+        {
+            memset(m_nodeOverstressed.begin(), 0, m_nodeOverstressed.size());
+        }
 
         // Reuse a persistent scratch buffer instead of allocating one every solve.
         // NsArray::clear() keeps capacity, so reserve() only allocates on the first call
@@ -1456,13 +1472,19 @@ private:
                 if (!isInvalidIndex(bondIndex) && bondHealth[blastBondIndex] > 0.0f)
                 {
                     const ExtStressMaterial& material = materialForBlastBond(blastBondIndex);
+                    BondData& bond = m_bondsData[bondIndex];
                     if (-stressNormal > material.compressionElasticLimit
                         || stressNormal > material.tensionElasticLimit
                         || stressShear > material.shearElasticLimit)
                     {
                         ++m_overstressedBondCount;
+                        // E1: exactly the condition generateStressDamage keys
+                        // its command on, evaluated on the same stored floats
+                        // — so the mask is neither wider nor narrower than
+                        // the set of bonds that will produce commands.
+                        m_nodeOverstressed[bond.node0] = 1;
+                        m_nodeOverstressed[bond.node1] = 1;
                     }
-                    BondData& bond = m_bondsData[bondIndex];
 
                     NVBLAST_ASSERT(getNodeData(bond.node0).solverNode != getNodeData(bond.node1).solverNode);
                     NVBLAST_ASSERT(bond.blastBondIndex == blastBondIndex);
@@ -1825,6 +1847,14 @@ private:
     bool                                m_bondsDirty;
 
     uint32_t                            m_overstressedBondCount;
+
+    /// E1: nodes incident to at least one overstressed bond, refreshed beside
+    /// m_overstressedBondCount in updateBondStress. Lets fracture-command
+    /// generation visit only the neighborhoods that can produce a command
+    /// instead of walking every bond of every actor (~230k visits to find
+    /// ~200 overstressed). Indexed by asset-graph node id — the same space
+    /// fillFractureCommands walks (addBond() is fed m_graph node indices).
+    Array<uint8_t>::type                m_nodeOverstressed;
 
     // Island partitioning (connected components of the solver graph)
     Array<uint32_t>::type               m_islandParent;
@@ -2997,11 +3027,22 @@ void ExtStressSolverImpl::fillFractureCommands(const NvBlastActor& actor, NvBlas
         uint32_t* graphNodeIndices = getScratchArray<uint32_t>(graphNodeCount);
         const uint32_t nodeCount = NvBlastActorGetGraphNodeIndices(graphNodeIndices, graphNodeCount, &actor, logLL);
 
+        // E1: only nodes flagged during the stress readback can have an
+        // overstressed incident bond, and generateStressDamage is pure for
+        // every other bond — it mutates nothing unless a limit is exceeded —
+        // so skipping unflagged nodes preserves every command, every value,
+        // and the exact emission order. Walk order itself is unchanged.
+        // BLAST_FRACTURE_NODE_SKIP=0 restores the full walk.
+        static const bool nodeSkip = [] {
+            const char* raw = std::getenv("BLAST_FRACTURE_NODE_SKIP");
+            return raw == nullptr || std::string(raw) != "0";
+        }();
         for (uint32_t i = 0; i < nodeCount; ++i)
         {
             const uint32_t node0 = graphNodeIndices[i];
 
-            if (anyBondWork)
+            if (anyBondWork
+                && (!nodeSkip || m_graphProcessor->isNodeOverstressed(node0)))
             {
                 for (uint32_t adjacencyIndex = m_graph.adjacencyPartition[node0]; adjacencyIndex < m_graph.adjacencyPartition[node0 + 1]; adjacencyIndex++)
                 {
