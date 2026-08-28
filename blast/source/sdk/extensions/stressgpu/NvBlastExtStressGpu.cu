@@ -381,6 +381,7 @@ __global__ void initializeSolve(
     float reciprocalLengthScale,
     float reciprocalLinearImpulseScale,
     float reciprocalAngularImpulseScale,
+    const float* colScale,
     bool warmStart)
 {
     // Threads walk the compacted active lists, not the raw arrays: a settled
@@ -421,10 +422,12 @@ __global__ void initializeSolve(
         {
         if (warmStart)
         {
+            // Solver variable is J' = J / colScale; storage stays physical.
+            const float recipCol = 1.0f / colScale[index];
             impulses[index].angular =
-                mul(impulses[index].angular, reciprocalAngularImpulseScale);
+                mul(impulses[index].angular, reciprocalAngularImpulseScale * recipCol);
             impulses[index].linear =
-                mul(impulses[index].linear, reciprocalLinearImpulseScale);
+                mul(impulses[index].linear, reciprocalLinearImpulseScale * recipCol);
         }
         else
         {
@@ -442,6 +445,7 @@ __global__ void couplingRightMultiply(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     const std::uint32_t* activeBonds,
@@ -466,7 +470,13 @@ __global__ void couplingRightMultiply(
         return;
     }
 
-    const AngLin impulse = bonds[bond];
+    // Column scale: the operator is C*S, one multiply per bond.
+    AngLin impulse = bonds[bond];
+    {
+        const float s_j = colScale[bond];
+        impulse.angular = mul(impulse.angular, s_j);
+        impulse.linear = mul(impulse.linear, s_j);
+    }
     const Vec4 node0Angular = sub(impulse.angular, cross(offset0[bond], impulse.linear));
     const Vec4 node1Angular = sub(cross(offset1[bond], impulse.linear), impulse.angular);
     atomicAddVec(nodes[node0[bond]].angular, node0Angular);
@@ -494,6 +504,7 @@ __global__ void gatherRightMultiply(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     const Inertia* inertia,
@@ -539,7 +550,12 @@ __global__ void gatherRightMultiply(
         {
             continue;
         }
-        const AngLin impulse = bonds[bond];
+        AngLin impulse = bonds[bond];
+        {
+            const float s_j = colScale[bond];
+            impulse.angular = mul(impulse.angular, s_j);
+            impulse.linear = mul(impulse.linear, s_j);
+        }
         if (!isSecond)
         {
             angular = add(angular, sub(impulse.angular, cross(offset0[bond], impulse.linear)));
@@ -600,6 +616,7 @@ __global__ void couplingLeftMultiply(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     const std::uint32_t* activeBonds,
@@ -635,6 +652,12 @@ __global__ void couplingLeftMultiply(
     result.linear = add(
         sub(x0.linear, x1.linear),
         sub(cross(offset0[bond], x0.angular), cross(offset1[bond], x1.angular)));
+    // Transpose of the column scale: y = S * C^T * (...).
+    {
+        const float s_j = colScale[bond];
+        result.angular = mul(result.angular, s_j);
+        result.linear = mul(result.linear, s_j);
+    }
     bonds[bond] = result;
 }
 
@@ -1061,6 +1084,7 @@ __global__ void unscaleImpulses(
     const std::uint32_t* islandSkip,
     const std::uint32_t* activeBonds,
     const std::uint32_t* activeCounts,
+    const float* colScale,
     float linearScale,
     float angularScale)
 {
@@ -1072,8 +1096,10 @@ __global__ void unscaleImpulses(
     const std::uint32_t index = activeBonds[slot];
     if (!bondSettled(islandSkip, bondIsland[index]))
     {
-        impulses[index].angular = mul(impulses[index].angular, angularScale);
-        impulses[index].linear = mul(impulses[index].linear, linearScale);
+        // Back to physical: J = colScale * J'.
+        const float s_j = colScale[index];
+        impulses[index].angular = mul(impulses[index].angular, angularScale * s_j);
+        impulses[index].linear = mul(impulses[index].linear, linearScale * s_j);
     }
 }
 
@@ -1349,6 +1375,7 @@ uploadIslands();
         cudaFree(m_brokenCount);
         cudaFree(m_brokenBonds);
         cudaFree(m_health);
+        cudaFree(m_colScales);
         cudaFree(m_nodeDistances);
         cudaFree(m_materials);
         cudaFree(m_bondMaterials);
@@ -2282,6 +2309,7 @@ uploadIslands();
         m_hostInertia.resize(m_nodeCount);
         m_hostNormals.resize(m_bondCount);
         m_hostAreas.resize(m_bondCount);
+        m_hostColScale.resize(m_bondCount);
         m_hostNodeDistances.resize(m_bondCount);
         m_hostHealth.resize(m_bondCount);
         m_hostBondMaterials.resize(m_bondCount);
@@ -2348,6 +2376,7 @@ uploadIslands();
             }
             m_hostNormals[i] = normal;
             m_hostAreas[i] = bonds[i].area > 0.0f ? bonds[i].area : 1.0f;
+            m_hostColScale[i] = bonds[i].colScale > 0.0f ? bonds[i].colScale : 1.0f;
             m_hostNodeDistances[i] = distance > 1.0e-6f ? distance : 1.0f;
             m_hostHealth[i] = std::max(0.0f, bonds[i].health);
             m_hostBondMaterials[i] =
@@ -2428,6 +2457,7 @@ uploadIslands();
         allocateDevice(m_inertia, m_nodeCount, "allocate inertia");
         allocateDevice(m_normals, m_bondCount, "allocate normals");
         allocateDevice(m_areas, m_bondCount, "allocate areas");
+        allocateDevice(m_colScales, m_bondCount, "allocate compliance weights");
         allocateDevice(m_bondMaterials, m_bondCount, "allocate bond materials");
         allocateDevice(m_materials, m_materialCount, "allocate material table");
         allocateDevice(m_nodeDistances, m_bondCount, "allocate node distances");
@@ -2824,6 +2854,13 @@ uploadIslands();
             "upload areas");
         checkCuda(
             cudaMemcpy(
+                m_colScales,
+                m_hostColScale.data(),
+                sizeof(float) * m_bondCount,
+                cudaMemcpyHostToDevice),
+            "upload compliance weights");
+        checkCuda(
+            cudaMemcpy(
                 m_nodeDistances,
                 m_hostNodeDistances.data(),
                 sizeof(float) * m_bondCount,
@@ -2905,6 +2942,7 @@ uploadIslands();
                 m_offset0,
                 m_offset1,
                 m_health,
+                m_colScales,
                 m_bondIsland,
                 islandSkip,
                 m_inertia,
@@ -2933,6 +2971,7 @@ uploadIslands();
             m_offset0,
             m_offset1,
             m_health,
+            m_colScales,
             m_bondIsland,
             islandSkip,
             m_activeBonds,
@@ -2989,6 +3028,7 @@ uploadIslands();
             reciprocalLengthScale,
             reciprocalLinearImpulseScale,
             reciprocalAngularImpulseScale,
+            m_colScales,
             warmStart);
         m_kernelProfile.end(m_stream);
         if (warmStart)
@@ -3044,6 +3084,7 @@ uploadIslands();
                 m_offset0,
                 m_offset1,
                 m_health,
+                m_colScales,
                 m_bondIsland,
                 islandSkip,
                 m_activeBonds,
@@ -3135,6 +3176,7 @@ uploadIslands();
             islandSkip,
             m_activeBonds,
             m_activeCounts,
+            m_colScales,
             linearScale,
             angularScale);
         m_kernelProfile.end(m_stream);
@@ -3280,6 +3322,7 @@ uploadIslands();
     std::vector<Inertia> m_hostInertia;
     std::vector<Vec4> m_hostNormals;
     std::vector<float> m_hostAreas;
+    std::vector<float> m_hostColScale;
     std::vector<float> m_hostNodeDistances;
     std::vector<float> m_hostHealth;
     std::vector<std::uint32_t> m_hostBondMaterials;
@@ -3292,6 +3335,8 @@ uploadIslands();
     Inertia* m_inertia{nullptr};
     Vec4* m_normals{nullptr};
     float* m_areas{nullptr};
+    // Per-bond compliance weight, uploaded verbatim from the CPU processor.
+    float* m_colScales{nullptr};
     float* m_nodeDistances{nullptr};
     float* m_health{nullptr};
     std::uint32_t* m_bondMaterials{nullptr};

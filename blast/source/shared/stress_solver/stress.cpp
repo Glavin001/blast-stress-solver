@@ -77,6 +77,20 @@ StressProcessor::s_use_simd =
  * StressProcessor methods
  */
 
+bool
+StressProcessor::complianceWeightingEnabled()
+{
+    // Weight the solve toward the minimum-elastic-energy force distribution
+    // (see BondMatrix::colScale). On by default because it is the physically
+    // correct tie-break for an underdetermined structure; =0 restores the
+    // legacy minimum-norm behaviour for A/B.
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_AREA_COMPLIANCE");
+        return raw == nullptr || raw[0] != '0';
+    }();
+    return enabled;
+}
+
 void
 StressProcessor::prepare(const SolverNodeS* nodes, uint32_t N_nodes, const SolverBond* bonds, uint32_t N_bonds, const DataParams& params)
 {
@@ -202,8 +216,54 @@ StressProcessor::prepare(const SolverNodeS* nodes, uint32_t N_nodes, const Solve
         }
     }
 
-    // Create sparse matrix representation for B = (I^-1/2)*C
-    m_B.set(m_couplings.data(), m_recip_sqrt_I.data(), m_B_scratch.data(), N_nodes, N_bonds);
+    // Per-bond compliance weights: sqrt((E/E_ref) * A / L), geometric-mean
+    // normalised so the average column keeps unit scale (pure conditioning;
+    // a global factor does not change the minimiser).
+    //
+    // A is the bond's authored contact area, L the distance between the two
+    // chunks' centres of mass, E the joint material's Young's modulus with
+    // 30 GPa (concrete) as the reference and the fallback for materials that
+    // do not author one. Floors guard degenerate geometry, not physics: a
+    // zero-length bond is two coincident centroids, not a stiff joint.
+    if (complianceWeightingEnabled() && N_bonds > 0)
+    {
+        constexpr float E_REF = 30.0e9f;
+        constexpr float MIN_LENGTH = 0.05f;
+        constexpr float MIN_AREA = 1.0e-4f;
+        m_colScale.resize(N_bonds);
+        m_recipColScale.resize(N_bonds);
+        m_colScratch.resize(N_bonds);
+        double logSum = 0.0;
+        for (uint32_t i = 0; i < N_bonds; ++i)
+        {
+            const SolverBond& bond = bonds[i];
+            const NvcVec3 d = nodes[bond.nodes[0]].CoM - nodes[bond.nodes[1]].CoM;
+            const float length = std::max(std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z), MIN_LENGTH);
+            const float area = std::max(bond.area, MIN_AREA);
+            const float modulus = bond.modulus > 0.0f ? bond.modulus : E_REF;
+            const float weight = std::sqrt((modulus / E_REF) * area / length);
+            m_colScale[i] = weight;
+            logSum += std::log(weight);
+        }
+        const float mean = std::exp(float(logSum / N_bonds));
+        const float recipMean = mean > 0.0f ? 1.0f / mean : 1.0f;
+        for (uint32_t i = 0; i < N_bonds; ++i)
+        {
+            m_colScale[i] *= recipMean;
+            m_recipColScale[i] = 1.0f / m_colScale[i];
+        }
+    }
+    else
+    {
+        m_colScale.resize(0);
+        m_recipColScale.resize(0);
+        m_colScratch.resize(0);
+    }
+
+    // Create sparse matrix representation for B = (I^-1/2)*C*S
+    m_B.set(m_couplings.data(), m_recip_sqrt_I.data(), m_B_scratch.data(), N_nodes, N_bonds,
+            m_colScale.size() ? m_colScale.data() : nullptr,
+            m_colScratch.size() ? m_colScratch.data() : nullptr);
 }
 
 
@@ -233,10 +293,13 @@ StressProcessor::solve(AngLin6* impulses, const AngLin6* velocities, const Solve
         const float recip_mass_scale = 1.0f/m_mass_scale;
         const float recip_linear_impulse_scale = recip_length_scale*recip_mass_scale;
         const float recip_angular_impulse_scale = recip_length_scale*recip_linear_impulse_scale;
+        const bool colScaled = m_recipColScale.size() == N_bonds;
         for (uint32_t j = 0; j < N_bonds; ++j)
         {
-            impulses[j].ang *= recip_angular_impulse_scale;
-            impulses[j].lin *= recip_linear_impulse_scale;
+            // Solver variable is J' = S^-1 * J; storage stays physical J.
+            const float recip_col = colScaled ? m_recipColScale[j] : 1.0f;
+            impulses[j].ang *= recip_angular_impulse_scale * recip_col;
+            impulses[j].lin *= recip_linear_impulse_scale * recip_col;
         }
     }
 
@@ -272,10 +335,13 @@ StressProcessor::solve(AngLin6* impulses, const AngLin6* velocities, const Solve
     // Undo length and mass scaling
     const float linear_impulse_scale = m_length_scale*m_mass_scale;
     const float angular_impulse_scale = m_length_scale*linear_impulse_scale;
+    const bool colScaledOut = m_colScale.size() == N_bonds;
     for (uint32_t j = 0; j < N_bonds; ++j)
     {
-        impulses[j].ang *= angular_impulse_scale;
-        impulses[j].lin *= linear_impulse_scale;
+        // Back to physical: J = S * J'.
+        const float col = colScaledOut ? m_colScale[j] : 1.0f;
+        impulses[j].ang *= angular_impulse_scale * col;
+        impulses[j].lin *= linear_impulse_scale * col;
     }
 
     m_can_resume = true;
@@ -377,6 +443,7 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
     m_g2lStamp.assign(N_nodes, 0);      // 0 == unstamped; island k uses stamp (k+1)
     m_l2g.resize(N_nodes);
     m_localC.resize(N_bonds);
+    m_localColScale.resize(m_colScale.size() ? N_bonds : 0);
     m_localI.resize(N_nodes);
     m_localImpulses.resize(N_bonds);
     m_rhs.resize(N_nodes);
@@ -441,6 +508,7 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
             lc.node1 = m_g2l[g1];
             localC[lb] = lc;
             x[lb] = impulses[b];
+            if (m_localColScale.size()) m_localColScale[lb] = m_colScale[b];
         }
 
         if (skippable)
@@ -454,10 +522,12 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
         // Warm-start impulse scaling (matches solve()).
         if (params.warmStart)
         {
+            const bool colScaled = m_localColScale.size() != 0;
             for (uint32_t j = 0; j < localN; ++j)
             {
-                x[j].ang *= recip_angular_impulse_scale;
-                x[j].lin *= recip_linear_impulse_scale;
+                const float recip_col = colScaled ? 1.0f / m_localColScale[j] : 1.0f;
+                x[j].ang *= recip_angular_impulse_scale * recip_col;
+                x[j].lin *= recip_linear_impulse_scale * recip_col;
             }
         }
 
@@ -481,7 +551,9 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
 
         // Island-local bond matrix view over the gathered couplings/inertia.
         BondMatrixS lB;
-        lB.set(localC, localI, m_B_scratch.data(), localM, localN);
+        lB.set(localC, localI, m_B_scratch.data(), localM, localN,
+               m_localColScale.size() ? m_localColScale.data() : nullptr,
+               m_colScratch.size() ? m_colScratch.data() : nullptr);
 
         const uint32_t maxIter = params.maxIter ? params.maxIter : 6 * std::max(localM, localN);
         const unsigned warmth  = params.warmStart ? 1u : 0u;   // hot-resume (cache) not used per island
@@ -492,11 +564,15 @@ StressProcessor::solveIslandAware(AngLin6* impulses, const AngLin6* velocities, 
             CGNR_SISD().solve(x, lB, b_rhs, localM, localN, cache, &err, params.tolerance, maxIter, warmth);
 
         // Undo scaling and scatter the bond impulses back to their global positions.
-        for (uint32_t j = 0; j < localN; ++j)
         {
-            x[j].ang *= angular_impulse_scale;
-            x[j].lin *= linear_impulse_scale;
-            impulses[m_bondsByIsland[bBegin + j]] = x[j];
+            const bool colScaled = m_localColScale.size() != 0;
+            for (uint32_t j = 0; j < localN; ++j)
+            {
+                const float col = colScaled ? m_localColScale[j] : 1.0f;
+                x[j].ang *= angular_impulse_scale * col;
+                x[j].lin *= linear_impulse_scale * col;
+                impulses[m_bondsByIsland[bBegin + j]] = x[j];
+            }
         }
 
         // Record the settled-state baseline for next frame: the inputs just solved and whether it converged.
@@ -524,6 +600,15 @@ StressProcessor::removeBond(uint32_t bondIndex)
 
     m_couplings[bondIndex] = m_couplings.back();
     m_couplings.pop_back();
+    if (m_colScale.size() > 0)
+    {
+        // Same swap-remove as the couplings, or the weights stop describing
+        // the bonds they sit next to.
+        m_colScale[bondIndex] = m_colScale.back();
+        m_colScale.pop_back();
+        m_recipColScale[bondIndex] = m_recipColScale.back();
+        m_recipColScale.pop_back();
+    }
     --m_B.N;
     m_can_resume = false;
     m_skipValid = false;        // topology changed: drop the settled-state baseline

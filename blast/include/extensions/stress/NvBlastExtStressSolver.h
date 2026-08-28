@@ -169,6 +169,13 @@ struct ExtStressMaterial
     float shearElasticLimit;        //!< < 0 inherits compression
     float shearFatalLimit;          //!< < 0 inherits compression
 
+    //! Young's modulus, Pa. STIFFNESS, not strength: how much this material
+    //! deforms under load, which is what decides how an over-connected
+    //! structure SHARES load between parallel paths (k = EA/L). 0 means
+    //! unknown and is treated as the 30 GPa reference (concrete), which
+    //! reduces the compliance weighting to pure geometry.
+    float elasticModulusPa;
+
     //! Chunk comminution. Disabled unless crush.capPressure > 0. @see ExtStressCrushProperties
     ExtStressCrushProperties crush;
 
@@ -178,7 +185,8 @@ struct ExtStressMaterial
         tensionElasticLimit(-1.0f),
         tensionFatalLimit(-1.0f),
         shearElasticLimit(-1.0f),
-        shearFatalLimit(-1.0f)
+        shearFatalLimit(-1.0f),
+        elasticModulusPa(0.0f)
     {}
 };
 
@@ -247,6 +255,15 @@ public:
     \param[in]  localPosition   Node local position.
     */
     virtual void                            setNodeInfo(uint32_t graphNodeIndex, float mass, float volume, NvcVec3 localPosition) = 0;
+
+    /**
+    Real rotational inertia (kg m^2) for a graph node, from its actual shape.
+
+    The solver otherwise approximates every chunk as a sphere of its volume,
+    which mis-weights the moment balance for exactly the flat, wide pieces
+    buildings are made of. 0 restores the sphere fallback.
+    */
+    virtual void                            setNodeGeometricInertia(uint32_t graphNode, float inertia) = 0;
 
     /**
     Set all nodes info using low level NvBlastAsset data.

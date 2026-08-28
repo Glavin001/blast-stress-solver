@@ -26,6 +26,7 @@
  */
 import {
   clipConvex, polygonArea, polygonCentroid, voronoiCells, sharedEdgeLength,
+  sharedEdgeMidpoint, convexIntersectPoly,
   prismMesh, mulberry32, round, v, convexIntersectArea,
 } from '../../scripts/export-fractured-city.mjs';
 import { MATERIALS, MATERIAL_INDEX, materialTable, bondMaterialName, material } from './materials.mjs';
@@ -263,13 +264,20 @@ export class ScenePackBuilder {
    * normal books compression as shear -- upstream traced a facade sitting below
    * a safety factor of 1 while standing still to exactly that.
    */
-  #addBond(a, b, area, normal, matName) {
+  #addBond(a, b, area, normal, matName, contactCentroid = null) {
     if (!(area > MIN_BOND_AREA)) return false;
     const ca = this.nodes[a].centroid, cb = this.nodes[b].centroid;
     const len = Math.hypot(...normal) || 1;
+    // The bond centroid is the moment arm's far end: the solver measures
+    // torque from each chunk's CoM to this point. The real contact patch when
+    // the caller knows it; the chunk midpoint only as a fallback, because a
+    // midpoint centroid reads every eccentric bearing as concentric.
+    const cc = contactCentroid;
     this.bonds.push({
       node0: a, node1: b,
-      centroid: v((ca.x + cb.x) / 2, (ca.y + cb.y) / 2, (ca.z + cb.z) / 2),
+      centroid: cc
+        ? v(cc[0], cc[1], cc[2])
+        : v((ca.x + cb.x) / 2, (ca.y + cb.y) / 2, (ca.z + cb.z) / 2),
       normal: v(normal[0] / len, normal[1] / len, normal[2] / len),
       area: round(area),
       m: MATERIAL_INDEX[matName],
@@ -490,7 +498,12 @@ export class ScenePackBuilder {
           const edge = sharedEdgeLength(si.poly, nu, nw, d);
           if (edge > 1e-6) {
             const t = Math.min(si.hi, sj.hi) - Math.max(si.lo, sj.lo);
-            if (t > 1e-6) this.#addBond(si.node, sj.node, edge * t, f.toWorld(nu, nw, 0), mat);
+            if (t > 1e-6) {
+              const mid2 = sharedEdgeMidpoint(si.poly, nu, nw, d);
+              const tMid = (Math.max(si.lo, sj.lo) + Math.min(si.hi, sj.hi)) / 2;
+              this.#addBond(si.node, sj.node, edge * t, f.toWorld(nu, nw, 0), mat,
+                mid2 ? f.toWorld(mid2[0], mid2[1], tMid) : null);
+            }
           }
           continue;
         }
@@ -503,8 +516,14 @@ export class ScenePackBuilder {
         if (dt === 1) {
           // Stacked along the extrusion: the contact is the overlap of the two
           // cross-sections, which convexIntersectArea gives exactly.
-          const area = convexIntersectArea(si.poly, sj.poly);
-          if (area > 0) this.#addBond(si.node, sj.node, area, f.toWorld(0, 0, 1), mat);
+          const patch = convexIntersectPoly(si.poly, sj.poly);
+          const area = patch.length >= 3 ? polygonArea(patch) : 0;
+          if (area > 0) {
+            const [cu, cw] = polygonCentroid(patch);
+            const tFace = (Math.max(si.lo, sj.lo) + Math.min(si.hi, sj.hi)) / 2;
+            this.#addBond(si.node, sj.node, area, f.toWorld(0, 0, 1), mat,
+              f.toWorld(cu, cw, tFace));
+          }
           continue;
         }
 
@@ -526,7 +545,12 @@ export class ScenePackBuilder {
         const t = Math.min(si.hi, sj.hi) - Math.max(si.lo, sj.lo);
         if (edge > 1e-6 && t > 1e-6) {
           const n = k === 0 ? [1, 0] : [0, 1];
-          this.#addBond(si.node, sj.node, edge * t, f.toWorld(n[0], n[1], 0), mat);
+          const spanMid = (Math.max(a[0], b[0]) + Math.min(a[1], b[1])) / 2;
+          const tMid = (Math.max(si.lo, sj.lo) + Math.min(si.hi, sj.hi)) / 2;
+          const cu = k === 0 ? line : spanMid;
+          const cw = k === 0 ? spanMid : line;
+          this.#addBond(si.node, sj.node, edge * t, f.toWorld(n[0], n[1], 0), mat,
+            f.toWorld(cu, cw, tMid));
         }
       }
     }
@@ -559,7 +583,7 @@ export class ScenePackBuilder {
             );
             if (!c) continue;
             if (c.penetration > TOUCH_EPS) this.penetratingContacts++;
-            this.#addBond(sa.node, sb.node, c.area, c.normal, matName);
+            this.#addBond(sa.node, sb.node, c.area, c.normal, matName, c.centroid);
           }
         }
       }

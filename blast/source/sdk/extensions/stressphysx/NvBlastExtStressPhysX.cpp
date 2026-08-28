@@ -279,6 +279,7 @@ public:
             target.tension_fatal_limit = source.tensionFatalLimit;
             target.shear_elastic_limit = source.shearElasticLimit;
             target.shear_fatal_limit = source.shearFatalLimit;
+            target.elastic_modulus_pa = source.elasticModulusPa;
 
             if (source.crushCapPressure > 0.0f)
             {
@@ -373,6 +374,37 @@ public:
             solverNode.centroid = toStress(source.centroid);
             solverNode.mass = source.mass;
             solverNode.volume = source.volume;
+            // Rotational inertia from the chunk's REAL shape. The solver's own
+            // fallback is a sphere of equal volume, which mis-weights the
+            // moment balance for the flat, wide pieces buildings are made of:
+            // a slab's inertia about its flat axis and about its edge differ
+            // by an order of magnitude, and the sphere splits the difference.
+            //
+            // Box: average of the three principal inertias,
+            // (Ix+Iy+Iz)/3 = m(X^2+Y^2+Z^2)/18 for full extents X,Y,Z -- an
+            // isotropic scalar because that is what the solver stores. Hulls
+            // use their bounding box, which errs slightly large, in the same
+            // direction as the hull's own convexity.
+            {
+                physx::PxVec3 halfExtents = source.geometry.halfExtents;
+                if (source.geometry.type == ExtStressPhysXGeometryType::Convex
+                    && source.geometry.convexPoints != nullptr
+                    && source.geometry.convexPointCount > 0)
+                {
+                    physx::PxVec3 lo = source.geometry.convexPoints[0];
+                    physx::PxVec3 hi = lo;
+                    for (uint32_t pt = 1; pt < source.geometry.convexPointCount; ++pt)
+                    {
+                        lo = lo.minimum(source.geometry.convexPoints[pt]);
+                        hi = hi.maximum(source.geometry.convexPoints[pt]);
+                    }
+                    halfExtents = (hi - lo) * 0.5f;
+                }
+                const physx::PxVec3 full = halfExtents * 2.0f;
+                solverNode.inertia = source.mass > 0.0f
+                    ? source.mass * (full.x*full.x + full.y*full.y + full.z*full.z) / 18.0f
+                    : 0.0f;
+            }
         }
 
         std::vector<ExtStressBondDesc> solverBonds(desc.bondCount);

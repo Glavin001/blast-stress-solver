@@ -545,6 +545,11 @@ struct ExtStressPhysXMaterial
     float shearElasticLimit;
     float shearFatalLimit;
 
+    // Young's modulus, Pa. Stiffness rather than strength: what decides how an
+    // over-connected structure shares load between parallel paths. 0 = treat
+    // as the 30 GPa concrete reference.
+    float elasticModulusPa = 0.0f;
+
     /*
     Optional CHUNK crushing (comminution). The limits above decide whether a
     JOINT fails; these decide whether the CHUNK ITSELF is ground up and leaves

@@ -73,6 +73,13 @@ struct SolverBond
     // Area is GEOMETRY: the real contact patch. Strength is authored through
     // the material, never by inflating area.
     float       area{1.0f};
+    // Young's modulus (Pa) of the joint's material. Used with area and length
+    // to weight the solve toward the minimum-ENERGY force distribution: a
+    // joint's stiffness is EA/L, and among the many force distributions that
+    // balance an over-connected structure, the real one is the one minimising
+    // elastic energy (Castigliano). 0 means "unknown" and is treated as the
+    // reference modulus, leaving pure area/length weighting.
+    float       modulus{0.0f};
     // Material index into the solver's ExtStressMaterial table. When graph
     // reduction merges bonds of different materials into one solver bond,
     // this holds the WEAKEST member's material (conservative; only the

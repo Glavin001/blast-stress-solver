@@ -165,6 +165,28 @@ const LOOK = {
   'white-stone':         { color: '#f2efe8', textureKey: 'white-concrete', roughness: 0.88, metalness: 0.0 },
 };
 
+// Young's modulus, Pa -- STIFFNESS, the property that decides how load is
+// SHARED between parallel paths (k = EA/L), as opposed to the strength limits
+// that decide when a joint breaks. Handbook values, not tuning knobs:
+// concrete ~30 GPa, steel ~200, stone masonry ~15, brick masonry ~5, softwood
+// along the grain ~10, glass ~70. The clip and facade entries are joints and
+// gaskets rather than solids, and their LOW stiffness is the physics: a soft
+// fixing sheds load to the structure behind it instead of carrying the wall.
+const MODULUS = {
+  'reinforced-concrete': 30e9,
+  'concrete-slab': 27e9,
+  stone: 15e9,
+  'white-stone': 15e9,
+  brick: 5e9,
+  steel: 200e9,
+  'wood-frame': 10e9,
+  glass: 70e9,
+  'glazing-clip': 2e9,
+  'facade-panel': 8e9,
+  'facade-clip': 1e9,
+  'footing-anchor': 30e9,
+};
+
 function entry(name, elastic, band, tensionFrac, shearFrac) {
   const t = elastic * tensionFrac;
   const s = elastic * shearFrac;
@@ -173,6 +195,7 @@ function entry(name, elastic, band, tensionFrac, shearFrac) {
     compressionElastic: elastic, compressionFatal: elastic * band,
     tensionElastic: t, tensionFatal: t * band,
     shearElastic: s, shearFatal: s * band,
+    elasticModulus: MODULUS[name] ?? 30e9,
     ...LOOK[name],
     density: DENSITY[name],
   };

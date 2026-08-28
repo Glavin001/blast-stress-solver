@@ -27,6 +27,10 @@ struct ExtStressGpuBond
     // Damage pool. Seed = area; a uniform seed makes authored strength
     // meaningless (see the CPU-path history).
     float health{1.0f};
+    // Per-column compliance weight sqrt((E/E_ref)*A/L), computed by the CPU
+    // StressProcessor and uploaded verbatim so both backends solve the same
+    // weighted system. 1.0 when compliance weighting is disabled.
+    float colScale{1.0f};
     // Index into the material table handed to create().
     std::uint32_t material{0};
 };

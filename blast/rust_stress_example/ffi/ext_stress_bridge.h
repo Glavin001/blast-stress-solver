@@ -14,6 +14,9 @@ typedef struct ExtStressNodeDesc {
     StressVec3 centroid;
     float mass;
     float volume;
+    /* Rotational inertia (kg m^2) from the chunk's real shape, or 0 to let the
+       solver fall back to its sphere-of-equal-volume approximation. */
+    float inertia;
 } ExtStressNodeDesc;
 
 typedef struct ExtStressBondDesc {
@@ -45,6 +48,9 @@ typedef struct ExtStressMaterialDesc {
     float tension_fatal_limit;
     float shear_elastic_limit;
     float shear_fatal_limit;
+    /* Young's modulus, Pa. Stiffness, not strength: decides how parallel load
+       paths SHARE load (k = EA/L). 0 = unknown, treated as 30 GPa concrete. */
+    float elastic_modulus_pa;
     float crush_cap_pressure;         /* Pa. <= 0 disables crushing. */
     float crush_cohesion;             /* Pa. Drucker-Prager intercept at p = 0. */
     float crush_friction_slope;       /* dq/dp of the cone, dimensionless. */

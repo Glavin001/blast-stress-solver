@@ -17,7 +17,7 @@
  * is exactly the bearing area — the same quantity `convexIntersectArea` gives
  * for two stacked slabs, generalised to any orientation.
  */
-import { polygonArea, convexIntersectArea } from '../../scripts/export-fractured-city.mjs';
+import { polygonArea, convexIntersectPoly, polygonCentroid } from '../../scripts/export-fractured-city.mjs';
 
 const TOUCH_EPS = 1e-3;
 const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -137,7 +137,8 @@ export function prismContact(A, B, { maxPenetration = 0.02 } = {}) {
   const flat = (verts) => hull2D(verts.map((v) => [dot3(v, e0), dot3(v, e1)]));
   const pa = flat(va), pb = flat(vb);
   if (pa.length < 3 || pb.length < 3) return null;
-  const area = convexIntersectArea(pa, pb);
+  const patch = convexIntersectPoly(pa, pb);
+  const area = patch.length >= 3 ? polygonArea(patch) : 0;
   if (!(area > 0)) return null;
   // Reject a contact that is really an EDGE rather than a face.
   //
@@ -149,5 +150,23 @@ export function prismContact(A, B, { maxPenetration = 0.02 } = {}) {
   // of the smaller face; anything far below that is numerical.
   const smallest = Math.min(polygonArea(pa), polygonArea(pb));
   if (area < 0.02 * smallest) return null;
-  return { area, normal: bestAxis, penetration: Math.max(0, bestOverlap) };
+
+  // Where the patch actually IS, in 3D. The solver's moment arms run from
+  // each chunk's centre of mass to the bond centroid, so a centroid at the
+  // midpoint of the two chunks -- what callers used before this existed --
+  // reads every eccentric bearing as concentric: a column landing on a slab's
+  // EDGE claimed to be landing on its middle. The 2D patch centroid lifts back
+  // to 3D through the same (e0, e1) basis the shadow was projected through,
+  // placed on the contact plane at the midpoint of the two bodies' overlap
+  // along the contact normal.
+  const [c2u, c2v] = polygonCentroid(patch);
+  const [pa0, pa1] = projectExtent(va, bestAxis);
+  const [pb0, pb1] = projectExtent(vb, bestAxis);
+  const mid = (Math.max(pa0, pb0) + Math.min(pa1, pb1)) / 2;
+  const centroid = [
+    e0[0] * c2u + e1[0] * c2v + bestAxis[0] * mid,
+    e0[1] * c2u + e1[1] * c2v + bestAxis[1] * mid,
+    e0[2] * c2u + e1[2] * c2v + bestAxis[2] * mid,
+  ];
+  return { area, normal: bestAxis, penetration: Math.max(0, bestOverlap), centroid };
 }

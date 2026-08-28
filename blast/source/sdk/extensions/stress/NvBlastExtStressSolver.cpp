@@ -148,6 +148,18 @@ public:
 
     void initialize()
     {
+        // Resolve each bond's Young's modulus from its material before the
+        // processor computes compliance weights: stiffness is EA/L, and
+        // without E a steel tie and a stone bed joint of equal size would
+        // share load equally when steel is ~20x stiffer.
+        for (uint32_t i = 0; i < m_bonds.size(); ++i)
+        {
+            const uint32_t material = m_bonds[i].material;
+            m_bonds[i].modulus = (m_materials && material < m_materialCount)
+                ? m_materials[material].elasticModulusPa
+                : 0.0f;
+        }
+
         StressProcessor::DataParams params;
         params.centerBonds = true;
         params.equalizeMasses = true;
@@ -195,6 +207,10 @@ public:
                 gpu.area = bond.area > 0.0f ? bond.area : 1.0f;
                 gpu.health = gpu.area;
                 gpu.material = bond.material;
+                // The exact weights the CPU processor computed, so the two
+                // backends solve the same weighted system rather than two
+                // systems that agree only when every joint is the same size.
+                gpu.colScale = m_stressProcessor.getColumnScale(i);
             }
             // Convert the resolved material table for the device-side damage
             // kernel; layouts match field-for-field.
@@ -765,6 +781,12 @@ public:
         NvVec3 localVel;
         uint32_t solverNode;
         uint32_t neighborsCount;
+        // Real rotational inertia (kg m^2) from the chunk's actual shape, or 0
+        // to fall back to the sphere approximation. A building is made of
+        // flat, wide things; a slab's inertia about its flat axis and about
+        // its edge differ by an order of magnitude, and the sphere splits the
+        // difference wrongly for exactly those pieces.
+        float geometricInertia;
 
         // --- chunk crushing (see ExtStressCrushProperties) ---
         // Love-Weber virial accumulator, sigma*V in Voigt order
@@ -794,6 +816,7 @@ public:
             int32_t indexShift;
         };
         float volume;
+        float geometricInertia;
     };
 
     struct SolverBondData
@@ -1158,6 +1181,12 @@ public:
         m_nodesData[node].mass = mass;
         m_nodesData[node].volume = volume;
         m_nodesData[node].localPos = localPos;
+        m_nodesDirty = true;
+    }
+
+    void setNodeGeometricInertia(uint32_t node, float inertia)
+    {
+        m_nodesData[node].geometricInertia = inertia > 0.0f ? inertia : 0.0f;
         m_nodesDirty = true;
     }
 
@@ -1962,6 +1991,7 @@ private:
             solverNode.localPos = NvVec3(NvZero);
             solverNode.mass = 0.0f;
             solverNode.volume = 0.0f;
+            solverNode.geometricInertia = 0.0f;
         }
 
         for (NodeData& node : m_nodesData)
@@ -1971,6 +2001,11 @@ private:
             solverNode.localPos += node.localPos;
             solverNode.mass += node.mass;
             solverNode.volume += node.volume;
+            // Summed without the parallel-axis term. Exact at graph reduction
+            // 0, where every solver node is a single chunk -- which is what
+            // production runs; an aggregate underestimates slightly, erring
+            // toward the old sphere behaviour.
+            solverNode.geometricInertia += node.geometricInertia;
         }
 
         for (SolverNodeData& solverNode : m_solverNodesData)
@@ -1983,8 +2018,14 @@ private:
         {
             const SolverNodeData& solverNode = m_solverNodesData[nodeIndex];
 
-            const float R = NvPow(solverNode.volume * 3.0f * NvInvPi / 4.0f, 1.0f / 3.0f); // sphere volume approximation
-            const float inertia = solverNode.mass * (R * R * 0.4f); // sphere inertia tensor approximation: I = 2/5 * M * R^2 ; invI = 1 / I;
+            // Real shape-derived inertia when the host supplied one; the sphere
+            // approximation (I = 2/5 M R^2 from volume) only as fallback.
+            float inertia = solverNode.geometricInertia;
+            if (inertia <= 0.0f)
+            {
+                const float R = NvPow(solverNode.volume * 3.0f * NvInvPi / 4.0f, 1.0f / 3.0f);
+                inertia = solverNode.mass * (R * R * 0.4f);
+            }
             m_solver.setNodeMassInfo(nodeIndex, solverNode.localPos, solverNode.mass, inertia);
         }
 
@@ -2310,6 +2351,7 @@ public:
     virtual void                            setAllNodesInfoFromLL(float density = 1.0f) override;
 
     virtual void                            setNodeInfo(uint32_t graphNode, float mass, float volume, NvcVec3 localPos) override;
+    virtual void                            setNodeGeometricInertia(uint32_t graphNode, float inertia) override;
 
     virtual void                            setSettings(const ExtStressSolverSettings& settings) override
     {
@@ -2928,6 +2970,11 @@ void ExtStressSolverImpl::setAllNodesInfoFromLL(float density)
 void ExtStressSolverImpl::setNodeInfo(uint32_t graphNode, float mass, float volume, NvcVec3 localPos)
 {
     m_graphProcessor->setNodeInfo(graphNode, mass, volume, toNvShared(localPos));
+}
+
+void ExtStressSolverImpl::setNodeGeometricInertia(uint32_t graphNode, float inertia)
+{
+    m_graphProcessor->setNodeGeometricInertia(graphNode, inertia);
 }
 
 bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& com, NvcVec3& force, NvcVec3& torque)

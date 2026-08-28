@@ -208,6 +208,7 @@ inline ExtStressSolverSettings toSettings(const ExtStressSolverSettingsDesc* set
 inline ExtStressMaterial toMaterial(const ExtStressMaterialDesc& desc)
 {
     ExtStressMaterial material;
+    material.elasticModulusPa = desc.elastic_modulus_pa;
     material.compressionElasticLimit = desc.compression_elastic_limit;
     material.compressionFatalLimit = desc.compression_fatal_limit;
     material.tensionElasticLimit = desc.tension_elastic_limit;
@@ -584,6 +585,10 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
                                         nodeDesc.mass,
                                         nodeDesc.volume > 0.0f ? nodeDesc.volume : std::max(nodeDesc.mass, 1.0f),
                                         toNvcVec3(nodeDesc.centroid));
+            if (nodeDesc.inertia > 0.0f)
+            {
+                handle->solver->setNodeGeometricInertia(graphIndex, nodeDesc.inertia);
+            }
         }
     }
 
