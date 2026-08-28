@@ -380,7 +380,7 @@ export const v = (x, y, z) => ({ x: round(x), y: round(y), z: round(z) });
 const EPS = 1e-9;
 
 /** Clip a convex polygon by the half-plane {p : dot(n,p) <= d} (Sutherland-Hodgman). */
-function clipConvex(poly, nx, ny, d) {
+export function clipConvex(poly, nx, ny, d) {
   const out = [];
   for (let i = 0; i < poly.length; i++) {
     const a = poly[i], b = poly[(i + 1) % poly.length];
@@ -395,7 +395,7 @@ function clipConvex(poly, nx, ny, d) {
   return out;
 }
 
-function polygonArea(poly, signed = false) {
+export function polygonArea(poly, signed = false) {
   let a = 0;
   for (let i = 0; i < poly.length; i++) {
     const p = poly[i], q = poly[(i + 1) % poly.length];
@@ -406,7 +406,7 @@ function polygonArea(poly, signed = false) {
   return signed ? a / 2 : Math.abs(a) / 2;
 }
 
-function polygonCentroid(poly) {
+export function polygonCentroid(poly) {
   let a = 0, cx = 0, cy = 0;
   for (let i = 0; i < poly.length; i++) {
     const p = poly[i], q = poly[(i + 1) % poly.length];
@@ -426,7 +426,7 @@ function polygonCentroid(poly) {
  * cells tile the rectangle exactly: no gaps, no overlaps, areas summing to the
  * rectangle area. Verified by the caller.
  */
-function voronoiCells(seeds, x0, y0, x1, y1) {
+export function voronoiCells(seeds, x0, y0, x1, y1) {
   const rect = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
   return seeds.map((s, i) => {
     let poly = rect;
@@ -447,7 +447,7 @@ function voronoiCells(seeds, x0, y0, x1, y1) {
  * Cells i and j of a Voronoi diagram share their bisector, so we measure the
  * part of i's boundary lying on that bisector — the exact contact edge.
  */
-function sharedEdgeLength(poly, nx, ny, d) {
+export function sharedEdgeLength(poly, nx, ny, d) {
   const len = Math.hypot(nx, ny);
   if (len < EPS) return 0;
   nx /= len; ny /= len; d /= len;
@@ -472,7 +472,7 @@ function sharedEdgeLength(poly, nx, ny, d) {
  * the old code could use the column's 0.4 m square section because the column
  * was one piece.
  */
-function convexIntersectArea(a, b) {
+export function convexIntersectArea(a, b) {
   if (a.length < 3 || b.length < 3) return 0;
   // Outward normals depend on winding, so take it from the signed area.
   const sign = polygonArea(b, true) >= 0 ? 1 : -1;
@@ -488,7 +488,7 @@ function convexIntersectArea(a, b) {
 }
 
 /** Exact area of (convex polygon) ∩ (axis-aligned rect). */
-function polygonRectArea(poly, x0, y0, x1, y1) {
+export function polygonRectArea(poly, x0, y0, x1, y1) {
   let p = poly;
   p = clipConvex(p, -1, 0, -x0); if (!p.length) return 0;
   p = clipConvex(p, 1, 0, x1); if (!p.length) return 0;
@@ -498,7 +498,7 @@ function polygonRectArea(poly, x0, y0, x1, y1) {
 }
 
 /** Convex-hull triangle mesh of a prism: polygon extruded +/- t/2 along its normal. */
-function prismMesh(poly, thickness, toWorld, centroid) {
+export function prismMesh(poly, thickness, toWorld, centroid) {
   const h = thickness / 2;
   const positions = [], normals = [], indices = [];
   const push = (p, n) => {

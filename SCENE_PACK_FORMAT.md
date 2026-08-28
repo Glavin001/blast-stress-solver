@@ -98,6 +98,11 @@ too weak or too strong, change the material.
     "nodes":         [ { "centroid": {"x":0,"y":0.32,"z":0}, "mass": 0, "volume": 12.6 } ],
     "nodeSizes":     [ { "x": 4.5, "y": 0.6, "z": 4.67 } ],
     "nodeColliders": [ { "kind": "cuboid", "halfExtents": {"x":2.25,"y":0.3,"z":2.33} } ],
+    // A fracturer that bounds its pattern count stores each distinct shard once
+    // here and references it with { "kind": "shape", "shape": N }. Resolved at
+    // parse, so nothing downstream sees the difference. Omit it entirely when
+    // every shard is one-of-a-kind.
+    "shapeLibrary": [ { "kind": "convex_hull", "points": [ ... ] } ],
     "nodeTypes":     [ "foundation" ],    // optional; parallel to `nodes`
     "bonds": [
       { "node0": 12, "node1": 468,
@@ -188,6 +193,48 @@ v2 adds one thing: a structure can be made of **more than one material**.
 - An index outside the table is a **hard error**, not a clamp. Silently
   clamping to material 0 would turn an authoring typo into a mysteriously
   strong joint.
+
+### Presentation fields — optional, additive
+
+A material may carry appearance alongside strength. These are **advisory**: a
+solver ignores them, and a pack is no less valid without them. They exist
+because a renderer otherwise has no way to know that a chunk is glass — a
+scene pack describes what a structure is made of structurally, and until now
+that knowledge stopped at the solver.
+
+| Field | Meaning |
+|---|---|
+| `color` | CSS hex; base colour, or a tint under a texture |
+| `opacity` | 0-1. **Presence of this field is what marks a material transparent** |
+| `textureKey` | consumer-defined surface name (`brick`, `stone`, `metal`, …), or null |
+| `roughness`, `metalness` | PBR terms, for a consumer that shades this way |
+| `density` | kg/m^3. Advisory only — node `mass` is already baked at export |
+
+### Per-node material — optional
+
+Version 2 assigns material per BOND, which is right for the solver: a joint has
+a strength and a bond is a joint. It leaves a renderer with nothing, because a
+chunk has no material of its own.
+
+Two optional parallel arrays close that gap without touching solver behaviour:
+
+```
+scenario.nodeMaterials  [String]   material NAMES, parallel to nodes
+scenario.nodePieces     [u32]      which authored piece a node was fractured
+                                   from, parallel to nodes
+nodes[].m               u32        material index — the same field v3 defines
+```
+
+`nodeMaterials` is the renderer's key. `nodes[].m` is the same information as an
+index, so a v3 loader already parsing it for crush properties needs no new
+field. `nodePieces` records that twenty shards came from one wall: it is what
+lets a consumer tell "two shards of one piece" from "two different pieces",
+which is the difference between a meaningful interpenetration check and a
+hundred false positives — shards of one piece tile exactly yet their bounding
+boxes overlap.
+
+A loader that ignores all three is still conformant. Nothing here changes how a
+bond behaves.
 
 ### Rules for v2 loaders
 
@@ -407,3 +454,10 @@ concept of, but must not misinterpret one.
 | `camera`, `projectile` | demo-only | demo-only | demo-only |
 | `nodeMeshes` | render only | render only | ignored (boxes/hulls from colliders) |
 | `nodes[].m`, `materials[].crush` (v3) | ignored | ignored | yes |
+| `nodeMaterials`, `nodePieces`, `materials[].color/opacity/textureKey` | ignored | ignored | ignored |
+
+The presentation fields and per-node material are honored by no solver at
+all — they are read by renderers. vibe-land-2's standalone structure viewer
+(`/structure`) is the current consumer; its city path still shades every
+chunk through one material.
+
