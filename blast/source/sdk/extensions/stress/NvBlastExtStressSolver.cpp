@@ -1532,6 +1532,50 @@ private:
         }
     }
 
+    /**
+    Per-bond stress from the solved impulses. THE largest named cost in the
+    tick: 9.90 ms at grid 2, 64.5% of the graph solve, ~7x the GPU kernel it
+    post-processes.
+
+    Measured properties, so the next change starts from evidence:
+
+      - Linear in TOTAL live bonds, not in activity. 2.41 ms at 74.5k bonds,
+        9.90 ms at 268k -- 4.10x for 3.60x. Halving awake bodies does not
+        move it.
+      - The unchanged-stress skip (BLAST_SKIP_UNCHANGED_BOND_STRESS) removes
+        only 6.5%, because during demolition 41-98% of groups genuinely
+        re-solve. Skipping is the wrong lever; the ceiling is the settled
+        fraction and it is small when it matters.
+      - The parallel fan-out above this is over STRUCTURES, and there are
+        four. Measured concurrency 2.21x on a 32-core box, so ~26 cores are
+        idle while this runs.
+
+    The two viable fixes, and what each needs:
+
+    1. Parallelise this loop. Biggest available win and the cheaper of the
+       two, but this library has no task dispatcher -- the pool lives in the
+       caller (vibe-land-4 physx-bridge, stress_executor_). Needs a
+       dispatch hook plumbed caller -> adapter -> here.
+
+       Bit-exactness needs care in exactly one place. Per-bond writes
+       (stressNormal/stressShear) are independent; m_nodeOverstressed is
+       set-to-1 only so races are benign; m_overstressedBondCount is a sum.
+       But bondIndicesToRemove is ORDER-SENSITIVE -- removal order feeds
+       back into topology -- so it must be per-strip local vectors
+       concatenated in strip order, exactly as resolve_support_loads does
+       for its supporter ingest.
+
+    2. Move it to CUDA. The impulses are already on the device and are
+       copied back specifically so this walk can run on the host. Needs six
+       host structures made device-resident and coherent: bondHealth, the
+       asset NvBlastBond array, m_bondsData, m_nodesData positions,
+       m_blastBondIndexMap, and the material table, plus the ragged
+       per-group blastBondIndices as a CSR rebuilt on topology change.
+
+    Either way the equivalence harness is the gate: it compares broken-bond
+    counts per tick and caught a 0.0975% divergence in the flat-bondless
+    change that every other gate passed.
+    */
     void updateBondStress(const float* bondHealth, const NvBlastBond* bonds)
     {
         m_overstressedBondCount = 0;
