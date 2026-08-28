@@ -68,7 +68,26 @@ for (let i = 0; i < argv.length; i++) {
   if (argv[i] === '--no-autobond') { autobond = false; continue; }
   names.push(argv[i]);
 }
-const selected = names.length ? names : Object.keys(STRUCTURES);
+/**
+ * Built only when asked for by name.
+ *
+ * `skyline` is every authored structure in one scene: 56,509 chunks and
+ * 1.5 million hull points. The client builds draw data for every chunk in a
+ * scene up front and the GPU upload happens lazily, on the first frame a mesh
+ * is actually rendered -- so the whole cost arrives in one frame the moment
+ * the buildings come into view, which is enough to have Safari kill the tab on
+ * an iPhone. It survives loading, and it survives looking at empty sky; it
+ * dies when you turn around.
+ *
+ * It is still a useful scene for desktop work and for anything that wants
+ * every building at once, so it stays buildable -- `node build.mjs skyline` --
+ * and simply stops being something a plain rebuild hands to a phone.
+ */
+const OPT_IN_ONLY = new Set(['skyline']);
+
+const selected = names.length
+  ? names
+  : Object.keys(STRUCTURES).filter((name) => !OPT_IN_ONLY.has(name));
 for (const n of selected) {
   if (!STRUCTURES[n]) {
     console.error(`unknown structure "${n}" (have: ${Object.keys(STRUCTURES).join(', ')})`);
