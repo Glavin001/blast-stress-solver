@@ -100,7 +100,13 @@ export function buildPark432(cfg = {}) {
   const ch = C.coreSide / 2;
 
   // ── the stair core, and the void it needs through every plate ────────────
-  const stairAt = [-ch + 0.3, -ch + 0.3];
+  // Flush into the core's corner, so the flights bear on the core walls
+  // themselves. Held off by 0.3 they hung in mid-air once the shaft grew to
+  // the full core (31 overhanging landings); wrapped in their own enclosure
+  // instead, that enclosure's walls shared volume with the core's (595 pairs).
+  // Sitting them against the wall is both the simplest and what a stair in a
+  // core corner actually does.
+  const stairAt = [-ch, -ch];
   // Per storey: the first flight climbs from the podium and is taller than the
   // rest, so a shaft sized from a typical floor is too short for it.
   const dryFor = (k) => staircase(DRY_RUN,
@@ -110,6 +116,27 @@ export function buildPark432(cfg = {}) {
   );
   const CORE_T = C.coreThickness;
   const void_ = dry.void;
+
+  // The core the plates actually need.
+  //
+  // coreSide has always been 9.4 m, but the shaft was built around the
+  // STAIRCASE footprint -- a ~4 m box parked at (-4.4, -4.4), because stairAt
+  // puts the flight in the core's corner. So every floor plate was a 28 m
+  // square spanning to its perimeter piers over one small off-centre stub.
+  //
+  // Bending in a plate goes as span squared, and the arithmetic lands exactly
+  // where the audit did: w = 8.2 kN/m^2 on a 28 m span is M = wL^2/8 = 807
+  // kN.m/m against a section modulus of 0.0193 m^3, so 42 MPa on a 14.4 MPa
+  // tension limit -- 2.8x, and slab-to-slab seams were the hottest joint class
+  // in the tower by a factor of two over anything else. Over ninety seconds
+  // that is not a rounding error: 5 bonds broke in the first half and 14,561
+  // in the second.
+  //
+  // A real tower of this proportion has a real central core, and 432 Park's is
+  // most of its middle. Giving the plates the full 9.4 m box to bear on cuts
+  // the clear span to 9.3 m, and span squared does the rest: 4.6 MPa, 0.32 of
+  // the limit. The staircase still lives inside it.
+  const core = { x0: -ch, x1: ch, z0: -ch, z1: ch };
 
   // The core lands on its OWN raft, not on the podium plate. It carries most of
   // the building, and routing that through a floor-plate material on the way to
@@ -122,8 +149,8 @@ export function buildPark432(cfg = {}) {
   // stair arriving from below at the podium, so no arrival strip is needed
   // here and the raft can fill the shaft outright.
   const shaftOuter = {
-    x0: dry.x0 - CORE_T, x1: dry.x1 + CORE_T,
-    z0: dry.z0 - CORE_T, z1: dry.z1 + CORE_T,
+    x0: core.x0 - CORE_T, x1: core.x1 + CORE_T,
+    z0: core.z0 - CORE_T, z1: core.z1 + CORE_T,
   };
   b.box({ type: 'foundation', material: 'footing-anchor',
     min: [shaftOuter.x0, -C.footingDepth, shaftOuter.z0],
@@ -159,7 +186,7 @@ export function buildPark432(cfg = {}) {
       // anyway: its whole top face bears on the slab, rather than the slab's
       // edge meeting its side.
     stairShaft(b, {
-      footprint: dry, y0: slabTop(k - 1), y1: slabBase(k),
+      footprint: core, y0: slabTop(k - 1), y1: slabBase(k),
       material: 'reinforced-concrete', openSide: '-x', thickness: CORE_T,
     });
     staircase(b, {
