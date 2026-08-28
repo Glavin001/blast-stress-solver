@@ -73,10 +73,24 @@ export function buildAlgedra(cfg = {}) {
   const slabTop = (k) => (k === 0 ? podiumTop : slabBase(k) + C.slabThickness);
   const roofLevel = C.floors + 1;                    // the roof is one more slab
 
-  // Column grid: four lines in X, three in Z. Kept well inboard of the
-  // perimeter glazing so the two never share space.
-  const colX = [-hx * 0.72, -hx * 0.36, 0, hx * 0.36, hx * 0.72];
-  const colZ = [-hz * 0.62, 0, hz * 0.62];
+  // Column grid: five lines in X, three in Z, with the outer lines carried out
+  // to the facade.
+  //
+  // They used to stop at 0.72 and 0.62 of the half-width, which left 6.4 m of
+  // slab in X and 4.6 m in Z hanging off the last column with nothing under it
+  // but the lobby glazing -- for seven storeys, plus the balcony bands beyond
+  // that. A building does not work that way: the perimeter of every floor was
+  // being carried by cantilever action back to a line six metres inboard, and
+  // the only thing standing where the facade meets the ground was glass.
+  //
+  // Perimeter columns are what a real stilted base has, and they are also what
+  // makes the ground floor worth shooting at: cut one and the bay above it has
+  // somewhere to try to redistribute to, which is the whole point. Kept just
+  // clear of the glazing plane (bx below) so the two never share space.
+  const perimeterX = hx - 1.6;
+  const perimeterZ = hz - 1.4;
+  const colX = [-perimeterX, -hx * 0.36, 0, hx * 0.36, perimeterX];
+  const colZ = [-perimeterZ, 0, perimeterZ];
 
   const bw = C.beamWidth / 2;
   const beamBottom = (k) => slabBase(k) - C.beamDepth;
