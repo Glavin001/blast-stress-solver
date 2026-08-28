@@ -30,7 +30,14 @@ export const ALGEDRA = {
   floors: 7,
   floorHeight: 3.4,
   groundHeight: 4.6,    // the tall, open, glazed base
-  slabThickness: 0.35,
+  // 0.45, not 0.35. Two reasons, both measured: a 10.7 m bay at 0.35 m is a
+  // span-to-depth ratio of 31, past what a flat plate is usually taken to; and
+  // slab-to-beam was the top joint class by time overloaded, which is the
+  // interface a thin plate leans on hardest. Real reinforced concrete pours
+  // beam and slab together and the two act as one T-section -- authored as
+  // separate pieces they can only share load through the bond between them,
+  // so the thinner the plate the more it asks of that seam.
+  slabThickness: 0.45,
   columnSize: 0.6,
   // A stilt here carries ~900 t. At 0.5 m square that is 35 MPa on the
   // concrete it lands on; 0.8 m brings it to 14 MPa, which is what a base
