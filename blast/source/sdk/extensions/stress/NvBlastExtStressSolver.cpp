@@ -1153,6 +1153,25 @@ public:
         updateBondStress(bondHealth, bonds);
         m_hostBondStressMilliseconds = walkMs(bondStart);
 
+        // Why the skip rate is what it is. Two causes need opposite fixes:
+        // groups that genuinely re-solved (nothing to do about it here) and
+        // groups that are unchanged but latched overstressed (their health
+        // moves every tick). stderr rather than five layers of FFI, because
+        // this answers one question once.
+        if (std::getenv("BLAST_BOND_STRESS_STATS") != nullptr && (++m_bsTicks % 120) == 0)
+        {
+            const double t = m_bsTotal > 0 ? double(m_bsTotal) : 1.0;
+            fprintf(stderr,
+                    "[bond-stress] groups/tick %.0f | dirty %.1f%% | "
+                    "overstress-blocked %.1f%% | SKIPPED %.1f%%\n",
+                    t / 120.0,
+                    100.0 * double(m_bsDirty) / t,
+                    100.0 * double(m_bsOverstressBlocked) / t,
+                    100.0 * double(m_bondStressGroupsSkipped - m_bsSkipMark) / t);
+            m_bsTotal = m_bsDirty = m_bsOverstressBlocked = 0;
+            m_bsSkipMark = m_bondStressGroupsSkipped;
+        }
+
         // Per-chunk stress runs after the bonds because it consumes the same
         // solved impulses. Skipped entirely when no material enables crush.
         const auto nodeStart = SolveClock::now();
@@ -1187,6 +1206,8 @@ public:
     /// condition. Starts all-1 so the first tick after a resize never skips.
     std::vector<uint8_t> m_groupOverstressed;
     uint64_t m_bondStressGroupsSkipped{0};
+    uint64_t m_bsTotal{0}, m_bsDirty{0}, m_bsOverstressBlocked{0};
+    uint64_t m_bsTicks{0}, m_bsSkipMark{0};
     float m_hostWalkInMilliseconds{0.0f};
     float m_hostResetMilliseconds{0.0f};
     float m_hostBondStressMilliseconds{0.0f};
@@ -1560,6 +1581,18 @@ private:
         m_groupOverstressed.resize(m_solverBondsData.size(), 1u);
         for (uint32_t i = 0; i < m_solverBondsData.size(); ++i)
         {
+            ++m_bsTotal;
+            if (haveDirty)
+            {
+                if (dirty[i] != 0u)
+                {
+                    ++m_bsDirty;          // re-solved: must recompute
+                }
+                else if (m_groupOverstressed[i] != 0u)
+                {
+                    ++m_bsOverstressBlocked;  // unchanged, but taking damage
+                }
+            }
             if (haveDirty && dirty[i] == 0u && m_groupOverstressed[i] == 0u)
             {
                 ++m_bondStressGroupsSkipped;
