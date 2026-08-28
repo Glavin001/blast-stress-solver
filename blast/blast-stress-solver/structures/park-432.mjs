@@ -34,6 +34,10 @@ export const PARK_432 = {
   // thought of spanning 4.67 m bays alone: slab seams at 2.5x mid-bay, every
   // storey. The real tower's grid is exactly this: pier, spandrel, window.
   spandrelBeamDepth: 0.8,
+  // Band beams under each plate, core face to pier face. Wide and shallow, the
+  // way a residential band beam is, so the ceiling stays a ceiling.
+  ribWidth: 0.8,
+  ribDepth: 0.6,
   glassThickness: 0.07,
   columnSize: 1.1,         // perimeter columns are the piers themselves
   coreSide: 9.4,
@@ -67,8 +71,19 @@ export function buildPark432(cfg = {}) {
   // Perimeter piers are pulled inside the building line rather than straddling
   // it. Straddling halves how much of each pier the plate above actually bears
   // on, which pushes the load it does not take onto the core instead.
-  const clamp = (v) => Math.max(-h + cs, Math.min(h - cs, v));
+  const pierRing = h - cs;                 // the line the outermost piers sit on
+  const clamp = (v) => Math.max(-pierRing, Math.min(pierRing, v));
   const pierAt = Array.from({ length: C.baysPerSide + 1 }, (_, i) => clamp(-h + i * bayW));
+  // A pier is on the perimeter when it sits on the RING, not on the building
+  // line. This test used to read `< h`, and since clamp pulls the outer piers
+  // in to h - cs it was true for all 49 grid positions -- so the tower was
+  // built with zero perimeter columns for its whole life. Every storey's
+  // perimeter load was travelling plate -> spandrel ring -> facade-panel
+  // cladding -> plate below, and on the mechanical floors, which have no
+  // infill at all, the spandrel ring simply hung off the plate it was meant
+  // to be holding up. That is the delayed collapse the audit kept reporting.
+  const onPerimeter = (x, z) =>
+    Math.abs(x) > pierRing - 1e-6 || Math.abs(z) > pierRing - 1e-6;
 
   // ── footings: a continuous strip under the perimeter pier line ───────────
   //
@@ -189,6 +204,29 @@ export function buildPark432(cfg = {}) {
       footprint: core, y0: slabTop(k - 1), y1: slabBase(k),
       material: 'reinforced-concrete', openSide: '-x', thickness: CORE_T,
     });
+    // ...and the fourth wall, which stairShaft leaves out so you can walk in.
+    //
+    // Leaving it out cost far more than a doorway. The plate bears on the core
+    // wherever a wall meets its underside, so with the -x side missing there
+    // was no bearing line at x = -5.6 at all: along z = 0 the plate ran from
+    // the perimeter at x = -12.9 clear across the shaft to the +x wall at
+    // x = +4.7. That is a 17.6 m span, not the 7.3 m every other side gets,
+    // and moment goes as span squared -- one face of this tower was carrying
+    // roughly six times the bending of the other three.
+    //
+    // A real core is a closed shear-wall box with door openings punched in it,
+    // which is exactly what this is: the wall in two segments with a 1.4 m
+    // door onto the stair landing. The plate spans 1.4 m over the opening,
+    // which is nothing, and gains a continuous bearing line over the other
+    // 9.8 m.
+    {
+      const doorZ0 = -4.0, doorZ1 = -2.6;   // onto the stair arrival landing
+      for (const [z0, z1] of [[core.z0 - CORE_T, doorZ0], [doorZ1, core.z1 + CORE_T]]) {
+        b.box({ type: 'core', material: 'reinforced-concrete',
+          min: [core.x0 - CORE_T, slabTop(k - 1), z0],
+          max: [core.x0, slabBase(k), z1] });
+      }
+    }
     staircase(b, {
       at: stairAt, y0: slabTop(k - 1), y1: slabTop(k), axis: 'x',
       material: 'reinforced-concrete', newelPost: false,
@@ -199,7 +237,7 @@ export function buildPark432(cfg = {}) {
     // one and the podium carries nothing, which floats the entire tower.
     for (const x of pierAt) {
       for (const z of pierAt) {
-        if (Math.abs(x) < h - 1e-6 && Math.abs(z) < h - 1e-6) continue;
+        if (!onPerimeter(x, z)) continue;
         b.box({ type: 'column', material: 'reinforced-concrete',
           min: [x - cs, slabTop(k - 1), z - cs], max: [x + cs, slabBase(k), z + cs] });
       }
@@ -229,6 +267,60 @@ export function buildPark432(cfg = {}) {
               : [[bBot, a0], [bBot, a1], [bTop, a1], [bTop, a0]],
           });
         }
+      }
+    }
+
+    // ── band beams: the ribs that stop the plate spanning core to facade ────
+    //
+    // With the core closed the plate is a 7.3 m one-way span in every wing,
+    // and the audit still put slab<->slab at the top of the class list --
+    // these are the plate's own fracture seams carrying that span moment,
+    // with no reinforcement crossing them because this model has none. The
+    // only lever left is geometric: put beams under the plate so it spans
+    // BETWEEN them instead, 4.67 m rather than 7.3 m, which is 0.41 of the
+    // moment.
+    //
+    // The layout is chosen so that no two ribs can ever cross, because the
+    // obvious two-way grid does exactly that -- a previous attempt put 1,434
+    // pairs of beams inside each other at the crossings and left the beam
+    // lines that miss the core spanning 26 m over nothing.
+    //
+    // The trick is that a rib is only allowed where it has something to bear
+    // on at BOTH ends:
+    //   - X-ribs live in the +-X wings, and only on the grid lines that pass
+    //     behind the core (|z| < 5.6), so the core wall carries the inner end
+    //     and a pier carries the outer end.
+    //   - Z-ribs live in the +-Z wings on the same lines, so they are at
+    //     |x| < 5.6 -- and an X-rib is at |x| > 5.6. Disjoint in x: they
+    //     cannot meet.
+    //   - the four corner bays are reached by one more X-rib each, on the
+    //     grid line that clears the core entirely. That one has no core to
+    //     sit on, so it is SEGMENTED between the Z-rib beside it and the
+    //     pier line -- one direction continuous, the other framing into it,
+    //     which is the ordinary primary/secondary beam hierarchy.
+    {
+      const rw = C.ribWidth / 2;
+      const coreOut = ch + CORE_T;         // 5.6 — the core's outer wall face
+      const wingOut = pierRing - cs;       // 12.9 — the pier line's inner face
+      const bTop = slabBase(k);
+      const bBot = bTop - C.ribDepth;
+      // Grid lines that pass behind the core, and so have a wall to bear on.
+      const onCore = pierAt.filter((v) => Math.abs(v) + rw < coreOut - 1e-6);
+      // Grid lines that clear the core and fit inside a wing: the corner ribs.
+      const offCore = pierAt.filter((v) => Math.abs(v) - rw > coreOut + 1e-6
+        && Math.abs(v) + rw < wingOut - 1e-6);
+      // The outer face of the outermost Z-rib — what a corner rib lands on.
+      const land = Math.max(...onCore.map(Math.abs)) + rw;
+      const rib = (min, max) =>
+        b.box({ type: 'beam', material: 'reinforced-concrete', min, max });
+      for (const s of [-1, 1]) {
+        const lo = s < 0 ? -wingOut : coreOut;
+        const hi = s < 0 ? -coreOut : wingOut;
+        for (const z of onCore) rib([lo, bBot, z - rw], [hi, bTop, z + rw]);
+        for (const x of onCore) rib([x - rw, bBot, lo], [x + rw, bTop, hi]);
+        const cLo = s < 0 ? -wingOut : land;
+        const cHi = s < 0 ? -land : wingOut;
+        for (const z of offCore) rib([cLo, bBot, z - rw], [cHi, bTop, z + rw]);
       }
     }
 
