@@ -345,6 +345,8 @@ struct ExtStressPhysXTelemetry
     /// blocks inside solveTick that had no timer.
     double stressGraphSolveMilliseconds;
     /// The three host walks inside the graph solve.
+    /// Cumulative bond groups skipped by the unchanged-stress short circuit.
+    uint64_t bondStressGroupsSkipped{0};
     double stressHostWalkInMilliseconds;
     double stressHostResetMilliseconds;
     double stressHostBondStressMilliseconds;

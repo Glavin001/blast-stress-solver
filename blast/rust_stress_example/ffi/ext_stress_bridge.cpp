@@ -1509,6 +1509,13 @@ ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handleP
     return (handle && handle->solver) ? handle->solver->getGpuImpulseCopyMilliseconds() : 0.0f;
 }
 
+extern "C" uint64_t
+ext_stress_solver_bond_stress_groups_skipped(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressGroupsSkipped() : 0U;
+}
+
 extern "C" float
 ext_stress_solver_host_walk_in_milliseconds(const ExtStressSolverHandle* handlePtr)
 {

@@ -278,6 +278,9 @@ public:
 #endif
     }
 
+    /// Which solver bonds re-solved this tick. Empty means "assume all".
+    const std::vector<uint8_t>& bondDirty() const { return m_bondDirty; }
+
     float getGpuImpulseCopyMilliseconds() const
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
@@ -438,6 +441,7 @@ public:
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
         m_gpuFrameSolveMilliseconds = 0.0f;
         m_gpuFrameHostWorkMilliseconds = 0.0f;
+        m_bondDirty.clear();
         m_gpuImpulseCopyMilliseconds = 0.0f;
         m_gpuImpulseCopyCount = 0;
         m_gpuFrameHostBlockedMilliseconds = 0.0f;
@@ -527,6 +531,23 @@ public:
                         m_gpuImpulses[i].linear.y,
                         m_gpuImpulses[i].linear.z};
                 }
+                // Dirty mask over solver bonds, from the same compacted list
+                // the impulse copy uses. A bond absent from it kept the
+                // impulses it already had, so anything derived from those
+                // impulses is unchanged too.
+                const bool compactedList =
+                    changed != nullptr && changedCount < impulseCount;
+                m_bondDirty.assign(impulseCount, compactedList ? 0u : 1u);
+                if (compactedList)
+                {
+                    for (uint32_t k = 0; k < changedCount; ++k)
+                    {
+                        if (changed[k] < m_bondDirty.size())
+                        {
+                            m_bondDirty[changed[k]] = 1u;
+                        }
+                    }
+                }
                 m_gpuImpulseCopyMilliseconds =
                     std::chrono::duration<float, std::milli>(
                         std::chrono::steady_clock::now() - copyStart).count();
@@ -609,6 +630,8 @@ private:
     StressProcessor             m_stressProcessor;
     POD_Buffer<AngLin6>         m_velocities;
     POD_Buffer<AngLin6>         m_impulses;
+    /// Per-solver-bond dirty flags; see bondDirty().
+    std::vector<uint8_t>        m_bondDirty;
     AngLin6ErrorSq              m_error_sq;
     bool                        m_converged;
     bool                        m_forceColdStart;
@@ -1137,6 +1160,18 @@ public:
         m_hostNodeStressMilliseconds = walkMs(nodeStart);
     }
 
+    /// A/B for the unchanged-bond-stress skip (default OFF until audited).
+    static bool skipUnchangedBondStress()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_SKIP_UNCHANGED_BOND_STRESS");
+            return raw != nullptr && std::string(raw) != "0";
+        }();
+        return enabled;
+    }
+
+    uint64_t getBondStressGroupsSkipped() const { return m_bondStressGroupsSkipped; }
+
     bool calcError(float& linear, float& angular) const
     {
         return m_solver.calcError(linear, angular);
@@ -1148,6 +1183,10 @@ public:
     float getHostResetMilliseconds() const { return m_hostResetMilliseconds; }
     float getHostBondStressMilliseconds() const { return m_hostBondStressMilliseconds; }
     float getHostNodeStressMilliseconds() const { return m_hostNodeStressMilliseconds; }
+    /// Per-group "was overstressed last tick", the second half of the skip
+    /// condition. Starts all-1 so the first tick after a resize never skips.
+    std::vector<uint8_t> m_groupOverstressed;
+    uint64_t m_bondStressGroupsSkipped{0};
     float m_hostWalkInMilliseconds{0.0f};
     float m_hostResetMilliseconds{0.0f};
     float m_hostBondStressMilliseconds{0.0f};
@@ -1489,8 +1528,44 @@ private:
         Array<uint32_t>::type& bondIndicesToRemove = m_bondIndicesToRemove;
         bondIndicesToRemove.clear();
         bondIndicesToRemove.reserve(getBondCount());
+
+        // Skip groups whose stress provably cannot have changed.
+        //
+        // This walk is 9.90 ms -- 64.5% of the graph solve and 24.7% of the
+        // whole Blast tick, roughly 7x the GPU kernel it post-processes --
+        // and it runs over every solver bond every tick regardless of what
+        // moved. The solver already knows what moved: bondDirty() is the same
+        // compacted list the impulse copy uses.
+        //
+        // The skip is exact, not approximate, and needs BOTH conditions:
+        //
+        //   not dirty        -- the impulses this group's stress is computed
+        //                       from are byte-identical to last tick's, so
+        //                       recomputing yields the same stressNormal and
+        //                       stressShear it already holds.
+        //   not overstressed -- an overstressed bond takes damage every tick,
+        //                       so its HEALTH changes even when its impulse
+        //                       does not, and health is the other input.
+        //                       Skipping one would freeze a bond mid-failure.
+        //
+        // A group meeting both contributes nothing to m_overstressedBondCount
+        // or m_nodeOverstressed (it was not overstressed) and nothing to
+        // bondIndicesToRemove (unchanged health cannot cross a threshold it
+        // did not cross last tick), so the reset-and-rebuild above stays
+        // correct without re-applying anything for it.
+        const std::vector<uint8_t>& dirty = m_solver.bondDirty();
+        const bool haveDirty = skipUnchangedBondStress()
+            && dirty.size() == m_solverBondsData.size()
+            && m_groupOverstressed.size() == m_solverBondsData.size();
+        m_groupOverstressed.resize(m_solverBondsData.size(), 1u);
         for (uint32_t i = 0; i < m_solverBondsData.size(); ++i)
         {
+            if (haveDirty && dirty[i] == 0u && m_groupOverstressed[i] == 0u)
+            {
+                ++m_bondStressGroupsSkipped;
+                continue;
+            }
+            m_groupOverstressed[i] = 0u;
             // calculate the total area of all bonds involved so pressure can be calculated
             float totalArea = 0.0f;
             // calculate an average normal and centroid for all bonds as well, weighted by their area
@@ -1574,6 +1649,10 @@ private:
                         || stressShear > material.shearElasticLimit)
                     {
                         ++m_overstressedBondCount;
+                        // Latch the group as overstressed so next tick cannot
+                        // skip it: its health will change even if its impulse
+                        // does not.
+                        m_groupOverstressed[i] = 1u;
                         // E1: exactly the condition generateStressDamage keys
                         // its command on, evaluated on the same stored floats
                         // — so the mask is neither wider nor narrower than
@@ -2246,6 +2325,11 @@ public:
     virtual float                           getGpuImpulseCopyMilliseconds() const override
     {
         return m_graphProcessor->getGpuImpulseCopyMilliseconds();
+    }
+
+    virtual uint64_t                        getBondStressGroupsSkipped() const override
+    {
+        return m_graphProcessor->getBondStressGroupsSkipped();
     }
 
     virtual uint32_t                        getGpuImpulseCopyCount() const override

@@ -582,6 +582,10 @@ public:
     virtual float                           getHostBondStressMilliseconds() const = 0;
     virtual float                           getHostNodeStressMilliseconds() const = 0;
     virtual float                           getGpuImpulseCopyMilliseconds() const = 0;
+    /// Solver bond groups whose stress was provably unchanged and skipped.
+    /// MUST be non-zero when the skip is enabled, or the A/B is measuring
+    /// nothing and cannot tell "no win" from "never ran".
+    virtual uint64_t                        getBondStressGroupsSkipped() const = 0;
     virtual uint32_t                        getGpuImpulseCopyCount() const = 0;
     virtual float                           getGpuHostWorkMilliseconds() const = 0;
     virtual float                           getGpuHostBlockedMilliseconds() const = 0;
