@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "NvBlast.h"
@@ -293,6 +296,23 @@ ExtStressSolverHandleImpl::ActorEntry* findActorByIndex(ExtStressSolverHandleImp
         }
     }
     return nullptr;
+}
+
+/// E6: A/B for the apply-path bookkeeping rewrite (default ON, =0 restores
+/// the erase-per-split / rebuild-per-command path). One binary, two arms.
+///
+/// Three superlinear terms lived here, all bookkeeping, all invisible at one
+/// split and multiplicative at four hundred: a full O(total nodes) index
+/// rebuild once per fracture command (every erase/push re-dirtied it), a
+/// linear actor scan per generated actor, and an O(bodies) vector erase per
+/// split. Same values, same order — only the cost changes.
+static bool applyIndexIncremental()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_APPLY_INDEX_INCREMENTAL");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
 }
 
 const ExtStressSolverHandleImpl::ActorEntry* findActorByPointer(const ExtStressSolverHandleImpl& handle, const NvBlastActor* actor)
@@ -1636,10 +1656,32 @@ extern "C" uint8_t ext_stress_solver_generate_fracture_commands_per_actor(const 
     auto* mutableHandle = const_cast<ExtStressSolverHandleImpl*>(handle);
     mutableHandle->pendingChunkFractures.clear();
 
+    // E6: one O(bodies) map build per CALL replaces one O(bodies) linear scan
+    // per generated actor. generate mutates no actor entries, so pointers
+    // stay valid for the whole loop.
+    std::unordered_map<const NvBlastActor*, const ExtStressSolverHandleImpl::ActorEntry*> actorsByPointer;
+    if (applyIndexIncremental())
+    {
+        actorsByPointer.reserve(handle->actors.size());
+        for (const auto& actorEntry : handle->actors)
+        {
+            actorsByPointer.emplace(actorEntry.actor, &actorEntry);
+        }
+    }
+
     for (uint32_t i = 0; i < generated && commandCount < command_capacity; ++i)
     {
         const NvBlastFractureBuffers& buffer = buffers[i];
-        const auto* entry = findActorByPointer(*handle, llActors[i]);
+        const ExtStressSolverHandleImpl::ActorEntry* entry;
+        if (applyIndexIncremental())
+        {
+            const auto found = actorsByPointer.find(llActors[i]);
+            entry = found == actorsByPointer.end() ? nullptr : found->second;
+        }
+        else
+        {
+            entry = findActorByPointer(*handle, llActors[i]);
+        }
         const uint32_t actorIndex = entry ? entry->actorIndex : UINT32_MAX;
 
         const uint32_t bondCount = buffer.bondFractureCount;
@@ -1725,9 +1767,21 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
         return 0U;
     }
 
-    // This call erases the parent actor entry and pushes child entries below, so
-    // the input-node -> actor index must be rebuilt before the next lookup.
-    handle->actorIndexDirty = true;
+    // This call retires parent actor entries and pushes child entries below.
+    // E6 (incremental): build the index ONCE here, keep it correct in place
+    // at each mutation, and compact + dirty once at the end — instead of a
+    // full O(total nodes) rebuild on the first lookup after every mutation,
+    // which made a 400-split tick quadratic.
+    if (applyIndexIncremental())
+    {
+        handle->actorIndexDirty = true;
+        ensureActorIndex(*handle);
+    }
+    else
+    {
+        handle->actorIndexDirty = true;
+    }
+    bool anyTombstone = false;
 
     uint32_t storedEvents = 0;
     uint32_t storedChildren = 0;
@@ -1817,16 +1871,40 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
 
         if (entryIndex < handle->actors.size())
         {
-            handle->actors.erase(handle->actors.begin() + static_cast<std::ptrdiff_t>(entryIndex));
-            // Erasing shifts every later entry left. The actorIndex -> slot
-            // table must be invalidated HERE, not just on push_back: a second
-            // fracture command in this same call would otherwise resolve its
-            // actor through stale slots and read a DIFFERENT actor's node
-            // list -- which is exactly how promotions ended up pairing chunks
-            // from buildings seventy metres apart. The old linear scan was
-            // immune because it read the live vector; the indexed lookup is
-            // only correct if every mutation marks it dirty.
-            handle->actorIndexDirty = true;
+            if (applyIndexIncremental())
+            {
+                // E6: tombstone instead of erase — no slot shifts, so the
+                // index stays valid without a rebuild. The parent's
+                // actorIndex mapping is cleared NOW, before its children
+                // register (a child may legitimately reuse the family
+                // index). Node lists freed here; nothing reads a tombstone.
+                // Survivor order is preserved by the stable compaction at
+                // the end, so the final vector is byte-for-byte the sequence
+                // the erase path produced.
+                ExtStressSolverHandleImpl::ActorEntry& dead = handle->actors[entryIndex];
+                if (dead.actorIndex < handle->actorIndexToSlot.size())
+                {
+                    handle->actorIndexToSlot[dead.actorIndex] = UINT32_MAX;
+                }
+                dead.actor = nullptr;
+                dead.actorIndex = UINT32_MAX;
+                dead.graphNodes.clear();
+                dead.inputNodes.clear();
+                anyTombstone = true;
+            }
+            else
+            {
+                handle->actors.erase(handle->actors.begin() + static_cast<std::ptrdiff_t>(entryIndex));
+                // Erasing shifts every later entry left. The actorIndex -> slot
+                // table must be invalidated HERE, not just on push_back: a second
+                // fracture command in this same call would otherwise resolve its
+                // actor through stale slots and read a DIFFERENT actor's node
+                // list -- which is exactly how promotions ended up pairing chunks
+                // from buildings seventy metres apart. The old linear scan was
+                // immune because it read the live vector; the indexed lookup is
+                // only correct if every mutation marks it dirty.
+                handle->actorIndexDirty = true;
+            }
         }
 
         ExtStressSplitEvent* evt = nullptr;
@@ -1906,14 +1984,62 @@ extern "C" uint8_t ext_stress_solver_apply_fracture_commands(ExtStressSolverHand
                 truncated = true;
             }
 
-            handle->actors.push_back(std::move(entry));
-            handle->actorIndexDirty = true;
+            if (applyIndexIncremental())
+            {
+                // E6: register the child's mappings in place of the rebuild.
+                const uint32_t slot = static_cast<uint32_t>(handle->actors.size());
+                if (entry.actorIndex != UINT32_MAX)
+                {
+                    if (entry.actorIndex >= handle->actorIndexToSlot.size())
+                    {
+                        handle->actorIndexToSlot.resize(entry.actorIndex + 1, UINT32_MAX);
+                    }
+                    handle->actorIndexToSlot[entry.actorIndex] = slot;
+                }
+                for (uint32_t inputNode : entry.inputNodes)
+                {
+                    if (inputNode < handle->inputNodeToActorSlot.size())
+                    {
+                        handle->inputNodeToActorSlot[inputNode] = slot;
+                    }
+                }
+                handle->actors.push_back(std::move(entry));
+            }
+            else
+            {
+                handle->actors.push_back(std::move(entry));
+                handle->actorIndexDirty = true;
+            }
         }
 
         if (evt)
         {
             ++storedEvents;
         }
+    }
+
+    if (applyIndexIncremental() && anyTombstone)
+    {
+        // E6: stable compaction — one O(bodies) pass per CALL, in place of an
+        // O(bodies) memmove per split. Relative survivor order and the
+        // appended-children tail are exactly what erase-in-place produced.
+        // Slots change here, so the index goes dirty ONCE; the next lookup
+        // (first force injection of the next tick) rebuilds it, which is the
+        // same steady-state the old path had after any apply.
+        std::size_t write = 0;
+        for (std::size_t read = 0; read < handle->actors.size(); ++read)
+        {
+            if (handle->actors[read].actor != nullptr)
+            {
+                if (write != read)
+                {
+                    handle->actors[write] = std::move(handle->actors[read]);
+                }
+                ++write;
+            }
+        }
+        handle->actors.resize(write);
+        handle->actorIndexDirty = true;
     }
 
     if (out_event_count)
