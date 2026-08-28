@@ -296,10 +296,19 @@ struct ExtStressPhysXTelemetry
     /// a fracture there, and every contact routed into it is work whose only
     /// possible outcome is zero. Counted to size that waste before anything
     /// is built on the assumption.
-    uint32_t singleNodeBodyCount;
+    uint32_t singleNodeBodyCount{0};
     /// Contacts queued this tick whose target node belongs to a single-node
     /// body — the directly skippable share of the contact stream.
-    uint32_t singleNodeContacts;
+    uint32_t singleNodeContacts{0};
+    /// Single-node bodies that are AWAKE. These can never break — no bonds —
+    /// so they contribute nothing to the stress solve and are not even in its
+    /// island set, yet each one is a full PhysX rigid body generating contact
+    /// reports. If the awake population is mostly these, then retiring them
+    /// is the lever, and it costs the stress path nothing at all.
+    uint32_t singleNodeAwakeBodies{0};
+    /// Contacts dropped because their body has no bonds and therefore nothing
+    /// the contact could ever affect. Cumulative.
+    uint64_t bondlessContactsSkipped{0};
     uint32_t awakeDynamicBodyCount;
     uint32_t overstressedBondCount;
     uint32_t solverIslandCount;

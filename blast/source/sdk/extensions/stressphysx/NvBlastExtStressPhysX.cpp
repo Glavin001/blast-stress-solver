@@ -33,6 +33,18 @@ namespace
 
 constexpr uint32_t INVALID_INDEX = std::numeric_limits<uint32_t>::max();
 
+/// A/B for dropping contacts aimed at bodies that have no bonds (default
+/// ON). Not an approximation -- see the comment at the drop site -- but
+/// switchable so one binary produces both arms of the measurement.
+static bool skipBondlessContacts()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_SKIP_BONDLESS_CONTACTS");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
 /// A/B for the per-body contacted-actor hoist (default ON). One binary, two
 /// arms: separate builds would reintroduce build identity as a confounder,
 /// which is how a whole afternoon of measurements went wrong on this tree.
@@ -529,6 +541,34 @@ public:
             return false;
         }
 
+        // A contact on a body with no bonds cannot do anything.
+        //
+        // Islands are built by walking BONDS (stress.cpp): a node with no
+        // bond never joins one, so it is not in any island, the CG solve
+        // never visits it, and no bond of its can be overstressed because it
+        // has none. Every stage this contact would pass through -- the queue
+        // push, the pose transform, the three array appends, the solver's
+        // per-force accumulation -- is work whose only possible outcome is
+        // zero. Dropping it is not an approximation; it removes arithmetic
+        // that provably cannot change a result.
+        //
+        // Measured on a grid-2 collapse: 92% of AWAKE bodies are single-node
+        // debris, and 65% of queued contacts are aimed at them.
+        //
+        // Wake is handled before the skip: a single-node body still needs to
+        // be woken by an impact, and that is the one effect a contact on it
+        // legitimately has.
+        if (skipBondlessContacts() && !contact.wake
+            && nodeIndex < m_nodes.size())
+        {
+            const BodyState* owner = m_nodes[nodeIndex].body;
+            if (owner != nullptr && owner->nodes.size() == 1)
+            {
+                ++m_telemetry.bondlessContactsSkipped;
+                return false;
+            }
+        }
+
         QueuedContact queued;
         queued.nodeIndex = nodeIndex;
         queued.position = contact.worldPosition;
@@ -794,6 +834,13 @@ public:
         uint32_t* outWakeCount)
     {
         uint32_t wakeCount = 0;
+        // Written before the empty-queue early return, not after the loop:
+        // this struct is not zero-initialised, so a tick with no contacts
+        // left the field holding whatever was in that memory. It read ~1.1e9
+        // in the first live reports, which is exactly the kind of number that
+        // is obviously wrong -- the dangerous version of this bug is the one
+        // that returns a plausible value.
+        m_telemetry.singleNodeContacts = 0;
         resetCrushStrainRates();
         if (m_contacts.empty())
         {
@@ -1358,14 +1405,23 @@ public:
         // contacts routed into them and their share of the solve cannot
         // change anything. Sized before anything is built on it.
         uint32_t singleNode = 0;
+        uint32_t singleNodeAwake = 0;
         for (const auto& entry : m_actorBodies)
         {
             if (entry.second && entry.second->nodes.size() == 1)
             {
                 ++singleNode;
+                const PxRigidDynamic* actor = entry.second->body;
+                if (actor != nullptr
+                    && !actor->getRigidBodyFlags().isSet(PxRigidBodyFlag::eKINEMATIC)
+                    && !actor->isSleeping())
+                {
+                    ++singleNodeAwake;
+                }
             }
         }
         m_telemetry.singleNodeBodyCount = singleNode;
+        m_telemetry.singleNodeAwakeBodies = singleNodeAwake;
         m_tickPhase = TickPhase::Idle;
         return true;
     }
