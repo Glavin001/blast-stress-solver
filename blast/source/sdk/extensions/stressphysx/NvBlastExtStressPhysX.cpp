@@ -32,6 +32,18 @@ namespace
 {
 
 constexpr uint32_t INVALID_INDEX = std::numeric_limits<uint32_t>::max();
+
+/// A/B for the per-body contacted-actor hoist (default ON). One binary, two
+/// arms: separate builds would reintroduce build identity as a confounder,
+/// which is how a whole afternoon of measurements went wrong on this tree.
+static bool contactedActorHoist()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_CONTACTED_ACTOR_HOIST");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
+}
 constexpr uint32_t MAX_GPU_CONVEX_POINTS = 64;
 constexpr float MIN_MASS = 1.0e-6f;
 using TelemetryClock = std::chrono::steady_clock;
@@ -858,7 +870,22 @@ public:
             // support nodes up, and without the matching gravity pulling the
             // rest down the solver sees a net upward load and reports
             // wrong-signed stress. addGravityFromSnapshot consults this.
-            m_contactedActors.insert(body.actorIndex);
+            // Once per body per tick, not once per CONTACT. Measured live:
+            // 170,781 queued contacts against at most a few thousand distinct
+            // bodies, so this unordered_set was being hashed ~7x more often
+            // than it could possibly learn anything. Idempotent, so the set
+            // contents are identical -- including for a body whose snapshot
+            // is missing below, which is why this uses its own generation
+            // rather than the pose cache's.
+            if (!contactedActorHoist())
+            {
+                m_contactedActors.insert(body.actorIndex);
+            }
+            else if (body.contactedActorGeneration != generation)
+            {
+                m_contactedActors.insert(body.actorIndex);
+                body.contactedActorGeneration = generation;
+            }
             const ExtStressPhysXBodySnapshot* found = snapshotFor(body);
             if (found == nullptr)
             {
@@ -2013,6 +2040,12 @@ private:
         mutable bool snapshotWasActive{false};
         uint64_t contactGeneration{0};
         PxTransform contactGlobalPose{PxIdentity};
+        /// Separate from contactGeneration on purpose: the contacted-actor
+        /// record is taken BEFORE the snapshot lookup can reject a contact,
+        /// so a body whose snapshot row is missing must still be recorded as
+        /// contacted. Sharing the pose generation would silently change which
+        /// actors carry gravity.
+        uint64_t contactedActorGeneration{0};
 
         ~BodyState()
         {
