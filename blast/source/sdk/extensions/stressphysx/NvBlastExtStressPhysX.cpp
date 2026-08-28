@@ -2960,15 +2960,38 @@ private:
             return finishCrushOnly();
         }
 
-        std::vector<NodeSnapshot> nodeSnapshots(m_nodes.size());
+        // E7: the node-sized scratch, reused. These were fresh allocations —
+        // zero-filled, ~1 MB each at 24k nodes — on EVERY fracturing tick,
+        // the same disease BLAST_FRACTURE_REUSE_BUFFERS cured for the
+        // bond-sized buffers; it never reached these. resize() to the same
+        // size touches nothing after the first tick, and every element a
+        // reader visits was written this tick first: snapshotParents fills
+        // every node of every fracturing parent, and the only readers
+        // (makeChildPlan, the continuity loop) visit child nodes, which are
+        // subsets of their parent's nodes. The apply buffers are written by
+        // the callee up to the returned counts, which is all anyone reads.
+        if (reuseBuffers)
+        {
+            m_nodeSnapshotScratch.resize(m_nodes.size());
+            m_splitEventScratch.resize(commandCount);
+            m_splitChildScratch.resize(m_nodes.size());
+            m_splitChildNodeScratch.resize(m_nodes.size());
+        }
+        else
+        {
+            m_nodeSnapshotScratch.assign(m_nodes.size(), NodeSnapshot{});
+            m_splitEventScratch.assign(commandCount, ExtStressSplitEvent{});
+            m_splitChildScratch.assign(m_nodes.size(), ExtStressActor{});
+            m_splitChildNodeScratch.assign(m_nodes.size(), 0u);
+        }
+        std::vector<NodeSnapshot>& nodeSnapshots = m_nodeSnapshotScratch;
+        std::vector<ExtStressSplitEvent>& events = m_splitEventScratch;
+        std::vector<ExtStressActor>& children = m_splitChildScratch;
+        std::vector<uint32_t>& childNodes = m_splitChildNodeScratch;
         const std::map<uint32_t, ParentMotion> parentMotions =
             snapshotParents(commands, nodeSnapshots);
         m_telemetry.fracturePrepMilliseconds += elapsedMilliseconds(phase);
         phase = TelemetryClock::now();
-
-        std::vector<ExtStressSplitEvent> events(commandCount);
-        std::vector<ExtStressActor> children(m_nodes.size());
-        std::vector<uint32_t> childNodes(m_nodes.size());
         uint32_t eventCount = 0;
         uint32_t childCount = 0;
         uint32_t childNodeCount = 0;
@@ -3795,6 +3818,12 @@ private:
     std::vector<ExtStressFractureCommands> m_fractureCommands;
     std::vector<ExtStressFractureCommands> m_fractureLimited;
     std::vector<ExtStressBondFracture> m_fractureBonds;
+    /// E7: node-sized fracture scratch, grow-only under
+    /// BLAST_FRACTURE_REUSE_BUFFERS (see the bond-sized pair above).
+    std::vector<NodeSnapshot> m_nodeSnapshotScratch;
+    std::vector<ExtStressSplitEvent> m_splitEventScratch;
+    std::vector<ExtStressActor> m_splitChildScratch;
+    std::vector<uint32_t> m_splitChildNodeScratch;
     std::map<uint32_t, std::unique_ptr<BodyState>> m_actorBodies;
     /// getBodySnapshots' sorted view, invalidated on every m_actorBodies
     /// mutation. Mutable: the snapshot read is const.
