@@ -335,6 +335,11 @@ struct ExtStressPhysXTelemetry
     double fractureRebuildMilliseconds;  ///< rebuildLookupTables: three whole-population hash maps
     double mappingValidationMilliseconds;
     double gpuStressSolveMilliseconds;
+    /// Of the host wall inside the GPU solve: working, versus blocked on the
+    /// device. Only the first can be reclaimed by faster host code, so the
+    /// split is the ceiling on every host-side optimization of this path.
+    double gpuStressHostWorkMilliseconds;
+    double gpuStressHostBlockedMilliseconds;
     uint64_t gpuStressHostToDeviceBytes;
     uint64_t gpuStressDeviceToHostBytes;
     uint64_t chunksCrushed;
