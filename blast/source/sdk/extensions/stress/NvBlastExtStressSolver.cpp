@@ -1103,28 +1103,55 @@ public:
 
     void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false, bool skipSettled = false, float deltaTime = 0.0f)
     {
-        sync(bonds, islandAware);
+        // The 11.2 ms that looked like an unattributed remainder is in here,
+        // not in the GPU call. Three host walks bracket the solve: a node
+        // walk in, and two per-bond/per-node walks out.
+        using SolveClock = std::chrono::steady_clock;
+        const auto walkMs = [](SolveClock::time_point from) {
+            return std::chrono::duration<float, std::milli>(
+                       SolveClock::now() - from).count();
+        };
 
+        const auto syncStart = SolveClock::now();
+        sync(bonds, islandAware);
         for (const NodeData& node : m_nodesData)
         {
             m_solver.setNodeVelocities(node.solverNode, node.localVel, NvVec3(NvZero));
         }
+        m_hostWalkInMilliseconds = walkMs(syncStart);
 
         m_solver.solve(settings.maxSolverIterationsPerFrame, warmStart, islandAware, skipSettled);
 
+        const auto outStart = SolveClock::now();
         resetVelocities();
+        m_hostResetMilliseconds = walkMs(outStart);
 
+        const auto bondStart = SolveClock::now();
         updateBondStress(bondHealth, bonds);
+        m_hostBondStressMilliseconds = walkMs(bondStart);
 
         // Per-chunk stress runs after the bonds because it consumes the same
         // solved impulses. Skipped entirely when no material enables crush.
+        const auto nodeStart = SolveClock::now();
         updateNodeStress(bondHealth, deltaTime);
+        m_hostNodeStressMilliseconds = walkMs(nodeStart);
     }
 
     bool calcError(float& linear, float& angular) const
     {
         return m_solver.calcError(linear, angular);
     }
+
+    /// Host walks bracketing the solve. These are where the 11.2 ms that
+    /// looked like an unattributed remainder actually lives.
+    float getHostWalkInMilliseconds() const { return m_hostWalkInMilliseconds; }
+    float getHostResetMilliseconds() const { return m_hostResetMilliseconds; }
+    float getHostBondStressMilliseconds() const { return m_hostBondStressMilliseconds; }
+    float getHostNodeStressMilliseconds() const { return m_hostNodeStressMilliseconds; }
+    float m_hostWalkInMilliseconds{0.0f};
+    float m_hostResetMilliseconds{0.0f};
+    float m_hostBondStressMilliseconds{0.0f};
+    float m_hostNodeStressMilliseconds{0.0f};
 
     bool getBondStress(uint32_t blastBondIndex, float& compression, float& tension, float& shear) const
     {
@@ -2206,6 +2233,15 @@ public:
     {
         return m_calcErrorMilliseconds;
     }
+
+    virtual float                           getHostWalkInMilliseconds() const override
+    { return m_graphProcessor->getHostWalkInMilliseconds(); }
+    virtual float                           getHostResetMilliseconds() const override
+    { return m_graphProcessor->getHostResetMilliseconds(); }
+    virtual float                           getHostBondStressMilliseconds() const override
+    { return m_graphProcessor->getHostBondStressMilliseconds(); }
+    virtual float                           getHostNodeStressMilliseconds() const override
+    { return m_graphProcessor->getHostNodeStressMilliseconds(); }
 
     virtual float                           getGpuImpulseCopyMilliseconds() const override
     {

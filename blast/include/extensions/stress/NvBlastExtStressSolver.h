@@ -576,6 +576,11 @@ public:
     virtual float                           getGraphSolveMilliseconds() const = 0;
     virtual float                           getCalcErrorMilliseconds() const = 0;
     /// Per-bond host copy of solved impulses out of the GPU buffer.
+    /// Host walks bracketing the GPU solve inside GraphProcessor::solve.
+    virtual float                           getHostWalkInMilliseconds() const = 0;
+    virtual float                           getHostResetMilliseconds() const = 0;
+    virtual float                           getHostBondStressMilliseconds() const = 0;
+    virtual float                           getHostNodeStressMilliseconds() const = 0;
     virtual float                           getGpuImpulseCopyMilliseconds() const = 0;
     virtual uint32_t                        getGpuImpulseCopyCount() const = 0;
     virtual float                           getGpuHostWorkMilliseconds() const = 0;

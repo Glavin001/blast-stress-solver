@@ -344,6 +344,11 @@ struct ExtStressPhysXTelemetry
     /// The graph-solve call itself, and the crushed-node drain: the two
     /// blocks inside solveTick that had no timer.
     double stressGraphSolveMilliseconds;
+    /// The three host walks inside the graph solve.
+    double stressHostWalkInMilliseconds;
+    double stressHostResetMilliseconds;
+    double stressHostBondStressMilliseconds;
+    double stressHostNodeStressMilliseconds;
     double stressDrainMilliseconds;
     /// Audit of the flat bondless flags against the two-deref predicate they
     /// replace. Mismatches must be zero.

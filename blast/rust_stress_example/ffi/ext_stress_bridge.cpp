@@ -1510,6 +1510,34 @@ ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handleP
 }
 
 extern "C" float
+ext_stress_solver_host_walk_in_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getHostWalkInMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_host_reset_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getHostResetMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_host_bond_stress_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getHostBondStressMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_host_node_stress_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getHostNodeStressMilliseconds() : 0.0f;
+}
+
+extern "C" float
 ext_stress_solver_graph_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
 {
     const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
