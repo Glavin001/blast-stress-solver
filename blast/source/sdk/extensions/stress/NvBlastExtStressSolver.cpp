@@ -1574,11 +1574,20 @@ private:
         // bondIndicesToRemove (unchanged health cannot cross a threshold it
         // did not cross last tick), so the reset-and-rebuild above stays
         // correct without re-applying anything for it.
+        // Resize BEFORE the check that reads the size, not after. As written
+        // the other way round, the very first tick at any new group count saw
+        // m_groupOverstressed.size() == 0, failed the guard, and disabled the
+        // skip for that tick -- and after a fracture that is every tick that
+        // matters. Measured: dirty+blocked+skipped summed to 15-65%, never
+        // 100%, and the missing share was ticks where the guard was false and
+        // every group took the full walk.
+        //
+        // New groups start latched overstressed (1u), so a group that has
+        // never been evaluated is never skipped.
+        m_groupOverstressed.resize(m_solverBondsData.size(), 1u);
         const std::vector<uint8_t>& dirty = m_solver.bondDirty();
         const bool haveDirty = skipUnchangedBondStress()
-            && dirty.size() == m_solverBondsData.size()
-            && m_groupOverstressed.size() == m_solverBondsData.size();
-        m_groupOverstressed.resize(m_solverBondsData.size(), 1u);
+            && dirty.size() == m_solverBondsData.size();
         for (uint32_t i = 0; i < m_solverBondsData.size(); ++i)
         {
             ++m_bsTotal;
