@@ -309,3 +309,41 @@ Chasing a seventh without resolving that is how the next day gets spent.
 The cheap way to settle it: take one bond in a stripped garage, print its
 stress, its material's elastic and fatal limits, and the stressMultiplier the
 damage path computes for it, and check they agree with each other.
+
+### Narrowed: where to look for the missing damage
+
+Traced the two paths that should agree.
+
+REPORTED UTILISATION (`getBondUtilisations`, solver ~4221) divides each fibre
+stress by that bond's OWN material elastic limit and takes the max. So a
+reported 2.93 means stress is 2.93x elastic -- not some other reference.
+
+DAMAGE (`generateStressDamage`, ~4939) computes
+`stressMultiplier = (stress - elastic) / (fatal - elastic)` and breaks the bond
+outright at >= 1. At band 1.35 a joint at 2.93x elastic gives 5.5, which is an
+immediate break. It does not break.
+
+Both read the same stresses -- the overstress test at ~2466 uses
+`calcSolverBondStresses` + `fibreStresses`, exactly what the report uses -- so
+the formulas are not the discrepancy. What sits between them is the GATE:
+
+    const bool anyBondWork = graphNodeCount > 1
+                          && m_graphProcessor->getOverstressedBondCount() > 0;
+    ...
+    if (anyBondWork && (!nodeSkip || m_graphProcessor->isNodeOverstressed(node0)))
+
+Damage only runs for nodes that path marks overstressed, and those marks come
+from the strip walk, which is itself skippable: a group that is "not dirty and
+not overstressed" is skipped, and `m_overstressedBondCount` is rebuilt from
+what the walk visits (~2341), with a cached value restored at ~2745 and ~2832.
+
+**So the first thing to check is whether a bond can be overstressed while the
+group holding it is marked clean.** That is exactly the shape of the two bugs
+already found in this area -- the settled-island skip freezing stresses at tick
+2, and the sampler running every 30 ticks -- and it would produce precisely
+this symptom: a joint the report can see at 2.93x that the damage path never
+visits.
+
+Concretely, in a stripped garage: pick a bond the report shows above 1.0, and
+check `isNodeOverstressed` for both its nodes and whether its group was skipped
+that tick. If the group is clean while the bond is hot, that is the bug.
