@@ -116,3 +116,47 @@ at both ends.
   - Report what you MEASURED, including things that did not work. A negative
     result stops the next person repeating it, and several of the entries
     above are negative results.
+
+## How long settling SHOULD take, and why a flat bar is wrong
+
+A ten-second bar was set on the theory that a sound structure settles fast and
+a slow one is badly built. The first half is true. The second is not, and the
+measurement says why:
+
+| structure | dynamic chunks | hops to ground | settles |
+|---|---:|---:|---|
+| house-1story | 325 | 7 | 0 s |
+| parking-garage | 3,350 | 19 | 4 s |
+| comp-stack, 8 floors | 560 | ~24 | under 10 s |
+| minas-tirith | 46,635 | 32 | 96 s |
+| petronas | 24,628 | 50 | past 300 s |
+| park-432 | 24,896 | 67 | 84 s |
+
+"Hops to ground" is the longest chain of bonds between an anchored chunk and
+the farthest chunk from it -- the load path, counted in joints.
+
+It is not chunk count that decides this. The parking garage has 3,350 chunks
+and settles in 4 s; a 32-floor component stack has 2,240 and does not settle at
+all. The garage is squat and the stack is tall, and the numerical reason is
+that conjugate gradient moves information roughly one hop per iteration. At the
+shipping 32 iterations a frame, a 67-hop load path needs two frames just to
+propagate once, and convergence needs many propagations.
+
+So a tall building cannot settle as fast as a short one, however well it is
+built, and a flat bar in seconds is really a bar on height. Three consequences:
+
+  - **Compare like with like.** A structure is slow relative to OTHERS OF ITS
+    DEPTH, not against a constant. That is the comparison that means something.
+  - **Shortening the load path is a real lever**, and it is an authoring one:
+    a column fractured into five chunks per storey has five times the hops of
+    one fractured into one. Granularity along the load path costs convergence.
+  - **Decoupling is the strongest lever of all.** Islands solve independently,
+    so a city of separate buildings is many small problems rather than one
+    large one. Minas Tirith already has 111 islands; its largest is 15,782
+    chunks of continuous ring wall, and segmenting that wall -- which real
+    fortifications do, with movement joints -- would split the biggest problem
+    in the city into several small ones.
+
+The gate should therefore assert what is genuinely a structural property --
+that a structure settles AT ALL and breaks nothing doing it -- and hold the
+time bar against comparable depth rather than a constant.
