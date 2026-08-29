@@ -14,6 +14,7 @@ out="${TMPDIR:-/tmp}/blast_gpu_solve_bench"
 "$cuda/bin/nvcc" -std=c++17 -O3 -m64 "-arch=$arch" -lineinfo -Xcompiler -fPIC \
   -DNVBLAST_ENABLE_CUDA_STRESS \
   -I"$blast/include/extensions/stressgpu" \
+  -I"$blast/include/extensions/stress" \
   "$blast/source/sdk/extensions/stressgpu/NvBlastExtStressGpu.cu" \
   "$here/gpu_solve_bench.cpp" \
   -o "$out" -lcuda -lcudart

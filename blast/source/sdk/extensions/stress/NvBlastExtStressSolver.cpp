@@ -27,6 +27,7 @@
 
 #include <chrono>
 #include "NvBlastExtStressSolver.h"
+#include "NvBlastExtStressFormula.h"
 #include "NvBlast.h"
 #include "NvBlastGlobals.h"
 #include "NvBlastArray.h"
@@ -904,29 +905,16 @@ public:
             return;
         }
 
-        // impulseLinear in the direction of the bond normal is stressNormal, perpendicular is stressShear
-        // ignore impulseAngular for now, not sure how to account for that
-        // convert to pressure to factor out area
+        // One body for this equation, shared with the device kernel -- see
+        // NvBlastExtStressFormula.h for why, and for the two deliberate
+        // differences from the form that used to be inlined here.
         NvVec3 impulseLinear, impulseAngular;
         getSolverInternalBondImpulses(bondIdx, impulseLinear, impulseAngular);
-        const float normalComponentLinear = impulseLinear.dot(bondNormal);
-        stressNormal = normalComponentLinear / bondArea;
-        const float impulseLinearMagSqr = impulseLinear.magnitudeSquared();
-        stressShear = sqrtf(impulseLinearMagSqr - normalComponentLinear * normalComponentLinear) / bondArea;
-
-        // impulseAngular in the direction of the bond normal is twist, perpendicular is bend
-        // take abs() of the dot product because only the magnitude of the twist matters, not direction
-        const float normalComponentAngular = abs(impulseAngular.dot(bondNormal));
-        const float twist = normalComponentAngular / bondArea;
-        const float impulseAngularMagSqr = impulseAngular.magnitudeSquared();
-        const float bend = sqrtf(impulseAngularMagSqr - normalComponentAngular * normalComponentAngular) / bondArea;
-
-        // interpret angular pressure as a composition of linear pressures
-        // dividing by nodeDist for scaling
-        const float twistContribution = twist * 2.0f / nodeDist;
-        stressShear += twistContribution;
-        const float bendContribution = bend * 2.0f / nodeDist;
-        stressNormal += std::copysign(bendContribution, stressNormal);
+        extStressCalcBondStress(
+            ExtStressVec3{impulseLinear.x, impulseLinear.y, impulseLinear.z},
+            ExtStressVec3{impulseAngular.x, impulseAngular.y, impulseAngular.z},
+            ExtStressVec3{bondNormal.x, bondNormal.y, bondNormal.z},
+            bondArea, nodeDist, stressNormal, stressShear);
     }
 
     float mapStressToRange(float stress, float elasticLimit, float fatalLimit) const
@@ -1095,11 +1083,15 @@ public:
                     const uint32_t solverBondIndex = entry->second;
                     auto& blastBondIndices = m_solverBondsData[solverBondIndex].blastBondIndices;
                     blastBondIndices.findAndReplaceWithLast(blastBondIndex);
+                    // Same edit against the flattened mirror, so the device
+                    // walk keeps seeing the membership the host walk sees.
+                    bondStressCsrRemoveMember(solverBondIndex, blastBondIndex);
                     if (blastBondIndices.empty())
                     {
                         // all bonds associated with this solver bond were removed, so let's remove solver bond
 
                         m_solverBondsData.replaceWithLast(solverBondIndex);
+                        bondStressCsrRemoveGroup(solverBondIndex);
                         m_solver.replaceWithLast(solverBondIndex);
                         if (m_solver.getBondCount() > 0)
                         {
@@ -1220,6 +1212,46 @@ public:
         return enabled;
     }
 
+    /// Device bond-stress walk (Step 4). Default OFF.
+    static bool bondStressGpu()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_BOND_STRESS_GPU");
+            return raw != nullptr && std::string(raw) != "0";
+        }();
+        return enabled;
+    }
+
+    /// Dual-run audit of the device walk against the serial one. Default OFF.
+    static bool bondStressGpuVerify()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_BOND_STRESS_GPU_VERIFY");
+            return raw != nullptr && std::string(raw) != "0";
+        }();
+        return enabled;
+    }
+
+    /// Audit of the flattened mirror itself against m_solverBondsData.
+    static bool bondStressCsrVerify()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_BOND_STRESS_CSR_VERIFY");
+            return raw != nullptr && std::string(raw) != "0";
+        }();
+        return enabled;
+    }
+
+    /// The mirror costs memory and a maintenance branch on every bond
+    /// removal, so it is only built when something actually reads it. With
+    /// every flag off this whole mechanism is inert.
+    static bool bondStressMirrorEnabled()
+    {
+        static const bool enabled =
+            bondStressGpu() || bondStressGpuVerify() || bondStressCsrVerify();
+        return enabled;
+    }
+
     uint64_t getBondStressGroupsSkipped() const { return m_bondStressGroupsSkipped; }
     uint64_t getBondStressParallelChecks() const { return m_bsParChecks; }
     uint64_t getBondStressParallelMismatches() const { return m_bsParMismatches; }
@@ -1265,6 +1297,48 @@ public:
     std::vector<BondStressStrip> m_bondStressStrips;
     /// Verify-mode scratch and audit counters. Mismatches must be zero.
     BondStressStrip m_verifySerialStrip;
+
+    // ── Flattened mirror of m_solverBondsData, for the device bond-stress walk ──
+    //
+    // Every per-member INPUT to the walk is static between graph resyncs. Node
+    // positions only move through setNodeInfo, which sets m_nodesDirty and so
+    // forces a resync; that makes nodeDisp -- and the sign-aligned bond normal
+    // derived from it -- fixed for the lifetime of this table. Only bond HEALTH
+    // and the solved impulses change per tick, and health arrives as a flat
+    // array already indexed by blast bond, so it needs no gather.
+    //
+    // Between resyncs groups only ever SHRINK, and by exactly the two edits the
+    // host applies to m_solverBondsData:
+    //   member removed -> findAndReplaceWithLast inside its group
+    //   group emptied  -> replaceWithLast over the group table
+    // Neither moves a member RANGE, because (begin, count) is stored per group
+    // and it is those entries that get swapped. So the member arrays are built
+    // once per resync and only ever edited in place. Dead tail slots are left
+    // behind; the next resync repacks them.
+    //
+    // Slot order within a group is the order the device must emit removals in,
+    // and it is NOT sorted -- see the note on bondStressFinish.
+    std::vector<uint32_t> m_bsCsrGroupBegin;
+    std::vector<uint32_t> m_bsCsrGroupCount;
+    std::vector<uint32_t> m_bsMemberBlastBond;
+    std::vector<uint32_t> m_bsMemberNode0;
+    std::vector<uint32_t> m_bsMemberNode1;
+    std::vector<uint32_t> m_bsMemberMaterial;
+    std::vector<float>    m_bsMemberNormal;    // 3 floats per slot, sign-aligned
+    std::vector<float>    m_bsMemberCentroid;  // 3 floats per slot
+    std::vector<float>    m_bsMemberNodeDisp;  // 3 floats per slot
+    /// blast bond -> owning group, or InvalidIndex. Kept in step with the
+    /// group swaps so the device can map its outputs back without the host
+    /// having to walk anything.
+    std::vector<uint32_t> m_bsBlastBondGroup;
+    /// Set by anything that invalidates the mirror; cleared by a rebuild.
+    bool m_bsCsrDirty{true};
+    /// Audit counters for BLAST_BOND_STRESS_CSR_VERIFY. Explicit initialisers:
+    /// a telemetry field without one has already reported 4.5e18 checks once.
+    uint64_t m_bsCsrChecks{0};
+    uint64_t m_bsCsrMismatches{0};
+    uint64_t m_bsCsrRebuilds{0};
+    uint64_t m_bsCsrTicks{0};
     uint64_t m_bsParChecks{0};
     uint64_t m_bsParMismatches{0};
     float m_hostWalkInMilliseconds{0.0f};
@@ -1700,6 +1774,32 @@ public:
         m_bsHaveDirty = skipUnchangedBondStress()
             && m_bsDirtyPtr->size() == m_solverBondsData.size();
         m_bsGroupCount = static_cast<uint32_t>(m_solverBondsData.size());
+
+        // Keep the flattened mirror in step before anything reads it.
+        if (bondStressMirrorEnabled())
+        {
+            if (m_bsCsrDirty)
+            {
+                rebuildBondStressCsr(bonds);
+                ++m_bsCsrRebuilds;
+            }
+            ++m_bsCsrTicks;
+        }
+        if (bondStressCsrVerify())
+        {
+            verifyBondStressCsr(bonds);
+            if ((m_bsCsrTicks % 600) == 0)
+            {
+                fprintf(stderr,
+                        "[bond-stress-csr] ticks=%llu rebuilds=%llu (%.1f%%) "
+                        "checks=%llu MISMATCHES=%llu\n",
+                        (unsigned long long)m_bsCsrTicks,
+                        (unsigned long long)m_bsCsrRebuilds,
+                        100.0 * double(m_bsCsrRebuilds) / double(m_bsCsrTicks),
+                        (unsigned long long)m_bsCsrChecks,
+                        (unsigned long long)m_bsCsrMismatches);
+            }
+        }
         m_bondStressStrips.resize(kBondStressStrips);
         for (uint32_t sIdx = 0; sIdx < kBondStressStrips; ++sIdx)
         {
@@ -1737,6 +1837,22 @@ public:
     /// serial order because the ranges are contiguous and ascending -- the
     /// property the 222M-check audit verified element by element, and the one
     /// that matters because removal order feeds back into topology.
+    ///
+    /// The emitted order is (group index, then member SLOT within the group).
+    /// It is NOT ascending by blast bond index, and a GPU port must not assume
+    /// it is:
+    ///   - removeBondIfExists does blastBondIndices.findAndReplaceWithLast,
+    ///     which moves the group's LAST member into the removed member's slot,
+    ///     so within-group slot order is a permutation, not a sort;
+    ///   - groups are built in m_bondsData order (syncBonds), and m_bondsData
+    ///     is itself replaceWithLast'd, so group order is not sorted either.
+    /// Measured on a grid-1 shot run: 2 of 200 non-empty removal lists came
+    /// out non-ascending (5 descending adjacent pairs of 774). So compacting
+    /// removals on the device and SORTING BY INDEX would reproduce a
+    /// different order than this walk on ~1% of the ticks that break bonds.
+    /// The order-preserving device equivalent is a stable segmented
+    /// compaction: prefix-sum the per-group removal counts, then have each
+    /// group write its own removals at its offset in ascending slot order.
     void bondStressFinish()
     {
         Array<uint32_t>::type& bondIndicesToRemove = m_bondIndicesToRemove;
@@ -1896,6 +2012,216 @@ public:
             }
     }
 
+    /// Rebuild the flattened mirror from m_solverBondsData. Called only when
+    /// the mirror is dirty, which means a resync or an edit we could not
+    /// mirror incrementally.
+    void rebuildBondStressCsr(const NvBlastBond* bonds)
+    {
+        const uint32_t groupCount = static_cast<uint32_t>(m_solverBondsData.size());
+        uint32_t total = 0;
+        for (uint32_t g = 0; g < groupCount; ++g)
+        {
+            total += m_solverBondsData[g].blastBondIndices.size();
+        }
+
+        m_bsCsrGroupBegin.resize(groupCount);
+        m_bsCsrGroupCount.resize(groupCount);
+        m_bsMemberBlastBond.resize(total);
+        m_bsMemberNode0.resize(total);
+        m_bsMemberNode1.resize(total);
+        m_bsMemberMaterial.resize(total);
+        m_bsMemberNormal.resize(3 * static_cast<size_t>(total));
+        m_bsMemberCentroid.resize(3 * static_cast<size_t>(total));
+        m_bsMemberNodeDisp.resize(3 * static_cast<size_t>(total));
+        m_bsBlastBondGroup.assign(m_blastBondIndexMap.size(), invalidIndex<uint32_t>());
+
+        uint32_t slot = 0;
+        for (uint32_t g = 0; g < groupCount; ++g)
+        {
+            const auto& members = m_solverBondsData[g].blastBondIndices;
+            m_bsCsrGroupBegin[g] = slot;
+            m_bsCsrGroupCount[g] = members.size();
+            for (const uint32_t blastBondIndex : members)
+            {
+                fillBondStressMember(slot, g, blastBondIndex, bonds);
+                ++slot;
+            }
+        }
+        m_bsCsrDirty = false;
+    }
+
+    /// One member slot. Everything here is derived from data that cannot
+    /// change until the next resync.
+    void fillBondStressMember(
+        uint32_t slot, uint32_t group, uint32_t blastBondIndex, const NvBlastBond* bonds)
+    {
+        m_bsMemberBlastBond[slot] = blastBondIndex;
+        if (blastBondIndex < m_bsBlastBondGroup.size())
+        {
+            m_bsBlastBondGroup[blastBondIndex] = group;
+        }
+
+        const uint32_t bondIndex = m_blastBondIndexMap[blastBondIndex];
+        // A member with no graph bond contributes nothing the walk can read;
+        // park it on node 0 with a zero normal so the device sees the same
+        // "no contribution" the host's isInvalidIndex guard produces.
+        if (isInvalidIndex(bondIndex))
+        {
+            m_bsMemberNode0[slot] = 0;
+            m_bsMemberNode1[slot] = 0;
+            m_bsMemberMaterial[slot] = 0;
+            for (uint32_t k = 0; k < 3; ++k)
+            {
+                m_bsMemberNormal[3 * static_cast<size_t>(slot) + k] = 0.0f;
+                m_bsMemberCentroid[3 * static_cast<size_t>(slot) + k] = 0.0f;
+                m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + k] = 0.0f;
+            }
+            return;
+        }
+
+        const BondData& bond = m_bondsData[bondIndex];
+        m_bsMemberNode0[slot] = bond.node0;
+        m_bsMemberNode1[slot] = bond.node1;
+        m_bsMemberMaterial[slot] =
+            m_bondMaterials ? m_bondMaterials[blastBondIndex] : 0;
+
+        const NvBlastBond& blastBond = bonds[blastBondIndex];
+        const nvidia::NvVec3 nodeDisp =
+            m_nodesData[bond.node1].localPos - m_nodesData[bond.node0].localPos;
+        const nvidia::NvVec3 assetNormal(
+            blastBond.normal[0], blastBond.normal[1], blastBond.normal[2]);
+        // Same alignment the walk does, hoisted here because it depends only
+        // on asset geometry and node positions.
+        const nvidia::NvVec3 aligned =
+            std::copysign(1.0f, assetNormal.dot(nodeDisp)) * assetNormal;
+
+        m_bsMemberNormal[3 * static_cast<size_t>(slot) + 0] = aligned.x;
+        m_bsMemberNormal[3 * static_cast<size_t>(slot) + 1] = aligned.y;
+        m_bsMemberNormal[3 * static_cast<size_t>(slot) + 2] = aligned.z;
+        m_bsMemberCentroid[3 * static_cast<size_t>(slot) + 0] = blastBond.centroid[0];
+        m_bsMemberCentroid[3 * static_cast<size_t>(slot) + 1] = blastBond.centroid[1];
+        m_bsMemberCentroid[3 * static_cast<size_t>(slot) + 2] = blastBond.centroid[2];
+        m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + 0] = nodeDisp.x;
+        m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + 1] = nodeDisp.y;
+        m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + 2] = nodeDisp.z;
+    }
+
+    /// Mirror of blastBondIndices.findAndReplaceWithLast: the group's LAST
+    /// member moves into the removed member's slot. Reproducing this exactly
+    /// is what keeps the device's removal order equal to the serial walk's.
+    void bondStressCsrRemoveMember(uint32_t group, uint32_t blastBondIndex)
+    {
+        if (!bondStressMirrorEnabled() || m_bsCsrDirty
+            || group >= m_bsCsrGroupCount.size())
+        {
+            return;
+        }
+        const uint32_t begin = m_bsCsrGroupBegin[group];
+        const uint32_t count = m_bsCsrGroupCount[group];
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            const uint32_t slot = begin + k;
+            if (m_bsMemberBlastBond[slot] != blastBondIndex)
+            {
+                continue;
+            }
+            const uint32_t last = begin + count - 1;
+            if (slot != last)
+            {
+                m_bsMemberBlastBond[slot] = m_bsMemberBlastBond[last];
+                m_bsMemberNode0[slot] = m_bsMemberNode0[last];
+                m_bsMemberNode1[slot] = m_bsMemberNode1[last];
+                m_bsMemberMaterial[slot] = m_bsMemberMaterial[last];
+                for (uint32_t c = 0; c < 3; ++c)
+                {
+                    m_bsMemberNormal[3 * static_cast<size_t>(slot) + c] =
+                        m_bsMemberNormal[3 * static_cast<size_t>(last) + c];
+                    m_bsMemberCentroid[3 * static_cast<size_t>(slot) + c] =
+                        m_bsMemberCentroid[3 * static_cast<size_t>(last) + c];
+                    m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + c] =
+                        m_bsMemberNodeDisp[3 * static_cast<size_t>(last) + c];
+                }
+            }
+            m_bsCsrGroupCount[group] = count - 1;
+            if (blastBondIndex < m_bsBlastBondGroup.size())
+            {
+                m_bsBlastBondGroup[blastBondIndex] = invalidIndex<uint32_t>();
+            }
+            return;
+        }
+        // Not found: the mirror and m_solverBondsData disagree, so stop
+        // trusting it rather than silently diverging.
+        m_bsCsrDirty = true;
+    }
+
+    /// Mirror of m_solverBondsData.replaceWithLast. Only the (begin, count)
+    /// entries move; the member ranges stay where they are.
+    void bondStressCsrRemoveGroup(uint32_t group)
+    {
+        if (!bondStressMirrorEnabled() || m_bsCsrDirty
+            || group >= m_bsCsrGroupCount.size())
+        {
+            return;
+        }
+        const uint32_t last = static_cast<uint32_t>(m_bsCsrGroupCount.size()) - 1;
+        if (group != last)
+        {
+            m_bsCsrGroupBegin[group] = m_bsCsrGroupBegin[last];
+            m_bsCsrGroupCount[group] = m_bsCsrGroupCount[last];
+            // The group that just moved owns different members now.
+            const uint32_t begin = m_bsCsrGroupBegin[group];
+            for (uint32_t k = 0; k < m_bsCsrGroupCount[group]; ++k)
+            {
+                const uint32_t blastBondIndex = m_bsMemberBlastBond[begin + k];
+                if (blastBondIndex < m_bsBlastBondGroup.size())
+                {
+                    m_bsBlastBondGroup[blastBondIndex] = group;
+                }
+            }
+        }
+        m_bsCsrGroupBegin.pop_back();
+        m_bsCsrGroupCount.pop_back();
+    }
+
+    /// BLAST_BOND_STRESS_CSR_VERIFY=1: rebuild a throwaway copy from
+    /// m_solverBondsData and compare it to the incrementally-maintained one,
+    /// slot by slot and in order. The incremental edits are the whole risk in
+    /// this mirror, and "the gates are green" is not evidence about them --
+    /// a 0.0975% divergence once passed every broad gate in this repo.
+    void verifyBondStressCsr(const NvBlastBond* bonds)
+    {
+        const uint32_t groupCount = static_cast<uint32_t>(m_solverBondsData.size());
+        ++m_bsCsrChecks;
+        if (m_bsCsrGroupCount.size() != groupCount)
+        {
+            ++m_bsCsrMismatches;
+            return;
+        }
+        for (uint32_t g = 0; g < groupCount; ++g)
+        {
+            const auto& members = m_solverBondsData[g].blastBondIndices;
+            ++m_bsCsrChecks;
+            if (m_bsCsrGroupCount[g] != members.size())
+            {
+                ++m_bsCsrMismatches;
+                continue;
+            }
+            const uint32_t begin = m_bsCsrGroupBegin[g];
+            for (uint32_t k = 0; k < m_bsCsrGroupCount[g]; ++k)
+            {
+                ++m_bsCsrChecks;
+                if (m_bsMemberBlastBond[begin + k] != members[k])
+                {
+                    ++m_bsCsrMismatches;
+                }
+            }
+        }
+        NV_UNUSED(bonds);
+    }
+
+    uint64_t getBondStressCsrChecks() const { return m_bsCsrChecks; }
+    uint64_t getBondStressCsrMismatches() const { return m_bsCsrMismatches; }
+
     void setDeferBondStress(bool defer) { m_deferBondStress = defer; }
     uint32_t bondStressStripCount() const { return kBondStressStrips; }
 
@@ -1942,6 +2268,13 @@ private:
         if (resynced && islandAware)
         {
             computeIslands();
+        }
+        if (resynced)
+        {
+            // A resync rebuilds m_solverBondsData wholesale, and can move node
+            // positions, so every static per-member value the mirror caches is
+            // stale. Rebuilt lazily at the next bondStressBegin.
+            m_bsCsrDirty = true;
         }
 
         CHECK_GRAPH_INTEGRITY;

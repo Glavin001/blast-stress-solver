@@ -10,6 +10,7 @@ out="${TMPDIR:-/tmp}/blast_gpu_settled_skip_test"
 "$cuda/bin/nvcc" -std=c++17 -O2 -m64 "-arch=$arch" -Xcompiler -fPIC \
   -DNVBLAST_ENABLE_CUDA_STRESS \
   -I"$blast/include/extensions/stressgpu" \
+  -I"$blast/include/extensions/stress" \
   "$blast/source/sdk/extensions/stressgpu/NvBlastExtStressGpu.cu" \
   "$here/gpu_settled_skip_test.cpp" \
   -o "$out" -lcuda -lcudart

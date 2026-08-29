@@ -1,6 +1,7 @@
 // Copyright (c) 2026 NVIDIA Corporation. All rights reserved.
 
 #include "NvBlastExtStressGpu.h"
+#include "NvBlastExtStressFormula.h"
 
 #include <cub/device/device_reduce.cuh>
 #include <cub/device/device_select.cuh>
@@ -1169,31 +1170,13 @@ __global__ void applyStressDamage(
     const Vec4 normal = normals[bond];
     const float area = areas[bond];
     const float distance = nodeDistances[bond];
-    const float linearNormal =
-        impulse.linear.x * normal.x
-        + impulse.linear.y * normal.y
-        + impulse.linear.z * normal.z;
-    const float linearMagnitudeSquared =
-        impulse.linear.x * impulse.linear.x
-        + impulse.linear.y * impulse.linear.y
-        + impulse.linear.z * impulse.linear.z;
-    float stressNormal = linearNormal / area;
-    float stressShear =
-        sqrtf(fmaxf(0.0f, linearMagnitudeSquared - linearNormal * linearNormal)) / area;
-
-    const float angularNormal = fabsf(
-        impulse.angular.x * normal.x
-        + impulse.angular.y * normal.y
-        + impulse.angular.z * normal.z);
-    const float angularMagnitudeSquared =
-        impulse.angular.x * impulse.angular.x
-        + impulse.angular.y * impulse.angular.y
-        + impulse.angular.z * impulse.angular.z;
-    const float twist = angularNormal / area;
-    const float bend =
-        sqrtf(fmaxf(0.0f, angularMagnitudeSquared - angularNormal * angularNormal)) / area;
-    stressShear += twist * 2.0f / distance;
-    stressNormal += copysignf(bend * 2.0f / distance, stressNormal);
+    // Same body as the host walk -- see NvBlastExtStressFormula.h.
+    float stressNormal, stressShear;
+    extStressCalcBondStress(
+        ExtStressVec3{impulse.linear.x, impulse.linear.y, impulse.linear.z},
+        ExtStressVec3{impulse.angular.x, impulse.angular.y, impulse.angular.z},
+        ExtStressVec3{normal.x, normal.y, normal.z},
+        area, distance, stressNormal, stressShear);
 
     // Each bond fails against its OWN material. The table is tiny and
     // L2-resident; a plain global read is sufficient.
