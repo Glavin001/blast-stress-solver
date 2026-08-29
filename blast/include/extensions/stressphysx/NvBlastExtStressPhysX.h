@@ -582,6 +582,10 @@ struct ExtStressPhysXMaterial
     // as the 30 GPa concrete reference.
     float elasticModulusPa = 0.0f;
 
+    // Fraction of a bond's original area that damage will not take below:
+    // reinforcement, as the thing it does. 0 keeps the runaway.
+    float residualAreaFraction = 0.0f;
+
     /*
     Optional CHUNK crushing (comminution). The limits above decide whether a
     JOINT fails; these decide whether the CHUNK ITSELF is ground up and leaves

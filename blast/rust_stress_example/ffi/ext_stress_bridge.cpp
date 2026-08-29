@@ -209,6 +209,7 @@ inline ExtStressMaterial toMaterial(const ExtStressMaterialDesc& desc)
 {
     ExtStressMaterial material;
     material.elasticModulusPa = desc.elastic_modulus_pa;
+    material.residualAreaFraction = desc.residual_area_fraction;
     material.compressionElasticLimit = desc.compression_elastic_limit;
     material.compressionFatalLimit = desc.compression_fatal_limit;
     material.tensionElasticLimit = desc.tension_elastic_limit;

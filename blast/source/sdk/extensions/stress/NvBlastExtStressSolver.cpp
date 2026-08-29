@@ -5016,6 +5016,30 @@ bool ExtStressSolverImpl::generateStressDamage(const NvBlastActor& actor, uint32
             {
                 bondDamage = bondHealth * stressMultiplier;
             }
+            // Damage ARRESTS at the residual the reinforcement represents.
+            //
+            // Health is remaining area and stress is force/health, so a joint
+            // that keeps losing area keeps raising its own stress -- the
+            // runaway that makes an overloaded joint fail eventually no matter
+            // how slowly. Stopping at a floor turns that into what a
+            // reinforced crack does: crack, weaken to the section the steel
+            // holds, and stay there.
+            // ...but only on the GRADUAL path. Past the fatal limit the joint
+            // goes outright, arrest or no arrest: reinforcement holds a crack
+            // open at a stable width, it does not survive the steel yielding.
+            // Clamping the fatal case too let bonds sit at 172x their elastic
+            // limit indefinitely, which is how a garage stripped of 90% of its
+            // columns stood there with nothing broken.
+            if (stressMultiplier < 1.0f && material.residualAreaFraction > 0.0f)
+            {
+                const float floorHealth =
+                    m_bonds[bondIndex].area * material.residualAreaFraction;
+                if (bondHealth - bondDamage < floorHealth)
+                {
+                    bondDamage = std::max(0.0f, bondHealth - floorHealth);
+                }
+            }
+
             const NvBlastBondFractureData data = {
                 0,
                 node0,

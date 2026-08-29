@@ -190,6 +190,24 @@ struct ExtStressMaterial
     float shearElasticLimit;        //!< < 0 inherits compression
     float shearFatalLimit;          //!< < 0 inherits compression
 
+    //! Fraction of a bond's ORIGINAL area that damage will not take below.
+    //!
+    //! Reinforcement, expressed as the thing it actually does. A reinforced
+    //! crack opens to a width the steel can hold and then STOPS -- it is a
+    //! stable state, not a stage of failure, and concrete past its tensile
+    //! strength with rebar across it stands for decades.
+    //!
+    //! Without this, damage accrues for as long as stress exceeds the elastic
+    //! limit, so any joint sitting even slightly over eventually sheds. That
+    //! is correct for a material with no reserve and wrong for every reinforced
+    //! one: a parking deck at 1.1x its cracking stress lost its seams whatever
+    //! the fatal limit said, and no combination of limits fixed it because the
+    //! missing behaviour was arrest rather than a threshold.
+    //!
+    //! 0 keeps the runaway, which is what plain masonry, glass and an
+    //! unreinforced seam should do.
+    float residualAreaFraction;
+
     //! Young's modulus, Pa. STIFFNESS, not strength: how much this material
     //! deforms under load, which is what decides how an over-connected
     //! structure SHARES load between parallel paths (k = EA/L). 0 means
@@ -207,7 +225,8 @@ struct ExtStressMaterial
         tensionFatalLimit(-1.0f),
         shearElasticLimit(-1.0f),
         shearFatalLimit(-1.0f),
-        elasticModulusPa(0.0f)
+        elasticModulusPa(0.0f),
+        residualAreaFraction(0.0f)
     {}
 };
 

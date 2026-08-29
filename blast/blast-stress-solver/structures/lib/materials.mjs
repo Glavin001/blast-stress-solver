@@ -187,6 +187,35 @@ const MODULUS = {
   'footing-anchor': 30e9,
 };
 
+/**
+ * How much of a joint's section survives after it has cracked, as a fraction.
+ *
+ * This is REINFORCEMENT, expressed as the thing reinforcement actually does. A
+ * reinforced crack opens to a width the steel can hold and then stops; it is a
+ * stable state, not a stage of failure, and concrete past its tensile strength
+ * with rebar across it stands for decades.
+ *
+ * Without it, damage accrues for as long as stress exceeds the elastic limit,
+ * so any joint sitting even slightly over eventually sheds. That is right for
+ * a material with no reserve and wrong for every reinforced one: a parking
+ * deck at 1.1x its cracking stress lost its seams whatever the fatal limit
+ * said, and no combination of limits fixed it, because what was missing was
+ * arrest rather than a threshold.
+ *
+ * 0 is the runaway, and it is correct for everything unreinforced -- masonry,
+ * glass, a stone bed joint, a facade clip.
+ */
+const RESIDUAL = {
+  // Rebar across a slab or column crack carries a good half of the section.
+  'reinforced-concrete': 0.5,
+  'concrete-slab': 0.45,
+  // Structural steel yields rather than parting: almost all of it survives.
+  steel: 0.8,
+  // Timber splits along the grain and the fibres bridge for a while.
+  'wood-frame': 0.25,
+  // Everything else runs away, which is what unreinforced material does.
+};
+
 function entry(name, elastic, band, tensionFrac, shearFrac) {
   const t = elastic * tensionFrac;
   const s = elastic * shearFrac;
@@ -196,6 +225,7 @@ function entry(name, elastic, band, tensionFrac, shearFrac) {
     tensionElastic: t, tensionFatal: t * band,
     shearElastic: s, shearFatal: s * band,
     elasticModulus: MODULUS[name] ?? 30e9,
+    residualAreaFraction: RESIDUAL[name] ?? 0,
     ...LOOK[name],
     density: DENSITY[name],
   };

@@ -323,6 +323,7 @@ public:
             target.shear_elastic_limit = source.shearElasticLimit;
             target.shear_fatal_limit = source.shearFatalLimit;
             target.elastic_modulus_pa = source.elasticModulusPa;
+            target.residual_area_fraction = source.residualAreaFraction;
 
             if (source.crushCapPressure > 0.0f)
             {

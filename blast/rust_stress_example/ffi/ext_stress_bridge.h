@@ -51,6 +51,8 @@ typedef struct ExtStressMaterialDesc {
     /* Young's modulus, Pa. Stiffness, not strength: decides how parallel load
        paths SHARE load (k = EA/L). 0 = unknown, treated as 30 GPa concrete. */
     float elastic_modulus_pa;
+    /* Fraction of original bond area damage will not go below. 0 = runaway. */
+    float residual_area_fraction;
     float crush_cap_pressure;         /* Pa. <= 0 disables crushing. */
     float crush_cohesion;             /* Pa. Drucker-Prager intercept at p = 0. */
     float crush_friction_slope;       /* dq/dp of the cone, dimensionless. */
