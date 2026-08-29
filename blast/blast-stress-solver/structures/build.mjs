@@ -31,6 +31,7 @@ import {
   buildRigCantilever, buildRigColumn, buildRigGarage, buildRigPane,
   buildRigPortal, buildRigToppled, buildRigWall,
 } from './rigs.mjs';
+import { standalone, row } from './components.mjs';
 import { shardHistogram } from './lib/fracture.mjs';
 import { verifyPack } from './verify.mjs';
 import { applyAutoBonds } from './lib/autobond.mjs';
@@ -60,6 +61,16 @@ const STRUCTURES = {
   'rig-pane': buildRigPane,
   'rig-wall': buildRigWall,
   'rig-toppled': buildRigToppled,
+  // Components: one bay, and the same bay composed, so "does it compose" is a
+  // measurement rather than an assumption. See components.mjs.
+  'comp-frame-bay': () => standalone('frame-bay'),
+  'comp-frame-bay-x2': () => row('frame-bay', 2),
+  'comp-frame-bay-x4': () => row('frame-bay', 4),
+  'comp-frame-bay-x8': () => row('frame-bay', 8),
+  'comp-wall-bay': () => standalone('wall-bay'),
+  'comp-wall-bay-x2': () => row('wall-bay', 2),
+  'comp-wall-bay-x4': () => row('wall-bay', 4),
+  'comp-wall-bay-x8': () => row('wall-bay', 8),
 };
 
 const argv = process.argv.slice(2);
