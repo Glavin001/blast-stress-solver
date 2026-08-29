@@ -395,7 +395,7 @@ export class ScenePackBuilder {
     const faceArea = polygonArea(poly);
     // `fracture: false` means no Voronoi, not "one enormous chunk": the piece is
     // still cut on the size grid. A foundation left whole came out at 363 m^3.
-    const n = p.fracture ? shardsFor(matName, faceArea, faceArea * (hi - lo)) : 1;
+    const n = p.fracture ? shardsFor(matName, faceArea, faceArea * (hi - lo), type) : 1;
     this.shardStats.push({ material: matName, shards: n });
 
     if (n <= 1) {
