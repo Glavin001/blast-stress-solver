@@ -34,31 +34,22 @@ one bad overload resolution away from truncating through abs(int).
 #include <cmath>
 
 /**
-Strict, non-contractable float ops on the device.
+Why this file uses fmaf explicitly.
 
-The host evaluates this equation with plain multiplies and adds. nvcc, with
-its default --fmad=true, contracts every mul+add into an FMA, which is more
-accurate but NOT the same value in the last bit. That difference is invisible
-almost all the time and then very visible in one specific regime: a freshly
-loaded city has enormous numbers of bonds sitting at essentially identical
-stress, so a 1-ulp disagreement straddles an elastic limit for a whole batch
-of them at once. Measured, before these were introduced: mismatches confined
-to ticks 8-120 -- the settling window -- and exactly zero afterwards.
+Earlier this equation forced STRICT non-contractable ops on the device
+(__fmul_rn/__fadd_rn) to stop nvcc fusing multiply-add, on the theory that the
+host did not fuse. The host does: the library compiles its C++ with -mfma and
+gcc contracts by default. So the two sides were made to disagree deliberately,
+and the unit tests caught it -- 1100 of 2024 cases differing.
 
-Forcing the individual ops keeps the device answer bit-identical to the host's
-instead, which is what lets the dual-run audit demand equality rather than a
-tolerance. It is deliberately local to this equation: building the whole .cu
-with -fmad=false would also change the CG solver kernels that ship today.
+Explicit fmaf is the fix for both halves of the problem at once. It is
+IEEE-754 defined and correctly rounded, so the host and the device compute the
+same bits no matter what either compiler would have chosen on its own. And it
+is MORE accurate here, not merely more consistent: a fused multiply-add rounds
+once instead of twice, which is exactly what the perpendicular component needs,
+since v - (v.n)n subtracts two nearly-equal quantities whenever the impulse is
+close to parallel with the bond normal.
 */
-#if defined(__CUDA_ARCH__)
-#define NVBLAST_SFMUL(a, b) __fmul_rn((a), (b))
-#define NVBLAST_SFADD(a, b) __fadd_rn((a), (b))
-#define NVBLAST_SFSUB(a, b) __fsub_rn((a), (b))
-#else
-#define NVBLAST_SFMUL(a, b) ((a) * (b))
-#define NVBLAST_SFADD(a, b) ((a) + (b))
-#define NVBLAST_SFSUB(a, b) ((a) - (b))
-#endif
 
 namespace Nv
 {
@@ -81,20 +72,25 @@ struct ExtStressVec3
     float x, y, z;
 };
 
+/// Dot product with a fixed, fully-specified rounding sequence.
+NVBLAST_STRESS_FORMULA_FN float extStressDot(const ExtStressVec3& a, const ExtStressVec3& b)
+{
+    return fmaf(a.z, b.z, fmaf(a.y, b.y, a.x * b.x));
+}
+
 /// |v - (v.n)n|, the magnitude of v perpendicular to a unit n.
 ///
-/// The numerically stable way to get the perpendicular magnitude: it never
-/// forms |v|^2 - (v.n)^2, so it never subtracts two nearly-equal large
-/// numbers when v is close to parallel with n.
+/// Stable in two ways. It never forms |v|^2 - (v.n)^2, so it never subtracts
+/// two nearly-equal LARGE numbers. And each component is taken with a single
+/// fused rounding, which is what keeps the remaining subtraction accurate when
+/// v is nearly parallel to n and the result is small.
 NVBLAST_STRESS_FORMULA_FN float extStressPerpendicularMagnitude(
     const ExtStressVec3& v, const ExtStressVec3& n, float vDotN)
 {
-    const float px = NVBLAST_SFSUB(v.x, NVBLAST_SFMUL(vDotN, n.x));
-    const float py = NVBLAST_SFSUB(v.y, NVBLAST_SFMUL(vDotN, n.y));
-    const float pz = NVBLAST_SFSUB(v.z, NVBLAST_SFMUL(vDotN, n.z));
-    return sqrtf(NVBLAST_SFADD(
-        NVBLAST_SFADD(NVBLAST_SFMUL(px, px), NVBLAST_SFMUL(py, py)),
-        NVBLAST_SFMUL(pz, pz)));
+    const float px = fmaf(-vDotN, n.x, v.x);
+    const float py = fmaf(-vDotN, n.y, v.y);
+    const float pz = fmaf(-vDotN, n.z, v.z);
+    return sqrtf(fmaf(pz, pz, fmaf(py, py, px * px)));
 }
 
 /**
@@ -123,11 +119,7 @@ NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
 {
     // Linear impulse along the normal is normal stress, perpendicular is
     // shear. Dividing by area converts impulse to pressure.
-    const float linearNormal = NVBLAST_SFADD(
-        NVBLAST_SFADD(
-            NVBLAST_SFMUL(impulseLinear.x, normal.x),
-            NVBLAST_SFMUL(impulseLinear.y, normal.y)),
-        NVBLAST_SFMUL(impulseLinear.z, normal.z));
+    const float linearNormal = extStressDot(impulseLinear, normal);
     stressNormal = linearNormal / area;
     // Shear is the magnitude of the component perpendicular to the normal,
     // taken by REMOVING the along-normal part rather than by
@@ -144,11 +136,7 @@ NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
 
     // Angular impulse along the normal is twist, perpendicular is bend. abs()
     // because only the magnitude of the twist matters, not its direction.
-    const float angularAlongNormal = NVBLAST_SFADD(
-        NVBLAST_SFADD(
-            NVBLAST_SFMUL(impulseAngular.x, normal.x),
-            NVBLAST_SFMUL(impulseAngular.y, normal.y)),
-        NVBLAST_SFMUL(impulseAngular.z, normal.z));
+    const float angularAlongNormal = extStressDot(impulseAngular, normal);
     // abs() because only the magnitude of the twist matters, not direction.
     const float twist = fabsf(angularAlongNormal) / area;
     // Same stable form as the shear. Squaring the dot product discarded its
@@ -158,9 +146,11 @@ NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
 
     // Interpret angular pressure as a composition of linear pressures,
     // dividing by nodeDist for scaling.
-    stressShear = NVBLAST_SFADD(stressShear, NVBLAST_SFMUL(twist, 2.0f) / nodeDist);
-    stressNormal = NVBLAST_SFADD(
-        stressNormal, copysignf(NVBLAST_SFMUL(bend, 2.0f) / nodeDist, stressNormal));
+    // Plain ops: multiplying by 2 is exact, and an add of a division result
+    // offers the compiler nothing to contract, so these are already the same
+    // sequence on both sides.
+    stressShear += twist * 2.0f / nodeDist;
+    stressNormal += copysignf(bend * 2.0f / nodeDist, stressNormal);
 }
 
 }  // namespace Blast

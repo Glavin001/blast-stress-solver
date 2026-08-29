@@ -1325,18 +1325,19 @@ __global__ void bondStressWalk(
                 break;
             }
 
-            // Strict ops: the host accumulates with plain mul/add, and an
-            // FMA here is a different value in the last bit.
-            nx = NVBLAST_SFADD(nx, NVBLAST_SFMUL(mnx, remainingArea));
-            ny = NVBLAST_SFADD(ny, NVBLAST_SFMUL(mny, remainingArea));
-            nz = NVBLAST_SFADD(nz, NVBLAST_SFMUL(mnz, remainingArea));
-            cx = NVBLAST_SFADD(cx, NVBLAST_SFMUL(mcx, remainingArea));
-            cy = NVBLAST_SFADD(cy, NVBLAST_SFMUL(mcy, remainingArea));
-            cz = NVBLAST_SFADD(cz, NVBLAST_SFMUL(mcz, remainingArea));
-            dx = NVBLAST_SFADD(dx, NVBLAST_SFMUL(mdx, remainingArea));
-            dy = NVBLAST_SFADD(dy, NVBLAST_SFMUL(mdy, remainingArea));
-            dz = NVBLAST_SFADD(dz, NVBLAST_SFMUL(mdz, remainingArea));
-            totalArea = NVBLAST_SFADD(totalArea, remainingArea);
+            // fmaf, because the host accumulates with `v += u * area` and is
+            // compiled with -mfma, so gcc contracts it. Matching that
+            // explicitly is what keeps the two walks bit-identical.
+            nx = fmaf(mnx, remainingArea, nx);
+            ny = fmaf(mny, remainingArea, ny);
+            nz = fmaf(mnz, remainingArea, nz);
+            cx = fmaf(mcx, remainingArea, cx);
+            cy = fmaf(mcy, remainingArea, cy);
+            cz = fmaf(mcz, remainingArea, cz);
+            dx = fmaf(mdx, remainingArea, dx);
+            dy = fmaf(mdy, remainingArea, dy);
+            dz = fmaf(mdz, remainingArea, dz);
+            totalArea += remainingArea;
         }
         else
         {
@@ -1355,15 +1356,14 @@ __global__ void bondStressWalk(
     // NvVec3::normalizeSafe -- reciprocal multiply, and a degenerate normal is
     // left alone rather than zeroed.
     {
-        const float mag = sqrtf(NVBLAST_SFADD(
-            NVBLAST_SFADD(NVBLAST_SFMUL(nx, nx), NVBLAST_SFMUL(ny, ny)),
-            NVBLAST_SFMUL(nz, nz)));
+        const float mag =
+            sqrtf(extStressDot(ExtStressVec3{nx, ny, nz}, ExtStressVec3{nx, ny, nz}));
         if (!(mag < NVBLAST_STRESS_NORMALIZATION_EPSILON))
         {
             const float inv = 1.0f / mag;
-            nx = NVBLAST_SFMUL(nx, inv);
-            ny = NVBLAST_SFMUL(ny, inv);
-            nz = NVBLAST_SFMUL(nz, inv);
+            nx *= inv;
+            ny *= inv;
+            nz *= inv;
         }
     }
 
@@ -1374,12 +1374,8 @@ __global__ void bondStressWalk(
         // that difference showed up as whole batches of bonds flipping across
         // an elastic limit together while the city was still settling.
         const float inv = 1.0f / totalArea;
-        cx = NVBLAST_SFMUL(cx, inv);
-        cy = NVBLAST_SFMUL(cy, inv);
-        cz = NVBLAST_SFMUL(cz, inv);
-        dx = NVBLAST_SFMUL(dx, inv);
-        dy = NVBLAST_SFMUL(dy, inv);
-        dz = NVBLAST_SFMUL(dz, inv);
+        cx *= inv; cy *= inv; cz *= inv;
+        dx *= inv; dy *= inv; dz *= inv;
     }
 
     float stressNormal = 0.0f;
@@ -1387,9 +1383,8 @@ __global__ void bondStressWalk(
     if (totalArea > 0.0f && totalArea < unbreakableLimit)
     {
         const AngLin impulse = impulses[g];
-        const float nodeDist = sqrtf(NVBLAST_SFADD(
-            NVBLAST_SFADD(NVBLAST_SFMUL(dx, dx), NVBLAST_SFMUL(dy, dy)),
-            NVBLAST_SFMUL(dz, dz)));
+        const float nodeDist =
+            sqrtf(extStressDot(ExtStressVec3{dx, dy, dz}, ExtStressVec3{dx, dy, dz}));
         extStressCalcBondStress(
             ExtStressVec3{impulse.linear.x, impulse.linear.y, impulse.linear.z},
             ExtStressVec3{impulse.angular.x, impulse.angular.y, impulse.angular.z},
