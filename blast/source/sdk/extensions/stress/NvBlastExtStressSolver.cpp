@@ -371,11 +371,15 @@ public:
     /// island partition are part of the same topology transaction, and the
     /// walk's guards read them. Unblocking at-rest needs the whole transaction
     /// applied, not the cheap part of it.
-    bool deviceImpulsesUsable() const
+    /// Non-const: applies the queued impulse permutation if one is
+    /// outstanding, because at rest no solve ever comes to do it.
+    bool deviceImpulsesUsable()
     {
-        return m_lastSolveOnDevice
-            && m_gpuSolver != nullptr
-            && !m_gpuSolver->hasPendingTopologyChange();
+        if (!m_lastSolveOnDevice || m_gpuSolver == nullptr)
+        {
+            return false;
+        }
+        return m_gpuSolver->flushImpulsePermutation();
     }
 #endif
 

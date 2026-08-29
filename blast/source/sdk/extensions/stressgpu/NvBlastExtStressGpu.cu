@@ -2129,6 +2129,36 @@ uploadIslands();
         return m_topologyDirty || !m_pendingImpulseSwaps.empty();
     }
 
+    bool flushImpulsePermutation() override
+    {
+        if (m_pendingImpulseSwaps.empty())
+        {
+            return true;
+        }
+        try
+        {
+            for (const auto& swap : m_pendingImpulseSwaps)
+            {
+                if (swap.first != swap.second)
+                {
+                    checkCuda(
+                        cudaMemcpy(
+                            m_impulses + swap.first,
+                            m_impulses + swap.second,
+                            sizeof(AngLin),
+                            cudaMemcpyDeviceToDevice),
+                        "flush impulse swap");
+                }
+            }
+            m_pendingImpulseSwaps.clear();
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+        return true;
+    }
+
     void resetWarmStart() override
     {
         ContextGuard context(m_cudaContext);

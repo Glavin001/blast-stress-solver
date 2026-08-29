@@ -294,6 +294,20 @@ public:
      */
     virtual bool hasPendingTopologyChange() const = 0;
 
+    /**
+     * Replay just the queued impulse swap-with-lasts, so the device impulse
+     * array is indexed the way the host's already is.
+     *
+     * Narrow on purpose: it does not repartition islands, re-upload topology
+     * or drop the captured graph, and it leaves the topology dirty so the next
+     * real solve still does all of that. It exists because a reader that only
+     * needs impulses BY INDEX should not have to wait for a solve that may
+     * never come -- at rest the solve early-outs every tick, so the swaps
+     * would otherwise sit unapplied indefinitely and the reader would be
+     * locked out of exactly the regime it is cheapest to measure in.
+     */
+    virtual bool flushImpulsePermutation() = 0;
+
 
     virtual void resetWarmStart() = 0;
 
