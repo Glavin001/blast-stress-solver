@@ -228,3 +228,52 @@ That is one function in NvBlastExtStressSolver.cpp, one new material field, and
 it is the thing to do before touching the garage again. Everything above --
 three geometric levers and two material tables -- was an attempt to work around
 its absence.
+
+## The last thing tried, and the constraint that stopped it
+
+Deck joints in a stripped garage sit at 2.9x their elastic limit. Elastic is
+3.8 MPa, so that is 11.0 MPa -- and the fatal limit is 3 x 3.8 = 11.4. They are
+held up by four tenths of a megapascal, and by a fatal limit that is not
+physical: the band from cracking to ultimate is what the STEEL adds, and 1%
+reinforcement at 500 MPa is 5 MPa on the gross section. That is a band of about
+1.35, not 3, and a band of 3 implies an ultimate tension no rebar ratio
+delivers.
+
+Setting it to 1.35 is rejected by the build's own gate, correctly:
+
+    FAIL  cladding is only 4.4x weaker than the frame -- a hit that takes
+          panels off will take structure with it
+
+The tier gap between frame and cladding must stay at 8x or more, and lowering
+concrete's ultimate closes it from the top. So the band cannot move on its own;
+facade-panel and its clips have to come down with it, re-derived rather than
+scaled, and the four authored-structure gates re-run against the result.
+
+That is the next piece of work, and it is bounded: derive cladding's cracking
+and ultimate the same way concrete's were derived here, check the tier gap
+holds, and the deck joints that are currently surviving on 0.4 MPa of
+unphysical margin will let go.
+
+## Summary of where the garage stands
+
+Working, committed, verified:
+
+  - stands on its own at 9.81 with realistic concrete, 3.8 MPa tension and
+    6.1 MPa shear
+  - carries 1200 Pa of live load, about half the code minimum, which is what
+    this slab-to-column connection takes
+  - real dimensions, verified by the flexural check rather than asserted:
+    7.6 x 8.0 m bays, 3.1 m storeys, 0.30 m slab, 0.55 m columns
+  - drop panels and mushroom capitals at every column head
+  - parameterised by gravity: maxSlabSpan, bayForGravity, liveLoadDensityScale
+  - convex fractures, 3,965 hulls against 145 cuboids
+
+Not working:
+
+  - it still does not collapse when the columns are stripped. At 90% removed:
+    0.00 m sag, 0 broken bonds.
+
+Two things stand between here and that, both identified and neither guessed:
+punching capacity should follow the PERIMETER rather than the bearing area, and
+the elastic-to-fatal band should come from the reinforcement rather than a flat
+3. The second is blocked on re-deriving cladding to keep the tier gap.
