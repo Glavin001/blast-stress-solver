@@ -2574,7 +2574,15 @@ public:
         {
             return false;
         }
-        if (!m_bsGpuActive || m_bsGpuStressNormal == nullptr)
+        // Only "is the device path live", NOT "have the stresses been fetched".
+        // Those became different questions when the readback went lazy, and
+        // conflating them sent every caller down the host path to read a
+        // BondData the device path never writes -- so every bond reported zero
+        // stress, nothing was ever damaged, and the city stopped fracturing
+        // entirely while the overstressed COUNT climbed to 4000. The dual-run
+        // audit could not see it: it makes the serial path authoritative, so
+        // it never exercises this branch.
+        if (!m_bsGpuActive)
         {
             const BondData& bond = m_bondsData[bondIndex];
             stressNormal = bond.stressNormal;
