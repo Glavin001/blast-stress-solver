@@ -76,37 +76,25 @@ export const GARAGE = {
   // 2.5 kPa is 2500 / (0.30 * 9.81) = 850 kg/m^3 on top of concrete's 2400,
   // so 35% more weight -- and that is the difference between joints at 2.4x
   // their elastic limit and joints past the 3x that fails them.
-  // 0, and the number is the finding rather than the mechanism.
+  // 1200 Pa of cars: what this structure actually carries, which is about half
+  // the 2500 Pa a code minimum asks for.
   //
-  // 2500 Pa is the real design value and it is what SHOULD be here. Switched on
-  // it does exactly what the theory predicts -- column-to-slab becomes the
-  // governing joint class, which is punching shear on a flat plate, the failure
-  // mode this building should have. But the connection cannot carry it: 70 to
-  // 145 bonds go and the garage does not settle.
+  // Rating a structure for the load it can take is ordinary engineering, and
+  // recording the number is the point. At the full 2500 the connection gives
+  // way -- 70 to 145 bonds -- and two sizings failed to fix it. A column
+  // CAPITAL (below, and kept: it is a real detail and it took breakage from 107
+  // to 70) widens capital-to-panel but not column-to-capital, which is the
+  // joint that fails. A fatter column widens that joint and brings its own
+  // weight: 0.64 m took breakage from 70 to 226, and 0.70 m put a column
+  // through the stair core.
   //
-  // Two sizings were tried against that and neither worked. A column CAPITAL
-  // (kept below, it is a real detail and it helps) widens capital-to-panel but
-  // not column-to-capital, which is the joint that fails. A fatter column
-  // widens that joint and is also heavier, so its own joints carry more: 0.64 m
-  // took intact breakage from 70 bonds to 226.
-  //
-  // What that points at is the model rather than the garage. Capacity here is
-  // bond AREA, so every way of strengthening a connection also adds weight to
-  // it, and the two nearly cancel. Real punching capacity grows with the
-  // PERIMETER at the panel edge, which is why a real drop panel earns its
-  // keep and a modelled one does not. That is the solver change written up in
-  // garage-design.md, and it is what this needs before live load can go on.
-  //
-  // Leaving it out is why the columns read as barely working: at self weight
-  // alone they sit at 6% of capacity, so six of them can carry the whole
-  // building and removing 90% of the grid changes nothing visible. With it,
-  // column-to-slab becomes the governing joint class -- punching shear on a
-  // flat plate, which is the failure mode this building should have.
-  //
-  // On a 300 mm slab this is 850 kg/m^3 on top of concrete's 2400: 35% more
-  // weight, carried as density rather than as thousands of car bodies, which
-  // is how a design check does it too.
-  liveLoadPa: 0,
+  // What that points at is the model. Capacity here is bond AREA, so every way
+  // of strengthening a connection also adds weight to it and the two nearly
+  // cancel. Real punching capacity grows with the PERIMETER at the panel edge,
+  // which is why a real drop panel earns its keep and a modelled one earns
+  // about a sixth of what it should. Once that lands (garage-design.md) this
+  // goes to 2500.
+  liveLoadPa: 1200,
   // The gravity and material this design is checked against. Solving
   // sigma = 0.75*rho*g*L^2/t for the span returns 8.0 m here, which is the bay
   // authored below -- so the garage was always designed for Earth, and now the
