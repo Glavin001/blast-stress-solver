@@ -220,6 +220,64 @@ static bool gatherRightMultiplyEnabled()
     return enabled;
 }
 
+/// BLAST_GPU_GRAPH_STATS=1: how often the active lists are actually refreshed,
+/// how often the captured graph is re-instantiated, and what the mid-enqueue
+/// sync costs. Pure diagnostics. Guessing these three wrong is how a sound
+/// idea gets implemented badly and then measured as a regression.
+static bool graphStatsEnabled()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_GPU_GRAPH_STATS");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Bake the captured graph at FULL launch width and stop tracking the active
+/// counts on the host. BLAST_GPU_FULL_LAUNCH=0 restores the sized-capture path.
+///
+/// The active lists still do their job: the kernels walk the compacted lists
+/// and bound themselves from DEVICE memory, so a settled city still touches
+/// only what moved. All that changes is the LAUNCH DIMENSION, where extra
+/// threads return immediately.
+///
+/// What this buys is measured, not assumed. At baseline the captured graph was
+/// being re-instantiated on 45.7% of solves, because graphMatches has an upper
+/// bound as well as a lower one -- the cap must also stay within 4x the ideal
+/// size, so a scene whose active set keeps shrinking recaptures forever. A
+/// fixed full-width cap satisfies both bounds permanently, and once the caps
+/// are fixed the counts are not needed on the host at all, which removes the
+/// mid-enqueue cudaStreamSynchronize (0.383 ms/solve) as a side effect.
+///
+/// The first attempt at this forced full width but LEFT the upper bound in
+/// place, so every tick failed graphMatches and recaptured. It measured as a
+/// regression and was very nearly recorded as a dead end.
+///
+/// MEASURED, corrected version, default OFF: it does remove the sync
+/// (0.423 -> 0.000 ms/solve) but costs more than it saves. gpu_host_work
+/// 1.581 -> 3.320 ms and stress_solve p50 14.00 -> 20.52 ms, because every
+/// kernel now launches at full width on every iteration. Recapture also did
+/// NOT fall (48.0% -> 62.7%), which is the useful part of the result: cap
+/// sizing was never what drove recapture. With both cap bounds bypassed
+/// entirely the rate stayed high, so the driver is the rest of graphMatches --
+/// applyTopologyChange nulls m_graphExec on every fracture tick, and
+/// WHOLE_RESET_ON_TOPOLOGY flips warmStart false->true->false around it.
+///
+/// The route to removing the sync WITHOUT paying full width is therefore to
+/// make the launch dimension a performance hint rather than a correctness
+/// requirement: grid-stride the solve kernels (they already bound from device
+/// memory) so a stale, undersized cap is merely slower, never wrong. Then the
+/// counts can come from the previous tick and the sync goes away for free.
+static bool fullLaunchCapacity()
+{
+    static const bool enabled = [] {
+        // Default OFF: measured a net regression (see the note above).
+        const char* raw = std::getenv("BLAST_GPU_FULL_LAUNCH");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return enabled;
+}
+
 static bool wholeResetOnTopology()
 {
     static const bool enabled = [] {
@@ -1712,6 +1770,19 @@ uploadIslands();
         finishSolve();
         finishImpulseReadback(bondImpulses, compacted);
         m_telemetry.hostFinishMilliseconds = hostMs(finishStart);
+        if (graphStatsEnabled() && (++m_statSolves % 600u) == 0u)
+        {
+            fprintf(stderr,
+                    "[gpu-graph] solves=%u listRefresh=%u listSkip=%u (%.1f%% refreshed) "
+                    "graphRecapture=%u (%.2f%% of solves) midSync=%.1f ms total "
+                    "(%.4f ms/solve)\n",
+                    m_statSolves, m_statListRefreshes, m_statListSkips,
+                    100.0 * double(m_statListRefreshes)
+                        / double(m_statListRefreshes + m_statListSkips + 1u),
+                    m_statGraphRecaptures,
+                    100.0 * double(m_statGraphRecaptures) / double(m_statSolves),
+                    m_statMidSyncMs, m_statMidSyncMs / double(m_statSolves));
+        }
         return true;
     }
 
@@ -2645,8 +2716,10 @@ private:
                        != 0);
         if (!m_activeListsDirty && m_prevListsSkipping == skipping && !maskChanged)
         {
+            ++m_statListSkips;
             return;
         }
+        ++m_statListRefreshes;
         // Flag, then order-preserving select. The flag buffer is shared by the
         // two selects; the stream orders bond-select before node-flag, so the
         // reuse cannot race. DeviceSelect writes each count straight into its
@@ -2693,18 +2766,24 @@ private:
                 cudaMemcpyDeviceToHost,
                 m_stream),
             "read active counts");
+        if (!fullLaunchCapacity())
         {
             // Priced separately: this is the host BLOCKED, not the host
             // working, and only the latter is reclaimable by faster host code.
             const auto syncStart = std::chrono::steady_clock::now();
             checkCuda(cudaStreamSynchronize(m_stream), "sync active counts");
-            m_activeListSyncMilliseconds +=
-                std::chrono::duration<float, std::milli>(
+            const double midSync =
+                std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - syncStart)
                     .count();
+            m_activeListSyncMilliseconds += static_cast<float>(midSync);
+            m_statMidSyncMs += midSync;
         }
-        m_activeBondCount = m_hostActiveCounts[0];
-        m_activeNodeCount = m_hostActiveCounts[1];
+        if (!fullLaunchCapacity())
+        {
+            m_activeBondCount = m_hostActiveCounts[0];
+            m_activeNodeCount = m_hostActiveCounts[1];
+        }
         if (skipping)
         {
             m_prevIslandSkip.assign(m_hostIslandSkip, m_hostIslandSkip + m_islandCount);
@@ -4092,12 +4171,13 @@ uploadIslands();
             // the launch dimensions that must cover them are baked. Recapture
             // when the lists outgrow the baked caps (mandatory -- threads past
             // the cap simply do not exist) or shrank far below them (waste).
-            && m_graphBondCap >= m_activeBondCount
-            && m_graphNodeCap >= m_activeNodeCount
-            && m_graphBondCap <= 4u * std::max(
-                   launchCapacity(m_activeBondCount, m_bondCount), 1024u)
-            && m_graphNodeCap <= 4u * std::max(
-                   launchCapacity(m_activeNodeCount, m_nodeCount), 1024u);
+            && (fullLaunchCapacity()
+                || (m_graphBondCap >= m_activeBondCount
+                    && m_graphNodeCap >= m_activeNodeCount
+                    && m_graphBondCap <= 4u * std::max(
+                           launchCapacity(m_activeBondCount, m_bondCount), 1024u)
+                    && m_graphNodeCap <= 4u * std::max(
+                           launchCapacity(m_activeNodeCount, m_nodeCount), 1024u)));
     }
 
     void executeSolve(const ExtStressGpuSolveParams& params)
@@ -4113,16 +4193,20 @@ uploadIslands();
             // The launch caps are normally computed in the capture branch
             // below; the eager path skips it, so they must be set here or
             // every grid is sized from a stale (or zero) cap.
-            m_graphBondCap = launchCapacity(m_activeBondCount, m_bondCount);
-            m_graphNodeCap = launchCapacity(m_activeNodeCount, m_nodeCount);
+            m_graphBondCap = fullLaunchCapacity()
+                ? m_bondCount : launchCapacity(m_activeBondCount, m_bondCount);
+            m_graphNodeCap = fullLaunchCapacity()
+                ? m_nodeCount : launchCapacity(m_activeNodeCount, m_nodeCount);
             launchSolve(params);
             ++m_profiledSolves;
             return;
         }
         if (!graphMatches(params, warmStart))
         {
-            m_graphBondCap = launchCapacity(m_activeBondCount, m_bondCount);
-            m_graphNodeCap = launchCapacity(m_activeNodeCount, m_nodeCount);
+            m_graphBondCap = fullLaunchCapacity()
+                ? m_bondCount : launchCapacity(m_activeBondCount, m_bondCount);
+            m_graphNodeCap = fullLaunchCapacity()
+                ? m_nodeCount : launchCapacity(m_activeNodeCount, m_nodeCount);
             if (m_graphExec)
             {
                 checkCuda(cudaGraphExecDestroy(m_graphExec), "destroy old solver graph exec");
@@ -4141,7 +4225,8 @@ uploadIslands();
                 cudaStreamEndCapture(m_stream, &m_graph),
                 "end solver graph capture");
             checkCuda(
-                cudaGraphInstantiate(&m_graphExec, m_graph, 0),
+                (++m_statGraphRecaptures,
+                 cudaGraphInstantiate(&m_graphExec, m_graph, 0)),
                 "instantiate solver graph");
             m_graphParams = params;
             m_graphWarmStart = warmStart;
@@ -4303,6 +4388,11 @@ uploadIslands();
     std::vector<std::uint32_t> m_prevIslandSkip;
     bool m_prevListsSkipping{false};
     bool m_activeListsDirty{true};
+    std::uint32_t m_statSolves{0};
+    std::uint32_t m_statListRefreshes{0};
+    std::uint32_t m_statListSkips{0};
+    std::uint32_t m_statGraphRecaptures{0};
+    double m_statMidSyncMs{0.0};
 
     // Device bond-stress walk. Capacities grow only.
     std::uint32_t* m_bsGroupBegin{nullptr};
