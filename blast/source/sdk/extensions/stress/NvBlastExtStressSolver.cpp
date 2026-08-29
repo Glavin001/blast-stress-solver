@@ -310,6 +310,41 @@ public:
     /// inputs.
     bool lastSolveOnDevice() const { return m_lastSolveOnDevice; }
 
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+    /// Audit: does the host's impulse mirror still equal what the device
+    /// holds? The host only copies back lastChangedBonds, so a bond the
+    /// solver did not re-solve keeps its previous host value -- which is only
+    /// correct if the device kept the same one.
+    void auditImpulseMirror(uint64_t& checks, uint64_t& mismatches, double& maxRel)
+    {
+        if (!m_gpuSolver) { return; }
+        const uint32_t n = static_cast<uint32_t>(m_impulses.size());
+        m_auditImpulses.resize(n);
+        if (!m_gpuSolver->readbackImpulses(m_auditImpulses.data(), n)) { return; }
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            const AngLin6& h = m_impulses[i];
+            const ExtStressGpuImpulse& d = m_auditImpulses[i];
+            const float hv[6] = {h.ang.x, h.ang.y, h.ang.z, h.lin.x, h.lin.y, h.lin.z};
+            const float dv[6] = {d.angular.x, d.angular.y, d.angular.z,
+                                 d.linear.x, d.linear.y, d.linear.z};
+            ++checks;
+            if (memcmp(hv, dv, sizeof(hv)) != 0)
+            {
+                ++mismatches;
+                for (int k = 0; k < 6; ++k)
+                {
+                    const double a = hv[k], b = dv[k];
+                    const double rel = std::abs(a) > 1e-9
+                        ? std::abs(b - a) / std::abs(a) : std::abs(b - a);
+                    if (rel > maxRel) maxRel = rel;
+                }
+            }
+        }
+    }
+    std::vector<ExtStressGpuImpulse> m_auditImpulses;
+#endif
+
     /// Device impulses usable BY INDEX: the last real solve ran there, and no
     /// bond removal has been queued since.
     ///
@@ -1427,6 +1462,19 @@ public:
     uint64_t m_bsRefuseStale{0};
     uint64_t m_bsRefusePendingTopo{0};
     uint64_t m_bsRefuseCsr{0};
+    uint64_t m_bsGpuStressChecks{0};
+    uint64_t m_bsGpuStressMismatches{0};
+    uint64_t m_bsGpuStressBig{0};
+    double m_bsGpuStressMaxRel{0.0};
+    uint64_t m_bsImpChecks{0};
+    uint64_t m_bsImpMismatches{0};
+    double m_bsImpMaxRel{0.0};
+    uint64_t m_bsPayChecks{0};
+    uint64_t m_bsPayNode{0};
+    uint64_t m_bsPayNormal{0};
+    uint64_t m_bsPayDisp{0};
+    uint64_t m_bsPayCentroid{0};
+    uint32_t m_bsDumped{0};
     uint64_t m_bsParChecks{0};
     uint64_t m_bsParMismatches{0};
     float m_hostWalkInMilliseconds{0.0f};
@@ -1890,7 +1938,7 @@ public:
                     "[bond-stress-gpu] ticks=%llu attempts=%llu ranOnDevice=%llu "
                     "checks=%llu MISMATCHES=%llu "
                     "(count=%llu removeSize=%llu removeOrder=%llu mask=%llu) "
-                    "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu)\n",
+                    "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu) STRESS_MISMATCH=%llu/%llu big=%llu maxRel=%.3e IMPULSE=%llu/%llu impMaxRel=%.3e PAYLOAD(n=%llu node=%llu normal=%llu disp=%llu centroid=%llu)\n",
                     (unsigned long long)m_bsCsrTicks,
                     (unsigned long long)m_bsGpuAttempts,
                     (unsigned long long)m_bsGpuRuns,
@@ -1905,7 +1953,19 @@ public:
                     (unsigned long long)m_bsRefuseNoSolver,
                     (unsigned long long)m_bsRefuseStale,
                     (unsigned long long)m_bsRefusePendingTopo,
-                    (unsigned long long)m_bsRefuseCsr);
+                    (unsigned long long)m_bsRefuseCsr,
+                    (unsigned long long)m_bsGpuStressMismatches,
+                    (unsigned long long)m_bsGpuStressChecks,
+                    (unsigned long long)m_bsGpuStressBig,
+                    m_bsGpuStressMaxRel,
+                    (unsigned long long)m_bsImpMismatches,
+                    (unsigned long long)m_bsImpChecks,
+                    m_bsImpMaxRel,
+                    (unsigned long long)m_bsPayChecks,
+                    (unsigned long long)m_bsPayNode,
+                    (unsigned long long)m_bsPayNormal,
+                    (unsigned long long)m_bsPayDisp,
+                    (unsigned long long)m_bsPayCentroid);
         }
         if (bondStressCsrVerify())
         {
@@ -2579,6 +2639,112 @@ public:
                     }
                 }
             }
+            // Output 4: the stress values themselves, which every consumer
+            // reads through bondStressOutputs. Checking the removal list, the
+            // count and the node mask only establishes that the two paths
+            // AGREE ABOUT WHAT CROSSED A LIMIT -- it says nothing about the
+            // numbers they hand out afterwards, and those feed excess forces,
+            // the virial, and every diagnostic. Compare exactly what a
+            // consumer would see, for every live bond, on both paths.
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+            m_solver.auditImpulseMirror(
+                m_bsImpChecks, m_bsImpMismatches, m_bsImpMaxRel);
+#endif
+            // The cached static payload, recomputed the way the walk does it.
+            // This table is the one thing the device reads that the host
+            // rebuilds from scratch every tick, so it is the obvious place for
+            // a stale value to hide.
+            for (uint32_t g = 0; g < m_bsCsrGroupSize.size(); ++g)
+            {
+                const uint32_t begin = m_bsCsrGroupBegin[g];
+                for (uint32_t k = 0; k < m_bsCsrGroupSize[g]; ++k)
+                {
+                    const uint32_t bb = m_bsCsrMemberBlastBond[begin + k];
+                    const uint32_t bondIndex = m_blastBondIndexMap[bb];
+                    if (isInvalidIndex(bondIndex)) { continue; }
+                    const BondData& bd = m_bondsData[bondIndex];
+                    const NvBlastBond& ab = bonds[bb];
+                    const nvidia::NvVec3 disp =
+                        m_nodesData[bd.node1].localPos - m_nodesData[bd.node0].localPos;
+                    const nvidia::NvVec3 an(ab.normal[0], ab.normal[1], ab.normal[2]);
+                    const nvidia::NvVec3 aligned = std::copysign(1.0f, an.dot(disp)) * an;
+                    const size_t base = 3 * static_cast<size_t>(bb);
+                    ++m_bsPayChecks;
+                    if (m_bsBondNode0[bb] != bd.node0 || m_bsBondNode1[bb] != bd.node1)
+                    { ++m_bsPayNode; }
+                    if (memcmp(&m_bsBondNormal[base], &aligned.x, 3 * sizeof(float)) != 0)
+                    { ++m_bsPayNormal; }
+                    if (memcmp(&m_bsBondNodeDisp[base], &disp.x, 3 * sizeof(float)) != 0)
+                    { ++m_bsPayDisp; }
+                    if (memcmp(&m_bsBondCentroid[base], ab.centroid, 3 * sizeof(float)) != 0)
+                    { ++m_bsPayCentroid; }
+                }
+            }
+            for (uint32_t g = 0; g < m_bsCsrGroupSize.size(); ++g)
+            {
+                const uint32_t begin = m_bsCsrGroupBegin[g];
+                for (uint32_t k = 0; k < m_bsCsrGroupSize[g]; ++k)
+                {
+                    const uint32_t bb = m_bsCsrMemberBlastBond[begin + k];
+                    if (!(bondHealth[bb] > 0.0f))
+                    {
+                        continue;
+                    }
+                    const uint32_t bondIndex = m_blastBondIndexMap[bb];
+                    if (isInvalidIndex(bondIndex))
+                    {
+                        continue;
+                    }
+                    const BondData& host = m_bondsData[bondIndex];
+                    const float devSn = m_bsGpuStressNormal[g];
+                    const float devSs = m_bsGpuStressShear[g];
+                    ++m_bsGpuStressChecks;
+                    if (memcmp(&host.stressNormal, &devSn, sizeof(float)) != 0
+                        || memcmp(&host.stressShear, &devSs, sizeof(float)) != 0)
+                    {
+                        ++m_bsGpuStressMismatches;
+                        // Size, not just presence. A last-bit difference that
+                        // never straddles a limit is a different finding from
+                        // a materially different number, and the bit-compare
+                        // alone cannot tell them apart.
+                        const double hn = host.stressNormal, dn = devSn;
+                        const double hs = host.stressShear, ds = devSs;
+                        const double rn = std::abs(hn) > 1e-9
+                            ? std::abs(dn - hn) / std::abs(hn) : std::abs(dn - hn);
+                        const double rs = std::abs(hs) > 1e-9
+                            ? std::abs(ds - hs) / std::abs(hs) : std::abs(ds - hs);
+                        const double rel = rn > rs ? rn : rs;
+                        if (rel > m_bsGpuStressMaxRel) m_bsGpuStressMaxRel = rel;
+                        if (rel > 1e-5) ++m_bsGpuStressBig;
+                        if (rel > 1e-3 && m_bsDumped < 3)
+                        {
+                            ++m_bsDumped;
+                            float ta = 0.0f; uint32_t live = 0;
+                            for (uint32_t j = 0; j < m_bsCsrGroupSize[g]; ++j)
+                            {
+                                const uint32_t mb = m_bsCsrMemberBlastBond[begin + j];
+                                if (bondHealth[mb] > 0.0f) { ta += bondHealth[mb]; ++live; }
+                            }
+                            fprintf(stderr,
+                                "[bs-dump] g=%u size=%u live=%u totalArea=%.6g | "
+                                "host sn=%.9g ss=%.9g | dev sn=%.9g ss=%.9g\n",
+                                g, m_bsCsrGroupSize[g], live, ta,
+                                host.stressNormal, host.stressShear, devSn, devSs);
+                        }
+                    }
+                    ++m_bsGpuStressChecks;
+                    const float devN[3] = {
+                        m_bsGpuNormal[3 * g + 0], m_bsGpuNormal[3 * g + 1], m_bsGpuNormal[3 * g + 2]};
+                    const float devC[3] = {
+                        m_bsGpuCentroid[3 * g + 0], m_bsGpuCentroid[3 * g + 1], m_bsGpuCentroid[3 * g + 2]};
+                    if (memcmp(&host.normal.x, devN, sizeof(devN)) != 0
+                        || memcmp(&host.centroid.x, devC, sizeof(devC)) != 0)
+                    {
+                        ++m_bsGpuStressMismatches;
+                    }
+                }
+            }
+
             for (uint32_t n = 0; n < m_nodeOverstressed.size(); ++n)
             {
                 ++m_bsGpuChecks;
@@ -2600,7 +2766,7 @@ public:
                 fprintf(stderr,
                         "[bond-stress-gpu] ticks=%llu checks=%llu MISMATCHES=%llu "
                         "(count=%llu removeSize=%llu removeOrder=%llu mask=%llu) "
-                        "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu)\n",
+                        "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu) STRESS_MISMATCH=%llu/%llu big=%llu maxRel=%.3e IMPULSE=%llu/%llu impMaxRel=%.3e PAYLOAD(n=%llu node=%llu normal=%llu disp=%llu centroid=%llu)\n",
                         (unsigned long long)m_bsCsrTicks,
                         (unsigned long long)m_bsGpuChecks,
                         (unsigned long long)m_bsGpuMismatches,
@@ -2613,7 +2779,19 @@ public:
                     (unsigned long long)m_bsRefuseNoSolver,
                     (unsigned long long)m_bsRefuseStale,
                     (unsigned long long)m_bsRefusePendingTopo,
-                    (unsigned long long)m_bsRefuseCsr);
+                    (unsigned long long)m_bsRefuseCsr,
+                    (unsigned long long)m_bsGpuStressMismatches,
+                    (unsigned long long)m_bsGpuStressChecks,
+                    (unsigned long long)m_bsGpuStressBig,
+                    m_bsGpuStressMaxRel,
+                    (unsigned long long)m_bsImpMismatches,
+                    (unsigned long long)m_bsImpChecks,
+                    m_bsImpMaxRel,
+                    (unsigned long long)m_bsPayChecks,
+                    (unsigned long long)m_bsPayNode,
+                    (unsigned long long)m_bsPayNormal,
+                    (unsigned long long)m_bsPayDisp,
+                    (unsigned long long)m_bsPayCentroid);
             }
             bondStressFinish();
             return;
