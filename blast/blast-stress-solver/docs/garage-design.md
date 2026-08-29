@@ -193,3 +193,38 @@ band this solver already has, used properly: elastic at concrete's cracking
 stress, fatal at the reinforcement's capacity, with the band between them wide
 rather than the 3x it is now. It is a materials change, it is expressible
 today, and it is the first thing to try next.
+
+## And the wide band does not do it either -- which locates the real gap
+
+Tried it: tension cracking at 3.8 MPa with ultimate at 30.7 (band 8), so the
+seam lets go early and keeps carrying to a rebar-like capacity. Still 222 bonds
+in an intact garage, against 194 with a narrow band.
+
+Widening the band only slows damage; it does not stop it. Anything above the
+elastic limit accrues damage for as long as it stays there, so a deck that
+sits at 1.1x cracking forever eventually sheds its seams whatever the fatal
+limit is.
+
+**That is the gap, and it is in the damage model rather than in any material.**
+A reinforced crack does not behave that way. It opens to a width the steel can
+hold and then STOPS -- it is a stable state, not a stage of failure. Concrete
+past its tensile strength with reinforcement across it reaches equilibrium and
+stays there for decades.
+
+So what is needed is damage that ARRESTS: above the elastic limit a joint loses
+section until the reduced section carries the load, and then stops, rather than
+continuing to accrue while any overload remains. The runaway path stays for
+joints that genuinely have no reserve -- plain masonry, glass, the seam between
+two unreinforced blocks -- which is where it belongs.
+
+Concretely: `generateStressDamage` currently takes health down by
+health * multiplier * dt * rate for as long as stress exceeds elastic. It wants
+a floor, per material, below which damage stops -- the residual capacity the
+reinforcement represents. A joint would then crack, weaken to that floor, and
+hold, which is both what reinforced concrete does and what would let this
+garage stand while still punching when a column goes.
+
+That is one function in NvBlastExtStressSolver.cpp, one new material field, and
+it is the thing to do before touching the garage again. Everything above --
+three geometric levers and two material tables -- was an attempt to work around
+its absence.
