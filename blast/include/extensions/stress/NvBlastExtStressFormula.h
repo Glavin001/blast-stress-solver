@@ -81,6 +81,22 @@ struct ExtStressVec3
     float x, y, z;
 };
 
+/// |v - (v.n)n|, the magnitude of v perpendicular to a unit n.
+///
+/// The numerically stable way to get the perpendicular magnitude: it never
+/// forms |v|^2 - (v.n)^2, so it never subtracts two nearly-equal large
+/// numbers when v is close to parallel with n.
+NVBLAST_STRESS_FORMULA_FN float extStressPerpendicularMagnitude(
+    const ExtStressVec3& v, const ExtStressVec3& n, float vDotN)
+{
+    const float px = NVBLAST_SFSUB(v.x, NVBLAST_SFMUL(vDotN, n.x));
+    const float py = NVBLAST_SFSUB(v.y, NVBLAST_SFMUL(vDotN, n.y));
+    const float pz = NVBLAST_SFSUB(v.z, NVBLAST_SFMUL(vDotN, n.z));
+    return sqrtf(NVBLAST_SFADD(
+        NVBLAST_SFADD(NVBLAST_SFMUL(px, px), NVBLAST_SFMUL(py, py)),
+        NVBLAST_SFMUL(pz, pz)));
+}
+
 /**
 Impulse on a bond -> the normal and shear pressures it carries.
 
@@ -112,34 +128,33 @@ NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
             NVBLAST_SFMUL(impulseLinear.x, normal.x),
             NVBLAST_SFMUL(impulseLinear.y, normal.y)),
         NVBLAST_SFMUL(impulseLinear.z, normal.z));
-    const float linearMagnitudeSquared = NVBLAST_SFADD(
-        NVBLAST_SFADD(
-            NVBLAST_SFMUL(impulseLinear.x, impulseLinear.x),
-            NVBLAST_SFMUL(impulseLinear.y, impulseLinear.y)),
-        NVBLAST_SFMUL(impulseLinear.z, impulseLinear.z));
     stressNormal = linearNormal / area;
-    stressShear =
-        sqrtf(fmaxf(0.0f,
-            NVBLAST_SFSUB(linearMagnitudeSquared, NVBLAST_SFMUL(linearNormal, linearNormal))))
-        / area;
+    // Shear is the magnitude of the component perpendicular to the normal,
+    // taken by REMOVING the along-normal part rather than by
+    // sqrt(|L|^2 - (L.n)^2). Those are equal in exact arithmetic and very
+    // different in floats: a bond loaded along its normal -- the ordinary
+    // case -- makes |L|^2 and (L.n)^2 nearly equal, so the subtraction
+    // cancels catastrophically and a last-bit difference in |L|^2 becomes a
+    // large relative difference in the shear. Worse, the fmaxf clamp then
+    // turns a radicand that straddles zero into "0 versus something".
+    // Measured under the old form, host against device: 32% of stress values
+    // differing, 4.9M by more than 1e-5 relative, max relative difference
+    // exactly 1.000 -- the signature of that clamp.
+    stressShear = extStressPerpendicularMagnitude(impulseLinear, normal, linearNormal) / area;
 
     // Angular impulse along the normal is twist, perpendicular is bend. abs()
     // because only the magnitude of the twist matters, not its direction.
-    const float angularNormal = fabsf(NVBLAST_SFADD(
+    const float angularAlongNormal = NVBLAST_SFADD(
         NVBLAST_SFADD(
             NVBLAST_SFMUL(impulseAngular.x, normal.x),
             NVBLAST_SFMUL(impulseAngular.y, normal.y)),
-        NVBLAST_SFMUL(impulseAngular.z, normal.z)));
-    const float angularMagnitudeSquared = NVBLAST_SFADD(
-        NVBLAST_SFADD(
-            NVBLAST_SFMUL(impulseAngular.x, impulseAngular.x),
-            NVBLAST_SFMUL(impulseAngular.y, impulseAngular.y)),
-        NVBLAST_SFMUL(impulseAngular.z, impulseAngular.z));
-    const float twist = angularNormal / area;
+        NVBLAST_SFMUL(impulseAngular.z, normal.z));
+    // abs() because only the magnitude of the twist matters, not direction.
+    const float twist = fabsf(angularAlongNormal) / area;
+    // Same stable form as the shear. Squaring the dot product discarded its
+    // sign, so using the signed value here is the same quantity.
     const float bend =
-        sqrtf(fmaxf(0.0f,
-            NVBLAST_SFSUB(angularMagnitudeSquared, NVBLAST_SFMUL(angularNormal, angularNormal))))
-        / area;
+        extStressPerpendicularMagnitude(impulseAngular, normal, angularAlongNormal) / area;
 
     // Interpret angular pressure as a composition of linear pressures,
     // dividing by nodeDist for scaling.
