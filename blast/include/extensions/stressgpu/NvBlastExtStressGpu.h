@@ -294,6 +294,7 @@ public:
      */
     virtual bool hasPendingTopologyChange() const = 0;
 
+
     virtual void resetWarmStart() = 0;
 
     virtual std::uint32_t nodeCount() const = 0;

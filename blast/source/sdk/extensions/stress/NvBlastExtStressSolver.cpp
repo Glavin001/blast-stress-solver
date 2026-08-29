@@ -327,6 +327,15 @@ public:
     /// in full, because it is linear in total live bonds rather than in
     /// activity. Measured under that stricter rule: 8, 2 and 1 device runs out
     /// of ~4200 ticks on three of the four structures.
+    /// Tried and rejected: a narrow flushImpulsePermutation() on the solver
+    /// that replays only the queued swaps, so the walk could also run at rest
+    /// (where no solve ever comes to apply them). It DID unblock engagement --
+    /// refusals from this predicate went 4196 -> 0 on the settled structures
+    /// -- and it broke the audit, 0 mismatches becoming 8. Replaying the
+    /// permutation is not sufficient on its own: the device's bond count and
+    /// island partition are part of the same topology transaction, and the
+    /// walk's guards read them. Unblocking at-rest needs the whole transaction
+    /// applied, not the cheap part of it.
     bool deviceImpulsesUsable() const
     {
         return m_lastSolveOnDevice
@@ -2318,7 +2327,7 @@ public:
         ExtStressGpuSolver* gpu = m_solver.gpuSolver();
         if (gpu == nullptr) { ++m_bsRefuseNoSolver; return false; }
         if (!m_solver.lastSolveOnDevice()) { ++m_bsRefuseStale; return false; }
-        if (gpu->hasPendingTopologyChange()) { ++m_bsRefusePendingTopo; return false; }
+        if (!m_solver.deviceImpulsesUsable()) { ++m_bsRefusePendingTopo; return false; }
         if (m_bsCsrDirty || m_bsCsrGroupSize.empty()) { ++m_bsRefuseCsr; return false; }
         // The device walk has no equivalent of the unchanged-group skip, which
         // is permanently default OFF anyway. Refuse rather than quietly
