@@ -27,6 +27,7 @@ export const DENSITY = {
   stone: 2600,
   steel: 7850,
   'reinforced-concrete': 2400,
+  'prestressed-concrete': 2400,
   'concrete-slab': 2400,
   'wood-frame': 600,
   'facade-panel': 2000,
@@ -99,6 +100,22 @@ const SPEC = [
   // Only usable because damage now ARRESTS at residualAreaFraction. Without
   // that, 3.8 MPa cracked every deck under its own weight.
   ['reinforced-concrete',   48e6,    3,    0.08,       0.126],
+  // Prestressed, for the 16 m garage beams and nothing else.
+  //
+  // Not a stronger concrete -- the same 48 MPa -- but a PRE-COMPRESSED one.
+  // Prestress works by putting the section into compression before any load
+  // arrives, so applied tension has to cancel that before the concrete sees
+  // any: an effective cracking stress of 11 MPa against plain concrete's 3.8.
+  // 0.28 is that 13.4 MPa over the 48 -- the upper end of the real range, and
+  // where the garage stops shedding bonds to stand up. At 0.23 it settled but
+  // still lost three.
+  //
+  // This is here because the model proved the point the hard way. A 16 m span
+  // in plain reinforced concrete cracked at 1.6x its elastic limit, and
+  // deepening the beam made it WORSE, not better, because past that span the
+  // beam is mostly carrying itself. That is precisely the span where real
+  // garages stop pouring beams and start stressing them.
+  ['prestressed-concrete',  48e6,    3,    0.28,       0.24],
   ['concrete-slab',         28e6,    2.5,  0.25,       0.28],
   ['stone',                 34e6,    3,    0.09,       0.18],
   // Masonry, not the brick unit. A fired brick reaches 20-50 MPa on its own;
@@ -158,6 +175,7 @@ const LOOK = {
   // beige that reads as a multi-storey car park, and Poly Haven's
   // "white_plaster" is a mid-tone tan.
   'reinforced-concrete': { color: '#e9e7e2', textureKey: 'white-concrete', roughness: 0.82, metalness: 0.0 },
+  'prestressed-concrete': { color: '#e4e1db', textureKey: 'white-concrete', roughness: 0.80, metalness: 0.0 },
   'concrete-slab':       { color: '#c9c6bf', textureKey: 'concrete-floor', roughness: 0.95, metalness: 0.0 },
   stone:                 { color: '#9b9287', textureKey: 'stone',   roughness: 0.92, metalness: 0.0 },
   brick:                 { color: '#9c5b45', textureKey: 'brick',   roughness: 0.90, metalness: 0.0 },
@@ -189,6 +207,7 @@ const LOOK = {
 // fixing sheds load to the structure behind it instead of carrying the wall.
 const MODULUS = {
   'reinforced-concrete': 30e9,
+  'prestressed-concrete': 30e9,
   'concrete-slab': 27e9,
   stone: 15e9,
   'white-stone': 15e9,
@@ -236,6 +255,9 @@ const RESIDUAL = {
   // that is genuinely overloaded still fails -- while one that is merely
   // cracked stops, which is the whole point.
   'reinforced-concrete': 0.10,
+  // Prestressing steel is a higher proportion of the section and is stressed
+  // far harder, so more of the beam survives cracking as a tie.
+  'prestressed-concrete': 0.16,
   'concrete-slab': 0.09,
   // Structural steel yields rather than parting, and it IS the section.
   steel: 0.6,

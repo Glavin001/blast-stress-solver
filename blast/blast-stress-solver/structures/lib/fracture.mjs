@@ -38,6 +38,7 @@ const MAX_CHUNK_VOLUME = {
   steel: 2.5,
   'wood-frame': 1.2,
   'reinforced-concrete': 3.5,
+  'prestressed-concrete': 3.5,
   'concrete-slab': 3.5,
   'facade-panel': 1.2,
   'facade-clip': 1.2,
@@ -74,6 +75,7 @@ const RULES = {
   // scale for one building. Big plates genuinely break into big pieces, and the
   // max clamp is what stops a large surface becoming a thousand of them.
   'reinforced-concrete': { cellArea: 2.00, min: 2, max: 10 },
+  'prestressed-concrete': { cellArea: 2.00, min: 2, max: 10 },
   'concrete-slab': { cellArea: 2.50, min: 2, max: 8 },
   'wood-frame': { cellArea: 0.80, min: 2, max: 6 },
   'footing-anchor': { cellArea: 0.60, min: 2, max: 6 },

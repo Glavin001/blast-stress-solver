@@ -442,12 +442,20 @@ export function slabWithOpening(builder, {
   // Superimposed load on the plate, as a density multiplier. A parking deck
   // carries cars; a floor plate in a tower carries furniture and people.
   densityScale = 1,
+  // Coarser or finer than the material's default subdivision. A deck spanning
+  // 4 m onto beams is nowhere near its bending limit, but its own chunk seams
+  // are: the solver's section-modulus term goes as 6/sqrt(area), so small
+  // seams get large bending amplification, and the deck was consistently the
+  // largest population of overloaded joints in the parking garage for that
+  // reason alone. Bigger cells mean bigger seams, and a deck that breaks into
+  // panels rather than gravel.
+  cellVolume = null,
 }) {
   const [x0, y0, z0] = min, [x1, y1, z1] = max;
   const o = opening;
   const panel = (a0, b0, a1, b1) => {
     if (!(a1 - a0 > 0.05) || !(b1 - b0 > 0.05)) return;
-    builder.box({ type, material, min: [a0, y0, b0], max: [a1, y1, b1], densityScale });
+    builder.box({ type, material, min: [a0, y0, b0], max: [a1, y1, b1], densityScale, cellVolume });
   };
   panel(x0 + inset, z0 + inset, o.x0, z1 - inset);           // strip left of the hole
   panel(o.x1, z0 + inset, x1 - inset, z1 - inset);           // strip right of it
