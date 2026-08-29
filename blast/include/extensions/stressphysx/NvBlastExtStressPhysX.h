@@ -279,6 +279,9 @@ struct ExtStressPhysXTelemetry
     uint64_t contactsProcessed;
     uint64_t contactsDropped;
     uint64_t sleepingActorsSkipped;
+    /// Ticks on which gravity application was skipped because the body
+    /// snapshot was bit-identical to the previous tick and no contact landed.
+    uint64_t gravityQuietSkips;
     uint64_t splits;
     uint64_t bodiesCreated;
     uint64_t bodiesReused;

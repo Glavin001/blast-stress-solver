@@ -207,6 +207,7 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , contactsProcessed(0)
     , contactsDropped(0)
     , sleepingActorsSkipped(0)
+    , gravityQuietSkips(0)
     , splits(0)
     , bodiesCreated(0)
     , bodiesReused(0)
@@ -714,6 +715,69 @@ public:
     }
 
     /// Gravity injection from a caller-supplied snapshot. No PhysX calls.
+    /// Default ON. Off-switch for the quiet-tick gravity skip below.
+    static bool gravityQuietSkipEnabled()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_GRAVITY_QUIET_SKIP");
+            return raw == nullptr || std::string(raw)[0] != '0';
+        }();
+        return enabled;
+    }
+
+    /// True when this tick's body snapshot is identical to last tick's and no
+    /// contact landed, i.e. nothing about the stress inputs can have changed.
+    ///
+    /// Comparing 108 poses to decide this costs nothing; what it buys is
+    /// skipping gravity application across ~87,000 nodes. On an idle city that
+    /// is ~1.0 ms/tick directly, and it unlocks another ~0.9 ms indirectly:
+    /// addNodeForce is the only writer of localVel, so once gravity stops
+    /// touching it the solver's walk-in skips itself too.
+    ///
+    /// Safety rests on the loads persisting. The solver keeps its velocity
+    /// array between ticks and the walk-in is what overwrites it, so if both
+    /// gravity and the walk-in sit out a tick, the solver simply re-solves the
+    /// inputs it already had -- which are the correct ones for a scene that
+    /// has not moved.
+    bool snapshotUnchanged(const ExtStressPhysXBodySnapshot* bodies, uint32_t bodyCount)
+    {
+        if (!m_contactedActors.empty() || bodyCount != m_lastSnapshotCount)
+        {
+            return false;
+        }
+        if (m_lastSnapshot.size() != bodyCount)
+        {
+            return false;
+        }
+        for (uint32_t i = 0; i < bodyCount; ++i)
+        {
+            const ExtStressPhysXBodySnapshot& now = bodies[i];
+            const ExtStressPhysXBodySnapshot& was = m_lastSnapshot[i];
+            if (now.bodyId != was.bodyId || now.actorIndex != was.actorIndex ||
+                now.nodeCount != was.nodeCount || now.kinematic != was.kinematic ||
+                now.sleeping != was.sleeping)
+            {
+                return false;
+            }
+            // Bit-exact pose comparison. An approximate one would let a slow
+            // drift accumulate silently under the skip.
+            if (now.globalPose.p.x != was.globalPose.p.x ||
+                now.globalPose.p.y != was.globalPose.p.y ||
+                now.globalPose.p.z != was.globalPose.p.z ||
+                now.globalPose.q.x != was.globalPose.q.x ||
+                now.globalPose.q.y != was.globalPose.q.y ||
+                now.globalPose.q.z != was.globalPose.q.z ||
+                now.globalPose.q.w != was.globalPose.q.w ||
+                now.angularVelocity.x != was.angularVelocity.x ||
+                now.angularVelocity.y != was.angularVelocity.y ||
+                now.angularVelocity.z != was.angularVelocity.z)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void addGravityFromSnapshot(
         const PxVec3& worldGravity,
         const ExtStressPhysXBodySnapshot* bodies,
@@ -723,6 +787,18 @@ public:
             const char* raw = std::getenv("BLAST_GRAVITY_SKIP_SINGLETON");
             return raw == nullptr || std::string(raw)[0] != '0';
         }();
+        // The skip needs the PREVIOUS tick to have applied gravity for these
+        // same poses, so one unchanged tick in isolation is not enough: the
+        // first quiet tick still applies, and only the ones after it skip.
+        const bool unchanged = gravityQuietSkipEnabled() && snapshotUnchanged(bodies, bodyCount);
+        const bool skipLoads = unchanged && m_lastSnapshotApplied;
+        m_lastSnapshot.assign(bodies, bodies + bodyCount);
+        m_lastSnapshotCount = bodyCount;
+        m_lastSnapshotApplied = !skipLoads;
+        if (skipLoads)
+        {
+            ++m_telemetry.gravityQuietSkips;
+        }
         for (uint32_t i = 0; i < bodyCount; ++i)
         {
             const ExtStressPhysXBodySnapshot& snapshot = bodies[i];
@@ -792,6 +868,13 @@ public:
                 {
                     ++m_telemetry.awakeDynamicBodyCount;
                 }
+            }
+            // Counters above are still tallied on a skipped tick -- they are
+            // what "awake" and "sleeping skipped" report, and un-counting them
+            // once already made a whole bench comparison garbage.
+            if (skipLoads)
+            {
+                continue;
             }
             const PxVec3 localGravity = snapshot.globalPose.q.rotateInv(worldGravity);
             const StressVec3 bridgeGravity = toStress(localGravity);
@@ -4090,6 +4173,12 @@ private:
     /// pair their weight even while PhysX has them asleep. Member (not local)
     /// so the begin phase allocates nothing while running concurrently.
     std::unordered_set<uint32_t> m_contactedActors;
+    // Previous tick's body snapshot, for the quiet-tick gravity skip. Sized by
+    // body count (~108 for the downtown city), not by node count, so holding
+    // and comparing it is free next to the ~87,000 node writes it avoids.
+    std::vector<ExtStressPhysXBodySnapshot> m_lastSnapshot;
+    uint32_t m_lastSnapshotCount{0};
+    bool m_lastSnapshotApplied{false};
     std::vector<ExtStressPhysXSplitContinuity> m_continuity;
     std::vector<ResimBodySnapshot> m_resimSnapshot;
     std::unordered_map<ExtStressPhysXId, uint32_t> m_resimIndexByBodyId;

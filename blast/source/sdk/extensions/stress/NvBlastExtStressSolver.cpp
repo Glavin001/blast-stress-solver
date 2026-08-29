@@ -1097,6 +1097,9 @@ public:
         {
             // NOTE - passing in acceleration as velocity.  The impulse solver's output will be interpreted as force.
             m_nodesData[node].localVel += (mode == ExtForceMode::FORCE) ? force/mass : force;
+            // The ONLY place localVel is ever written. That is what lets the
+            // walk-in below skip itself on a quiet tick.
+            m_velocitiesTouched = true;
         }
     }
 
@@ -1233,6 +1236,17 @@ public:
         m_solver.setSkipStableUnconverged(enabled);
     }
 
+    /// Default ON. Off-switch for the quiet-tick walk-in skip, so a bad soak
+    /// is an env change rather than a rebuild.
+    static bool walkInSkipEnabled()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_WALKIN_SKIP");
+            return raw == nullptr || std::string(raw)[0] != '0';
+        }();
+        return enabled;
+    }
+
     void solve(const ExtStressSolverSettings& settings, const float* bondHealth, const NvBlastBond* bonds, bool warmStart = true, bool islandAware = false, bool skipSettled = false, float deltaTime = 0.0f)
     {
         // The 11.2 ms that looked like an unattributed remainder is in here,
@@ -1246,10 +1260,51 @@ public:
 
         const auto syncStart = SolveClock::now();
         sync(bonds, islandAware);
-        for (const NodeData& node : m_nodesData)
+        // The walk-in used to transpose EVERY node into the solver every tick,
+        // unconditionally. On an idle city that is the single largest cost in
+        // the whole tick -- 0.93 ms of a 3.65 ms idle tick, writing the same
+        // zeros over ~87,000 nodes -- because nothing has moved and nothing
+        // will read the result.
+        //
+        // It can be skipped outright, and the condition is exact rather than
+        // heuristic. addNodeForce is the ONLY writer of localVel, and
+        // resetVelocities() zeroes localVel after every solve. So if no force
+        // was applied this tick AND none was applied last tick, then every
+        // localVel is zero and the solver's m_velocities were already set to
+        // zero by last tick's walk. Writing them again cannot change anything.
+        //
+        // Retaining last tick's velocities is the POINT, not a hazard, and
+        // getting that backwards cost 15x. An earlier version also required
+        // the previous tick to be quiet, reasoning that leaving stale non-zero
+        // velocities standing would be a bug. But the caller only stops
+        // applying forces when it has established that nothing moved, and in
+        // that case last tick's velocities are exactly the right inputs. With
+        // the two-tick rule the first quiet tick still walked in and wrote the
+        // zeros that the skipped gravity had left behind -- which unloaded
+        // every structure, woke the islands the solver had settled, and turned
+        // a 3.7 ms idle tick into 54 ms.
+        //
+        // So: quiet means leave the solver's inputs alone. addNodeForce is the
+        // only writer of localVel, so "quiet" is exact -- if nothing called it,
+        // there is nothing to transpose.
+        //
+        // A node-count change means the mapping to solver nodes moved under
+        // us, so that tick always walks in full.
+        const bool nodeCountStable = (m_nodesData.size() == m_walkInNodeCount);
+        const bool quietNow = !m_velocitiesTouched;
+        if (!(walkInSkipEnabled() && quietNow && nodeCountStable))
         {
-            m_solver.setNodeVelocities(node.solverNode, node.localVel, NvVec3(NvZero));
+            for (const NodeData& node : m_nodesData)
+            {
+                m_solver.setNodeVelocities(node.solverNode, node.localVel, NvVec3(NvZero));
+            }
         }
+        else
+        {
+            ++m_walkInSkipped;
+        }
+        m_walkInNodeCount = m_nodesData.size();
+        m_velocitiesTouched = false;
         m_hostWalkInMilliseconds = walkMs(syncStart);
 
         m_solver.solve(settings.maxSolverIterationsPerFrame, warmStart, islandAware, skipSettled);
@@ -1517,6 +1572,10 @@ public:
     uint64_t m_bsParChecks{0};
     uint64_t m_bsParMismatches{0};
     float m_hostWalkInMilliseconds{0.0f};
+    // Walk-in skip state. See the comment at the walk-in in solve().
+    bool m_velocitiesTouched{true};
+    size_t m_walkInNodeCount{0};
+    uint64_t m_walkInSkipped{0};
     float m_hostResetMilliseconds{0.0f};
     float m_hostBondStressMilliseconds{0.0f};
     float m_hostNodeStressMilliseconds{0.0f};
