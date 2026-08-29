@@ -71,6 +71,12 @@ const STRUCTURES = {
   'comp-wall-bay-x2': () => row('wall-bay', 2),
   'comp-wall-bay-x4': () => row('wall-bay', 4),
   'comp-wall-bay-x8': () => row('wall-bay', 8),
+  // The composition ladder: wall -> room -> storey -> stack. Each rung is
+  // auditable on its own, and each is built from the rung below by the same
+  // code the real buildings call.
+  'comp-room': () => standalone('room'),
+  'comp-storey': () => standalone('storey'),
+  'comp-stack': () => standalone('stack'),
 };
 
 const argv = process.argv.slice(2);

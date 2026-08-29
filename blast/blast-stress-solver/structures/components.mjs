@@ -46,6 +46,72 @@ import { columnGrid, beamsBetween, floorPlate } from './lib/elements.mjs';
 const FOOTING = 0.8;
 
 /**
+ * How a component is held while it is being tested on its own.
+ *
+ * A bay tested only on footings has been proven standing on the ground, which
+ * is not where most of them live. The pieces that gave the most trouble were
+ * the ones attached to something else -- roofs on masonry, balconies off a
+ * plate, a spandrel hanging from the floor above -- and their failures were
+ * all AT the attachment.
+ *
+ * So a component declares what it is mounted on, and the mount is emitted as a
+ * fixed anchor standing in for the neighbour. The component then meets the
+ * same interface it will meet in the building: same face, same material, same
+ * bond. What it does against the mock is what it will do in company.
+ *
+ *   ground   footings underneath, for anything that stands
+ *   slab     a fixed plate beneath, for a storey stacked on the one below
+ *   wall     a fixed wall face alongside, for anything hung off a wall
+ *   free     nothing at all, to find out what a piece cannot do unaided
+ *
+ * `free` is not a mistake: a component that stands up with no mount is one
+ * that is carrying itself, and knowing which pieces those are tells you where
+ * a structure's real load paths have to be.
+ */
+export const MOUNTS = ['ground', 'slab', 'wall', 'free'];
+
+/**
+ * Emit the mock support for a component footprint.
+ *
+ * @param footprint {min:[x,z], max:[x,z]} the plan the component occupies
+ */
+export function mount(b, kind, footprint, { y = 0, material = 'footing-anchor' } = {}) {
+  const [x0, z0] = footprint.min;
+  const [x1, z1] = footprint.max;
+  switch (kind) {
+    case 'ground':
+      b.box({
+        type: 'foundation', material,
+        min: [x0, y - FOOTING, z0], max: [x1, y, z1],
+        fixed: true, fracture: false,
+      });
+      return;
+    case 'slab':
+      // The floor below, as the component meets it: a plate of real thickness
+      // whose top face is the bearing surface, not a block in the ground.
+      b.box({
+        type: 'foundation', material,
+        min: [x0 - 0.3, y - 0.35, z0 - 0.3], max: [x1 + 0.3, y, z1 + 0.3],
+        fixed: true, fracture: false,
+      });
+      return;
+    case 'wall':
+      // A wall face on the -X side, which is what a balcony, a landing or a
+      // lean-to roof actually hangs from.
+      b.box({
+        type: 'foundation', material,
+        min: [x0 - 0.6, y - FOOTING, z0 - 0.3], max: [x0, y + 4.0, z1 + 0.3],
+        fixed: true, fracture: false,
+      });
+      return;
+    case 'free':
+      return;
+    default:
+      throw new Error(`unknown mount "${kind}" (have: ${MOUNTS.join(', ')})`);
+  }
+}
+
+/**
  * One bay of a framed floor: four columns, beams between them, a plate on top.
  *
  * The unit almost every tower here is really made of. 432 Park's ribs, Algedra's
@@ -67,6 +133,7 @@ export function frameBay(b, {
   // plates lapping over the shared line by a column width. Naive tiling does
   // not compose; a grid does, and this is the difference between them.
   skipMinusX = false,
+  mountKind = 'ground',
 } = {}) {
   const [ox, oy, oz] = at;
   const h = span / 2;
@@ -79,11 +146,7 @@ export function frameBay(b, {
     const c = columnSize / 2 + 0.15;
     for (const x of colXs) {
       for (const z of zs) {
-        b.box({
-          type: 'foundation', material: 'footing-anchor',
-          min: [x - c, oy - FOOTING, z - c], max: [x + c, oy, z + c],
-          fixed: true, fracture: false,
-        });
+        mount(b, mountKind, { min: [x - c, z - c], max: [x + c, z + c] }, { y: oy });
       }
     }
   }
@@ -127,16 +190,14 @@ export function wallBay(b, {
   material = 'white-stone',
   parapet = true,
   footings = true,
+  mountKind = 'ground',
 } = {}) {
   const [ox, oy, oz] = at;
   const hl = length / 2, ht = thickness / 2;
   if (footings) {
-    b.box({
-      type: 'foundation', material: 'footing-anchor',
-      min: [ox - hl, oy - FOOTING, oz - ht - 0.2],
-      max: [ox + hl, oy, oz + ht + 0.2],
-      fixed: true, fracture: false,
-    });
+    mount(b, mountKind, {
+      min: [ox - hl, oz - ht - 0.2], max: [ox + hl, oz + ht + 0.2],
+    }, { y: oy });
   }
   b.box({
     type: 'wall', material,
@@ -153,9 +214,116 @@ export function wallBay(b, {
   }
 }
 
+
+/**
+ * Four wall bays enclosing a space: the next rung up from a single wall.
+ *
+ * The interesting thing a room has that a wall does not is CORNERS, and
+ * corners are where masonry either braces itself or does not. Two walls meeting
+ * at a right angle each stop the other buckling out of plane, which is why a
+ * room stands at proportions a single wall of the same thickness will not.
+ */
+export function room(b, {
+  at = [0, 0, 0],
+  size = 6.0,
+  height = 4.0,
+  thickness = 0.6,
+  material = 'white-stone',
+  mountKind = 'ground',
+  parapet = false,
+} = {}) {
+  const [ox, oy, oz] = at;
+  const h = size / 2, ht = thickness / 2;
+  // The two X-walls run the full length and own the corners; the Z-walls stop
+  // short of them. Sharing an exact boundary is what makes these bond --
+  // overlapping them puts every corner over the interpenetration limit.
+  for (const sz of [-1, 1]) {
+    wallBay(b, {
+      at: [ox, oy, oz + sz * (h - ht)],
+      length: size, height, thickness, material, parapet, mountKind,
+    });
+  }
+  const inner = size - thickness * 2;
+  for (const sx of [-1, 1]) {
+    if (inner <= 0.2) continue;
+    const cx = ox + sx * (h - ht);
+    if (mountKind !== 'free') {
+      // Inset past the X-walls' own footing margin. wallBay pads its footing
+      // 0.2 m beyond the wall so the wall lands well inside it; at a corner
+      // that padding is exactly what the cross-wall's footing runs into.
+      const pad = 0.25;
+      mount(b, mountKind, {
+        min: [cx - ht, oz - inner / 2 + pad], max: [cx + ht, oz + inner / 2 - pad],
+      }, { y: oy });
+    }
+    b.box({
+      type: 'wall', material,
+      min: [cx - ht, oy, oz - inner / 2], max: [cx + ht, oy + height, oz + inner / 2],
+    });
+  }
+}
+
+/**
+ * A room with a floor over it: one storey, ready to be stacked.
+ *
+ * Emitted with mountKind 'slab' this is the middle of a stack -- the plate
+ * below is a mock, so the storey meets the same bearing it will meet in the
+ * real building. That is the whole point of mounts: this measurement is about
+ * a storey in a tower, not a storey standing alone in a field.
+ */
+export function storey(b, {
+  at = [0, 0, 0],
+  size = 6.0,
+  height = 4.0,
+  thickness = 0.6,
+  slabThickness = 0.3,
+  material = 'white-stone',
+  deckMaterial = 'reinforced-concrete',
+  mountKind = 'ground',
+} = {}) {
+  const [ox, oy, oz] = at;
+  const h = size / 2;
+  room(b, { at, size, height, thickness, material, mountKind, parapet: false });
+  floorPlate(b, {
+    material: deckMaterial,
+    min: [ox - h, oz - h], max: [ox + h, oz + h],
+    y: oy + height + slabThickness, thickness: slabThickness,
+  });
+}
+
+/**
+ * Storeys stacked, each bearing on the plate of the one below.
+ *
+ * The rung that answers "how tall before it stops working". Only the ground
+ * storey is mounted; the rest stand on the real plate beneath them, so this is
+ * a genuine stack rather than a column of independently-anchored boxes.
+ */
+export function stack(b, {
+  at = [0, 0, 0],
+  floors = 4,
+  size = 6.0,
+  height = 4.0,
+  thickness = 0.6,
+  slabThickness = 0.3,
+  material = 'white-stone',
+  mountKind = 'ground',
+} = {}) {
+  const [ox, oy, oz] = at;
+  for (let k = 0; k < floors; k += 1) {
+    storey(b, {
+      at: [ox, oy + k * (height + slabThickness), oz],
+      size, height, thickness, slabThickness, material,
+      mountKind: k === 0 ? mountKind : 'free',
+    });
+  }
+}
+
 export const COMPONENTS = {
   'frame-bay': frameBay,
   'wall-bay': wallBay,
+  room,
+  storey,
+  stack,
 };
 
 /**
