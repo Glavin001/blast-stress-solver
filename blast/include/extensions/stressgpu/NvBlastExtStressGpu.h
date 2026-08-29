@@ -316,6 +316,12 @@ public:
      * broke, and the virial wants the centroid only when chunk crushing is on.
      * Pulling them across every tick cost more than the kernel did.
      */
+    /// Per-group stresses, also left on the device. Nothing reads a bond's
+    /// stress unless its node came back flagged, which on a settled city is
+    /// never, so pulling them across every tick was pure loss.
+    virtual bool readbackGroupStresses(
+        const float*& stressNormal, const float*& stressShear) = 0;
+
     virtual bool readbackGroupVectors(
         const float*& groupNormal, const float*& groupCentroid) = 0;
 

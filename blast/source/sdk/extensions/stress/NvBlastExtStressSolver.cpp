@@ -1448,8 +1448,8 @@ public:
     uint64_t m_bsTopologyUploaded{~0ull};
     /// Set for the tick when the device walk produced this tick's outputs.
     bool m_bsGpuActive{false};
-    const float* m_bsGpuStressNormal{nullptr};
-    const float* m_bsGpuStressShear{nullptr};
+    mutable const float* m_bsGpuStressNormal{nullptr};
+    mutable const float* m_bsGpuStressShear{nullptr};
     mutable const float* m_bsGpuNormal{nullptr};
     mutable const float* m_bsGpuCentroid{nullptr};
     std::vector<uint32_t> m_bsGpuRemovals;
@@ -2475,8 +2475,9 @@ public:
         }
         // Pinned staging owned by the solver, valid until the next call, and
         // there is exactly one call per tick.
-        m_bsGpuStressNormal = result.groupStressNormal;
-        m_bsGpuStressShear = result.groupStressShear;
+        // Fetched on first use, like the vectors.
+        m_bsGpuStressNormal = nullptr;
+        m_bsGpuStressShear = nullptr;
         // Fetched on first use, not every tick -- see readbackGroupVectors.
         m_bsGpuNormal = nullptr;
         m_bsGpuCentroid = nullptr;
@@ -2593,6 +2594,15 @@ public:
             stressShear = 0.0f;
             normal = m_bondsData[bondIndex].normal;
             centroid = m_bondsData[bondIndex].centroid;
+            return true;
+        }
+        if (m_bsGpuStressNormal == nullptr && !fetchBondStressStresses())
+        {
+            const BondData& bond = m_bondsData[bondIndex];
+            stressNormal = bond.stressNormal;
+            stressShear = bond.stressShear;
+            normal = bond.normal;
+            centroid = bond.centroid;
             return true;
         }
         stressNormal = m_bsGpuStressNormal[group];
@@ -2759,7 +2769,12 @@ public:
             }
             // The vectors are fetched lazily now, so the audit has to ask for
             // them rather than assume the tick already paid for them.
+            const bool haveStresses = fetchBondStressStresses();
             const bool haveVectors = fetchBondStressVectors();
+            if (!haveStresses)
+            {
+                m_bsGpuStressNormal = nullptr;
+            }
             for (uint32_t g = 0; g < m_bsCsrGroupSize.size(); ++g)
             {
                 const uint32_t begin = m_bsCsrGroupBegin[g];
@@ -2776,6 +2791,7 @@ public:
                         continue;
                     }
                     const BondData& host = m_bondsData[bondIndex];
+                    if (m_bsGpuStressNormal == nullptr) { continue; }
                     const float devSn = m_bsGpuStressNormal[g];
                     const float devSs = m_bsGpuStressShear[g];
                     ++m_bsGpuStressChecks;
@@ -2902,6 +2918,20 @@ public:
             bond.normal = normal;
             bond.centroid = centroid;
         }
+    }
+
+    bool fetchBondStressStresses() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        ExtStressGpuSolver* gpu = m_solver.gpuSolver();
+        if (gpu == nullptr)
+        {
+            return false;
+        }
+        return gpu->readbackGroupStresses(m_bsGpuStressNormal, m_bsGpuStressShear);
+#else
+        return false;
+#endif
     }
 
     bool fetchBondStressVectors() const

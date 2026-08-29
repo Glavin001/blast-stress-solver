@@ -1839,9 +1839,47 @@ uploadIslands();
         return true;
     }
 
+    bool readbackGroupStresses(const float*& stressNormal, const float*& stressShear) override
+    {
+        if (!m_bsReady || m_bsVectorGroups == 0 || m_bsStream == nullptr)
+        {
+            return false;
+        }
+        if (!m_bsStressFetched)
+        {
+            try
+            {
+                // On m_bsStream, not the legacy default stream: a blocking
+                // cudaMemcpy there implicitly synchronises with EVERY stream
+                // on the device, so the lazy fetch would wait on PhysX's whole
+                // pipeline. That turned a cheap deferred read into a stall and
+                // showed up as a 2.2x spread between otherwise identical arms.
+                checkCuda(
+                    cudaMemcpyAsync(m_bsHostGroupStressNormal, m_bsGroupStressNormal,
+                                    sizeof(float) * m_bsVectorGroups,
+                                    cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs lazy read sn");
+                checkCuda(
+                    cudaMemcpyAsync(m_bsHostGroupStressShear, m_bsGroupStressShear,
+                                    sizeof(float) * m_bsVectorGroups,
+                                    cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs lazy read ss");
+                checkCuda(cudaStreamSynchronize(m_bsStream), "bs lazy stress sync");
+            }
+            catch (const std::exception&)
+            {
+                return false;
+            }
+            m_bsStressFetched = true;
+        }
+        stressNormal = m_bsHostGroupStressNormal;
+        stressShear = m_bsHostGroupStressShear;
+        return true;
+    }
+
     bool readbackGroupVectors(const float*& groupNormal, const float*& groupCentroid) override
     {
-        if (!m_bsReady || m_bsVectorGroups == 0)
+        if (!m_bsReady || m_bsVectorGroups == 0 || m_bsStream == nullptr)
         {
             return false;
         }
@@ -1850,15 +1888,18 @@ uploadIslands();
             try
             {
                 checkCuda(
-                    cudaMemcpy(
+                    cudaMemcpyAsync(
                         m_bsHostGroupNormal, m_bsGroupNormal,
-                        sizeof(float) * 3u * m_bsVectorGroups, cudaMemcpyDeviceToHost),
+                        sizeof(float) * 3u * m_bsVectorGroups,
+                        cudaMemcpyDeviceToHost, m_bsStream),
                     "bs lazy read normal");
                 checkCuda(
-                    cudaMemcpy(
+                    cudaMemcpyAsync(
                         m_bsHostGroupCentroid, m_bsGroupCentroid,
-                        sizeof(float) * 3u * m_bsVectorGroups, cudaMemcpyDeviceToHost),
+                        sizeof(float) * 3u * m_bsVectorGroups,
+                        cudaMemcpyDeviceToHost, m_bsStream),
                     "bs lazy read centroid");
+                checkCuda(cudaStreamSynchronize(m_bsStream), "bs lazy vector sync");
             }
             catch (const std::exception&)
             {
@@ -2075,28 +2116,38 @@ uploadIslands();
                     sizeof(std::uint8_t) * csr.graphNodeCount,
                     cudaMemcpyDeviceToHost, m_bsStream),
                 "bs read node mask");
-            checkCuda(
-                cudaMemcpyAsync(
-                    m_bsHostGroupStressNormal, m_bsGroupStressNormal, sizeof(float) * groups,
-                    cudaMemcpyDeviceToHost, m_bsStream),
-                "bs read sn");
-            checkCuda(
-                cudaMemcpyAsync(
-                    m_bsHostGroupStressShear, m_bsGroupStressShear, sizeof(float) * groups,
-                    cudaMemcpyDeviceToHost, m_bsStream),
-                "bs read ss");
             m_telemetry.bondStressBytesDown =
                 2ull * sizeof(std::uint32_t)
-                + sizeof(std::uint8_t) * csr.graphNodeCount
-                + sizeof(float) * 2ull * groups;
+                + sizeof(std::uint8_t) * csr.graphNodeCount;
             m_bsVectorsFetched = false;
+            m_bsStressFetched = false;
             m_bsVectorGroups = groups;
             cudaEventRecord(m_bsEvReadStop, m_bsStream);
             const auto bsSyncStart = std::chrono::steady_clock::now();
             m_telemetry.bondStressEnqueueMs =
                 std::chrono::duration<float, std::milli>(bsSyncStart - prepStart).count()
                 - m_telemetry.bondStressPrepMs;
-            checkCuda(cudaStreamSynchronize(m_bsStream), "bs sync");
+            // Spin, then fall back to blocking.
+            //
+            // The device work here is ~0.13 ms. cudaStreamSynchronize under
+            // the default scheduling policy is free to hand the core back to
+            // the OS, and getting it back costs more than the work did.
+            // Spinning on a query for a bounded number of iterations covers
+            // the common case without giving up the thread; anything longer
+            // than that is a real stall and worth blocking on.
+            {
+                bool done = false;
+                for (int spin = 0; spin < 20000; ++spin)
+                {
+                    const cudaError_t q = cudaStreamQuery(m_bsStream);
+                    if (q == cudaSuccess) { done = true; break; }
+                    if (q != cudaErrorNotReady) { checkCuda(q, "bs spin"); }
+                }
+                if (!done)
+                {
+                    checkCuda(cudaStreamSynchronize(m_bsStream), "bs sync");
+                }
+            }
             const auto bsSyncEnd = std::chrono::steady_clock::now();
             m_telemetry.bondStressSyncMs =
                 std::chrono::duration<float, std::milli>(bsSyncEnd - bsSyncStart).count();
@@ -2127,8 +2178,11 @@ uploadIslands();
             result.removeCount = removeCount;
             result.overstressedBondCount = m_bsHostCounts[0];
             result.nodeOverstressed = m_bsHostNodeOverstressed;
-            result.groupStressNormal = m_bsHostGroupStressNormal;
-            result.groupStressShear = m_bsHostGroupStressShear;
+            // Also deferred. Nothing reads a bond's stress unless its node
+            // came back flagged, so on a tick with no overstress -- which is
+            // every tick of a settled city -- these are never wanted.
+            result.groupStressNormal = nullptr;
+            result.groupStressShear = nullptr;
             // Left null on purpose: fetched only if someone asks.
             result.groupNormal = nullptr;
             result.groupCentroid = nullptr;
@@ -4215,6 +4269,7 @@ uploadIslands();
     bool m_bsCsrResident{false};
     bool m_bsHealthResident{false};
     bool m_bsVectorsFetched{false};
+    bool m_bsStressFetched{false};
     std::uint32_t m_bsVectorGroups{0};
     cudaStream_t m_bsStream{nullptr};
     cudaEvent_t m_bsEvUploadStart{nullptr};
