@@ -126,6 +126,68 @@ struct ExtStressGpuTelemetry
  * solve, callers upload only node velocity/load inputs and read impulses only
  * when validation, fracture evaluation, or diagnostics require them.
  */
+/**
+Flattened solver-bond-group topology for the device bond-stress walk.
+
+Mirrors SupportGraphProcessor's own flattened copy of m_solverBondsData. The
+payload arrays are indexed by BLAST BOND, which is an asset-level index that is
+never permuted, so they are uploaded once per graph resync. Only the three CSR
+arrays change when a bond breaks, and they are small enough to refresh whole.
+
+Member SLOT order inside a group is significant: it is the order the serial
+host walk emits bond removals in, and it is not sorted.
+*/
+struct ExtStressGpuBondStressTopology
+{
+    std::uint32_t groupCount{0};
+    std::uint32_t memberSlotCount{0};
+    std::uint32_t graphNodeCount{0};
+    std::uint32_t blastBondCount{0};
+
+    /// CSR over member slots. [groupCount] each.
+    const std::uint32_t* groupBegin{nullptr};
+    const std::uint32_t* groupSize{nullptr};
+    /// [memberSlotCount] -- blast bond index living in each slot.
+    const std::uint32_t* memberBlastBond{nullptr};
+
+    /// Static per blast bond. [blastBondCount], or 3x that for the vectors.
+    const std::uint32_t* bondNode0{nullptr};
+    const std::uint32_t* bondNode1{nullptr};
+    const std::uint32_t* bondMaterial{nullptr};
+    const float* bondNormal{nullptr};    ///< already sign-aligned to nodeDisp
+    const float* bondCentroid{nullptr};
+    const float* bondNodeDisp{nullptr};
+
+    /// The three ELASTIC limits per material, in the caller's OWN resolved
+    /// table: compression, tension, shear. Carried here rather than reusing
+    /// the solver's copy, which is uploaded once at create() and goes stale
+    /// the moment materials are pushed again -- the host walk resolves each
+    /// bond against the live table, so the device must too.
+    const float* materialElasticLimits{nullptr};
+    std::uint32_t materialCount{0};
+};
+
+/**
+What the device walk hands back. All pointers are host-side staging owned by
+the solver and valid until the next updateBondStress call.
+*/
+struct ExtStressGpuBondStressResult
+{
+    /// Blast bond indices, in exactly the order the serial walk emits them:
+    /// group index ascending, then member slot ascending inside each group.
+    const std::uint32_t* bondIndicesToRemove{nullptr};
+    std::uint32_t removeCount{0};
+    std::uint32_t overstressedBondCount{0};
+    /// [graphNodeCount], set-to-1. Feeds the E1 fracture-walk node skip.
+    const std::uint8_t* nodeOverstressed{nullptr};
+    /// Per solver bond group. A group the walk skipped keeps its previous
+    /// values, exactly as the host's BondData does.
+    const float* groupStressNormal{nullptr};
+    const float* groupStressShear{nullptr};
+    const float* groupNormal{nullptr};    ///< 3 per group
+    const float* groupCentroid{nullptr};  ///< 3 per group
+};
+
 class ExtStressGpuSolver
 {
 public:
@@ -194,6 +256,43 @@ public:
      * without the allocation churn.
      */
     virtual bool removeBond(std::uint32_t bondIndex) = 0;
+
+
+    /**
+     * Hand over the flattened group topology. Cheap to call: it re-uploads the
+     * static payload, so it belongs on a graph resync, not on a tick. The three
+     * CSR arrays are refreshed on every updateBondStress instead.
+     */
+    virtual bool setBondStressTopology(const ExtStressGpuBondStressTopology& topology) = 0;
+
+    /**
+     * The bond-stress walk, on the device.
+     *
+     * Consumes the impulses already resident from the last solve -- which is
+     * what makes this worth doing, since those impulses are currently copied
+     * back to the host for no other reason than to feed this walk.
+     *
+     * One thread per group, with the member loop run serially in slot order.
+     * That is deliberate: it reproduces the host's sequential float
+     * accumulation operation for operation, so the dual-run audit can demand
+     * bit-equality rather than a tolerance.
+     */
+    virtual bool updateBondStress(
+        const ExtStressGpuBondStressTopology& csr,
+        const float* blastBondHealth,
+        float unbreakableLimit,
+        ExtStressGpuBondStressResult& result) = 0;
+
+    /**
+     * Whether a topology edit is queued but not yet applied to the device.
+     *
+     * removeBond only RECORDS the swap-with-last; it is replayed inside the
+     * next solve. The host applies its own replaceWithLast immediately, so
+     * while this is true the two impulse arrays are indexed differently and
+     * anything reading device impulses by host bond index reads the wrong
+     * bond.
+     */
+    virtual bool hasPendingTopologyChange() const = 0;
 
     virtual void resetWarmStart() = 0;
 

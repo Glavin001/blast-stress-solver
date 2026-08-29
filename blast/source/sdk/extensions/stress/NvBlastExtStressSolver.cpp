@@ -297,6 +297,44 @@ public:
     /// Which solver bonds re-solved this tick. Empty means "assume all".
     const std::vector<uint8_t>& bondDirty() const { return m_bondDirty; }
 
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+    /// The resident device solver, for the bond-stress walk that consumes the
+    /// impulses it already holds. Null when the GPU path is not active.
+    ExtStressGpuSolver* gpuSolver() const { return m_gpuSolver; }
+
+    /// Whether the LAST solve actually ran on the device. Having a solver is
+    /// not the same thing: solveAndReadbackImpulses can fail over to the host
+    /// StressProcessor, and the CPU early-out skips the solve entirely. In
+    /// both cases the device's resident impulses are not what the host walk
+    /// would read, so a device bond-stress walk would be computing from stale
+    /// inputs.
+    bool lastSolveOnDevice() const { return m_lastSolveOnDevice; }
+
+    /// Device impulses usable BY INDEX: the last real solve ran there, and no
+    /// bond removal has been queued since.
+    ///
+    /// Both halves are load-bearing. removeBond only RECORDS its
+    /// swap-with-last and replays it inside the next solve, while the host
+    /// applies its own replaceWithLast immediately -- so between a tick that
+    /// broke bonds and the next real solve the two impulse arrays are indexed
+    /// differently. Reading device impulses by host bond index there does not
+    /// diverge slightly, it reads a DIFFERENT BOND: measured 15.8% of group
+    /// stresses differing bit for bit, max relative difference 120.
+    ///
+    /// Demanding a solve THIS tick instead is also sound, and throws away most
+    /// of the benefit: at grid 2 the settled structures early-out of the solve
+    /// nearly every tick, and they are exactly the ones still paying the walk
+    /// in full, because it is linear in total live bonds rather than in
+    /// activity. Measured under that stricter rule: 8, 2 and 1 device runs out
+    /// of ~4200 ticks on three of the four structures.
+    bool deviceImpulsesUsable() const
+    {
+        return m_lastSolveOnDevice
+            && m_gpuSolver != nullptr
+            && !m_gpuSolver->hasPendingTopologyChange();
+    }
+#endif
+
     float getGpuImpulseCopyMilliseconds() const
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
@@ -474,6 +512,11 @@ public:
             return;
         }
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        // Sticky across the settled early-out on purpose: that path solves
+        // nothing, so it cannot invalidate what the device holds. What DOES
+        // invalidate it is a queued topology change, tested separately -- see
+        // deviceImpulsesUsable().
+        m_lastSolveOnDevice = false;
         if (m_gpuSolver)
         {
             for (uint32_t i = 0; i < m_velocities.size(); ++i)
@@ -592,6 +635,7 @@ public:
                     : AngLin6ErrorSq{FLT_MAX, FLT_MAX};
                 m_forceColdStart = false;
                 m_inputsChanged = false;
+                m_lastSolveOnDevice = true;
                 return;
             }
         }
@@ -605,6 +649,7 @@ public:
         m_converged = (m_stressProcessor.solve(m_impulses.data(), m_velocities.data(), params, &m_error_sq) >= 0);
         m_forceColdStart = false;
         m_inputsChanged = false;
+        m_lastSolveOnDevice = false;
     }
 
     // Number of settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
@@ -645,6 +690,7 @@ private:
     Array<SolverBond>::type     m_bonds;
     StressProcessor             m_stressProcessor;
     POD_Buffer<AngLin6>         m_velocities;
+    bool                        m_lastSolveOnDevice{false};
     POD_Buffer<AngLin6>         m_impulses;
     /// Per-solver-bond dirty flags; see bondDirty().
     std::vector<uint8_t>        m_bondDirty;
@@ -1311,34 +1357,67 @@ public:
     // host applies to m_solverBondsData:
     //   member removed -> findAndReplaceWithLast inside its group
     //   group emptied  -> replaceWithLast over the group table
-    // Neither moves a member RANGE, because (begin, count) is stored per group
-    // and it is those entries that get swapped. So the member arrays are built
-    // once per resync and only ever edited in place. Dead tail slots are left
-    // behind; the next resync repacks them.
+    // Neither moves a member RANGE, because (begin, size) is stored per group
+    // and it is those entries that get swapped.
+    //
+    // The payload is indexed by BLAST BOND rather than by member slot, and that
+    // is the point of the layout. Blast bond indices are asset-level and are
+    // never permuted, so the node pair, material, normal, centroid and node
+    // displacement are written once per resync and never touched again. What a
+    // bond removal edits is then only the CSR -- three uint32 arrays -- which
+    // is small enough to refresh on the device wholesale, instead of needing
+    // its own incremental scatter that could silently fall out of step.
     //
     // Slot order within a group is the order the device must emit removals in,
     // and it is NOT sorted -- see the note on bondStressFinish.
     std::vector<uint32_t> m_bsCsrGroupBegin;
-    std::vector<uint32_t> m_bsCsrGroupCount;
-    std::vector<uint32_t> m_bsMemberBlastBond;
-    std::vector<uint32_t> m_bsMemberNode0;
-    std::vector<uint32_t> m_bsMemberNode1;
-    std::vector<uint32_t> m_bsMemberMaterial;
-    std::vector<float>    m_bsMemberNormal;    // 3 floats per slot, sign-aligned
-    std::vector<float>    m_bsMemberCentroid;  // 3 floats per slot
-    std::vector<float>    m_bsMemberNodeDisp;  // 3 floats per slot
-    /// blast bond -> owning group, or InvalidIndex. Kept in step with the
-    /// group swaps so the device can map its outputs back without the host
-    /// having to walk anything.
+    std::vector<uint32_t> m_bsCsrGroupSize;
+    std::vector<uint32_t> m_bsCsrMemberBlastBond;
+    // Static per blast bond, valid until the next resync.
+    std::vector<uint32_t> m_bsBondNode0;
+    std::vector<uint32_t> m_bsBondNode1;
+    std::vector<uint32_t> m_bsBondMaterial;
+    std::vector<float>    m_bsBondNormal;    // 3 floats per blast bond
+    std::vector<float>    m_bsBondCentroid;  // 3 floats per blast bond
+    std::vector<float>    m_bsBondNodeDisp;  // 3 floats per blast bond
+    /// blast bond -> owning group, or InvalidIndex. Lets the device map its
+    /// per-group outputs back without the host walking anything.
     std::vector<uint32_t> m_bsBlastBondGroup;
+    std::vector<float> m_bsMaterialLimits;
     /// Set by anything that invalidates the mirror; cleared by a rebuild.
     bool m_bsCsrDirty{true};
-    /// Audit counters for BLAST_BOND_STRESS_CSR_VERIFY. Explicit initialisers:
-    /// a telemetry field without one has already reported 4.5e18 checks once.
+    /// Audit counters. Explicit initialisers: a telemetry field without one
+    /// has already reported 4.5e18 checks once.
     uint64_t m_bsCsrChecks{0};
     uint64_t m_bsCsrMismatches{0};
     uint64_t m_bsCsrRebuilds{0};
     uint64_t m_bsCsrTicks{0};
+    /// Which rebuild generation the device currently holds.
+    uint64_t m_bsTopologyUploaded{~0ull};
+    /// Set for the tick when the device walk produced this tick's outputs.
+    bool m_bsGpuActive{false};
+    const float* m_bsGpuStressNormal{nullptr};
+    const float* m_bsGpuStressShear{nullptr};
+    const float* m_bsGpuNormal{nullptr};
+    const float* m_bsGpuCentroid{nullptr};
+    std::vector<uint32_t> m_bsGpuRemovals;
+    std::vector<uint32_t> m_bsVerifyRemovals;
+    std::vector<uint32_t> m_bsSerialRemovals;
+    std::vector<uint8_t> m_bsVerifyMask;
+    uint64_t m_bsGpuChecks{0};
+    uint64_t m_bsGpuMismatches{0};
+    uint64_t m_bsGpuMismCount{0};
+    uint64_t m_bsGpuMismRemoveSize{0};
+    uint64_t m_bsGpuMismRemoveOrder{0};
+    uint64_t m_bsGpuMismMask{0};
+    uint64_t m_bsGpuFirstBadTick{0};
+    uint64_t m_bsGpuLastBadTick{0};
+    uint64_t m_bsGpuAttempts{0};
+    uint64_t m_bsGpuRuns{0};
+    uint64_t m_bsRefuseNoSolver{0};
+    uint64_t m_bsRefuseStale{0};
+    uint64_t m_bsRefusePendingTopo{0};
+    uint64_t m_bsRefuseCsr{0};
     uint64_t m_bsParChecks{0};
     uint64_t m_bsParMismatches{0};
     float m_hostWalkInMilliseconds{0.0f};
@@ -1348,8 +1427,9 @@ public:
 
     bool getBondStress(uint32_t blastBondIndex, float& compression, float& tension, float& shear) const
     {
-        const uint32_t bondIndex = m_blastBondIndexMap[blastBondIndex];
-        if (isInvalidIndex(bondIndex))
+        float stressNormal, stressShear;
+        nvidia::NvVec3 normal, centroid;
+        if (!bondStressOutputs(blastBondIndex, stressNormal, stressShear, normal, centroid))
         {
             return false;
         }
@@ -1358,19 +1438,19 @@ public:
         // they both measure stress parallel to the bond normal direction
         // compression is the force resisting two nodes being pushed together (it pushes them apart)
         // tension is the force resisting two nodes being pulled apart (it pulls them together)
-        if (m_bondsData[bondIndex].stressNormal <= 0.0f)
+        if (stressNormal <= 0.0f)
         {
-            compression = -m_bondsData[bondIndex].stressNormal;
+            compression = -stressNormal;
             tension = 0.0f;
         }
         else
         {
             compression = 0.0f;
-            tension = m_bondsData[bondIndex].stressNormal;
+            tension = stressNormal;
         }
 
         // shear is independent and can co-exist with compression and tension
-        shear = m_bondsData[bondIndex].stressShear;         // the force perpendicular to the bond normal direction
+        shear = stressShear;         // the force perpendicular to the bond normal direction
 
         return true;
     }
@@ -1652,14 +1732,20 @@ private:
                 }
                 const BondData& bond = m_bondsData[bondIndex];
                 const NvVec3 force = impulseLinear * (remainingArea * recipTotalArea);
+                // In GPU mode the walk never wrote BondData, so the centroid
+                // comes from the per-group device output instead.
+                float ignoredNormalStress, ignoredShear;
+                NvVec3 ignoredNormal, centroid = bond.centroid;
+                bondStressOutputs(
+                    blastBondIndex, ignoredNormalStress, ignoredShear, ignoredNormal, centroid);
 
                 if (materialForNode(bond.node0).crush.enabled())
                 {
-                    accumulateVirial(bond.node0, bond.centroid - m_nodesData[bond.node0].localPos, force);
+                    accumulateVirial(bond.node0, centroid - m_nodesData[bond.node0].localPos, force);
                 }
                 if (materialForNode(bond.node1).crush.enabled())
                 {
-                    accumulateVirial(bond.node1, bond.centroid - m_nodesData[bond.node1].localPos, -force);
+                    accumulateVirial(bond.node1, centroid - m_nodesData[bond.node1].localPos, -force);
                 }
             }
         }
@@ -1775,6 +1861,10 @@ public:
             && m_bsDirtyPtr->size() == m_solverBondsData.size();
         m_bsGroupCount = static_cast<uint32_t>(m_solverBondsData.size());
 
+        // A fallback tick must not leave the previous tick's device pointers
+        // looking live.
+        m_bsGpuActive = false;
+
         // Keep the flattened mirror in step before anything reads it.
         if (bondStressMirrorEnabled())
         {
@@ -1785,9 +1875,32 @@ public:
             }
             ++m_bsCsrTicks;
         }
+        if (bondStressGpu() && (m_bsCsrTicks % 600) == 0 && m_bsCsrTicks > 0)
+        {
+            fprintf(stderr,
+                    "[bond-stress-gpu] ticks=%llu attempts=%llu ranOnDevice=%llu "
+                    "checks=%llu MISMATCHES=%llu "
+                    "(count=%llu removeSize=%llu removeOrder=%llu mask=%llu) "
+                    "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu)\n",
+                    (unsigned long long)m_bsCsrTicks,
+                    (unsigned long long)m_bsGpuAttempts,
+                    (unsigned long long)m_bsGpuRuns,
+                    (unsigned long long)m_bsGpuChecks,
+                    (unsigned long long)m_bsGpuMismatches,
+                    (unsigned long long)m_bsGpuMismCount,
+                    (unsigned long long)m_bsGpuMismRemoveSize,
+                    (unsigned long long)m_bsGpuMismRemoveOrder,
+                    (unsigned long long)m_bsGpuMismMask,
+                    (unsigned long long)m_bsGpuFirstBadTick,
+                    (unsigned long long)m_bsGpuLastBadTick,
+                    (unsigned long long)m_bsRefuseNoSolver,
+                    (unsigned long long)m_bsRefuseStale,
+                    (unsigned long long)m_bsRefusePendingTopo,
+                    (unsigned long long)m_bsRefuseCsr);
+        }
         if (bondStressCsrVerify())
         {
-            verifyBondStressCsr(bonds);
+            verifyBondStressCsr();
             if ((m_bsCsrTicks % 600) == 0)
             {
                 fprintf(stderr,
@@ -2012,12 +2125,13 @@ public:
             }
     }
 
-    /// Rebuild the flattened mirror from m_solverBondsData. Called only when
-    /// the mirror is dirty, which means a resync or an edit we could not
-    /// mirror incrementally.
+    /// Rebuild the flattened mirror from m_solverBondsData. Cold path: the
+    /// audit measured one rebuild per run, because the incremental edits below
+    /// absorb essentially all topology churn.
     void rebuildBondStressCsr(const NvBlastBond* bonds)
     {
         const uint32_t groupCount = static_cast<uint32_t>(m_solverBondsData.size());
+        const uint32_t blastBondCount = static_cast<uint32_t>(m_blastBondIndexMap.size());
         uint32_t total = 0;
         for (uint32_t g = 0; g < groupCount; ++g)
         {
@@ -2025,64 +2139,54 @@ public:
         }
 
         m_bsCsrGroupBegin.resize(groupCount);
-        m_bsCsrGroupCount.resize(groupCount);
-        m_bsMemberBlastBond.resize(total);
-        m_bsMemberNode0.resize(total);
-        m_bsMemberNode1.resize(total);
-        m_bsMemberMaterial.resize(total);
-        m_bsMemberNormal.resize(3 * static_cast<size_t>(total));
-        m_bsMemberCentroid.resize(3 * static_cast<size_t>(total));
-        m_bsMemberNodeDisp.resize(3 * static_cast<size_t>(total));
-        m_bsBlastBondGroup.assign(m_blastBondIndexMap.size(), invalidIndex<uint32_t>());
+        m_bsCsrGroupSize.resize(groupCount);
+        m_bsCsrMemberBlastBond.resize(total);
+        // 0xFFFFFFFF, not 0: the kernel uses it as the "no graph bond" sentinel
+        // that stands in for the host walk's isInvalidIndex guard, and node 0
+        // is a real node that would otherwise get flagged spuriously.
+        m_bsBondNode0.assign(blastBondCount, invalidIndex<uint32_t>());
+        m_bsBondNode1.assign(blastBondCount, invalidIndex<uint32_t>());
+        m_bsBondMaterial.assign(blastBondCount, 0);
+        m_bsBondNormal.assign(3 * static_cast<size_t>(blastBondCount), 0.0f);
+        m_bsBondCentroid.assign(3 * static_cast<size_t>(blastBondCount), 0.0f);
+        m_bsBondNodeDisp.assign(3 * static_cast<size_t>(blastBondCount), 0.0f);
+        m_bsBlastBondGroup.assign(blastBondCount, invalidIndex<uint32_t>());
 
         uint32_t slot = 0;
         for (uint32_t g = 0; g < groupCount; ++g)
         {
             const auto& members = m_solverBondsData[g].blastBondIndices;
             m_bsCsrGroupBegin[g] = slot;
-            m_bsCsrGroupCount[g] = members.size();
+            m_bsCsrGroupSize[g] = members.size();
             for (const uint32_t blastBondIndex : members)
             {
-                fillBondStressMember(slot, g, blastBondIndex, bonds);
-                ++slot;
+                m_bsCsrMemberBlastBond[slot++] = blastBondIndex;
+                fillBondStressBond(g, blastBondIndex, bonds);
             }
         }
         m_bsCsrDirty = false;
     }
 
-    /// One member slot. Everything here is derived from data that cannot
-    /// change until the next resync.
-    void fillBondStressMember(
-        uint32_t slot, uint32_t group, uint32_t blastBondIndex, const NvBlastBond* bonds)
+    /// The static payload for one blast bond. Everything here derives from
+    /// asset geometry and node positions, both of which are pinned until the
+    /// next resync.
+    void fillBondStressBond(uint32_t group, uint32_t blastBondIndex, const NvBlastBond* bonds)
     {
-        m_bsMemberBlastBond[slot] = blastBondIndex;
-        if (blastBondIndex < m_bsBlastBondGroup.size())
-        {
-            m_bsBlastBondGroup[blastBondIndex] = group;
-        }
+        m_bsBlastBondGroup[blastBondIndex] = group;
 
         const uint32_t bondIndex = m_blastBondIndexMap[blastBondIndex];
-        // A member with no graph bond contributes nothing the walk can read;
-        // park it on node 0 with a zero normal so the device sees the same
-        // "no contribution" the host's isInvalidIndex guard produces.
         if (isInvalidIndex(bondIndex))
         {
-            m_bsMemberNode0[slot] = 0;
-            m_bsMemberNode1[slot] = 0;
-            m_bsMemberMaterial[slot] = 0;
-            for (uint32_t k = 0; k < 3; ++k)
-            {
-                m_bsMemberNormal[3 * static_cast<size_t>(slot) + k] = 0.0f;
-                m_bsMemberCentroid[3 * static_cast<size_t>(slot) + k] = 0.0f;
-                m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + k] = 0.0f;
-            }
+            // No graph bond: the host walk's isInvalidIndex guard makes this
+            // member contribute nothing, and a zero normal with a zero node
+            // pair reproduces that on the device.
             return;
         }
 
         const BondData& bond = m_bondsData[bondIndex];
-        m_bsMemberNode0[slot] = bond.node0;
-        m_bsMemberNode1[slot] = bond.node1;
-        m_bsMemberMaterial[slot] =
+        m_bsBondNode0[blastBondIndex] = bond.node0;
+        m_bsBondNode1[blastBondIndex] = bond.node1;
+        m_bsBondMaterial[blastBondIndex] =
             m_bondMaterials ? m_bondMaterials[blastBondIndex] : 0;
 
         const NvBlastBond& blastBond = bonds[blastBondIndex];
@@ -2090,20 +2194,21 @@ public:
             m_nodesData[bond.node1].localPos - m_nodesData[bond.node0].localPos;
         const nvidia::NvVec3 assetNormal(
             blastBond.normal[0], blastBond.normal[1], blastBond.normal[2]);
-        // Same alignment the walk does, hoisted here because it depends only
-        // on asset geometry and node positions.
+        // The same alignment the walk does, hoisted here because it depends
+        // only on asset geometry and node positions.
         const nvidia::NvVec3 aligned =
             std::copysign(1.0f, assetNormal.dot(nodeDisp)) * assetNormal;
 
-        m_bsMemberNormal[3 * static_cast<size_t>(slot) + 0] = aligned.x;
-        m_bsMemberNormal[3 * static_cast<size_t>(slot) + 1] = aligned.y;
-        m_bsMemberNormal[3 * static_cast<size_t>(slot) + 2] = aligned.z;
-        m_bsMemberCentroid[3 * static_cast<size_t>(slot) + 0] = blastBond.centroid[0];
-        m_bsMemberCentroid[3 * static_cast<size_t>(slot) + 1] = blastBond.centroid[1];
-        m_bsMemberCentroid[3 * static_cast<size_t>(slot) + 2] = blastBond.centroid[2];
-        m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + 0] = nodeDisp.x;
-        m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + 1] = nodeDisp.y;
-        m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + 2] = nodeDisp.z;
+        const size_t base = 3 * static_cast<size_t>(blastBondIndex);
+        m_bsBondNormal[base + 0] = aligned.x;
+        m_bsBondNormal[base + 1] = aligned.y;
+        m_bsBondNormal[base + 2] = aligned.z;
+        m_bsBondCentroid[base + 0] = blastBond.centroid[0];
+        m_bsBondCentroid[base + 1] = blastBond.centroid[1];
+        m_bsBondCentroid[base + 2] = blastBond.centroid[2];
+        m_bsBondNodeDisp[base + 0] = nodeDisp.x;
+        m_bsBondNodeDisp[base + 1] = nodeDisp.y;
+        m_bsBondNodeDisp[base + 2] = nodeDisp.z;
     }
 
     /// Mirror of blastBondIndices.findAndReplaceWithLast: the group's LAST
@@ -2112,37 +2217,20 @@ public:
     void bondStressCsrRemoveMember(uint32_t group, uint32_t blastBondIndex)
     {
         if (!bondStressMirrorEnabled() || m_bsCsrDirty
-            || group >= m_bsCsrGroupCount.size())
+            || group >= m_bsCsrGroupSize.size())
         {
             return;
         }
         const uint32_t begin = m_bsCsrGroupBegin[group];
-        const uint32_t count = m_bsCsrGroupCount[group];
-        for (uint32_t k = 0; k < count; ++k)
+        const uint32_t size = m_bsCsrGroupSize[group];
+        for (uint32_t k = 0; k < size; ++k)
         {
-            const uint32_t slot = begin + k;
-            if (m_bsMemberBlastBond[slot] != blastBondIndex)
+            if (m_bsCsrMemberBlastBond[begin + k] != blastBondIndex)
             {
                 continue;
             }
-            const uint32_t last = begin + count - 1;
-            if (slot != last)
-            {
-                m_bsMemberBlastBond[slot] = m_bsMemberBlastBond[last];
-                m_bsMemberNode0[slot] = m_bsMemberNode0[last];
-                m_bsMemberNode1[slot] = m_bsMemberNode1[last];
-                m_bsMemberMaterial[slot] = m_bsMemberMaterial[last];
-                for (uint32_t c = 0; c < 3; ++c)
-                {
-                    m_bsMemberNormal[3 * static_cast<size_t>(slot) + c] =
-                        m_bsMemberNormal[3 * static_cast<size_t>(last) + c];
-                    m_bsMemberCentroid[3 * static_cast<size_t>(slot) + c] =
-                        m_bsMemberCentroid[3 * static_cast<size_t>(last) + c];
-                    m_bsMemberNodeDisp[3 * static_cast<size_t>(slot) + c] =
-                        m_bsMemberNodeDisp[3 * static_cast<size_t>(last) + c];
-                }
-            }
-            m_bsCsrGroupCount[group] = count - 1;
+            m_bsCsrMemberBlastBond[begin + k] = m_bsCsrMemberBlastBond[begin + size - 1];
+            m_bsCsrGroupSize[group] = size - 1;
             if (blastBondIndex < m_bsBlastBondGroup.size())
             {
                 m_bsBlastBondGroup[blastBondIndex] = invalidIndex<uint32_t>();
@@ -2154,25 +2242,25 @@ public:
         m_bsCsrDirty = true;
     }
 
-    /// Mirror of m_solverBondsData.replaceWithLast. Only the (begin, count)
+    /// Mirror of m_solverBondsData.replaceWithLast. Only the (begin, size)
     /// entries move; the member ranges stay where they are.
     void bondStressCsrRemoveGroup(uint32_t group)
     {
         if (!bondStressMirrorEnabled() || m_bsCsrDirty
-            || group >= m_bsCsrGroupCount.size())
+            || group >= m_bsCsrGroupSize.size())
         {
             return;
         }
-        const uint32_t last = static_cast<uint32_t>(m_bsCsrGroupCount.size()) - 1;
+        const uint32_t last = static_cast<uint32_t>(m_bsCsrGroupSize.size()) - 1;
         if (group != last)
         {
             m_bsCsrGroupBegin[group] = m_bsCsrGroupBegin[last];
-            m_bsCsrGroupCount[group] = m_bsCsrGroupCount[last];
+            m_bsCsrGroupSize[group] = m_bsCsrGroupSize[last];
             // The group that just moved owns different members now.
             const uint32_t begin = m_bsCsrGroupBegin[group];
-            for (uint32_t k = 0; k < m_bsCsrGroupCount[group]; ++k)
+            for (uint32_t k = 0; k < m_bsCsrGroupSize[group]; ++k)
             {
-                const uint32_t blastBondIndex = m_bsMemberBlastBond[begin + k];
+                const uint32_t blastBondIndex = m_bsCsrMemberBlastBond[begin + k];
                 if (blastBondIndex < m_bsBlastBondGroup.size())
                 {
                     m_bsBlastBondGroup[blastBondIndex] = group;
@@ -2180,19 +2268,19 @@ public:
             }
         }
         m_bsCsrGroupBegin.pop_back();
-        m_bsCsrGroupCount.pop_back();
+        m_bsCsrGroupSize.pop_back();
     }
 
-    /// BLAST_BOND_STRESS_CSR_VERIFY=1: rebuild a throwaway copy from
-    /// m_solverBondsData and compare it to the incrementally-maintained one,
-    /// slot by slot and in order. The incremental edits are the whole risk in
-    /// this mirror, and "the gates are green" is not evidence about them --
-    /// a 0.0975% divergence once passed every broad gate in this repo.
-    void verifyBondStressCsr(const NvBlastBond* bonds)
+    /// BLAST_BOND_STRESS_CSR_VERIFY=1: compare the incrementally-maintained
+    /// mirror to m_solverBondsData, group by group and slot by slot IN ORDER.
+    /// The incremental edits are the whole risk here, and "the gates are
+    /// green" is not evidence about them -- a 0.0975% divergence once passed
+    /// every broad gate in this repo.
+    void verifyBondStressCsr()
     {
         const uint32_t groupCount = static_cast<uint32_t>(m_solverBondsData.size());
         ++m_bsCsrChecks;
-        if (m_bsCsrGroupCount.size() != groupCount)
+        if (m_bsCsrGroupSize.size() != groupCount)
         {
             ++m_bsCsrMismatches;
             return;
@@ -2201,26 +2289,190 @@ public:
         {
             const auto& members = m_solverBondsData[g].blastBondIndices;
             ++m_bsCsrChecks;
-            if (m_bsCsrGroupCount[g] != members.size())
+            if (m_bsCsrGroupSize[g] != members.size())
             {
                 ++m_bsCsrMismatches;
                 continue;
             }
             const uint32_t begin = m_bsCsrGroupBegin[g];
-            for (uint32_t k = 0; k < m_bsCsrGroupCount[g]; ++k)
+            for (uint32_t k = 0; k < m_bsCsrGroupSize[g]; ++k)
             {
                 ++m_bsCsrChecks;
-                if (m_bsMemberBlastBond[begin + k] != members[k])
+                if (m_bsCsrMemberBlastBond[begin + k] != members[k])
                 {
                     ++m_bsCsrMismatches;
                 }
             }
         }
-        NV_UNUSED(bonds);
     }
 
     uint64_t getBondStressCsrChecks() const { return m_bsCsrChecks; }
     uint64_t getBondStressCsrMismatches() const { return m_bsCsrMismatches; }
+
+    /// Run the walk on the device, consuming the impulses already resident
+    /// there. Returns false if anything is not ready, in which case the caller
+    /// falls back to the serial walk.
+    bool runBondStressOnDevice(const float* bondHealth)
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        ExtStressGpuSolver* gpu = m_solver.gpuSolver();
+        if (gpu == nullptr) { ++m_bsRefuseNoSolver; return false; }
+        if (!m_solver.lastSolveOnDevice()) { ++m_bsRefuseStale; return false; }
+        if (gpu->hasPendingTopologyChange()) { ++m_bsRefusePendingTopo; return false; }
+        if (m_bsCsrDirty || m_bsCsrGroupSize.empty()) { ++m_bsRefuseCsr; return false; }
+        // The device walk has no equivalent of the unchanged-group skip, which
+        // is permanently default OFF anyway. Refuse rather than quietly
+        // computing something else.
+        if (m_bsHaveDirty)
+        {
+            return false;
+        }
+
+        refreshBondStressMaterials();
+        ExtStressGpuBondStressTopology csr{};
+        fillBondStressTopology(csr);
+        if (csr.groupCount == 0)
+        {
+            return false;
+        }
+
+        if (m_bsTopologyUploaded != m_bsCsrRebuilds)
+        {
+            if (!gpu->setBondStressTopology(csr))
+            {
+                return false;
+            }
+            m_bsTopologyUploaded = m_bsCsrRebuilds;
+        }
+
+        ExtStressGpuBondStressResult result{};
+        if (!gpu->updateBondStress(csr, bondHealth, kUnbreakableLimit, result))
+        {
+            return false;
+        }
+
+        m_overstressedBondCount = result.overstressedBondCount;
+        if (!m_nodeOverstressed.empty() && result.nodeOverstressed != nullptr)
+        {
+            memcpy(
+                m_nodeOverstressed.begin(),
+                result.nodeOverstressed,
+                m_nodeOverstressed.size());
+        }
+        // Pinned staging owned by the solver, valid until the next call, and
+        // there is exactly one call per tick.
+        m_bsGpuStressNormal = result.groupStressNormal;
+        m_bsGpuStressShear = result.groupStressShear;
+        m_bsGpuNormal = result.groupNormal;
+        m_bsGpuCentroid = result.groupCentroid;
+        m_bsGpuActive = true;
+
+        m_bsGpuRemovals.assign(
+            result.bondIndicesToRemove,
+            result.bondIndicesToRemove + result.removeCount);
+        return true;
+#else
+        NV_UNUSED(bondHealth);
+        return false;
+#endif
+    }
+
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+    void fillBondStressTopology(ExtStressGpuBondStressTopology& csr) const
+    {
+        csr.groupCount = static_cast<uint32_t>(m_bsCsrGroupSize.size());
+        csr.memberSlotCount = static_cast<uint32_t>(m_bsCsrMemberBlastBond.size());
+        csr.graphNodeCount = static_cast<uint32_t>(m_nodesData.size());
+        csr.blastBondCount = static_cast<uint32_t>(m_bsBondNode0.size());
+        csr.groupBegin = m_bsCsrGroupBegin.data();
+        csr.groupSize = m_bsCsrGroupSize.data();
+        csr.memberBlastBond = m_bsCsrMemberBlastBond.data();
+        csr.bondNode0 = m_bsBondNode0.data();
+        csr.bondNode1 = m_bsBondNode1.data();
+        csr.bondMaterial = m_bsBondMaterial.data();
+        csr.bondNormal = m_bsBondNormal.data();
+        csr.bondCentroid = m_bsBondCentroid.data();
+        csr.bondNodeDisp = m_bsBondNodeDisp.data();
+        csr.materialElasticLimits = m_bsMaterialLimits.data();
+        csr.materialCount = static_cast<uint32_t>(m_bsMaterialLimits.size() / 3);
+    }
+#endif
+
+    /// The elastic limits the walk actually thresholds against, resolved
+    /// exactly as materialForBlastBond resolves them. Rebuilt every tick: the
+    /// table is a handful of entries, and it can be pushed again without a
+    /// graph resync, so caching it against the rebuild generation would go
+    /// stale silently.
+    void refreshBondStressMaterials()
+    {
+        if (!m_materials || m_materialCount == 0)
+        {
+            // materialForBlastBond's default, resolved the same way.
+            ExtStressMaterial d;
+            d.tensionElasticLimit = d.compressionElasticLimit;
+            d.shearElasticLimit = d.compressionElasticLimit;
+            m_bsMaterialLimits.resize(3);
+            m_bsMaterialLimits[0] = d.compressionElasticLimit;
+            m_bsMaterialLimits[1] = d.tensionElasticLimit;
+            m_bsMaterialLimits[2] = d.shearElasticLimit;
+            return;
+        }
+        m_bsMaterialLimits.resize(3 * static_cast<size_t>(m_materialCount));
+        for (uint32_t i = 0; i < m_materialCount; ++i)
+        {
+            m_bsMaterialLimits[3 * i + 0] = m_materials[i].compressionElasticLimit;
+            m_bsMaterialLimits[3 * i + 1] = m_materials[i].tensionElasticLimit;
+            m_bsMaterialLimits[3 * i + 2] = m_materials[i].shearElasticLimit;
+        }
+    }
+
+    /// The walk's four outputs for one blast bond, from whichever path
+    /// produced them. In GPU mode m_bondsData is never written -- avoiding
+    /// that 268k-entry scatter is most of the point -- so every consumer goes
+    /// through here instead of reading BondData directly.
+    bool bondStressOutputs(
+        uint32_t blastBondIndex, float& stressNormal, float& stressShear,
+        nvidia::NvVec3& normal, nvidia::NvVec3& centroid) const
+    {
+        const uint32_t bondIndex = m_blastBondIndexMap[blastBondIndex];
+        if (isInvalidIndex(bondIndex))
+        {
+            return false;
+        }
+        if (!m_bsGpuActive || m_bsGpuStressNormal == nullptr)
+        {
+            const BondData& bond = m_bondsData[bondIndex];
+            stressNormal = bond.stressNormal;
+            stressShear = bond.stressShear;
+            normal = bond.normal;
+            centroid = bond.centroid;
+            return true;
+        }
+        const uint32_t group = blastBondIndex < m_bsBlastBondGroup.size()
+            ? m_bsBlastBondGroup[blastBondIndex]
+            : invalidIndex<uint32_t>();
+        if (isInvalidIndex(group) || group >= m_bsCsrGroupSize.size())
+        {
+            // Internal bond (both endpoints in one solver node): the serial
+            // walk never updates it either, and syncBonds left it at zero.
+            stressNormal = 0.0f;
+            stressShear = 0.0f;
+            normal = m_bondsData[bondIndex].normal;
+            centroid = m_bondsData[bondIndex].centroid;
+            return true;
+        }
+        stressNormal = m_bsGpuStressNormal[group];
+        stressShear = m_bsGpuStressShear[group];
+        normal = nvidia::NvVec3(
+            m_bsGpuNormal[3 * group + 0],
+            m_bsGpuNormal[3 * group + 1],
+            m_bsGpuNormal[3 * group + 2]);
+        centroid = nvidia::NvVec3(
+            m_bsGpuCentroid[3 * group + 0],
+            m_bsGpuCentroid[3 * group + 1],
+            m_bsGpuCentroid[3 * group + 2]);
+        return true;
+    }
 
     void setDeferBondStress(bool defer) { m_deferBondStress = defer; }
     uint32_t bondStressStripCount() const { return kBondStressStrips; }
@@ -2240,12 +2492,148 @@ public:
     void updateBondStress(const float* bondHealth, const NvBlastBond* bonds)
     {
         bondStressBegin(bondHealth, bonds);
+
+        bool ranOnDevice = false;
+        if (bondStressGpu())
+        {
+            ++m_bsGpuAttempts;
+            ranOnDevice = runBondStressOnDevice(bondHealth);
+            m_bsGpuRuns += ranOnDevice ? 1u : 0u;
+        }
+        if (ranOnDevice)
+        {
+            if (!bondStressGpuVerify())
+            {
+                for (const uint32_t blastBondIndex : m_bsGpuRemovals)
+                {
+                    removeBondIfExists(blastBondIndex);
+                }
+                return;
+            }
+
+            // Dual run. Snapshot what the device produced, then re-run the
+            // serial walk on the SAME inputs -- health is not mutated by
+            // either path, so the second run sees exactly what the first did
+            // -- and compare before anything is applied.
+            const uint32_t gpuCount = m_overstressedBondCount;
+            m_bsVerifyMask.assign(
+                m_nodeOverstressed.begin(), m_nodeOverstressed.begin() + m_nodeOverstressed.size());
+            m_bsVerifyRemovals = m_bsGpuRemovals;
+
+            bondStressBegin(bondHealth, bonds);
+            for (uint32_t sIdx = 0; sIdx < kBondStressStrips; ++sIdx)
+            {
+                bondStressStrip(sIdx);
+            }
+
+            // The serial removal list, in strip order, which is serial order.
+            m_bsSerialRemovals.clear();
+            uint32_t serialCount = 0;
+            for (const BondStressStrip& strip : m_bondStressStrips)
+            {
+                serialCount += strip.count;
+                for (const uint32_t removed : strip.remove)
+                {
+                    m_bsSerialRemovals.push_back(removed);
+                }
+            }
+
+            ++m_bsGpuChecks;
+            if (gpuCount != serialCount)
+            {
+                ++m_bsGpuMismatches;
+                ++m_bsGpuMismCount;
+                if (m_bsGpuFirstBadTick == 0) m_bsGpuFirstBadTick = m_bsCsrTicks;
+                m_bsGpuLastBadTick = m_bsCsrTicks;
+            }
+            ++m_bsGpuChecks;
+            if (m_bsVerifyRemovals.size() != m_bsSerialRemovals.size())
+            {
+                ++m_bsGpuMismatches;
+                ++m_bsGpuMismRemoveSize;
+                if (m_bsGpuFirstBadTick == 0) m_bsGpuFirstBadTick = m_bsCsrTicks;
+                m_bsGpuLastBadTick = m_bsCsrTicks;
+            }
+            else
+            {
+                // Element by element and IN ORDER: removal order feeds back
+                // into topology, so "same set" is not sufficient.
+                for (size_t k = 0; k < m_bsSerialRemovals.size(); ++k)
+                {
+                    ++m_bsGpuChecks;
+                    if (m_bsVerifyRemovals[k] != m_bsSerialRemovals[k])
+                    {
+                        ++m_bsGpuMismatches;
+                        ++m_bsGpuMismRemoveOrder;
+                        if (m_bsGpuFirstBadTick == 0) m_bsGpuFirstBadTick = m_bsCsrTicks;
+                m_bsGpuLastBadTick = m_bsCsrTicks;
+                    }
+                }
+            }
+            for (uint32_t n = 0; n < m_nodeOverstressed.size(); ++n)
+            {
+                ++m_bsGpuChecks;
+                if (m_bsVerifyMask[n] != m_nodeOverstressed[n])
+                {
+                    ++m_bsGpuMismatches;
+                    ++m_bsGpuMismMask;
+                    if (m_bsGpuFirstBadTick == 0) m_bsGpuFirstBadTick = m_bsCsrTicks;
+                m_bsGpuLastBadTick = m_bsCsrTicks;
+                }
+            }
+
+            // The serial run is authoritative while auditing, and it wrote
+            // m_bondsData, so consumers must read that rather than the device
+            // outputs.
+            m_bsGpuActive = false;
+            if (false)
+            {
+                fprintf(stderr,
+                        "[bond-stress-gpu] ticks=%llu checks=%llu MISMATCHES=%llu "
+                        "(count=%llu removeSize=%llu removeOrder=%llu mask=%llu) "
+                        "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu)\n",
+                        (unsigned long long)m_bsCsrTicks,
+                        (unsigned long long)m_bsGpuChecks,
+                        (unsigned long long)m_bsGpuMismatches,
+                        (unsigned long long)m_bsGpuMismCount,
+                        (unsigned long long)m_bsGpuMismRemoveSize,
+                        (unsigned long long)m_bsGpuMismRemoveOrder,
+                        (unsigned long long)m_bsGpuMismMask,
+                        (unsigned long long)m_bsGpuFirstBadTick,
+                        (unsigned long long)m_bsGpuLastBadTick,
+                    (unsigned long long)m_bsRefuseNoSolver,
+                    (unsigned long long)m_bsRefuseStale,
+                    (unsigned long long)m_bsRefusePendingTopo,
+                    (unsigned long long)m_bsRefuseCsr);
+            }
+            bondStressFinish();
+            return;
+        }
+
         for (uint32_t sIdx = 0; sIdx < kBondStressStrips; ++sIdx)
         {
             bondStressStrip(sIdx);
         }
         bondStressFinish();
     }
+
+    /// Overlay the walk's live outputs onto a BondData copy, for the
+    /// consumers that were written against the AoS.
+    void overlayBondStressOutputs(uint32_t blastBondIndex, BondData& bond) const
+    {
+        float stressNormal, stressShear;
+        nvidia::NvVec3 normal, centroid;
+        if (bondStressOutputs(blastBondIndex, stressNormal, stressShear, normal, centroid))
+        {
+            bond.stressNormal = stressNormal;
+            bond.stressShear = stressShear;
+            bond.normal = normal;
+            bond.centroid = centroid;
+        }
+    }
+
+    uint64_t getBondStressGpuChecks() const { return m_bsGpuChecks; }
+    uint64_t getBondStressGpuMismatches() const { return m_bsGpuMismatches; }
 
 private:
 
@@ -3526,7 +3914,9 @@ bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& co
             }
 
             // this bond should contribute forces to the output
-            const auto bondData = m_graphProcessor->getBondData(internalBondIndex);
+            auto bondData = m_graphProcessor->getBondData(internalBondIndex);
+            // GPU mode leaves BondData unwritten; overlay the live values.
+            m_graphProcessor->overlayBondStressOutputs(blastBondIndex, bondData);
             NVBLAST_ASSERT(blastBondIndex == bondData.blastBondIndex);
             uint32_t node0, node1;
             m_graphProcessor->getSolverInternalBondNodes(internalBondIndex, node0, node1);

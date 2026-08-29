@@ -33,6 +33,33 @@ one bad overload resolution away from truncating through abs(int).
 
 #include <cmath>
 
+/**
+Strict, non-contractable float ops on the device.
+
+The host evaluates this equation with plain multiplies and adds. nvcc, with
+its default --fmad=true, contracts every mul+add into an FMA, which is more
+accurate but NOT the same value in the last bit. That difference is invisible
+almost all the time and then very visible in one specific regime: a freshly
+loaded city has enormous numbers of bonds sitting at essentially identical
+stress, so a 1-ulp disagreement straddles an elastic limit for a whole batch
+of them at once. Measured, before these were introduced: mismatches confined
+to ticks 8-120 -- the settling window -- and exactly zero afterwards.
+
+Forcing the individual ops keeps the device answer bit-identical to the host's
+instead, which is what lets the dual-run audit demand equality rather than a
+tolerance. It is deliberately local to this equation: building the whole .cu
+with -fmad=false would also change the CG solver kernels that ship today.
+*/
+#if defined(__CUDA_ARCH__)
+#define NVBLAST_SFMUL(a, b) __fmul_rn((a), (b))
+#define NVBLAST_SFADD(a, b) __fadd_rn((a), (b))
+#define NVBLAST_SFSUB(a, b) __fsub_rn((a), (b))
+#else
+#define NVBLAST_SFMUL(a, b) ((a) * (b))
+#define NVBLAST_SFADD(a, b) ((a) + (b))
+#define NVBLAST_SFSUB(a, b) ((a) - (b))
+#endif
+
 namespace Nv
 {
 namespace Blast
@@ -80,32 +107,45 @@ NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
 {
     // Linear impulse along the normal is normal stress, perpendicular is
     // shear. Dividing by area converts impulse to pressure.
-    const float linearNormal =
-        impulseLinear.x * normal.x + impulseLinear.y * normal.y + impulseLinear.z * normal.z;
-    const float linearMagnitudeSquared =
-        impulseLinear.x * impulseLinear.x
-        + impulseLinear.y * impulseLinear.y
-        + impulseLinear.z * impulseLinear.z;
+    const float linearNormal = NVBLAST_SFADD(
+        NVBLAST_SFADD(
+            NVBLAST_SFMUL(impulseLinear.x, normal.x),
+            NVBLAST_SFMUL(impulseLinear.y, normal.y)),
+        NVBLAST_SFMUL(impulseLinear.z, normal.z));
+    const float linearMagnitudeSquared = NVBLAST_SFADD(
+        NVBLAST_SFADD(
+            NVBLAST_SFMUL(impulseLinear.x, impulseLinear.x),
+            NVBLAST_SFMUL(impulseLinear.y, impulseLinear.y)),
+        NVBLAST_SFMUL(impulseLinear.z, impulseLinear.z));
     stressNormal = linearNormal / area;
     stressShear =
-        sqrtf(fmaxf(0.0f, linearMagnitudeSquared - linearNormal * linearNormal)) / area;
+        sqrtf(fmaxf(0.0f,
+            NVBLAST_SFSUB(linearMagnitudeSquared, NVBLAST_SFMUL(linearNormal, linearNormal))))
+        / area;
 
     // Angular impulse along the normal is twist, perpendicular is bend. abs()
     // because only the magnitude of the twist matters, not its direction.
-    const float angularNormal = fabsf(
-        impulseAngular.x * normal.x + impulseAngular.y * normal.y + impulseAngular.z * normal.z);
-    const float angularMagnitudeSquared =
-        impulseAngular.x * impulseAngular.x
-        + impulseAngular.y * impulseAngular.y
-        + impulseAngular.z * impulseAngular.z;
+    const float angularNormal = fabsf(NVBLAST_SFADD(
+        NVBLAST_SFADD(
+            NVBLAST_SFMUL(impulseAngular.x, normal.x),
+            NVBLAST_SFMUL(impulseAngular.y, normal.y)),
+        NVBLAST_SFMUL(impulseAngular.z, normal.z)));
+    const float angularMagnitudeSquared = NVBLAST_SFADD(
+        NVBLAST_SFADD(
+            NVBLAST_SFMUL(impulseAngular.x, impulseAngular.x),
+            NVBLAST_SFMUL(impulseAngular.y, impulseAngular.y)),
+        NVBLAST_SFMUL(impulseAngular.z, impulseAngular.z));
     const float twist = angularNormal / area;
     const float bend =
-        sqrtf(fmaxf(0.0f, angularMagnitudeSquared - angularNormal * angularNormal)) / area;
+        sqrtf(fmaxf(0.0f,
+            NVBLAST_SFSUB(angularMagnitudeSquared, NVBLAST_SFMUL(angularNormal, angularNormal))))
+        / area;
 
     // Interpret angular pressure as a composition of linear pressures,
     // dividing by nodeDist for scaling.
-    stressShear += twist * 2.0f / nodeDist;
-    stressNormal += copysignf(bend * 2.0f / nodeDist, stressNormal);
+    stressShear = NVBLAST_SFADD(stressShear, NVBLAST_SFMUL(twist, 2.0f) / nodeDist);
+    stressNormal = NVBLAST_SFADD(
+        stressNormal, copysignf(NVBLAST_SFMUL(bend, 2.0f) / nodeDist, stressNormal));
 }
 
 }  // namespace Blast
