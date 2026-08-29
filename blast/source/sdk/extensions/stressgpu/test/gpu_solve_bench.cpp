@@ -27,6 +27,7 @@
 #include "NvBlastExtStressGpu.h"
 
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -56,6 +57,25 @@ bool envFlag(const char* name)
 {
     const char* raw = std::getenv(name);
     return raw != nullptr && std::string(raw) != "0";
+}
+
+/// CPU time consumed by this process, all threads, in milliseconds.
+///
+/// Wall clock on a shared box measures the box. Two runs of THIS bench doing
+/// provably identical work -- same graph, same velocities, same iteration
+/// count -- disagree by 5-12% on wall clock when a co-tenant is busy, which is
+/// wider than most of the changes being judged. CLOCK_PROCESS_CPUTIME_ID only
+/// advances while our own threads are on-CPU, so a neighbour cannot inflate
+/// it, and it is the metric an A/B should be decided on.
+double processCpuMs()
+{
+    timespec ts{};
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0)
+    {
+        return 0.0;
+    }
+    return static_cast<double>(ts.tv_sec) * 1000.0 +
+           static_cast<double>(ts.tv_nsec) / 1.0e6;
 }
 
 /// Production's shape: many independent structures, each a column of chunks
@@ -206,6 +226,7 @@ int main()
     std::uint32_t iterationTotal = 0;
     std::uint32_t skippedTotal = 0;
     const auto wallStart = std::chrono::steady_clock::now();
+    const double cpuStart = processCpuMs();
     for (std::uint32_t i = 0; i < solves; ++i)
     {
         drive(i + 100);
@@ -227,6 +248,7 @@ int main()
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - wallStart)
             .count();
+    const double cpuMs = processCpuMs() - cpuStart;
 
     std::printf(
         "solve: device %.3f ms/solve, wall %.3f ms/solve, mean %.1f iterations, "
@@ -250,6 +272,27 @@ int main()
         syncMsTotal / solves,
         finishMsTotal / solves,
         solveMsTotal / solves);
+
+    // One machine-readable line so an A/B runner never has to parse prose.
+    // `iterations` and `skipped` are WORK, and they are exact: if two arms
+    // disagree on them the arms are not doing the same job and comparing their
+    // times is meaningless. The runner checks that before it compares cost.
+    std::printf(
+        "BENCHRESULT cpu_ms=%.4f wall_ms=%.4f device_ms=%.4f plan_ms=%.4f "
+        "blocked_ms=%.4f finish_ms=%.4f iterations=%u skipped=%u solves=%u "
+        "bonds=%zu nodes=%zu islands=%u\n",
+        cpuMs / solves,
+        wallMs / solves,
+        solveMsTotal / solves,
+        planMsTotal / solves,
+        syncMsTotal / solves,
+        finishMsTotal / solves,
+        iterationTotal,
+        skippedTotal,
+        solves,
+        scene.bonds.size(),
+        scene.nodes.size(),
+        islands);
 
     solver->release();
     return 0;
