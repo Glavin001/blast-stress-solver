@@ -277,3 +277,35 @@ Two things stand between here and that, both identified and neither guessed:
 punching capacity should follow the PERIMETER rather than the bearing area, and
 the elastic-to-fatal band should come from the reinforcement rather than a flat
 3. The second is blocked on re-deriving cladding to keep the tier gap.
+
+## The band was tried properly, with cladding re-derived, and it regressed
+
+The tier-gap objection above is arithmetic, so it was satisfied rather than
+worked around: reinforced concrete's band to 1.35 (the reinforcement figure),
+and facade-panel from 12 to 6.0 MPa so the frame-to-cladding ratio comes back to
+9x. Weaker cladding is also the more honest number -- these are non-structural
+panels whose job is to come off, and 12 MPa was closer to a structural precast
+unit.
+
+All 27 packs build. The garage still stands. And the building tier went from
+6 of 7 passing to 3 of 7, so it was reverted.
+
+Two things worth keeping from it:
+
+  - The tier gate is not the obstacle. It can be satisfied by moving both sides,
+    and doing so is defensible on its own terms.
+  - Something in the utilisation path does not match the model of it that this
+    document has been reasoning with. At band 1.35 a joint reported at 2.93x
+    its elastic limit is far past fatal -- stressMultiplier would be 5.5 -- and
+    should break in one tick. It does not. Either the reported utilisation is
+    not stress/elastic, or the damage path is not reading the band the material
+    table thinks it set.
+
+**That question should be answered before any further material tuning.** Six
+levers have now been tried against this garage and the last three all failed in
+ways that only make sense if the number being read is not the number being set.
+Chasing a seventh without resolving that is how the next day gets spent.
+
+The cheap way to settle it: take one bond in a stripped garage, print its
+stress, its material's elastic and fatal limits, and the stressMultiplier the
+damage path computes for it, and check they agree with each other.
