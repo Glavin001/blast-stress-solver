@@ -164,7 +164,32 @@ NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
     // Plain ops: multiplying by 2 is exact, and an add of a division result
     // offers the compiler nothing to contract, so these are already the same
     // sequence on both sides.
-    stressShear += twist * 2.0f / nodeDist;
+    // Torsion, on the same footing as bending.
+    //
+    // This was the last user of the nodeDist scaling, and it was left behind
+    // when bending moved to a section modulus -- an asymmetry with no physical
+    // justification: both are angular impulses turned into a peak surface
+    // stress, and both want a section dimension rather than the distance
+    // between two chunk centroids. Metres where centimetres belong understates
+    // it by about an order of magnitude, which matters most in exactly the case
+    // it was reported in: a deck left hanging off a few columns twists at the
+    // joints that remain.
+    //
+    // For a roughly square patch of side a, the peak torsional shear is
+    // T/(0.208*a^3); since twist = T/a^2 that is twist/(0.208*a), i.e.
+    // 4.81*twist/sqrt(area). Same 1/sqrt(area) shape as bending, different
+    // constant, and bounded by the same gain for the same reason -- below a
+    // certain joint size the formula is amplifying the discretisation's own
+    // moments rather than the structure's.
+    if (bendGainMax > 0.0f)
+    {
+        const float torsionGain = 4.81f / sqrtf(area > 1.0e-6f ? area : 1.0e-6f);
+        stressShear += twist * (torsionGain < bendGainMax ? torsionGain : bendGainMax);
+    }
+    else
+    {
+        stressShear += twist * 2.0f / nodeDist;
+    }
 
     if (bendGainMax <= 0.0f)
     {
