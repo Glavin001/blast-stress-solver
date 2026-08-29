@@ -83,7 +83,22 @@ const SPEC = [
   // essentially in one piece. Reinforced concrete is not that ductile — it
   // cracks. 3 keeps a frame that yields visibly before it fails while letting
   // an impact of that size do real damage.
-  ['reinforced-concrete',   48e6,    3,    0.30,       0.40],
+  // Tension and shear as CONCRETE, not as concrete-with-rebar-across-every-seam.
+  //
+  // A fracture seam has no steel crossing it, so 14.4 MPa of tension and 19.2
+  // of shear described a continuity that is not there -- and with them a deck
+  // could not crack along its hogging lines and a column head could not punch
+  // through a slab, which are the two things a parking garage does. A garage
+  // stripped of 90% of its ground columns sagged 0.00 m.
+  //
+  // 3.8 MPa is plain concrete in tension. 6.1 MPa is derived, not picked: real
+  // punching capacity is 0.35*sqrt(f'c) = 2.07 MPa over the 0.89 m^2 punching
+  // perimeter, and this model's bond is the 0.30 m^2 column face, so the same
+  // capacity concentrates 2.9x when expressed through it.
+  //
+  // Only usable because damage now ARRESTS at residualAreaFraction. Without
+  // that, 3.8 MPa cracked every deck under its own weight.
+  ['reinforced-concrete',   48e6,    3,    0.08,       0.126],
   ['concrete-slab',         28e6,    2.5,  0.25,       0.28],
   ['stone',                 34e6,    3,    0.09,       0.18],
   // Masonry, not the brick unit. A fired brick reaches 20-50 MPa on its own;
@@ -206,13 +221,26 @@ const MODULUS = {
  * glass, a stone bed joint, a facade clip.
  */
 const RESIDUAL = {
-  // Rebar across a slab or column crack carries a good half of the section.
-  'reinforced-concrete': 0.5,
-  'concrete-slab': 0.45,
-  // Structural steel yields rather than parting: almost all of it survives.
-  steel: 0.8,
+  // A tenth, not a half.
+  //
+  // The residual is what the STEEL can carry, expressed as an equivalent area
+  // of the gross section. Slab and column reinforcement is around 1% of the
+  // section by area at roughly ten times concrete's strength, so it stands in
+  // for about a tenth of the gross -- not half.
+  //
+  // Half was tried and it is why nothing broke. Arrest puts a ceiling on
+  // stress at 1/residual times whatever the joint carried before it cracked;
+  // at 0.5 that ceiling is 2x, which lands just under the fatal limit at 3x,
+  // so every overloaded joint in the garage pinned at 2.95-3.00 and none of
+  // them ever went. At 0.1 the ceiling is 10x, which is past fatal, so a joint
+  // that is genuinely overloaded still fails -- while one that is merely
+  // cracked stops, which is the whole point.
+  'reinforced-concrete': 0.10,
+  'concrete-slab': 0.09,
+  // Structural steel yields rather than parting, and it IS the section.
+  steel: 0.6,
   // Timber splits along the grain and the fibres bridge for a while.
-  'wood-frame': 0.25,
+  'wood-frame': 0.08,
   // Everything else runs away, which is what unreinforced material does.
 };
 
