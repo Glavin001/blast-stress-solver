@@ -59,6 +59,49 @@ static uint32_t validateInterval()
 /// A/B for dropping contacts aimed at bodies that have no bonds (default
 /// ON). Not an approximation -- see the comment at the drop site -- but
 /// switchable so one binary produces both arms of the measurement.
+/// A/B for the flat per-node bondless flags (default ON). One binary, two
+/// arms: the alternative is comparing two builds, which reintroduces build
+/// identity as a confounder -- the mistake that cost a day on this tree.
+/// DEFAULT ON, audited.
+///
+/// queueContact's hot path used to do m_nodes[nodeIndex].body followed by
+/// owner->nodes.size() -- a random index into an 87k-entry array then a
+/// dependent deref into a separately allocated BodyState. Two cache misses
+/// per queued contact, ~72k a tick at grid 2, paid purely to DECIDE, with
+/// "skip" the answer 65% of the time. This is one byte from a flat array
+/// that fits in L2.
+///
+/// It shipped default-off for two rounds because the audit caught a real
+/// bug: refreshNodeBondless() ran in beginTick, while body composition
+/// changes in endTick, and the contacts that consult the flags arrive in
+/// the NEXT step's callback -- before that beginTick. So on every tick
+/// after a fracture the flags described the previous composition:
+///
+///   101,135,704 checks, 98,633 mismatches (0.0975%, the fracture rate)
+///
+/// and a contact wrongly classed as bondless is DROPPED before the solver
+/// sees it, i.e. lost load on freshly fractured chunks. Rebuilding after
+/// endTick instead, so the flags describe the composition the contacts will
+/// actually be resolved against:
+///
+///   152,193,650 checks, 0 mismatches
+///
+/// Measured win, matched buckets, n=5242 per arm: cb_queue -39.7% p50,
+/// cb_tick -26.7%, physx_step -15.8%. That last one is the interesting
+/// number -- the contact callback runs on the host thread INSIDE
+/// fetchResults, so a figure labelled "PhysX" has always contained our code.
+///
+/// BLAST_NODE_BONDLESS_FLAT=0 restores the two derefs;
+/// BLAST_NODE_BONDLESS_VERIFY=1 re-runs the audit.
+static bool flatBondlessFlags()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_NODE_BONDLESS_FLAT");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
 static bool skipBondlessContacts()
 {
     static const bool enabled = [] {
@@ -616,11 +659,51 @@ public:
         // Wake is handled before the skip: a single-node body still needs to
         // be woken by an impact, and that is the one effect a contact on it
         // legitimately has.
-        if (skipBondlessContacts() && !contact.wake
-            && nodeIndex < m_nodes.size())
+        // One byte read, not two pointer chases.
+        //
+        // This test used to be m_nodes[nodeIndex].body followed by
+        // owner->nodes.size(), which is a random index into an 87k-entry node
+        // array and then a dependent deref into a separately allocated
+        // BodyState -- two cache misses, paid for EVERY queued contact
+        // (~72k a tick at grid 2) purely to decide, and 65% of the time the
+        // answer is "skip and return".
+        //
+        // m_nodeBondless is a flat byte per node, rebuilt sequentially once
+        // per tick in refreshNodeBondless(). 87 KB fits in L2, the rebuild is
+        // a linear walk over bodies rather than random access, and the
+        // decision it encodes is bit-identical to the two derefs it replaces.
+        if (skipBondlessContacts() && !contact.wake)
         {
-            const BodyState* owner = m_nodes[nodeIndex].body;
-            if (owner != nullptr && owner->nodes.size() == 1)
+            bool bondless = false;
+            if (flatBondlessFlags())
+            {
+                bondless = nodeIndex < m_nodeBondless.size()
+                    && m_nodeBondless[nodeIndex] != 0;
+                // The flat array is only an optimisation if it encodes the
+                // SAME predicate. BLAST_NODE_BONDLESS_VERIFY=1 evaluates both
+                // and counts disagreements; it must stay 0. Same discipline as
+                // the node cache, which ran 75M checks clean before shipping.
+                static const bool verify = [] {
+                    const char* raw = std::getenv("BLAST_NODE_BONDLESS_VERIFY");
+                    return raw != nullptr && std::string(raw) != "0";
+                }();
+                if (verify && nodeIndex < m_nodes.size())
+                {
+                    const BodyState* owner = m_nodes[nodeIndex].body;
+                    const bool truth = owner != nullptr && owner->nodes.size() == 1;
+                    ++m_telemetry.bondlessVerifyChecks;
+                    if (truth != bondless)
+                    {
+                        ++m_telemetry.bondlessVerifyMismatches;
+                    }
+                }
+            }
+            else if (nodeIndex < m_nodes.size())
+            {
+                const BodyState* owner = m_nodes[nodeIndex].body;
+                bondless = owner != nullptr && owner->nodes.size() == 1;
+            }
+            if (bondless)
             {
                 ++m_telemetry.bondlessContactsSkipped;
                 return false;
@@ -1110,6 +1193,37 @@ public:
         return true;
     }
 
+
+    /// Flat per-node "the body owning me has exactly one node" flags.
+    ///
+    /// Rebuilt once per tick by walking bodies in order and stamping their
+    /// nodes, which is sequential. The alternative -- asking per contact --
+    /// is two dependent random derefs times the contact count, and the
+    /// contact count is two orders of magnitude larger than the body count.
+    void refreshNodeBondless()
+    {
+        if (!skipBondlessContacts() || !flatBondlessFlags())
+        {
+            return;
+        }
+        m_nodeBondless.assign(m_nodes.size(), 0u);
+        for (const auto& entry : m_actorBodies)
+        {
+            const BodyState* body = entry.second.get();
+            if (body == nullptr || body->nodes.size() != 1)
+            {
+                continue;
+            }
+            for (const uint32_t node : body->nodes)
+            {
+                if (node < m_nodeBondless.size())
+                {
+                    m_nodeBondless[node] = 1u;
+                }
+            }
+        }
+    }
+
     bool beginTick(float dt, const PxVec3& worldGravity) override
     {
         ++m_telemetry.ticks;
@@ -1145,6 +1259,109 @@ public:
         return true;
     }
 
+    /// Telemetry pulled after a solve completes. Shared by the monolithic and
+    /// split paths so the two cannot report different things.
+    void collectSolveTelemetry()
+    {
+        m_telemetry.overstressedBondCount =
+            ext_stress_solver_overstressed_bond_count(m_solver);
+        m_telemetry.solverIslandCount = ext_stress_solver_island_count(m_solver);
+        m_telemetry.solverIslandsSkipped = ext_stress_solver_islands_skipped(m_solver);
+        m_telemetry.gpuStressSolveMilliseconds +=
+            ext_stress_solver_gpu_solve_milliseconds(m_solver);
+        m_telemetry.gpuStressHostWorkMilliseconds +=
+            ext_stress_solver_gpu_host_work_milliseconds(m_solver);
+        m_telemetry.stressImpulseCopyMilliseconds +=
+            ext_stress_solver_impulse_copy_milliseconds(m_solver);
+        m_telemetry.bondStressGroupsSkipped =
+            ext_stress_solver_bond_stress_groups_skipped(m_solver);
+        m_telemetry.bondStressGpuSkipped =
+            ext_stress_solver_bond_stress_gpu_skipped(m_solver);
+        m_telemetry.bondStressGpuRuns =
+            ext_stress_solver_bond_stress_gpu_runs(m_solver);
+        m_telemetry.bondStressParallelChecks =
+            ext_stress_solver_bond_stress_parallel_checks(m_solver);
+        m_telemetry.bondStressParallelMismatches =
+            ext_stress_solver_bond_stress_parallel_mismatches(m_solver);
+        m_telemetry.stressHostWalkInMilliseconds +=
+            ext_stress_solver_host_walk_in_milliseconds(m_solver);
+        m_telemetry.stressHostResetMilliseconds +=
+            ext_stress_solver_host_reset_milliseconds(m_solver);
+        m_telemetry.stressHostBondStressMilliseconds +=
+            ext_stress_solver_host_bond_stress_milliseconds(m_solver);
+        m_telemetry.stressHostNodeStressMilliseconds +=
+            ext_stress_solver_host_node_stress_milliseconds(m_solver);
+        m_telemetry.stressGraphSolveMilliseconds +=
+            ext_stress_solver_graph_solve_milliseconds(m_solver);
+        m_telemetry.stressInitializeMilliseconds +=
+            ext_stress_solver_initialize_milliseconds(m_solver);
+        m_telemetry.stressCalcErrorMilliseconds +=
+            ext_stress_solver_calc_error_milliseconds(m_solver);
+        m_telemetry.gpuStressHostBlockedMilliseconds +=
+            ext_stress_solver_gpu_host_blocked_milliseconds(m_solver);
+        m_telemetry.gpuStressHostToDeviceBytes +=
+            ext_stress_solver_gpu_host_to_device_bytes(m_solver);
+        m_telemetry.gpuStressDeviceToHostBytes +=
+            ext_stress_solver_gpu_device_to_host_bytes(m_solver);
+    }
+
+    /// Split solveTick, for callers that want to fan the bond-stress strips
+    /// of EVERY structure out in one flat dispatch instead of one per
+    /// structure. solveTickBeginSplit runs the CG solve and stops; the caller
+    /// then drives bondStressStrip(i) for i in [0, stripCount) and calls
+    /// solveTickFinishSplit.
+    ///
+    /// Refuses when unconvergedExtraUpdates > 0. That loop re-runs the whole
+    /// update -- CG solve AND bond stress -- until convergence, so a split
+    /// that hoists bond stress out of it would silently change how many times
+    /// each half runs. Production sets 0 and takes the split; anything else
+    /// falls back to the monolithic path rather than quietly meaning
+    /// something different.
+    bool supportsSplitSolve() const override
+    {
+        return m_settings.unconvergedExtraUpdates == 0;
+    }
+
+    uint32_t bondStressStripCount() const override
+    {
+        return ext_stress_solver_bond_stress_strip_count(m_solver);
+    }
+
+    bool solveTickBeginSplit() override
+    {
+        if (!supportsSplitSolve())
+        {
+            return false;
+        }
+        if (m_tickPhase != TickPhase::Prepared)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "solveTickBeginSplit requires a successful beginTick.");
+        }
+        m_splitPhaseStart = TelemetryClock::now();
+        ext_stress_solver_set_defer_bond_stress(m_solver, 1);
+        ext_stress_solver_update(m_solver);
+        return true;
+    }
+
+    void bondStressStrip(uint32_t stripIdx) override
+    {
+        ext_stress_solver_bond_stress_strip(m_solver, stripIdx);
+    }
+
+    bool solveTickFinishSplit() override
+    {
+        ext_stress_solver_bond_stress_complete(m_solver);
+        ext_stress_solver_set_defer_bond_stress(m_solver, 0);
+        collectSolveTelemetry();
+        drainCrushedNodes();
+        m_telemetry.stressSolveMilliseconds += elapsedMilliseconds(m_splitPhaseStart);
+        m_tickPhase = TickPhase::Solved;
+        return true;
+    }
+
     bool solveTick() override
     {
         if (m_tickPhase != TickPhase::Prepared)
@@ -1176,21 +1393,13 @@ public:
             ++m_telemetry.unconvergedTicks;
         }
 
-        m_telemetry.overstressedBondCount =
-            ext_stress_solver_overstressed_bond_count(m_solver);
-        m_telemetry.solverIslandCount = ext_stress_solver_island_count(m_solver);
-        m_telemetry.solverIslandsSkipped = ext_stress_solver_islands_skipped(m_solver);
-        m_telemetry.gpuStressSolveMilliseconds +=
-            ext_stress_solver_gpu_solve_milliseconds(m_solver);
-        m_telemetry.gpuStressHostWorkMilliseconds +=
-            ext_stress_solver_gpu_host_work_milliseconds(m_solver);
-        m_telemetry.gpuStressHostBlockedMilliseconds +=
-            ext_stress_solver_gpu_host_blocked_milliseconds(m_solver);
-        m_telemetry.gpuStressHostToDeviceBytes +=
-            ext_stress_solver_gpu_host_to_device_bytes(m_solver);
-        m_telemetry.gpuStressDeviceToHostBytes +=
-            ext_stress_solver_gpu_device_to_host_bytes(m_solver);
+        collectSolveTelemetry();
+        // The last untimed block inside solveTick. Named because solve's
+        // remainder was 48.4% and every named candidate so far came back
+        // negligible; a remainder that large has to be SOMETHING.
+        const TelemetryClock::time_point drainStart = TelemetryClock::now();
         drainCrushedNodes();
+        m_telemetry.stressDrainMilliseconds += elapsedMilliseconds(drainStart);
         m_telemetry.stressSolveMilliseconds += elapsedMilliseconds(phaseStart);
         m_tickPhase = TickPhase::Solved;
         return true;
@@ -1467,6 +1676,19 @@ public:
             m_telemetry.fractureTopologyMilliseconds += elapsedMilliseconds(phaseStart);
             if (!fractured)
             {
+        // Rebuild AFTER topology settles, not before the next beginTick.
+        //
+        // Fracture creates, splits and recycles bodies here in endTick. The
+        // contacts that consult these flags arrive in the NEXT step's contact
+        // callback -- which happens before the next beginTick. Rebuilding in
+        // beginTick therefore left the flags describing the previous
+        // composition on every tick after a topology change, and the audit
+        // measured exactly that: 98,633 mismatches in 101,135,704 checks,
+        // 0.0975%, which is the fracture rate.
+        //
+        // A contact wrongly classed as bondless is DROPPED before the solver
+        // sees it, so the failure was lost load on freshly fractured chunks.
+        refreshNodeBondless();
                 m_tickPhase = TickPhase::Idle;
                 return false;
             }
@@ -1516,6 +1738,19 @@ public:
             m_telemetry.singleNodeBodyCount = singleNode;
             m_telemetry.singleNodeAwakeBodies = singleNodeAwake;
         }
+        // Rebuild AFTER topology settles, not before the next beginTick.
+        //
+        // Fracture creates, splits and recycles bodies here in endTick. The
+        // contacts that consult these flags arrive in the NEXT step's contact
+        // callback -- which happens before the next beginTick. Rebuilding in
+        // beginTick therefore left the flags describing the previous
+        // composition on every tick after a topology change, and the audit
+        // measured exactly that: 98,633 mismatches in 101,135,704 checks,
+        // 0.0975%, which is the fracture rate.
+        //
+        // A contact wrongly classed as bondless is DROPPED before the solver
+        // sees it, so the failure was lost load on freshly fractured chunks.
+        refreshNodeBondless();
         m_tickPhase = TickPhase::Idle;
         return true;
     }
@@ -3850,6 +4085,9 @@ private:
 
     ExtStressSolverHandle* m_solver{nullptr};
     std::vector<NodeState> m_nodes;
+    /// See refreshNodeBondless(): one byte per node, replacing two dependent
+    /// pointer chases on the per-contact hot path.
+    std::vector<uint8_t> m_nodeBondless;
     std::vector<ExtStressPhysXBondDesc> m_bonds;
     /// Reused across ticks. These are sized by BOND count, and fracture() ran
     /// on every tick with an overstressed bond -- so a downtown-scale graph
@@ -3975,6 +4213,7 @@ private:
     ExtStressPhysXId m_nextBodyId{1};
     ExtStressPhysXId m_nextShapeId{1};
     uint64_t m_splitSequence{0};
+    TelemetryClock::time_point m_splitPhaseStart{};
     TickPhase m_tickPhase{TickPhase::Idle};
     float m_tickDt{0.0f};
     mutable uint64_t m_shapeSnapshotGeneration{0};

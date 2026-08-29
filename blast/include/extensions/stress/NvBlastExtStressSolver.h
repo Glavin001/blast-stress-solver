@@ -41,6 +41,27 @@ namespace Blast
 {
 
 /**
+Process-wide parallel-for hook.
+
+This library has no thread pool; the caller owns one. Rather than thread a
+dispatcher through three constructors, the caller installs it once and the
+solver uses it where a walk is large enough to be worth splitting. Free
+function plus a file static, because the pool it wraps is process-wide too.
+
+`body` is invoked with (userData, index) for index in [0, count). The call
+must not return until every index has run.
+*/
+typedef void (*ExtStressParallelForBody)(void* userData, uint32_t index);
+typedef void (*ExtStressParallelFor)(void* ctx,
+                                     uint32_t count,
+                                     ExtStressParallelForBody body,
+                                     void* bodyUserData);
+
+NV_C_API void NvBlastExtStressSetParallelFor(ExtStressParallelFor fn, void* ctx);
+NV_C_API void getExtStressParallelFor(ExtStressParallelFor& fn, void*& ctx);
+
+
+/**
 Stress Solver Settings
 
 Stress on every bond is calculated with these components:
@@ -603,6 +624,48 @@ public:
 
     /// Host wall time inside the GPU solve, split into work and waiting.
     /// Only the first is reclaimable by faster host code.
+    /// Host walls around the GPU solve: the pre-solve initialize, the graph
+    /// solve call itself, and the post-solve error walk.
+    virtual float                           getInitializeMilliseconds() const = 0;
+    virtual float                           getGraphSolveMilliseconds() const = 0;
+    virtual float                           getCalcErrorMilliseconds() const = 0;
+    /// Per-bond host copy of solved impulses out of the GPU buffer.
+    /// Host walks bracketing the GPU solve inside GraphProcessor::solve.
+    virtual float                           getHostWalkInMilliseconds() const = 0;
+    virtual float                           getHostResetMilliseconds() const = 0;
+    virtual float                           getHostBondStressMilliseconds() const = 0;
+    virtual float                           getHostNodeStressMilliseconds() const = 0;
+    virtual float                           getGpuImpulseCopyMilliseconds() const = 0;
+    /// Solver bond groups whose stress was provably unchanged and skipped.
+    /// MUST be non-zero when the skip is enabled, or the A/B is measuring
+    /// nothing and cannot tell "no win" from "never ran".
+    virtual uint64_t                        getBondStressGroupsSkipped() const = 0;
+
+    /// Deferred bond-stress driving. With defer set, update() runs the CG
+    /// solve and leaves the per-bond stress walk to the caller, which can then
+    /// fan every structure's strips out in ONE flat dispatch rather than one
+    /// dispatch per structure. Call: setDeferBondStress(true) -> update() ->
+    /// bondStressStrip(i) for i in [0, getBondStressStripCount())
+    /// -> bondStressComplete().
+    virtual void                            setDeferBondStress(bool defer) = 0;
+    virtual void                            bondStressStrip(uint32_t stripIdx) = 0;
+    virtual void                            bondStressComplete() = 0;
+    virtual uint32_t                        getBondStressStripCount() const = 0;
+    /// Verify-mode audit of the parallel bond-stress walk: group comparisons
+    /// performed, and orderings that disagreed. Mismatches must be zero; zero
+    /// CHECKS means the audit never ran and is inconclusive, not a pass.
+    /**
+    How often the device bond-stress walk answered from cache because none of
+    its inputs had moved, and how often it actually launched. Their ratio is
+    the skip rate, which is what decides whether the walk costs anything at
+    all on a settled structure.
+    */
+    virtual uint64_t                        getBondStressGpuSkipped() const = 0;
+    virtual uint64_t                        getBondStressGpuRuns() const = 0;
+
+    virtual uint64_t                        getBondStressParallelChecks() const = 0;
+    virtual uint64_t                        getBondStressParallelMismatches() const = 0;
+    virtual uint32_t                        getGpuImpulseCopyCount() const = 0;
     virtual float                           getGpuHostWorkMilliseconds() const = 0;
     virtual float                           getGpuHostBlockedMilliseconds() const = 0;
     virtual uint64_t                        getGpuHostToDeviceBytes() const = 0;

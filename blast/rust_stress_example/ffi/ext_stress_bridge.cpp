@@ -1518,6 +1518,134 @@ ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
 }
 
 extern "C" float
+ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuImpulseCopyMilliseconds() : 0.0f;
+}
+
+extern "C" void
+ext_stress_solver_set_defer_bond_stress(ExtStressSolverHandle* handlePtr, uint8_t defer)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setDeferBondStress(defer != 0);
+    }
+}
+
+extern "C" void
+ext_stress_solver_bond_stress_strip(ExtStressSolverHandle* handlePtr, uint32_t stripIdx)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->bondStressStrip(stripIdx);
+    }
+}
+
+extern "C" void
+ext_stress_solver_bond_stress_complete(ExtStressSolverHandle* handlePtr)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->bondStressComplete();
+    }
+}
+
+extern "C" uint32_t
+ext_stress_solver_bond_stress_strip_count(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressStripCount() : 0U;
+}
+
+extern "C" uint64_t
+ext_stress_solver_bond_stress_groups_skipped(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressGroupsSkipped() : 0U;
+}
+
+extern "C" uint64_t
+ext_stress_solver_bond_stress_gpu_skipped(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressGpuSkipped() : 0U;
+}
+
+extern "C" uint64_t
+ext_stress_solver_bond_stress_gpu_runs(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressGpuRuns() : 0U;
+}
+
+extern "C" uint64_t
+ext_stress_solver_bond_stress_parallel_checks(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressParallelChecks() : 0U;
+}
+
+extern "C" uint64_t
+ext_stress_solver_bond_stress_parallel_mismatches(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressParallelMismatches() : 0U;
+}
+
+extern "C" float
+ext_stress_solver_host_walk_in_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getHostWalkInMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_host_reset_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getHostResetMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_host_bond_stress_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getHostBondStressMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_host_node_stress_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getHostNodeStressMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_graph_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGraphSolveMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_initialize_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getInitializeMilliseconds() : 0.0f;
+}
+
+extern "C" float
+ext_stress_solver_calc_error_milliseconds(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getCalcErrorMilliseconds() : 0.0f;
+}
+
+extern "C" float
 ext_stress_solver_gpu_host_work_milliseconds(const ExtStressSolverHandle* handlePtr)
 {
     const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);

@@ -1,9 +1,14 @@
 // Copyright (c) 2026 NVIDIA Corporation. All rights reserved.
 
 #include "NvBlastExtStressGpu.h"
+#include "NvBlastExtStressFormula.h"
+
+/// NV_NORMALIZATION_EPSILON, without dragging NvFoundation into the .cu.
+#define NVBLAST_STRESS_NORMALIZATION_EPSILON float(1e-20f)
 
 #include <cub/device/device_reduce.cuh>
 #include <cub/device/device_select.cuh>
+#include <cub/device/device_scan.cuh>
 #include <cub/iterator/counting_input_iterator.cuh>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -1173,6 +1178,7 @@ __global__ void flagActiveNodes(
 }
 
 __global__ void applyStressDamage(
+    float bendGainMax,
     const AngLin* impulses,
     const Vec4* normals,
     const float* areas,
@@ -1195,31 +1201,13 @@ __global__ void applyStressDamage(
     const Vec4 normal = normals[bond];
     const float area = areas[bond];
     const float distance = nodeDistances[bond];
-    const float linearNormal =
-        impulse.linear.x * normal.x
-        + impulse.linear.y * normal.y
-        + impulse.linear.z * normal.z;
-    const float linearMagnitudeSquared =
-        impulse.linear.x * impulse.linear.x
-        + impulse.linear.y * impulse.linear.y
-        + impulse.linear.z * impulse.linear.z;
-    float stressNormal = linearNormal / area;
-    float stressShear =
-        sqrtf(fmaxf(0.0f, linearMagnitudeSquared - linearNormal * linearNormal)) / area;
-
-    const float angularNormal = fabsf(
-        impulse.angular.x * normal.x
-        + impulse.angular.y * normal.y
-        + impulse.angular.z * normal.z);
-    const float angularMagnitudeSquared =
-        impulse.angular.x * impulse.angular.x
-        + impulse.angular.y * impulse.angular.y
-        + impulse.angular.z * impulse.angular.z;
-    const float twist = angularNormal / area;
-    const float bend =
-        sqrtf(fmaxf(0.0f, angularMagnitudeSquared - angularNormal * angularNormal)) / area;
-    stressShear += twist * 2.0f / distance;
-    stressNormal += copysignf(bend * 2.0f / distance, stressNormal);
+    // Same body as the host walk -- see NvBlastExtStressFormula.h.
+    float stressNormal, stressShear, stressBend;
+    extStressCalcBondStress(
+        ExtStressVec3{impulse.linear.x, impulse.linear.y, impulse.linear.z},
+        ExtStressVec3{impulse.angular.x, impulse.angular.y, impulse.angular.z},
+        ExtStressVec3{normal.x, normal.y, normal.z},
+        area, distance, bendGainMax, stressNormal, stressShear, stressBend);
 
     // Each bond fails against its OWN material. The table is tiny and
     // L2-resident; a plain global read is sufficient.
@@ -1264,6 +1252,258 @@ __global__ void applyStressDamage(
             brokenBonds[output] = bond;
         }
     }
+}
+
+
+/// The bond-stress walk, one thread per solver bond group.
+///
+/// One thread per group with the member loop run SERIALLY in slot order, not a
+/// warp-level segmented reduction. Two reasons, and the second is the deciding
+/// one:
+///   - groups hold 1-4 blast bonds in practice, so a warp per group would idle
+///     most of its lanes;
+///   - a tree reduction sums the area-weighted accumulators in a different
+///     order than the host walk, which would make the dual-run audit a
+///     tolerance comparison. Accumulating serially in slot order reproduces the
+///     host's float arithmetic operation for operation, so the audit can demand
+///     equality instead. Given that a 0.0975% divergence once passed every
+///     broad gate in this repo, an exact audit is worth more than the lanes.
+///
+/// Everything here mirrors SupportGraphProcessor::processBondGroup, including
+/// the parts that are easy to miss: the unbreakable member takes over the
+/// group's values and STOPS the walk (so later members are never even examined
+/// for removal), normalizeSafe multiplies by a reciprocal and leaves a
+/// degenerate normal untouched rather than zeroing it, and the centroid and
+/// node displacement are only divided through when the total area can take
+/// damage.
+__global__ void bondStressWalk(
+    float bendGainMax,
+    const std::uint32_t* groupBegin,
+    const std::uint32_t* groupSize,
+    const std::uint32_t* memberBlastBond,
+    const std::uint32_t* bondNode0,
+    const std::uint32_t* bondNode1,
+    const std::uint32_t* bondMaterial,
+    const float* bondNormal,
+    const float* bondCentroid,
+    const float* bondNodeDisp,
+    const float* health,
+    const AngLin* impulses,
+    const float* materialElasticLimits,
+    std::uint32_t materialCount,
+    float unbreakableLimit,
+    std::uint32_t groupCount,
+    float* groupStressNormal,
+    float* groupStressShear,
+    float* groupNormalOut,
+    float* groupCentroidOut,
+    std::uint8_t* nodeOverstressed,
+    std::uint32_t* groupRemoveCount,
+    std::uint32_t* removeFlag,
+    std::uint32_t* overstressedCount)
+{
+    const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groupCount)
+    {
+        return;
+    }
+
+    const std::uint32_t begin = groupBegin[g];
+    const std::uint32_t size = groupSize[g];
+
+    // Cleared up front rather than as we go: the unbreakable break leaves the
+    // tail of the group unvisited, and a stale flag there would resurrect a
+    // removal the host never emitted.
+    for (std::uint32_t k = 0; k < size; ++k)
+    {
+        removeFlag[begin + k] = 0u;
+    }
+
+    float totalArea = 0.0f;
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+    float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+    std::uint32_t removeCount = 0;
+
+    for (std::uint32_t k = 0; k < size; ++k)
+    {
+        const std::uint32_t slot = begin + k;
+        const std::uint32_t bb = memberBlastBond[slot];
+        const float remainingArea = health[bb];
+        if (remainingArea > 0.0f)
+        {
+            const std::size_t base = 3u * static_cast<std::size_t>(bb);
+            const float mnx = bondNormal[base + 0];
+            const float mny = bondNormal[base + 1];
+            const float mnz = bondNormal[base + 2];
+            const float mcx = bondCentroid[base + 0];
+            const float mcy = bondCentroid[base + 1];
+            const float mcz = bondCentroid[base + 2];
+            const float mdx = bondNodeDisp[base + 0];
+            const float mdy = bondNodeDisp[base + 1];
+            const float mdz = bondNodeDisp[base + 2];
+
+            // canTakeDamage: health in (0, kUnbreakableLimit).
+            if (!(remainingArea < unbreakableLimit))
+            {
+                totalArea = unbreakableLimit;
+                nx = mnx; ny = mny; nz = mnz;
+                cx = mcx; cy = mcy; cz = mcz;
+                dx = mdx; dy = mdy; dz = mdz;
+                break;
+            }
+
+            // fmaf, because the host accumulates with `v += u * area` and is
+            // compiled with -mfma, so gcc contracts it. Matching that
+            // explicitly is what keeps the two walks bit-identical.
+            nx = fmaf(mnx, remainingArea, nx);
+            ny = fmaf(mny, remainingArea, ny);
+            nz = fmaf(mnz, remainingArea, nz);
+            cx = fmaf(mcx, remainingArea, cx);
+            cy = fmaf(mcy, remainingArea, cy);
+            cz = fmaf(mcz, remainingArea, cz);
+            dx = fmaf(mdx, remainingArea, dx);
+            dy = fmaf(mdy, remainingArea, dy);
+            dz = fmaf(mdz, remainingArea, dz);
+            totalArea += remainingArea;
+        }
+        else
+        {
+            removeFlag[slot] = 1u;
+            ++removeCount;
+        }
+    }
+
+    groupRemoveCount[g] = removeCount;
+
+    if (totalArea == 0.0f)
+    {
+        return;
+    }
+
+    // NvVec3::normalizeSafe -- reciprocal multiply, and a degenerate normal is
+    // left alone rather than zeroed.
+    {
+        const float mag =
+            sqrtf(extStressDot(ExtStressVec3{nx, ny, nz}, ExtStressVec3{nx, ny, nz}));
+        if (!(mag < NVBLAST_STRESS_NORMALIZATION_EPSILON))
+        {
+            const float inv = 1.0f / mag;
+            nx *= inv;
+            ny *= inv;
+            nz *= inv;
+        }
+    }
+
+    if (totalArea > 0.0f && totalArea < unbreakableLimit)
+    {
+        // NvVec3::operator/= takes the reciprocal ONCE and multiplies. A true
+        // per-component division is a different value in the last bit, and
+        // that difference showed up as whole batches of bonds flipping across
+        // an elastic limit together while the city was still settling.
+        const float inv = 1.0f / totalArea;
+        cx *= inv; cy *= inv; cz *= inv;
+        dx *= inv; dy *= inv; dz *= inv;
+    }
+
+    float stressNormal = 0.0f;
+    float stressShear = 0.0f;
+    float stressBend = 0.0f;
+    if (totalArea > 0.0f && totalArea < unbreakableLimit)
+    {
+        const AngLin impulse = impulses[g];
+        const float nodeDist =
+            sqrtf(extStressDot(ExtStressVec3{dx, dy, dz}, ExtStressVec3{dx, dy, dz}));
+        extStressCalcBondStress(
+            ExtStressVec3{impulse.linear.x, impulse.linear.y, impulse.linear.z},
+            ExtStressVec3{impulse.angular.x, impulse.angular.y, impulse.angular.z},
+            ExtStressVec3{nx, ny, nz},
+            totalArea, nodeDist, bendGainMax, stressNormal, stressShear, stressBend);
+    }
+
+    groupStressNormal[g] = stressNormal;
+    groupStressShear[g] = stressShear;
+    groupNormalOut[3u * g + 0u] = nx;
+    groupNormalOut[3u * g + 1u] = ny;
+    groupNormalOut[3u * g + 2u] = nz;
+    groupCentroidOut[3u * g + 0u] = cx;
+    groupCentroidOut[3u * g + 1u] = cy;
+    groupCentroidOut[3u * g + 2u] = cz;
+
+    // Every member shares the group's stress but fails against its OWN
+    // material, so overstress is counted per member.
+    std::uint32_t overstressed = 0;
+    for (std::uint32_t k = 0; k < size; ++k)
+    {
+        const std::uint32_t bb = memberBlastBond[begin + k];
+        const std::uint32_t node0 = bondNode0[bb];
+        if (node0 == 0xFFFFFFFFu || !(health[bb] > 0.0f))
+        {
+            continue;
+        }
+        const std::uint32_t rawIndex = bondMaterial[bb];
+        const std::uint32_t materialIndex = rawIndex < materialCount ? rawIndex : 0u;
+        const float compressionElastic = materialElasticLimits[3u * materialIndex + 0u];
+        const float tensionElastic = materialElasticLimits[3u * materialIndex + 1u];
+        const float shearElastic = materialElasticLimits[3u * materialIndex + 2u];
+        if (-stressNormal > compressionElastic
+            || stressNormal > tensionElastic
+            || stressShear > shearElastic)
+        {
+            ++overstressed;
+            nodeOverstressed[node0] = 1u;
+            nodeOverstressed[bondNode1[bb]] = 1u;
+        }
+    }
+    if (overstressed != 0)
+    {
+        atomicAdd(overstressedCount, overstressed);
+    }
+}
+
+/// Stable segmented compaction of the removal list.
+///
+/// Groups ascending (the offsets come from an exclusive scan over group index)
+/// and slots ascending inside each group -- which IS the serial walk's emission
+/// order. It is emphatically not sorted by blast bond index: measured on a
+/// grid-1 shot run, 2 of 200 non-empty removal lists came out non-ascending,
+/// so a sort would diverge from the host on ~1% of the ticks that break bonds,
+/// and removal order feeds back into topology.
+__global__ void bondStressNullKernel() {}
+
+__global__ void bondStressCompactRemovals(
+    const std::uint32_t* groupBegin,
+    const std::uint32_t* groupSize,
+    const std::uint32_t* memberBlastBond,
+    const std::uint32_t* removeFlag,
+    const std::uint32_t* removeOffset,
+    std::uint32_t groupCount,
+    std::uint32_t* removeList)
+{
+    const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groupCount)
+    {
+        return;
+    }
+    const std::uint32_t begin = groupBegin[g];
+    const std::uint32_t size = groupSize[g];
+    std::uint32_t out = removeOffset[g];
+    for (std::uint32_t k = 0; k < size; ++k)
+    {
+        if (removeFlag[begin + k] != 0u)
+        {
+            removeList[out++] = memberBlastBond[begin + k];
+        }
+    }
+}
+
+bool bondStressProbe()
+{
+    static const bool on = [] {
+        const char* raw = std::getenv("BLAST_BOND_STRESS_PROBE");
+        return raw != nullptr && std::string(raw) != "0";
+    }();
+    return on;
 }
 
 class ExtStressGpuSolverImpl final : public ExtStressGpuSolver
@@ -1332,6 +1572,7 @@ uploadIslands();
         cudaEventDestroy(m_downloadStart);
         cudaEventDestroy(m_downloadStop);
         cudaStreamDestroy(m_stream);
+        freeBondStress();
         cudaFreeHost(m_hostStatus);
         cudaFreeHost(m_hostBrokenCount);
         cudaFreeHost(m_hostIslandConvergedPinned);
@@ -1592,6 +1833,653 @@ uploadIslands();
         return m_changedBonds.data();
     }
 
+
+    // ── Device bond-stress walk ────────────────────────────────────────────
+    //
+    // The reason this exists: the impulses this walk consumes are already
+    // resident here, and are copied back to the host every tick for no other
+    // purpose than feeding it. On the host it is the largest single cost in
+    // the tick and it is linear in TOTAL live bonds, not in activity, so no
+    // amount of skipping or CPU fan-out reaches it.
+
+    bool setBondStressTopology(const ExtStressGpuBondStressTopology& topology) override
+    {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
+        if (topology.groupCount == 0 || topology.blastBondCount == 0)
+        {
+            m_bsReady = false;
+            return false;
+        }
+        try
+        {
+            ensureBondStressCapacity(topology);
+
+            // Static payload, indexed by blast bond: uploaded once per resync
+            // because blast bond indices are never permuted.
+            uploadBondStress(m_bsBondNode0, topology.bondNode0, topology.blastBondCount, "bs node0");
+            uploadBondStress(m_bsBondNode1, topology.bondNode1, topology.blastBondCount, "bs node1");
+            uploadBondStress(m_bsBondMaterial, topology.bondMaterial, topology.blastBondCount, "bs material");
+            uploadBondStress(m_bsBondNormal, topology.bondNormal, 3u * topology.blastBondCount, "bs normal");
+            uploadBondStress(m_bsBondCentroid, topology.bondCentroid, 3u * topology.blastBondCount, "bs centroid");
+            uploadBondStress(m_bsBondNodeDisp, topology.bondNodeDisp, 3u * topology.blastBondCount, "bs nodeDisp");
+
+            // syncBonds zeroes every bond's stress when the graph structure
+            // changes, because internal bonds stop being updated. Match it.
+            checkCuda(cudaMemset(m_bsGroupStressNormal, 0, sizeof(float) * topology.groupCount), "bs clear sn");
+            checkCuda(cudaMemset(m_bsGroupStressShear, 0, sizeof(float) * topology.groupCount), "bs clear ss");
+            checkCuda(cudaMemset(m_bsGroupNormal, 0, sizeof(float) * 3u * topology.groupCount), "bs clear n");
+            checkCuda(cudaMemset(m_bsGroupCentroid, 0, sizeof(float) * 3u * topology.groupCount), "bs clear c");
+            m_bsCsrResident = false;
+            m_bsHealthResident = false;
+            m_bsReady = true;
+        }
+        catch (const std::exception&)
+        {
+            m_bsReady = false;
+            return false;
+        }
+        return true;
+    }
+
+    bool readbackGroupStresses(const float*& stressNormal, const float*& stressShear) override
+    {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
+        if (!m_bsReady || m_bsVectorGroups == 0 || m_bsStream == nullptr)
+        {
+            return false;
+        }
+        if (!m_bsStressFetched)
+        {
+            try
+            {
+                // On m_bsStream, not the legacy default stream: a blocking
+                // cudaMemcpy there implicitly synchronises with EVERY stream
+                // on the device, so the lazy fetch would wait on PhysX's whole
+                // pipeline. That turned a cheap deferred read into a stall and
+                // showed up as a 2.2x spread between otherwise identical arms.
+                checkCuda(
+                    cudaMemcpyAsync(m_bsHostGroupStressNormal, m_bsGroupStressNormal,
+                                    sizeof(float) * m_bsVectorGroups,
+                                    cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs lazy read sn");
+                checkCuda(
+                    cudaMemcpyAsync(m_bsHostGroupStressShear, m_bsGroupStressShear,
+                                    sizeof(float) * m_bsVectorGroups,
+                                    cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs lazy read ss");
+                checkCuda(cudaStreamSynchronize(m_bsStream), "bs lazy stress sync");
+            }
+            catch (const std::exception&)
+            {
+                return false;
+            }
+            m_bsStressFetched = true;
+        }
+        stressNormal = m_bsHostGroupStressNormal;
+        stressShear = m_bsHostGroupStressShear;
+        return true;
+    }
+
+    bool readbackGroupVectors(const float*& groupNormal, const float*& groupCentroid) override
+    {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
+        if (!m_bsReady || m_bsVectorGroups == 0 || m_bsStream == nullptr)
+        {
+            return false;
+        }
+        if (!m_bsVectorsFetched)
+        {
+            try
+            {
+                checkCuda(
+                    cudaMemcpyAsync(
+                        m_bsHostGroupNormal, m_bsGroupNormal,
+                        sizeof(float) * 3u * m_bsVectorGroups,
+                        cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs lazy read normal");
+                checkCuda(
+                    cudaMemcpyAsync(
+                        m_bsHostGroupCentroid, m_bsGroupCentroid,
+                        sizeof(float) * 3u * m_bsVectorGroups,
+                        cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs lazy read centroid");
+                checkCuda(cudaStreamSynchronize(m_bsStream), "bs lazy vector sync");
+            }
+            catch (const std::exception&)
+            {
+                return false;
+            }
+            m_bsVectorsFetched = true;
+        }
+        groupNormal = m_bsHostGroupNormal;
+        groupCentroid = m_bsHostGroupCentroid;
+        return true;
+    }
+
+    bool updateBondStress(
+        const ExtStressGpuBondStressTopology& csr,
+        const float* blastBondHealth,
+        float unbreakableLimit,
+        ExtStressGpuBondStressResult& result) override
+    {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
+        if (!m_bsReady
+            || csr.groupCount == 0
+            || csr.groupCount > m_bsGroupCapacity
+            || csr.memberSlotCount > m_bsSlotCapacity
+            || csr.blastBondCount > m_bsBondCapacity
+            || csr.graphNodeCount > m_bsNodeCapacity
+            || csr.materialCount == 0
+            || csr.materialElasticLimits == nullptr
+            || csr.groupCount > m_bondCount)
+        {
+            return false;
+        }
+        try
+        {
+            const auto bsHostStart = std::chrono::steady_clock::now();
+            if (m_bsStream == nullptr)
+            {
+                // Its own stream, at the highest priority the device offers.
+                //
+                // The walk does not have to be ordered behind anything on the
+                // solver stream: it reads impulses the solve has already
+                // synchronised, and deviceImpulsesUsable() is what guarantees
+                // that. Sharing a stream only forced it to queue.
+                //
+                // Standalone this walk costs 0.056 ms at the city's group
+                // count and is unaffected by other PROCESSES hammering the
+                // GPU (+7%). In-game the identical work was costing 1.183 ms,
+                // so what it was waiting for was in this process: PhysX's own
+                // rigid-body simulation, in the same context.
+                int lo = 0, hi = 0;
+                cudaDeviceGetStreamPriorityRange(&lo, &hi);
+                cudaStreamCreateWithPriority(&m_bsStream, cudaStreamNonBlocking, hi);
+            }
+            if (m_bsEvUploadStart == nullptr)
+            {
+                cudaEventCreate(&m_bsEvUploadStart);
+                cudaEventCreate(&m_bsEvUploadStop);
+                cudaEventCreate(&m_bsEvKernelStop);
+                cudaEventCreate(&m_bsEvReadStop);
+            }
+            // Probe: what does synchronising cost when there is NOTHING to
+            // wait for? Three points, at the exact place in the tick the real
+            // walk runs. If an EMPTY sync already costs what the real one
+            // does, the fixed cost has nothing to do with our work.
+            if (bondStressProbe())
+            {
+                const auto p0 = std::chrono::steady_clock::now();
+                cudaStreamSynchronize(m_bsStream);          // nothing queued
+                const auto p1 = std::chrono::steady_clock::now();
+                bondStressNullKernel<<<1, 1, 0, m_bsStream>>>();
+                cudaStreamSynchronize(m_bsStream);          // FIRST empty launch
+                const auto p2 = std::chrono::steady_clock::now();
+                bondStressNullKernel<<<1, 1, 0, m_bsStream>>>();
+                cudaStreamSynchronize(m_bsStream);          // SECOND, back to back
+                const auto p2b = std::chrono::steady_clock::now();
+                m_telemetry.bondStressProbeKernel2Ms =
+                    std::chrono::duration<float, std::milli>(p2b - p2).count();
+                const auto p2c = std::chrono::steady_clock::now();
+                cudaMemcpyAsync(m_bsHostCounts, m_bsOverstressedCount,
+                                sizeof(std::uint32_t), cudaMemcpyDeviceToHost, m_bsStream);
+                cudaStreamSynchronize(m_bsStream);          // one 4-byte D2H
+                const auto p3 = std::chrono::steady_clock::now();
+                m_telemetry.bondStressProbeEmptyMs =
+                    std::chrono::duration<float, std::milli>(p1 - p0).count();
+                m_telemetry.bondStressProbeKernelMs =
+                    std::chrono::duration<float, std::milli>(p2 - p1).count();
+                m_telemetry.bondStressProbeCopyMs =
+                    std::chrono::duration<float, std::milli>(p3 - p2c).count();
+            }
+
+            const std::uint32_t groups = csr.groupCount;
+            m_telemetry.bondStressBytesUp = 0;
+            m_telemetry.bondStressBytesDown = 0;
+            cudaEventRecord(m_bsEvUploadStart, m_bsStream);
+
+            // Uploads go through PINNED staging, and only when the bytes
+            // actually changed.
+            //
+            // Measured before this: 1.13 MB per call taking 1.250 ms, which is
+            // 0.9 GB/s -- pageable-memory speed, not PCIe speed. cudaMemcpyAsync
+            // from a std::vector cannot DMA, so it stages through a driver
+            // bounce buffer and serialises against the stream. The kernel it
+            // was feeding runs in 0.041 ms.
+            //
+            // The CSR only changes when a bond breaks, and health only changes
+            // when something takes damage; at rest neither moves, so both
+            // uploads collapse to a compare.
+            std::uint64_t bytesUp = 0;
+            const auto prepStart = std::chrono::steady_clock::now();
+            if (csr.csrDirty || !m_bsCsrResident)
+            {
+                memcpy(m_bsPinGroupBegin, csr.groupBegin, sizeof(std::uint32_t) * groups);
+                memcpy(m_bsPinGroupSize, csr.groupSize, sizeof(std::uint32_t) * groups);
+                memcpy(m_bsPinMembers, csr.memberBlastBond,
+                       sizeof(std::uint32_t) * csr.memberSlotCount);
+                uploadBondStressAsync(m_bsGroupBegin, m_bsPinGroupBegin, groups, "bs groupBegin");
+                uploadBondStressAsync(m_bsGroupSize, m_bsPinGroupSize, groups, "bs groupSize");
+                uploadBondStressAsync(
+                    m_bsMemberBlastBond, m_bsPinMembers, csr.memberSlotCount, "bs members");
+                bytesUp += sizeof(std::uint32_t) * (2ull * groups + csr.memberSlotCount);
+                m_bsCsrResident = true;
+            }
+            const std::size_t healthBytes = sizeof(float) * csr.blastBondCount;
+            if (!m_bsHealthResident
+                || memcmp(m_bsPinHealth, blastBondHealth, healthBytes) != 0)
+            {
+                memcpy(m_bsPinHealth, blastBondHealth, healthBytes);
+                uploadBondStressAsync(
+                    m_bsHealth, m_bsPinHealth, csr.blastBondCount, "bs health");
+                bytesUp += healthBytes;
+                m_bsHealthResident = true;
+            }
+            // Small, and it can change without a topology rebuild, so it is
+            // refreshed every call rather than cached.
+            if (csr.materialCount > m_bsMaterialCapacity)
+            {
+                cudaFree(m_bsMaterialLimits);
+                m_bsMaterialLimits = nullptr;
+                allocateDevice(m_bsMaterialLimits, 3u * csr.materialCount, "bs alloc materials");
+                cudaFreeHost(m_bsPinMaterials);
+                allocateHost(m_bsPinMaterials, 3u * csr.materialCount, "bs pin materials");
+                m_bsMaterialCapacity = csr.materialCount;
+            }
+            memcpy(m_bsPinMaterials, csr.materialElasticLimits,
+                   sizeof(float) * 3u * csr.materialCount);
+            uploadBondStressAsync(
+                m_bsMaterialLimits, m_bsPinMaterials, 3u * csr.materialCount, "bs materials");
+
+            checkCuda(
+                cudaMemsetAsync(
+                    m_bsNodeOverstressed, 0, sizeof(std::uint8_t) * csr.graphNodeCount, m_bsStream),
+                "bs clear node mask");
+            checkCuda(
+                cudaMemsetAsync(m_bsOverstressedCount, 0, sizeof(std::uint32_t), m_bsStream),
+                "bs clear count");
+            // Sentinel entry for the exclusive scan, so offset[groups] is the
+            // total without a second reduction.
+            checkCuda(
+                cudaMemsetAsync(
+                    m_bsGroupRemoveCount + groups, 0, sizeof(std::uint32_t), m_bsStream),
+                "bs clear scan sentinel");
+
+            bytesUp += sizeof(float) * 3ull * csr.materialCount;
+            m_telemetry.bondStressBytesUp = bytesUp;
+            m_telemetry.bondStressPrepMs =
+                std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - prepStart).count();
+            cudaEventRecord(m_bsEvUploadStop, m_bsStream);
+
+            // Carry each reassigned slot's stored stress with it, so a slot
+            // handed to a different group does not answer with the old one's
+            // values on any tick that group is not reprocessed.
+            for (std::uint32_t i = 0; i < csr.groupSwapCount; ++i)
+            {
+                const std::uint32_t dst = csr.groupSwapDst[i];
+                const std::uint32_t src = csr.groupSwapSrc[i];
+                if (dst == src || dst >= m_bsGroupCapacity || src >= m_bsGroupCapacity)
+                {
+                    continue;
+                }
+                cudaMemcpyAsync(m_bsGroupStressNormal + dst, m_bsGroupStressNormal + src,
+                                sizeof(float), cudaMemcpyDeviceToDevice, m_bsStream);
+                cudaMemcpyAsync(m_bsGroupStressShear + dst, m_bsGroupStressShear + src,
+                                sizeof(float), cudaMemcpyDeviceToDevice, m_bsStream);
+                cudaMemcpyAsync(m_bsGroupNormal + 3 * dst, m_bsGroupNormal + 3 * src,
+                                sizeof(float) * 3, cudaMemcpyDeviceToDevice, m_bsStream);
+                cudaMemcpyAsync(m_bsGroupCentroid + 3 * dst, m_bsGroupCentroid + 3 * src,
+                                sizeof(float) * 3, cudaMemcpyDeviceToDevice, m_bsStream);
+            }
+
+            const std::uint32_t block = 128;
+            const std::uint32_t grid = (groups + block - 1) / block;
+            bondStressWalk<<<grid, block, 0, m_bsStream>>>(
+                m_bendGainMax,
+                m_bsGroupBegin, m_bsGroupSize, m_bsMemberBlastBond,
+                m_bsBondNode0, m_bsBondNode1, m_bsBondMaterial,
+                m_bsBondNormal, m_bsBondCentroid, m_bsBondNodeDisp,
+                m_bsHealth, m_impulses, m_bsMaterialLimits, csr.materialCount,
+                unbreakableLimit, groups,
+                m_bsGroupStressNormal, m_bsGroupStressShear,
+                m_bsGroupNormal, m_bsGroupCentroid,
+                m_bsNodeOverstressed, m_bsGroupRemoveCount,
+                m_bsRemoveFlag, m_bsOverstressedCount);
+            checkCuda(cudaGetLastError(), "bs walk launch");
+
+            std::size_t scanBytes = 0;
+            checkCuda(
+                cub::DeviceScan::ExclusiveSum(
+                    nullptr, scanBytes, m_bsGroupRemoveCount, m_bsGroupRemoveOffset,
+                    static_cast<int>(groups + 1), m_bsStream),
+                "bs scan sizing");
+            if (scanBytes > m_bsScanScratchBytes)
+            {
+                cudaFree(m_bsScanScratch);
+                m_bsScanScratch = nullptr;
+                allocateDevice(
+                    reinterpret_cast<char*&>(m_bsScanScratch), scanBytes, "bs scan scratch");
+                m_bsScanScratchBytes = scanBytes;
+            }
+            checkCuda(
+                cub::DeviceScan::ExclusiveSum(
+                    m_bsScanScratch, scanBytes, m_bsGroupRemoveCount, m_bsGroupRemoveOffset,
+                    static_cast<int>(groups + 1), m_bsStream),
+                "bs scan");
+
+            bondStressCompactRemovals<<<grid, block, 0, m_bsStream>>>(
+                m_bsGroupBegin, m_bsGroupSize, m_bsMemberBlastBond,
+                m_bsRemoveFlag, m_bsGroupRemoveOffset, groups, m_bsRemoveList);
+            checkCuda(cudaGetLastError(), "bs compact launch");
+            cudaEventRecord(m_bsEvKernelStop, m_bsStream);
+
+            // Fixed-size readbacks first, then one sync, then the removal list
+            // whose length we only know after it.
+            checkCuda(
+                cudaMemcpyAsync(
+                    m_bsHostCounts, m_bsOverstressedCount, sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, m_bsStream),
+                "bs read count");
+            checkCuda(
+                cudaMemcpyAsync(
+                    m_bsHostCounts + 1, m_bsGroupRemoveOffset + groups, sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, m_bsStream),
+                "bs read remove total");
+            checkCuda(
+                cudaMemcpyAsync(
+                    m_bsHostNodeOverstressed, m_bsNodeOverstressed,
+                    sizeof(std::uint8_t) * csr.graphNodeCount,
+                    cudaMemcpyDeviceToHost, m_bsStream),
+                "bs read node mask");
+            m_telemetry.bondStressBytesDown =
+                2ull * sizeof(std::uint32_t)
+                + sizeof(std::uint8_t) * csr.graphNodeCount;
+            m_bsVectorsFetched = false;
+            m_bsStressFetched = false;
+            m_bsVectorGroups = groups;
+            cudaEventRecord(m_bsEvReadStop, m_bsStream);
+            const auto bsSyncStart = std::chrono::steady_clock::now();
+            m_telemetry.bondStressEnqueueMs =
+                std::chrono::duration<float, std::milli>(bsSyncStart - prepStart).count()
+                - m_telemetry.bondStressPrepMs;
+            // Spin, then fall back to blocking.
+            //
+            // The device work here is ~0.13 ms. cudaStreamSynchronize under
+            // the default scheduling policy is free to hand the core back to
+            // the OS, and getting it back costs more than the work did.
+            // Spinning on a query for a bounded number of iterations covers
+            // the common case without giving up the thread; anything longer
+            // than that is a real stall and worth blocking on.
+            {
+                bool done = false;
+                for (int spin = 0; spin < 20000; ++spin)
+                {
+                    const cudaError_t q = cudaStreamQuery(m_bsStream);
+                    if (q == cudaSuccess) { done = true; break; }
+                    if (q != cudaErrorNotReady) { checkCuda(q, "bs spin"); }
+                }
+                if (!done)
+                {
+                    checkCuda(cudaStreamSynchronize(m_bsStream), "bs sync");
+                }
+            }
+            const auto bsSyncEnd = std::chrono::steady_clock::now();
+            m_telemetry.bondStressSyncMs =
+                std::chrono::duration<float, std::milli>(bsSyncEnd - bsSyncStart).count();
+            {
+                float up = 0.0f, kern = 0.0f, read = 0.0f;
+                cudaEventElapsedTime(&up, m_bsEvUploadStart, m_bsEvUploadStop);
+                cudaEventElapsedTime(&kern, m_bsEvUploadStop, m_bsEvKernelStop);
+                cudaEventElapsedTime(&read, m_bsEvKernelStop, m_bsEvReadStop);
+                m_telemetry.bondStressUploadMs = up;
+                m_telemetry.bondStressKernelMs = kern;
+                m_telemetry.bondStressReadbackMs = read;
+            }
+
+            const std::uint32_t removeCount =
+                m_bsHostCounts[1] > csr.memberSlotCount ? csr.memberSlotCount : m_bsHostCounts[1];
+            if (removeCount != 0)
+            {
+                checkCuda(
+                    cudaMemcpyAsync(
+                        m_bsHostRemoveList, m_bsRemoveList,
+                        sizeof(std::uint32_t) * removeCount,
+                        cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs read removals");
+                checkCuda(cudaStreamSynchronize(m_bsStream), "bs sync removals");
+            }
+
+            result.bondIndicesToRemove = m_bsHostRemoveList;
+            result.removeCount = removeCount;
+            result.overstressedBondCount = m_bsHostCounts[0];
+            result.nodeOverstressed = m_bsHostNodeOverstressed;
+            // Also deferred. Nothing reads a bond's stress unless its node
+            // came back flagged, so on a tick with no overstress -- which is
+            // every tick of a settled city -- these are never wanted.
+            result.groupStressNormal = nullptr;
+            result.groupStressShear = nullptr;
+            // Left null on purpose: fetched only if someone asks.
+            result.groupNormal = nullptr;
+            result.groupCentroid = nullptr;
+            m_telemetry.bondStressHostMs =
+                std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - bsHostStart).count();
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    template <typename T>
+    void uploadBondStress(T* dst, const T* src, std::uint32_t count, const char* name)
+    {
+        checkCuda(cudaMemcpy(dst, src, sizeof(T) * count, cudaMemcpyHostToDevice), name);
+    }
+
+    template <typename T>
+    void uploadBondStressAsync(T* dst, const T* src, std::uint32_t count, const char* name)
+    {
+        checkCuda(
+            cudaMemcpyAsync(dst, src, sizeof(T) * count, cudaMemcpyHostToDevice, m_bsStream),
+            name);
+    }
+
+    /// Grow-only: a resync can add groups back, and reallocating on every
+    /// shrink would churn for nothing.
+    void ensureBondStressCapacity(const ExtStressGpuBondStressTopology& topology)
+    {
+        if (topology.groupCount > m_bsGroupCapacity)
+        {
+            freeBondStressGroupBuffers();
+            const std::uint32_t n = topology.groupCount;
+            allocateDevice(m_bsGroupBegin, n, "bs alloc groupBegin");
+            allocateDevice(m_bsGroupSize, n, "bs alloc groupSize");
+            allocateDevice(m_bsGroupStressNormal, n, "bs alloc sn");
+            allocateDevice(m_bsGroupStressShear, n, "bs alloc ss");
+            allocateDevice(m_bsGroupNormal, 3u * n, "bs alloc normal");
+            allocateDevice(m_bsGroupCentroid, 3u * n, "bs alloc centroid");
+            allocateDevice(m_bsGroupRemoveCount, n + 1u, "bs alloc removeCount");
+            allocateDevice(m_bsGroupRemoveOffset, n + 1u, "bs alloc removeOffset");
+            allocateHost(m_bsPinGroupBegin, n, "bs pin groupBegin");
+            allocateHost(m_bsPinGroupSize, n, "bs pin groupSize");
+            allocateHost(m_bsHostGroupStressNormal, n, "bs host sn");
+            allocateHost(m_bsHostGroupStressShear, n, "bs host ss");
+            allocateHost(m_bsHostGroupNormal, 3u * n, "bs host normal");
+            allocateHost(m_bsHostGroupCentroid, 3u * n, "bs host centroid");
+            m_bsGroupCapacity = n;
+        }
+        if (topology.memberSlotCount > m_bsSlotCapacity)
+        {
+            cudaFree(m_bsMemberBlastBond); m_bsMemberBlastBond = nullptr;
+            cudaFree(m_bsRemoveFlag); m_bsRemoveFlag = nullptr;
+            cudaFree(m_bsRemoveList); m_bsRemoveList = nullptr;
+            cudaFreeHost(m_bsHostRemoveList); m_bsHostRemoveList = nullptr;
+            const std::uint32_t n = topology.memberSlotCount;
+            allocateDevice(m_bsMemberBlastBond, n, "bs alloc members");
+            allocateDevice(m_bsRemoveFlag, n, "bs alloc removeFlag");
+            allocateDevice(m_bsRemoveList, n, "bs alloc removeList");
+            allocateHost(m_bsHostRemoveList, n, "bs host removeList");
+            cudaFreeHost(m_bsPinMembers);
+            allocateHost(m_bsPinMembers, n, "bs pin members");
+            m_bsCsrResident = false;
+            m_bsSlotCapacity = n;
+        }
+        if (topology.blastBondCount > m_bsBondCapacity)
+        {
+            cudaFree(m_bsBondNode0); m_bsBondNode0 = nullptr;
+            cudaFree(m_bsBondNode1); m_bsBondNode1 = nullptr;
+            cudaFree(m_bsBondMaterial); m_bsBondMaterial = nullptr;
+            cudaFree(m_bsBondNormal); m_bsBondNormal = nullptr;
+            cudaFree(m_bsBondCentroid); m_bsBondCentroid = nullptr;
+            cudaFree(m_bsBondNodeDisp); m_bsBondNodeDisp = nullptr;
+            cudaFree(m_bsHealth); m_bsHealth = nullptr;
+            const std::uint32_t n = topology.blastBondCount;
+            allocateDevice(m_bsBondNode0, n, "bs alloc node0");
+            allocateDevice(m_bsBondNode1, n, "bs alloc node1");
+            allocateDevice(m_bsBondMaterial, n, "bs alloc material");
+            allocateDevice(m_bsBondNormal, 3u * n, "bs alloc bnormal");
+            allocateDevice(m_bsBondCentroid, 3u * n, "bs alloc bcentroid");
+            allocateDevice(m_bsBondNodeDisp, 3u * n, "bs alloc bdisp");
+            allocateDevice(m_bsHealth, n, "bs alloc health");
+            cudaFreeHost(m_bsPinHealth);
+            allocateHost(m_bsPinHealth, n, "bs pin health");
+            m_bsHealthResident = false;
+            m_bsBondCapacity = n;
+        }
+        if (topology.graphNodeCount > m_bsNodeCapacity)
+        {
+            cudaFree(m_bsNodeOverstressed); m_bsNodeOverstressed = nullptr;
+            cudaFreeHost(m_bsHostNodeOverstressed); m_bsHostNodeOverstressed = nullptr;
+            allocateDevice(m_bsNodeOverstressed, topology.graphNodeCount, "bs alloc node mask");
+            allocateHost(
+                m_bsHostNodeOverstressed, topology.graphNodeCount, "bs host node mask");
+            m_bsNodeCapacity = topology.graphNodeCount;
+        }
+        if (m_bsOverstressedCount == nullptr)
+        {
+            allocateDevice(m_bsOverstressedCount, 1, "bs alloc count");
+            allocateHost(m_bsHostCounts, 2, "bs host counts");
+        }
+    }
+
+    void freeBondStressGroupBuffers()
+    {
+        cudaFree(m_bsGroupBegin); m_bsGroupBegin = nullptr;
+        cudaFree(m_bsGroupSize); m_bsGroupSize = nullptr;
+        cudaFree(m_bsGroupStressNormal); m_bsGroupStressNormal = nullptr;
+        cudaFree(m_bsGroupStressShear); m_bsGroupStressShear = nullptr;
+        cudaFree(m_bsGroupNormal); m_bsGroupNormal = nullptr;
+        cudaFree(m_bsGroupCentroid); m_bsGroupCentroid = nullptr;
+        cudaFree(m_bsGroupRemoveCount); m_bsGroupRemoveCount = nullptr;
+        cudaFree(m_bsGroupRemoveOffset); m_bsGroupRemoveOffset = nullptr;
+        cudaFreeHost(m_bsPinGroupBegin); m_bsPinGroupBegin = nullptr;
+        cudaFreeHost(m_bsPinGroupSize); m_bsPinGroupSize = nullptr;
+        cudaFreeHost(m_bsHostGroupStressNormal); m_bsHostGroupStressNormal = nullptr;
+        cudaFreeHost(m_bsHostGroupStressShear); m_bsHostGroupStressShear = nullptr;
+        cudaFreeHost(m_bsHostGroupNormal); m_bsHostGroupNormal = nullptr;
+        cudaFreeHost(m_bsHostGroupCentroid); m_bsHostGroupCentroid = nullptr;
+    }
+
+    void freeBondStress()
+    {
+        freeBondStressGroupBuffers();
+        cudaFree(m_bsMemberBlastBond);
+        cudaFree(m_bsRemoveFlag);
+        cudaFree(m_bsRemoveList);
+        cudaFree(m_bsBondNode0);
+        cudaFree(m_bsBondNode1);
+        cudaFree(m_bsBondMaterial);
+        cudaFree(m_bsBondNormal);
+        cudaFree(m_bsBondCentroid);
+        cudaFree(m_bsBondNodeDisp);
+        cudaFree(m_bsHealth);
+        cudaFree(m_bsNodeOverstressed);
+        cudaFree(m_bsOverstressedCount);
+        cudaFree(m_bsScanScratch);
+        cudaFree(m_bsMaterialLimits);
+        cudaFreeHost(m_bsPinMembers);
+        cudaFreeHost(m_bsPinHealth);
+        cudaFreeHost(m_bsPinMaterials);
+        cudaFreeHost(m_bsHostRemoveList);
+        cudaFreeHost(m_bsHostNodeOverstressed);
+        cudaFreeHost(m_bsHostCounts);
+        if (m_bsStream) { cudaStreamDestroy(m_bsStream); m_bsStream = nullptr; }
+    }
+
+    bool hasPendingTopologyChange() const override
+    {
+        return m_topologyDirty || !m_pendingImpulseSwaps.empty();
+    }
+
+    bool flushImpulsePermutation() override
+    {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
+        if (m_pendingImpulseSwaps.empty())
+        {
+            return true;
+        }
+        try
+        {
+            for (const auto& swap : m_pendingImpulseSwaps)
+            {
+                if (swap.first != swap.second)
+                {
+                    checkCuda(
+                        cudaMemcpy(
+                            m_impulses + swap.first,
+                            m_impulses + swap.second,
+                            sizeof(AngLin),
+                            cudaMemcpyDeviceToDevice),
+                        "flush impulse swap");
+                }
+            }
+            m_pendingImpulseSwaps.clear();
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+        return true;
+    }
+
     void resetWarmStart() override
     {
         ContextGuard context(m_cudaContext);
@@ -1622,6 +2510,10 @@ private:
         const ExtStressGpuImpulse* nodeVelocities,
         const ExtStressGpuSolveParams& params)
     {
+        // Latch the bending policy the host resolved, so every kernel this
+        // solve launches uses the same one the CPU walk does.
+        m_bendGainMax = params.bendGainMax;
+
         if (!nodeVelocities || params.maxIterations == 0)
         {
             return false;
@@ -3201,6 +4093,7 @@ uploadIslands();
                 kBlockSize,
                 0,
                 m_stream>>>(
+                m_bendGainMax,
                 m_impulses,
                 m_normals,
                 m_areas,
@@ -3334,6 +4227,8 @@ uploadIslands();
     Vec4* m_offset1{nullptr};
     Inertia* m_inertia{nullptr};
     Vec4* m_normals{nullptr};
+    /// Bending policy, taken from solve params so the device matches the host.
+    float m_bendGainMax{0.0f};
     float* m_areas{nullptr};
     // Per-bond compliance weight, uploaded verbatim from the CPU processor.
     float* m_colScales{nullptr};
@@ -3464,6 +4359,60 @@ uploadIslands();
     std::vector<std::uint32_t> m_prevIslandSkip;
     bool m_prevListsSkipping{false};
     bool m_activeListsDirty{true};
+
+    // Device bond-stress walk. Capacities grow only.
+    std::uint32_t* m_bsGroupBegin{nullptr};
+    std::uint32_t* m_bsGroupSize{nullptr};
+    std::uint32_t* m_bsMemberBlastBond{nullptr};
+    std::uint32_t* m_bsBondNode0{nullptr};
+    std::uint32_t* m_bsBondNode1{nullptr};
+    std::uint32_t* m_bsBondMaterial{nullptr};
+    float* m_bsBondNormal{nullptr};
+    float* m_bsBondCentroid{nullptr};
+    float* m_bsBondNodeDisp{nullptr};
+    float* m_bsHealth{nullptr};
+    float* m_bsGroupStressNormal{nullptr};
+    float* m_bsGroupStressShear{nullptr};
+    float* m_bsGroupNormal{nullptr};
+    float* m_bsGroupCentroid{nullptr};
+    std::uint8_t* m_bsNodeOverstressed{nullptr};
+    std::uint32_t* m_bsGroupRemoveCount{nullptr};
+    std::uint32_t* m_bsGroupRemoveOffset{nullptr};
+    std::uint32_t* m_bsRemoveFlag{nullptr};
+    std::uint32_t* m_bsRemoveList{nullptr};
+    std::uint32_t* m_bsOverstressedCount{nullptr};
+    void* m_bsScanScratch{nullptr};
+    std::size_t m_bsScanScratchBytes{0};
+    std::uint32_t* m_bsHostRemoveList{nullptr};
+    std::uint8_t* m_bsHostNodeOverstressed{nullptr};
+    float* m_bsHostGroupStressNormal{nullptr};
+    float* m_bsHostGroupStressShear{nullptr};
+    float* m_bsHostGroupNormal{nullptr};
+    float* m_bsHostGroupCentroid{nullptr};
+    std::uint32_t* m_bsHostCounts{nullptr};
+    std::uint32_t m_bsGroupCapacity{0};
+    std::uint32_t m_bsSlotCapacity{0};
+    std::uint32_t m_bsNodeCapacity{0};
+    std::uint32_t m_bsBondCapacity{0};
+    float* m_bsMaterialLimits{nullptr};
+    std::uint32_t m_bsMaterialCapacity{0};
+    bool m_bsReady{false};
+    /// Pinned staging: pageable source memory cannot DMA.
+    std::uint32_t* m_bsPinGroupBegin{nullptr};
+    std::uint32_t* m_bsPinGroupSize{nullptr};
+    std::uint32_t* m_bsPinMembers{nullptr};
+    float* m_bsPinHealth{nullptr};
+    float* m_bsPinMaterials{nullptr};
+    bool m_bsCsrResident{false};
+    bool m_bsHealthResident{false};
+    bool m_bsVectorsFetched{false};
+    bool m_bsStressFetched{false};
+    std::uint32_t m_bsVectorGroups{0};
+    cudaStream_t m_bsStream{nullptr};
+    cudaEvent_t m_bsEvUploadStart{nullptr};
+    cudaEvent_t m_bsEvUploadStop{nullptr};
+    cudaEvent_t m_bsEvKernelStop{nullptr};
+    cudaEvent_t m_bsEvReadStop{nullptr};
 };
 
 } // namespace

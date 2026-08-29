@@ -339,6 +339,38 @@ struct ExtStressPhysXTelemetry
     /// device. Only the first can be reclaimed by faster host code, so the
     /// split is the ceiling on every host-side optimization of this path.
     double gpuStressHostWorkMilliseconds;
+    /// Host walls around the GPU solve inside solveTick.
+    double stressImpulseCopyMilliseconds;
+    /// The graph-solve call itself, and the crushed-node drain: the two
+    /// blocks inside solveTick that had no timer.
+    double stressGraphSolveMilliseconds;
+    /// The three host walks inside the graph solve.
+    /// Cumulative bond groups skipped by the unchanged-stress short circuit.
+    uint64_t bondStressGroupsSkipped{0};
+    /// Parallel-walk order audit; default-initialised so a build that never
+    /// runs verify publishes zeros rather than garbage.
+    /// Device bond-stress walk: cache hits and actual launches. Explicit {0}
+    /// like everything else here -- a field without one has reported 4.5e18
+    /// in this struct before.
+    uint64_t bondStressGpuSkipped{0};
+    uint64_t bondStressGpuRuns{0};
+    uint64_t bondStressParallelChecks{0};
+    uint64_t bondStressParallelMismatches{0};
+    double stressHostWalkInMilliseconds;
+    double stressHostResetMilliseconds;
+    double stressHostBondStressMilliseconds;
+    double stressHostNodeStressMilliseconds;
+    double stressDrainMilliseconds;
+    /// Audit of the flat bondless flags against the two-deref predicate they
+    /// replace. Mismatches must be zero.
+    /// Default-initialised explicitly: this struct is declared as a plain
+    /// member with no initialiser, so a field without one starts
+    /// indeterminate and `++` on it reads garbage. The first run of this
+    /// audit reported 4.5e18 checks and "MISMATCH" for exactly that reason.
+    uint64_t bondlessVerifyChecks{0};
+    uint64_t bondlessVerifyMismatches{0};
+    double stressInitializeMilliseconds;
+    double stressCalcErrorMilliseconds;
     double gpuStressHostBlockedMilliseconds;
     uint64_t gpuStressHostToDeviceBytes;
     uint64_t gpuStressDeviceToHostBytes;
@@ -709,6 +741,17 @@ public:
         uint32_t wakeCapacity,
         uint32_t* outWakeCount) = 0;
     virtual bool solveTick() = 0;
+
+    /// Split solve, for callers that fan the bond-stress strips of every
+    /// structure out in ONE flat dispatch instead of one per structure.
+    /// supportsSplitSolve() is false when unconvergedExtraUpdates > 0, whose
+    /// retry loop re-runs solve AND bond stress together; callers must fall
+    /// back to solveTick() then.
+    virtual bool supportsSplitSolve() const = 0;
+    virtual uint32_t bondStressStripCount() const = 0;
+    virtual bool solveTickBeginSplit() = 0;
+    virtual void bondStressStrip(uint32_t stripIdx) = 0;
+    virtual bool solveTickFinishSplit() = 0;
     virtual bool endTick() = 0;
     virtual bool tick(float dt, const physx::PxVec3& worldGravity) = 0;
 
