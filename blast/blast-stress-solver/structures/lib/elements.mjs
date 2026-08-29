@@ -439,12 +439,15 @@ export function shaftVoid(footprint, thickness = 0.25) {
  */
 export function slabWithOpening(builder, {
   type = 'slab', material = 'concrete-slab', min, max, opening, inset = 0,
+  // Superimposed load on the plate, as a density multiplier. A parking deck
+  // carries cars; a floor plate in a tower carries furniture and people.
+  densityScale = 1,
 }) {
   const [x0, y0, z0] = min, [x1, y1, z1] = max;
   const o = opening;
   const panel = (a0, b0, a1, b1) => {
     if (!(a1 - a0 > 0.05) || !(b1 - b0 > 0.05)) return;
-    builder.box({ type, material, min: [a0, y0, b0], max: [a1, y1, b1] });
+    builder.box({ type, material, min: [a0, y0, b0], max: [a1, y1, b1], densityScale });
   };
   panel(x0 + inset, z0 + inset, o.x0, z1 - inset);           // strip left of the hole
   panel(o.x1, z0 + inset, x1 - inset, z1 - inset);           // strip right of it

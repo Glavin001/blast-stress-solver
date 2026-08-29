@@ -172,7 +172,7 @@ export class ScenePackBuilder {
    */
   piece({ type, material: matName, axis, poly, lo, hi,
           fixed = false, fracture = true, cellVolume = null,
-          fractureBackend = undefined }) {
+          fractureBackend = undefined, densityScale = 1 }) {
     if (!FRAME[axis]) throw new Error(`bad axis "${axis}"`);
     if (!(hi > lo)) throw new Error(`${type}/${matName}: empty extent ${lo}..${hi} on ${axis}`);
     if (poly.length > MAX_POLY_VERTS) {
@@ -185,17 +185,17 @@ export class ScenePackBuilder {
     material(matName); // validates the name
     this.pieces.push({
       type, material: matName, axis, poly, lo, hi, fixed, fracture, cellVolume,
-      fractureBackend, group: this.currentGroup, shards: [],
+      fractureBackend, densityScale, group: this.currentGroup, shards: [],
     });
     return this.pieces.length - 1;
   }
 
   /** Convenience: an axis-aligned box, given world-space min/max corners. */
-  box({ type, material, min, max, axis = 'y', fixed = false, fracture = true, cellVolume = null,
+  box({ type, material, min, max, axis = 'y', fixed = false, fracture = true, cellVolume = null, densityScale = 1,
         fractureBackend = undefined }) {
     const f = FRAME[axis];
     return this.piece({
-      type, material, axis, fixed, fracture, cellVolume, fractureBackend,
+      type, material, axis, fixed, fracture, cellVolume, fractureBackend, densityScale,
       poly: rect(min[f.u], min[f.w], max[f.u], max[f.w]),
       lo: min[f.t], hi: max[f.t],
     });
@@ -222,7 +222,22 @@ export class ScenePackBuilder {
     const ct = (lo + hi) / 2;
     const centre = f.toWorld(cu, cw, ct);
     const volume = area * thickness;
-    const dens = material(matName).density;
+    // Superimposed load, carried as extra density on the piece that carries it.
+    //
+    // A parking deck holds cars, and 2.5 kPa of them is 35% of a 300 mm slab's
+    // own weight -- the difference between columns at 6% of capacity and
+    // columns with a real margin. Modelling each car as a body would be
+    // thousands of rigid bodies to express a distributed load, so it rides on
+    // the deck's density instead, which is what a design check does too.
+    // Superimposed load, carried as extra density on the piece that carries it.
+    //
+    // A parking deck holds cars, and 2.5 kPa of them is 35% of a 300 mm slab's
+    // own weight -- the difference between columns at 6% of their capacity and
+    // columns with a real margin. Modelling each car as a body would be
+    // thousands of rigid bodies to express a distributed load, so it rides on
+    // the deck's density, which is what a design check does too.
+    const scale = piece !== undefined ? (this.pieces[piece]?.densityScale ?? 1) : 1;
+    const dens = material(matName).density * scale;
     const [u0, w0, u1, w1] = polyBounds(poly);
     const size = f.toWorld(u1 - u0, w1 - w0, thickness);
 

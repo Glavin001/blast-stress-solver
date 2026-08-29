@@ -54,11 +54,50 @@ export const GARAGE = {
   // other end of its size range and honest about what it is doing.
   dropPanelSize: 2.4,      // plan size of the thickened pad
   dropPanelThickness: 0.2, // extra depth below the slab soffit
+  // Cars. A parking deck is designed for 2.5 kPa of live load, and leaving it
+  // out is why the columns read as barely working: at self weight alone they
+  // sit at 6% of capacity, so six of them can hold the whole building and
+  // removing 90% of the grid changes nothing visible.
+  //
+  // Carried as extra density on the deck rather than as thousands of car
+  // bodies, which is also how a design check does it. On a 300 mm slab,
+  // 2.5 kPa is 2500 / (0.30 * 9.81) = 850 kg/m^3 on top of concrete's 2400,
+  // so 35% more weight -- and that is the difference between joints at 2.4x
+  // their elastic limit and joints past the 3x that fails them.
+  // 0 for now, and the mechanism is the deliverable rather than the number.
+  //
+  // 2500 Pa is the real design value and it is what SHOULD be here: without it
+  // the columns sit at 6% of capacity, which is why six of them can hold the
+  // whole building and removing 90% of the grid changes nothing. With it, the
+  // punching zone finally governs -- column-to-slab becomes the top joint class
+  // by a wide margin, which is exactly the failure mode a flat plate has.
+  //
+  // It is off because the connection cannot yet carry it: 107 bonds go and the
+  // garage does not settle. That is the honest reading -- this geometry, with
+  // realistic concrete, is not sized for its own design live load. Fixing it is
+  // a sizing iteration on the column head (a larger drop panel, a wider column,
+  // or a shear-reinforced connection), not another material number.
+  //
+  // Set to 2500 to resume that work; everything downstream already handles it.
+  liveLoadPa: 0,
+  // The gravity and material this design is checked against. Solving
+  // sigma = 0.75*rho*g*L^2/t for the span returns 8.0 m here, which is the bay
+  // authored below -- so the garage was always designed for Earth, and now the
+  // world runs there too.
+  gravity: 9.81,
+  concreteDensity: 2400,
   spandrelHeight: 1.0,
   spandrelThickness: 0.22,
   rampWidth: 6.5,
   footingDepth: 1.2,
 };
+
+
+/** Density multiplier that carries a deck's live load, from the load itself. */
+export function liveLoadDensityScale({ liveLoadPa, slabThickness, gravity, concreteDensity }) {
+  const added = liveLoadPa / (slabThickness * gravity);
+  return 1 + added / concreteDensity;
+}
 
 export function buildParkingGarage(cfg = {}) {
   const C = { ...GARAGE, ...cfg };
@@ -69,6 +108,7 @@ export function buildParkingGarage(cfg = {}) {
   });
 
   const hw = C.width / 2, hd = C.depth / 2;
+  const liveLoad = liveLoadDensityScale(C);
   const cs = C.columnSize / 2;
   const deckTop = (k) => k * C.levelHeight;      // level 0 is the ground slab
   const deckBase = (k) => deckTop(k) - C.slabThickness;
@@ -135,6 +175,7 @@ export function buildParkingGarage(cfg = {}) {
       material: 'reinforced-concrete',
       min: [-hw, deckBase(k), -hd], max: [rampX0, deckTop(k), hd],
       opening: stair.void,
+      densityScale: liveLoad,
     });
     // A landing at BOTH ends of the ramp bay. With only one, the ramp climbed
     // to the far side of the building and arrived at nothing — thirty floating
