@@ -1803,6 +1803,14 @@ uploadIslands();
 
     bool setBondStressTopology(const ExtStressGpuBondStressTopology& topology) override
     {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
         if (topology.groupCount == 0 || topology.blastBondCount == 0)
         {
             m_bsReady = false;
@@ -1841,6 +1849,14 @@ uploadIslands();
 
     bool readbackGroupStresses(const float*& stressNormal, const float*& stressShear) override
     {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
         if (!m_bsReady || m_bsVectorGroups == 0 || m_bsStream == nullptr)
         {
             return false;
@@ -1879,6 +1895,14 @@ uploadIslands();
 
     bool readbackGroupVectors(const float*& groupNormal, const float*& groupCentroid) override
     {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
         if (!m_bsReady || m_bsVectorGroups == 0 || m_bsStream == nullptr)
         {
             return false;
@@ -1918,6 +1942,14 @@ uploadIslands();
         float unbreakableLimit,
         ExtStressGpuBondStressResult& result) override
     {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
         if (!m_bsReady
             || csr.groupCount == 0
             || csr.groupCount > m_bsGroupCapacity
@@ -2340,6 +2372,14 @@ uploadIslands();
 
     bool flushImpulsePermutation() override
     {
+        // Every other public entry point pushes PhysX's CUDA context before
+        // touching the device; these did not, so their allocations, streams
+        // and launches landed in whatever context the calling thread happened
+        // to have -- the primary one -- while the impulses they read were
+        // allocated under the guard in PhysX's. Cross-context by construction,
+        // and the reason a tiny kernel could not be submitted without the GPU
+        // switching contexts around it.
+        ContextGuard context(m_cudaContext);
         if (m_pendingImpulseSwaps.empty())
         {
             return true;
