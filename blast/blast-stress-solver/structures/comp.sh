@@ -7,7 +7,7 @@
 # is enough friction that you batch changes -- and batching is exactly how you
 # end up unable to say which of them helped.
 #
-#   ./comp.sh room                    # build + audit one component
+#   ./comp.sh room                    # build it, then run its stability test
 #   ./comp.sh stack --floors 8        # with an option
 #   ./comp.sh wall-bay --mount wall   # against a mocked wall instead of ground
 #   ./comp.sh room --ladder           # the whole composition ladder at once
@@ -60,9 +60,14 @@ else
 fi
 
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}${LD_LIBRARY_PATH:+:}/usr/local/cuda/lib64:/root/PhysX/physx/install/linux-clang/PhysX/bin/linux.x86_64/release"
-LIST=$(echo "$PACKS" | tr ' ' ',')
 cd "$GAME"
-AUDIT_MAX_SECS="${AUDIT_MAX_SECS:-60}" AUDIT_PACKS="$LIST" \
-  cargo test -p vibe-land-destruction --features cuda-stress \
-  --test structural_audit --release -- --ignored --nocapture 2>&1 \
-  | grep -E "^=== |STABLE|^  peak |joint classes"
+
+# Hand off to the test runner rather than re-implementing it. The stability
+# CONTRACT lives in tests/structural_stability.rs, one named test per
+# structure, so selection, filtering, parallelism and failure reporting are the
+# runner's job. This script's only remaining reason to exist is that the packs
+# are authored in Node and simulated in Rust, so something has to build before
+# it tests.
+FILTER=$(echo "$PACKS" | tr ' ' '\n' | sed 's/^comp-/comp_/; s/-/_/g' | head -1)
+cargo test -p vibe-land-destruction --features cuda-stress \
+  --test structural_stability --release "$FILTER" -- --nocapture
