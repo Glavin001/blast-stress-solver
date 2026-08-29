@@ -1827,6 +1827,8 @@ uploadIslands();
             checkCuda(cudaMemset(m_bsGroupStressShear, 0, sizeof(float) * topology.groupCount), "bs clear ss");
             checkCuda(cudaMemset(m_bsGroupNormal, 0, sizeof(float) * 3u * topology.groupCount), "bs clear n");
             checkCuda(cudaMemset(m_bsGroupCentroid, 0, sizeof(float) * 3u * topology.groupCount), "bs clear c");
+            m_bsCsrResident = false;
+            m_bsHealthResident = false;
             m_bsReady = true;
         }
         catch (const std::exception&)
@@ -1834,6 +1836,38 @@ uploadIslands();
             m_bsReady = false;
             return false;
         }
+        return true;
+    }
+
+    bool readbackGroupVectors(const float*& groupNormal, const float*& groupCentroid) override
+    {
+        if (!m_bsReady || m_bsVectorGroups == 0)
+        {
+            return false;
+        }
+        if (!m_bsVectorsFetched)
+        {
+            try
+            {
+                checkCuda(
+                    cudaMemcpy(
+                        m_bsHostGroupNormal, m_bsGroupNormal,
+                        sizeof(float) * 3u * m_bsVectorGroups, cudaMemcpyDeviceToHost),
+                    "bs lazy read normal");
+                checkCuda(
+                    cudaMemcpy(
+                        m_bsHostGroupCentroid, m_bsGroupCentroid,
+                        sizeof(float) * 3u * m_bsVectorGroups, cudaMemcpyDeviceToHost),
+                    "bs lazy read centroid");
+            }
+            catch (const std::exception&)
+            {
+                return false;
+            }
+            m_bsVectorsFetched = true;
+        }
+        groupNormal = m_bsHostGroupNormal;
+        groupCentroid = m_bsHostGroupCentroid;
         return true;
     }
 
@@ -1857,17 +1891,74 @@ uploadIslands();
         }
         try
         {
+            const auto bsHostStart = std::chrono::steady_clock::now();
+            if (m_bsStream == nullptr)
+            {
+                // Its own stream, at the highest priority the device offers.
+                //
+                // The walk does not have to be ordered behind anything on the
+                // solver stream: it reads impulses the solve has already
+                // synchronised, and deviceImpulsesUsable() is what guarantees
+                // that. Sharing a stream only forced it to queue.
+                //
+                // Standalone this walk costs 0.056 ms at the city's group
+                // count and is unaffected by other PROCESSES hammering the
+                // GPU (+7%). In-game the identical work was costing 1.183 ms,
+                // so what it was waiting for was in this process: PhysX's own
+                // rigid-body simulation, in the same context.
+                int lo = 0, hi = 0;
+                cudaDeviceGetStreamPriorityRange(&lo, &hi);
+                cudaStreamCreateWithPriority(&m_bsStream, cudaStreamNonBlocking, hi);
+            }
+            if (m_bsEvUploadStart == nullptr)
+            {
+                cudaEventCreate(&m_bsEvUploadStart);
+                cudaEventCreate(&m_bsEvUploadStop);
+                cudaEventCreate(&m_bsEvKernelStop);
+                cudaEventCreate(&m_bsEvReadStop);
+            }
             const std::uint32_t groups = csr.groupCount;
+            m_telemetry.bondStressBytesUp = 0;
+            m_telemetry.bondStressBytesDown = 0;
+            cudaEventRecord(m_bsEvUploadStart, m_bsStream);
 
-            // The CSR is the only thing a bond removal edits, so it is
-            // refreshed whole rather than needing its own incremental scatter
-            // that could fall out of step with the host's.
-            uploadBondStressAsync(m_bsGroupBegin, csr.groupBegin, groups, "bs groupBegin");
-            uploadBondStressAsync(m_bsGroupSize, csr.groupSize, groups, "bs groupSize");
-            uploadBondStressAsync(
-                m_bsMemberBlastBond, csr.memberBlastBond, csr.memberSlotCount, "bs members");
-            uploadBondStressAsync(
-                m_bsHealth, blastBondHealth, csr.blastBondCount, "bs health");
+            // Uploads go through PINNED staging, and only when the bytes
+            // actually changed.
+            //
+            // Measured before this: 1.13 MB per call taking 1.250 ms, which is
+            // 0.9 GB/s -- pageable-memory speed, not PCIe speed. cudaMemcpyAsync
+            // from a std::vector cannot DMA, so it stages through a driver
+            // bounce buffer and serialises against the stream. The kernel it
+            // was feeding runs in 0.041 ms.
+            //
+            // The CSR only changes when a bond breaks, and health only changes
+            // when something takes damage; at rest neither moves, so both
+            // uploads collapse to a compare.
+            std::uint64_t bytesUp = 0;
+            const auto prepStart = std::chrono::steady_clock::now();
+            if (csr.csrDirty || !m_bsCsrResident)
+            {
+                memcpy(m_bsPinGroupBegin, csr.groupBegin, sizeof(std::uint32_t) * groups);
+                memcpy(m_bsPinGroupSize, csr.groupSize, sizeof(std::uint32_t) * groups);
+                memcpy(m_bsPinMembers, csr.memberBlastBond,
+                       sizeof(std::uint32_t) * csr.memberSlotCount);
+                uploadBondStressAsync(m_bsGroupBegin, m_bsPinGroupBegin, groups, "bs groupBegin");
+                uploadBondStressAsync(m_bsGroupSize, m_bsPinGroupSize, groups, "bs groupSize");
+                uploadBondStressAsync(
+                    m_bsMemberBlastBond, m_bsPinMembers, csr.memberSlotCount, "bs members");
+                bytesUp += sizeof(std::uint32_t) * (2ull * groups + csr.memberSlotCount);
+                m_bsCsrResident = true;
+            }
+            const std::size_t healthBytes = sizeof(float) * csr.blastBondCount;
+            if (!m_bsHealthResident
+                || memcmp(m_bsPinHealth, blastBondHealth, healthBytes) != 0)
+            {
+                memcpy(m_bsPinHealth, blastBondHealth, healthBytes);
+                uploadBondStressAsync(
+                    m_bsHealth, m_bsPinHealth, csr.blastBondCount, "bs health");
+                bytesUp += healthBytes;
+                m_bsHealthResident = true;
+            }
             // Small, and it can change without a topology rebuild, so it is
             // refreshed every call rather than cached.
             if (csr.materialCount > m_bsMaterialCapacity)
@@ -1875,29 +1966,60 @@ uploadIslands();
                 cudaFree(m_bsMaterialLimits);
                 m_bsMaterialLimits = nullptr;
                 allocateDevice(m_bsMaterialLimits, 3u * csr.materialCount, "bs alloc materials");
+                cudaFreeHost(m_bsPinMaterials);
+                allocateHost(m_bsPinMaterials, 3u * csr.materialCount, "bs pin materials");
                 m_bsMaterialCapacity = csr.materialCount;
             }
+            memcpy(m_bsPinMaterials, csr.materialElasticLimits,
+                   sizeof(float) * 3u * csr.materialCount);
             uploadBondStressAsync(
-                m_bsMaterialLimits, csr.materialElasticLimits, 3u * csr.materialCount,
-                "bs materials");
+                m_bsMaterialLimits, m_bsPinMaterials, 3u * csr.materialCount, "bs materials");
 
             checkCuda(
                 cudaMemsetAsync(
-                    m_bsNodeOverstressed, 0, sizeof(std::uint8_t) * csr.graphNodeCount, m_stream),
+                    m_bsNodeOverstressed, 0, sizeof(std::uint8_t) * csr.graphNodeCount, m_bsStream),
                 "bs clear node mask");
             checkCuda(
-                cudaMemsetAsync(m_bsOverstressedCount, 0, sizeof(std::uint32_t), m_stream),
+                cudaMemsetAsync(m_bsOverstressedCount, 0, sizeof(std::uint32_t), m_bsStream),
                 "bs clear count");
             // Sentinel entry for the exclusive scan, so offset[groups] is the
             // total without a second reduction.
             checkCuda(
                 cudaMemsetAsync(
-                    m_bsGroupRemoveCount + groups, 0, sizeof(std::uint32_t), m_stream),
+                    m_bsGroupRemoveCount + groups, 0, sizeof(std::uint32_t), m_bsStream),
                 "bs clear scan sentinel");
+
+            bytesUp += sizeof(float) * 3ull * csr.materialCount;
+            m_telemetry.bondStressBytesUp = bytesUp;
+            m_telemetry.bondStressPrepMs =
+                std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - prepStart).count();
+            cudaEventRecord(m_bsEvUploadStop, m_bsStream);
+
+            // Carry each reassigned slot's stored stress with it, so a slot
+            // handed to a different group does not answer with the old one's
+            // values on any tick that group is not reprocessed.
+            for (std::uint32_t i = 0; i < csr.groupSwapCount; ++i)
+            {
+                const std::uint32_t dst = csr.groupSwapDst[i];
+                const std::uint32_t src = csr.groupSwapSrc[i];
+                if (dst == src || dst >= m_bsGroupCapacity || src >= m_bsGroupCapacity)
+                {
+                    continue;
+                }
+                cudaMemcpyAsync(m_bsGroupStressNormal + dst, m_bsGroupStressNormal + src,
+                                sizeof(float), cudaMemcpyDeviceToDevice, m_bsStream);
+                cudaMemcpyAsync(m_bsGroupStressShear + dst, m_bsGroupStressShear + src,
+                                sizeof(float), cudaMemcpyDeviceToDevice, m_bsStream);
+                cudaMemcpyAsync(m_bsGroupNormal + 3 * dst, m_bsGroupNormal + 3 * src,
+                                sizeof(float) * 3, cudaMemcpyDeviceToDevice, m_bsStream);
+                cudaMemcpyAsync(m_bsGroupCentroid + 3 * dst, m_bsGroupCentroid + 3 * src,
+                                sizeof(float) * 3, cudaMemcpyDeviceToDevice, m_bsStream);
+            }
 
             const std::uint32_t block = 128;
             const std::uint32_t grid = (groups + block - 1) / block;
-            bondStressWalk<<<grid, block, 0, m_stream>>>(
+            bondStressWalk<<<grid, block, 0, m_bsStream>>>(
                 m_bsGroupBegin, m_bsGroupSize, m_bsMemberBlastBond,
                 m_bsBondNode0, m_bsBondNode1, m_bsBondMaterial,
                 m_bsBondNormal, m_bsBondCentroid, m_bsBondNodeDisp,
@@ -1913,7 +2035,7 @@ uploadIslands();
             checkCuda(
                 cub::DeviceScan::ExclusiveSum(
                     nullptr, scanBytes, m_bsGroupRemoveCount, m_bsGroupRemoveOffset,
-                    static_cast<int>(groups + 1), m_stream),
+                    static_cast<int>(groups + 1), m_bsStream),
                 "bs scan sizing");
             if (scanBytes > m_bsScanScratchBytes)
             {
@@ -1926,53 +2048,67 @@ uploadIslands();
             checkCuda(
                 cub::DeviceScan::ExclusiveSum(
                     m_bsScanScratch, scanBytes, m_bsGroupRemoveCount, m_bsGroupRemoveOffset,
-                    static_cast<int>(groups + 1), m_stream),
+                    static_cast<int>(groups + 1), m_bsStream),
                 "bs scan");
 
-            bondStressCompactRemovals<<<grid, block, 0, m_stream>>>(
+            bondStressCompactRemovals<<<grid, block, 0, m_bsStream>>>(
                 m_bsGroupBegin, m_bsGroupSize, m_bsMemberBlastBond,
                 m_bsRemoveFlag, m_bsGroupRemoveOffset, groups, m_bsRemoveList);
             checkCuda(cudaGetLastError(), "bs compact launch");
+            cudaEventRecord(m_bsEvKernelStop, m_bsStream);
 
             // Fixed-size readbacks first, then one sync, then the removal list
             // whose length we only know after it.
             checkCuda(
                 cudaMemcpyAsync(
                     m_bsHostCounts, m_bsOverstressedCount, sizeof(std::uint32_t),
-                    cudaMemcpyDeviceToHost, m_stream),
+                    cudaMemcpyDeviceToHost, m_bsStream),
                 "bs read count");
             checkCuda(
                 cudaMemcpyAsync(
                     m_bsHostCounts + 1, m_bsGroupRemoveOffset + groups, sizeof(std::uint32_t),
-                    cudaMemcpyDeviceToHost, m_stream),
+                    cudaMemcpyDeviceToHost, m_bsStream),
                 "bs read remove total");
             checkCuda(
                 cudaMemcpyAsync(
                     m_bsHostNodeOverstressed, m_bsNodeOverstressed,
                     sizeof(std::uint8_t) * csr.graphNodeCount,
-                    cudaMemcpyDeviceToHost, m_stream),
+                    cudaMemcpyDeviceToHost, m_bsStream),
                 "bs read node mask");
             checkCuda(
                 cudaMemcpyAsync(
                     m_bsHostGroupStressNormal, m_bsGroupStressNormal, sizeof(float) * groups,
-                    cudaMemcpyDeviceToHost, m_stream),
+                    cudaMemcpyDeviceToHost, m_bsStream),
                 "bs read sn");
             checkCuda(
                 cudaMemcpyAsync(
                     m_bsHostGroupStressShear, m_bsGroupStressShear, sizeof(float) * groups,
-                    cudaMemcpyDeviceToHost, m_stream),
+                    cudaMemcpyDeviceToHost, m_bsStream),
                 "bs read ss");
-            checkCuda(
-                cudaMemcpyAsync(
-                    m_bsHostGroupNormal, m_bsGroupNormal, sizeof(float) * 3u * groups,
-                    cudaMemcpyDeviceToHost, m_stream),
-                "bs read normal");
-            checkCuda(
-                cudaMemcpyAsync(
-                    m_bsHostGroupCentroid, m_bsGroupCentroid, sizeof(float) * 3u * groups,
-                    cudaMemcpyDeviceToHost, m_stream),
-                "bs read centroid");
-            checkCuda(cudaStreamSynchronize(m_stream), "bs sync");
+            m_telemetry.bondStressBytesDown =
+                2ull * sizeof(std::uint32_t)
+                + sizeof(std::uint8_t) * csr.graphNodeCount
+                + sizeof(float) * 2ull * groups;
+            m_bsVectorsFetched = false;
+            m_bsVectorGroups = groups;
+            cudaEventRecord(m_bsEvReadStop, m_bsStream);
+            const auto bsSyncStart = std::chrono::steady_clock::now();
+            m_telemetry.bondStressEnqueueMs =
+                std::chrono::duration<float, std::milli>(bsSyncStart - prepStart).count()
+                - m_telemetry.bondStressPrepMs;
+            checkCuda(cudaStreamSynchronize(m_bsStream), "bs sync");
+            const auto bsSyncEnd = std::chrono::steady_clock::now();
+            m_telemetry.bondStressSyncMs =
+                std::chrono::duration<float, std::milli>(bsSyncEnd - bsSyncStart).count();
+            {
+                float up = 0.0f, kern = 0.0f, read = 0.0f;
+                cudaEventElapsedTime(&up, m_bsEvUploadStart, m_bsEvUploadStop);
+                cudaEventElapsedTime(&kern, m_bsEvUploadStop, m_bsEvKernelStop);
+                cudaEventElapsedTime(&read, m_bsEvKernelStop, m_bsEvReadStop);
+                m_telemetry.bondStressUploadMs = up;
+                m_telemetry.bondStressKernelMs = kern;
+                m_telemetry.bondStressReadbackMs = read;
+            }
 
             const std::uint32_t removeCount =
                 m_bsHostCounts[1] > csr.memberSlotCount ? csr.memberSlotCount : m_bsHostCounts[1];
@@ -1982,9 +2118,9 @@ uploadIslands();
                     cudaMemcpyAsync(
                         m_bsHostRemoveList, m_bsRemoveList,
                         sizeof(std::uint32_t) * removeCount,
-                        cudaMemcpyDeviceToHost, m_stream),
+                        cudaMemcpyDeviceToHost, m_bsStream),
                     "bs read removals");
-                checkCuda(cudaStreamSynchronize(m_stream), "bs sync removals");
+                checkCuda(cudaStreamSynchronize(m_bsStream), "bs sync removals");
             }
 
             result.bondIndicesToRemove = m_bsHostRemoveList;
@@ -1993,8 +2129,12 @@ uploadIslands();
             result.nodeOverstressed = m_bsHostNodeOverstressed;
             result.groupStressNormal = m_bsHostGroupStressNormal;
             result.groupStressShear = m_bsHostGroupStressShear;
-            result.groupNormal = m_bsHostGroupNormal;
-            result.groupCentroid = m_bsHostGroupCentroid;
+            // Left null on purpose: fetched only if someone asks.
+            result.groupNormal = nullptr;
+            result.groupCentroid = nullptr;
+            m_telemetry.bondStressHostMs =
+                std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - bsHostStart).count();
         }
         catch (const std::exception&)
         {
@@ -2013,7 +2153,8 @@ uploadIslands();
     void uploadBondStressAsync(T* dst, const T* src, std::uint32_t count, const char* name)
     {
         checkCuda(
-            cudaMemcpyAsync(dst, src, sizeof(T) * count, cudaMemcpyHostToDevice, m_stream), name);
+            cudaMemcpyAsync(dst, src, sizeof(T) * count, cudaMemcpyHostToDevice, m_bsStream),
+            name);
     }
 
     /// Grow-only: a resync can add groups back, and reallocating on every
@@ -2032,6 +2173,8 @@ uploadIslands();
             allocateDevice(m_bsGroupCentroid, 3u * n, "bs alloc centroid");
             allocateDevice(m_bsGroupRemoveCount, n + 1u, "bs alloc removeCount");
             allocateDevice(m_bsGroupRemoveOffset, n + 1u, "bs alloc removeOffset");
+            allocateHost(m_bsPinGroupBegin, n, "bs pin groupBegin");
+            allocateHost(m_bsPinGroupSize, n, "bs pin groupSize");
             allocateHost(m_bsHostGroupStressNormal, n, "bs host sn");
             allocateHost(m_bsHostGroupStressShear, n, "bs host ss");
             allocateHost(m_bsHostGroupNormal, 3u * n, "bs host normal");
@@ -2049,6 +2192,9 @@ uploadIslands();
             allocateDevice(m_bsRemoveFlag, n, "bs alloc removeFlag");
             allocateDevice(m_bsRemoveList, n, "bs alloc removeList");
             allocateHost(m_bsHostRemoveList, n, "bs host removeList");
+            cudaFreeHost(m_bsPinMembers);
+            allocateHost(m_bsPinMembers, n, "bs pin members");
+            m_bsCsrResident = false;
             m_bsSlotCapacity = n;
         }
         if (topology.blastBondCount > m_bsBondCapacity)
@@ -2068,6 +2214,9 @@ uploadIslands();
             allocateDevice(m_bsBondCentroid, 3u * n, "bs alloc bcentroid");
             allocateDevice(m_bsBondNodeDisp, 3u * n, "bs alloc bdisp");
             allocateDevice(m_bsHealth, n, "bs alloc health");
+            cudaFreeHost(m_bsPinHealth);
+            allocateHost(m_bsPinHealth, n, "bs pin health");
+            m_bsHealthResident = false;
             m_bsBondCapacity = n;
         }
         if (topology.graphNodeCount > m_bsNodeCapacity)
@@ -2096,6 +2245,8 @@ uploadIslands();
         cudaFree(m_bsGroupCentroid); m_bsGroupCentroid = nullptr;
         cudaFree(m_bsGroupRemoveCount); m_bsGroupRemoveCount = nullptr;
         cudaFree(m_bsGroupRemoveOffset); m_bsGroupRemoveOffset = nullptr;
+        cudaFreeHost(m_bsPinGroupBegin); m_bsPinGroupBegin = nullptr;
+        cudaFreeHost(m_bsPinGroupSize); m_bsPinGroupSize = nullptr;
         cudaFreeHost(m_bsHostGroupStressNormal); m_bsHostGroupStressNormal = nullptr;
         cudaFreeHost(m_bsHostGroupStressShear); m_bsHostGroupStressShear = nullptr;
         cudaFreeHost(m_bsHostGroupNormal); m_bsHostGroupNormal = nullptr;
@@ -2119,9 +2270,13 @@ uploadIslands();
         cudaFree(m_bsOverstressedCount);
         cudaFree(m_bsScanScratch);
         cudaFree(m_bsMaterialLimits);
+        cudaFreeHost(m_bsPinMembers);
+        cudaFreeHost(m_bsPinHealth);
+        cudaFreeHost(m_bsPinMaterials);
         cudaFreeHost(m_bsHostRemoveList);
         cudaFreeHost(m_bsHostNodeOverstressed);
         cudaFreeHost(m_bsHostCounts);
+        if (m_bsStream) { cudaStreamDestroy(m_bsStream); m_bsStream = nullptr; }
     }
 
     bool hasPendingTopologyChange() const override
@@ -4051,6 +4206,21 @@ uploadIslands();
     float* m_bsMaterialLimits{nullptr};
     std::uint32_t m_bsMaterialCapacity{0};
     bool m_bsReady{false};
+    /// Pinned staging: pageable source memory cannot DMA.
+    std::uint32_t* m_bsPinGroupBegin{nullptr};
+    std::uint32_t* m_bsPinGroupSize{nullptr};
+    std::uint32_t* m_bsPinMembers{nullptr};
+    float* m_bsPinHealth{nullptr};
+    float* m_bsPinMaterials{nullptr};
+    bool m_bsCsrResident{false};
+    bool m_bsHealthResident{false};
+    bool m_bsVectorsFetched{false};
+    std::uint32_t m_bsVectorGroups{0};
+    cudaStream_t m_bsStream{nullptr};
+    cudaEvent_t m_bsEvUploadStart{nullptr};
+    cudaEvent_t m_bsEvUploadStop{nullptr};
+    cudaEvent_t m_bsEvKernelStop{nullptr};
+    cudaEvent_t m_bsEvReadStop{nullptr};
 };
 
 } // namespace

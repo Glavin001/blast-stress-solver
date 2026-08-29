@@ -117,6 +117,18 @@ struct ExtStressGpuTelemetry
     /// Extra full solve passes spent chasing convergence. Each is another
     /// enqueue/sync/finish cycle, so it multiplies everything above.
     std::uint32_t extraPasses{0};
+
+    /// Bond-stress walk, split so the next optimisation is chosen from
+    /// evidence rather than from which part looks expensive.
+    float bondStressUploadMs{0.0f};
+    float bondStressKernelMs{0.0f};
+    float bondStressReadbackMs{0.0f};
+    float bondStressSyncMs{0.0f};
+    float bondStressHostMs{0.0f};
+    float bondStressPrepMs{0.0f};
+    float bondStressEnqueueMs{0.0f};
+    std::uint64_t bondStressBytesUp{0};
+    std::uint64_t bondStressBytesDown{0};
 };
 
 /**
@@ -165,6 +177,24 @@ struct ExtStressGpuBondStressTopology
     /// bond against the live table, so the device must too.
     const float* materialElasticLimits{nullptr};
     std::uint32_t materialCount{0};
+
+    /// Whether the three CSR arrays changed since the last call. They only
+    /// change when a bond breaks, so re-uploading them every tick spends
+    /// hundreds of KB per structure per tick to send identical bytes.
+    bool csrDirty{true};
+
+    /// Group slots the host has reassigned by replaceWithLast since the last
+    /// call, as (destination, source) pairs in the order they were applied.
+    ///
+    /// The device keeps its per-group stress in the slot, and a slot that has
+    /// been handed to a different group still holds the OLD group's values
+    /// until the new one is next processed. Everything with live members is
+    /// processed every tick so the window is narrow, but it is real: a longer
+    /// run with more removals showed 132 of 653M values diverging where a
+    /// shorter one showed none.
+    const std::uint32_t* groupSwapDst{nullptr};
+    const std::uint32_t* groupSwapSrc{nullptr};
+    std::uint32_t groupSwapCount{0};
 };
 
 /**
@@ -277,6 +307,18 @@ public:
      * accumulation operation for operation, so the dual-run audit can demand
      * bit-equality rather than a tolerance.
      */
+    /**
+     * Fetch the per-group normal and centroid, which updateBondStress leaves
+     * on the device.
+     *
+     * They are 6 of the 8 floats per group and almost nothing reads them on a
+     * given tick: excess forces wants the normal only for bonds that actually
+     * broke, and the virial wants the centroid only when chunk crushing is on.
+     * Pulling them across every tick cost more than the kernel did.
+     */
+    virtual bool readbackGroupVectors(
+        const float*& groupNormal, const float*& groupCentroid) = 0;
+
     virtual bool updateBondStress(
         const ExtStressGpuBondStressTopology& csr,
         const float* blastBondHealth,

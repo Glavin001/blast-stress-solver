@@ -1432,8 +1432,12 @@ public:
     /// per-group outputs back without the host walking anything.
     std::vector<uint32_t> m_bsBlastBondGroup;
     std::vector<float> m_bsMaterialLimits;
+    std::vector<uint32_t> m_bsGroupSwapDst;
+    std::vector<uint32_t> m_bsGroupSwapSrc;
     /// Set by anything that invalidates the mirror; cleared by a rebuild.
     bool m_bsCsrDirty{true};
+    /// The CSR changed since the device last took a copy.
+    bool m_bsCsrUploadDirty{true};
     /// Audit counters. Explicit initialisers: a telemetry field without one
     /// has already reported 4.5e18 checks once.
     uint64_t m_bsCsrChecks{0};
@@ -1446,8 +1450,8 @@ public:
     bool m_bsGpuActive{false};
     const float* m_bsGpuStressNormal{nullptr};
     const float* m_bsGpuStressShear{nullptr};
-    const float* m_bsGpuNormal{nullptr};
-    const float* m_bsGpuCentroid{nullptr};
+    mutable const float* m_bsGpuNormal{nullptr};
+    mutable const float* m_bsGpuCentroid{nullptr};
     std::vector<uint32_t> m_bsGpuRemovals;
     std::vector<uint32_t> m_bsVerifyRemovals;
     std::vector<uint32_t> m_bsSerialRemovals;
@@ -1462,6 +1466,16 @@ public:
     uint64_t m_bsGpuLastBadTick{0};
     uint64_t m_bsGpuAttempts{0};
     uint64_t m_bsGpuRuns{0};
+    double m_bsPhUpload{0.0};
+    double m_bsPhKernel{0.0};
+    double m_bsPhRead{0.0};
+    double m_bsPhSync{0.0};
+    double m_bsPhHost{0.0};
+    double m_bsPhPrep{0.0};
+    double m_bsPhEnq{0.0};
+    uint64_t m_bsPhUp{0};
+    uint64_t m_bsPhDown{0};
+    uint64_t m_bsPhCalls{0};
     uint64_t m_bsRefuseNoSolver{0};
     uint64_t m_bsRefuseStale{0};
     uint64_t m_bsRefusePendingTopo{0};
@@ -1938,6 +1952,19 @@ public:
         }
         if (bondStressGpu() && (m_bsCsrTicks % 600) == 0 && m_bsCsrTicks > 0)
         {
+            if (m_bsPhCalls > 0)
+            {
+                const double c = static_cast<double>(m_bsPhCalls);
+                fprintf(stderr,
+                        "[bs-phase] calls=%llu per-call ms: upload %.3f kernel %.3f "
+                        "readback %.3f | prep %.3f enqueue %.3f sync %.3f | host total %.3f "
+                        "| up %.2f MB down %.2f MB\n",
+                        (unsigned long long)m_bsPhCalls,
+                        m_bsPhUpload / c, m_bsPhKernel / c, m_bsPhRead / c,
+                        m_bsPhPrep / c, m_bsPhEnq / c, m_bsPhSync / c, m_bsPhHost / c,
+                        double(m_bsPhUp) / c / 1048576.0,
+                        double(m_bsPhDown) / c / 1048576.0);
+            }
             fprintf(stderr,
                     "[bond-stress-gpu] ticks=%llu attempts=%llu ranOnDevice=%llu "
                     "checks=%llu MISMATCHES=%llu "
@@ -2238,6 +2265,9 @@ public:
             }
         }
         m_bsCsrDirty = false;
+        m_bsCsrUploadDirty = true;
+        m_bsGroupSwapDst.clear();
+        m_bsGroupSwapSrc.clear();
     }
 
     /// The static payload for one blast bond. Everything here derives from
@@ -2304,6 +2334,7 @@ public:
             }
             m_bsCsrMemberBlastBond[begin + k] = m_bsCsrMemberBlastBond[begin + size - 1];
             m_bsCsrGroupSize[group] = size - 1;
+            m_bsCsrUploadDirty = true;
             if (blastBondIndex < m_bsBlastBondGroup.size())
             {
                 m_bsBlastBondGroup[blastBondIndex] = invalidIndex<uint32_t>();
@@ -2342,6 +2373,12 @@ public:
         }
         m_bsCsrGroupBegin.pop_back();
         m_bsCsrGroupSize.pop_back();
+        m_bsCsrUploadDirty = true;
+        if (group != last)
+        {
+            m_bsGroupSwapDst.push_back(group);
+            m_bsGroupSwapSrc.push_back(last);
+        }
     }
 
     /// BLAST_BOND_STRESS_CSR_VERIFY=1: compare the incrementally-maintained
@@ -2423,6 +2460,10 @@ public:
         {
             return false;
         }
+        // Only once the device has actually taken them.
+        m_bsCsrUploadDirty = false;
+        m_bsGroupSwapDst.clear();
+        m_bsGroupSwapSrc.clear();
 
         m_overstressedBondCount = result.overstressedBondCount;
         if (!m_nodeOverstressed.empty() && result.nodeOverstressed != nullptr)
@@ -2436,10 +2477,26 @@ public:
         // there is exactly one call per tick.
         m_bsGpuStressNormal = result.groupStressNormal;
         m_bsGpuStressShear = result.groupStressShear;
-        m_bsGpuNormal = result.groupNormal;
-        m_bsGpuCentroid = result.groupCentroid;
+        // Fetched on first use, not every tick -- see readbackGroupVectors.
+        m_bsGpuNormal = nullptr;
+        m_bsGpuCentroid = nullptr;
         m_bsGpuActive = true;
 
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        {
+            const ExtStressGpuTelemetry& t = gpu->telemetry();
+            m_bsPhUpload += t.bondStressUploadMs;
+            m_bsPhKernel += t.bondStressKernelMs;
+            m_bsPhRead += t.bondStressReadbackMs;
+            m_bsPhSync += t.bondStressSyncMs;
+            m_bsPhHost += t.bondStressHostMs;
+            m_bsPhPrep += t.bondStressPrepMs;
+            m_bsPhEnq += t.bondStressEnqueueMs;
+            m_bsPhUp += t.bondStressBytesUp;
+            m_bsPhDown += t.bondStressBytesDown;
+            ++m_bsPhCalls;
+        }
+#endif
         m_bsGpuRemovals.assign(
             result.bondIndicesToRemove,
             result.bondIndicesToRemove + result.removeCount);
@@ -2468,6 +2525,10 @@ public:
         csr.bondNodeDisp = m_bsBondNodeDisp.data();
         csr.materialElasticLimits = m_bsMaterialLimits.data();
         csr.materialCount = static_cast<uint32_t>(m_bsMaterialLimits.size() / 3);
+        csr.csrDirty = m_bsCsrUploadDirty;
+        csr.groupSwapDst = m_bsGroupSwapDst.empty() ? nullptr : m_bsGroupSwapDst.data();
+        csr.groupSwapSrc = m_bsGroupSwapSrc.empty() ? nullptr : m_bsGroupSwapSrc.data();
+        csr.groupSwapCount = static_cast<uint32_t>(m_bsGroupSwapDst.size());
     }
 #endif
 
@@ -2536,6 +2597,18 @@ public:
         }
         stressNormal = m_bsGpuStressNormal[group];
         stressShear = m_bsGpuStressShear[group];
+        // The vectors cost 6 of the 8 floats per group and are wanted by
+        // almost nothing on a given tick, so they are pulled across on first
+        // use. Callers that only want stress never pay for them.
+        if (m_bsGpuNormal == nullptr)
+        {
+            if (!fetchBondStressVectors())
+            {
+                normal = m_bondsData[bondIndex].normal;
+                centroid = m_bondsData[bondIndex].centroid;
+                return true;
+            }
+        }
         normal = nvidia::NvVec3(
             m_bsGpuNormal[3 * group + 0],
             m_bsGpuNormal[3 * group + 1],
@@ -2684,6 +2757,9 @@ public:
                     { ++m_bsPayCentroid; }
                 }
             }
+            // The vectors are fetched lazily now, so the audit has to ask for
+            // them rather than assume the tick already paid for them.
+            const bool haveVectors = fetchBondStressVectors();
             for (uint32_t g = 0; g < m_bsCsrGroupSize.size(); ++g)
             {
                 const uint32_t begin = m_bsCsrGroupBegin[g];
@@ -2736,15 +2812,20 @@ public:
                                 host.stressNormal, host.stressShear, devSn, devSs);
                         }
                     }
-                    ++m_bsGpuStressChecks;
-                    const float devN[3] = {
-                        m_bsGpuNormal[3 * g + 0], m_bsGpuNormal[3 * g + 1], m_bsGpuNormal[3 * g + 2]};
-                    const float devC[3] = {
-                        m_bsGpuCentroid[3 * g + 0], m_bsGpuCentroid[3 * g + 1], m_bsGpuCentroid[3 * g + 2]};
-                    if (memcmp(&host.normal.x, devN, sizeof(devN)) != 0
-                        || memcmp(&host.centroid.x, devC, sizeof(devC)) != 0)
+                    if (haveVectors && m_bsGpuNormal != nullptr && m_bsGpuCentroid != nullptr)
                     {
-                        ++m_bsGpuStressMismatches;
+                        ++m_bsGpuStressChecks;
+                        const float devN[3] = {m_bsGpuNormal[3 * g + 0],
+                                               m_bsGpuNormal[3 * g + 1],
+                                               m_bsGpuNormal[3 * g + 2]};
+                        const float devC[3] = {m_bsGpuCentroid[3 * g + 0],
+                                               m_bsGpuCentroid[3 * g + 1],
+                                               m_bsGpuCentroid[3 * g + 2]};
+                        if (memcmp(&host.normal.x, devN, sizeof(devN)) != 0
+                            || memcmp(&host.centroid.x, devC, sizeof(devC)) != 0)
+                        {
+                            ++m_bsGpuStressMismatches;
+                        }
                     }
                 }
             }
@@ -2821,6 +2902,20 @@ public:
             bond.normal = normal;
             bond.centroid = centroid;
         }
+    }
+
+    bool fetchBondStressVectors() const
+    {
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+        ExtStressGpuSolver* gpu = m_solver.gpuSolver();
+        if (gpu == nullptr)
+        {
+            return false;
+        }
+        return gpu->readbackGroupVectors(m_bsGpuNormal, m_bsGpuCentroid);
+#else
+        return false;
+#endif
     }
 
     uint64_t getBondStressGpuChecks() const { return m_bsGpuChecks; }
