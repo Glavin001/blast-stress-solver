@@ -227,11 +227,16 @@ double medianOf(std::vector<double>& v)
 int main(int argc, char** argv)
 {
     const int reps = argc > 1 ? atoi(argv[1]) : 200;
+    // Microseconds of idle between reps. The game submits this walk once per
+    // 16 ms tick; a tight loop keeps the context hot and hides whatever a cold
+    // submission costs. This makes the harness able to reproduce the game's
+    // duty cycle.
+    const int idleUs = argc > 2 ? atoi(argv[2]) : 0;
     std::uint64_t mismatches = 0;
     const std::uint32_t membersPerGroup = 2;
 
-    printf("== device bond-stress walk, standalone (%d reps, %u members/group)\n",
-           reps, membersPerGroup);
+    printf("== device bond-stress walk, standalone (%d reps, %u members/group, %d us idle between reps)\n",
+           reps, membersPerGroup, idleUs);
     printf("%9s %9s | %9s %9s %9s %9s | %9s %8s %9s %9s\n",
            "groups", "bonds", "gpu ms", "prep", "enqueue", "sync", "kernel",
            "cpu ms", "speedup", "gpu ns/grp");
@@ -269,6 +274,12 @@ int main(int argc, char** argv)
         std::vector<double> host, prep, enq, sync, kern;
         for (int r = 0; r < reps; ++r)
         {
+            if (idleUs > 0)
+            {
+                const auto until = std::chrono::steady_clock::now()
+                    + std::chrono::microseconds(idleUs);
+                while (std::chrono::steady_clock::now() < until) { }
+            }
             auto t = topologyOf(s, groups, blastBonds, false);
             const auto t0 = std::chrono::steady_clock::now();
             solver->updateBondStress(t, s.health.data(), 0.5f * 3.4028235e38f, result);

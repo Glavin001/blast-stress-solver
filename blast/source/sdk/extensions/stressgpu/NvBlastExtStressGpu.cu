@@ -1440,6 +1440,8 @@ __global__ void bondStressWalk(
 /// grid-1 shot run, 2 of 200 non-empty removal lists came out non-ascending,
 /// so a sort would diverge from the host on ~1% of the ticks that break bonds,
 /// and removal order feeds back into topology.
+__global__ void bondStressNullKernel() {}
+
 __global__ void bondStressCompactRemovals(
     const std::uint32_t* groupBegin,
     const std::uint32_t* groupSize,
@@ -1464,6 +1466,15 @@ __global__ void bondStressCompactRemovals(
             removeList[out++] = memberBlastBond[begin + k];
         }
     }
+}
+
+bool bondStressProbe()
+{
+    static const bool on = [] {
+        const char* raw = std::getenv("BLAST_BOND_STRESS_PROBE");
+        return raw != nullptr && std::string(raw) != "0";
+    }();
+    return on;
 }
 
 class ExtStressGpuSolverImpl final : public ExtStressGpuSolver
@@ -1990,6 +2001,36 @@ uploadIslands();
                 cudaEventCreate(&m_bsEvKernelStop);
                 cudaEventCreate(&m_bsEvReadStop);
             }
+            // Probe: what does synchronising cost when there is NOTHING to
+            // wait for? Three points, at the exact place in the tick the real
+            // walk runs. If an EMPTY sync already costs what the real one
+            // does, the fixed cost has nothing to do with our work.
+            if (bondStressProbe())
+            {
+                const auto p0 = std::chrono::steady_clock::now();
+                cudaStreamSynchronize(m_bsStream);          // nothing queued
+                const auto p1 = std::chrono::steady_clock::now();
+                bondStressNullKernel<<<1, 1, 0, m_bsStream>>>();
+                cudaStreamSynchronize(m_bsStream);          // FIRST empty launch
+                const auto p2 = std::chrono::steady_clock::now();
+                bondStressNullKernel<<<1, 1, 0, m_bsStream>>>();
+                cudaStreamSynchronize(m_bsStream);          // SECOND, back to back
+                const auto p2b = std::chrono::steady_clock::now();
+                m_telemetry.bondStressProbeKernel2Ms =
+                    std::chrono::duration<float, std::milli>(p2b - p2).count();
+                const auto p2c = std::chrono::steady_clock::now();
+                cudaMemcpyAsync(m_bsHostCounts, m_bsOverstressedCount,
+                                sizeof(std::uint32_t), cudaMemcpyDeviceToHost, m_bsStream);
+                cudaStreamSynchronize(m_bsStream);          // one 4-byte D2H
+                const auto p3 = std::chrono::steady_clock::now();
+                m_telemetry.bondStressProbeEmptyMs =
+                    std::chrono::duration<float, std::milli>(p1 - p0).count();
+                m_telemetry.bondStressProbeKernelMs =
+                    std::chrono::duration<float, std::milli>(p2 - p1).count();
+                m_telemetry.bondStressProbeCopyMs =
+                    std::chrono::duration<float, std::milli>(p3 - p2c).count();
+            }
+
             const std::uint32_t groups = csr.groupCount;
             m_telemetry.bondStressBytesUp = 0;
             m_telemetry.bondStressBytesDown = 0;

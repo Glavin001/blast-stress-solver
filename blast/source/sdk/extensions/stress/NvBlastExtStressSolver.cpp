@@ -297,6 +297,11 @@ public:
     /// Which solver bonds re-solved this tick. Empty means "assume all".
     const std::vector<uint8_t>& bondDirty() const { return m_bondDirty; }
 
+    /// Advances only when a solve actually produced new impulses. The settled
+    /// early-out does not touch it, so an unchanged serial is a positive
+    /// statement that every impulse is bit-identical to the last observation.
+    uint64_t solveSerial() const { return m_solveSerial; }
+
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
     /// The resident device solver, for the bond-stress walk that consumes the
     /// impulses it already holds. Null when the GPU path is not active.
@@ -684,6 +689,7 @@ public:
                 m_forceColdStart = false;
                 m_inputsChanged = false;
                 m_lastSolveOnDevice = true;
+                ++m_solveSerial;
                 return;
             }
         }
@@ -698,6 +704,7 @@ public:
         m_forceColdStart = false;
         m_inputsChanged = false;
         m_lastSolveOnDevice = false;
+        ++m_solveSerial;
     }
 
     // Number of settled islands skipped in the last island-aware solve (Stage 3 instrumentation).
@@ -739,6 +746,7 @@ private:
     StressProcessor             m_stressProcessor;
     POD_Buffer<AngLin6>         m_velocities;
     bool                        m_lastSolveOnDevice{false};
+    uint64_t                    m_solveSerial{0};
     POD_Buffer<AngLin6>         m_impulses;
     /// Per-solver-bond dirty flags; see bondDirty().
     std::vector<uint8_t>        m_bondDirty;
@@ -1434,6 +1442,15 @@ public:
     std::vector<float> m_bsMaterialLimits;
     std::vector<uint32_t> m_bsGroupSwapDst;
     std::vector<uint32_t> m_bsGroupSwapSrc;
+    /// The inputs the cached answer belongs to, and the answer.
+    std::vector<float> m_bsHealthShadow;
+    std::vector<float> m_bsMaterialShadow;
+    std::vector<uint8_t> m_bsCacheMask;
+    std::vector<uint32_t> m_bsCacheRemovals;
+    uint64_t m_bsCacheSolveSerial{~0ull};
+    uint32_t m_bsCacheOverstressed{0};
+    bool m_bsCacheValid{false};
+    uint64_t m_bsSkippedLaunches{0};
     /// Set by anything that invalidates the mirror; cleared by a rebuild.
     bool m_bsCsrDirty{true};
     /// The CSR changed since the device last took a copy.
@@ -1473,6 +1490,10 @@ public:
     double m_bsPhHost{0.0};
     double m_bsPhPrep{0.0};
     double m_bsPhEnq{0.0};
+    double m_bsPrEmpty{0.0};
+    double m_bsPrKernel{0.0};
+    double m_bsPrKernel2{0.0};
+    double m_bsPrCopy{0.0};
     uint64_t m_bsPhUp{0};
     uint64_t m_bsPhDown{0};
     uint64_t m_bsPhCalls{0};
@@ -1958,12 +1979,13 @@ public:
                 fprintf(stderr,
                         "[bs-phase] calls=%llu per-call ms: upload %.3f kernel %.3f "
                         "readback %.3f | prep %.3f enqueue %.3f sync %.3f | host total %.3f "
-                        "| up %.2f MB down %.2f MB\n",
+                        "| skipped %llu/%llu launches | up %.2f MB down %.2f MB | PROBE empty %.3f nullkernel1 %.3f nullkernel2 %.3f copy4B %.3f\n",
                         (unsigned long long)m_bsPhCalls,
                         m_bsPhUpload / c, m_bsPhKernel / c, m_bsPhRead / c,
                         m_bsPhPrep / c, m_bsPhEnq / c, m_bsPhSync / c, m_bsPhHost / c,
                         double(m_bsPhUp) / c / 1048576.0,
-                        double(m_bsPhDown) / c / 1048576.0);
+                        double(m_bsPhDown) / c / 1048576.0,
+                        m_bsPrEmpty / c, m_bsPrKernel / c, m_bsPrKernel2 / c, m_bsPrCopy / c);
             }
             fprintf(stderr,
                     "[bond-stress-gpu] ticks=%llu attempts=%llu ranOnDevice=%llu "
@@ -2266,6 +2288,7 @@ public:
         }
         m_bsCsrDirty = false;
         m_bsCsrUploadDirty = true;
+        m_bsCacheValid = false;
         m_bsGroupSwapDst.clear();
         m_bsGroupSwapSrc.clear();
     }
@@ -2319,6 +2342,7 @@ public:
     /// is what keeps the device's removal order equal to the serial walk's.
     void bondStressCsrRemoveMember(uint32_t group, uint32_t blastBondIndex)
     {
+        m_bsCacheValid = false;
         if (!bondStressMirrorEnabled() || m_bsCsrDirty
             || group >= m_bsCsrGroupSize.size())
         {
@@ -2350,6 +2374,7 @@ public:
     /// entries move; the member ranges stay where they are.
     void bondStressCsrRemoveGroup(uint32_t group)
     {
+        m_bsCacheValid = false;
         if (!bondStressMirrorEnabled() || m_bsCsrDirty
             || group >= m_bsCsrGroupSize.size())
         {
@@ -2439,6 +2464,51 @@ public:
         }
 
         refreshBondStressMaterials();
+
+        // Nothing to launch if nothing changed.
+        //
+        // The walk is a pure function of health, the CSR, the material limits
+        // and the impulses. When none of them moved, last tick's answer is
+        // still the answer, and the kernel is not worth its submission: on a
+        // GPU shared with other work, getting ANY kernel onto an SM costs
+        // ~0.5 ms -- a null kernel measures the same as this one -- while the
+        // walk's own device time is ~0.07 ms. Skipping the launch removes the
+        // whole fixed cost rather than amortising it, and at rest that is
+        // every tick.
+        //
+        // This is the same idea as BLAST_SKIP_UNCHANGED_BOND_STRESS, which was
+        // measured at only 6.4% on the CPU walk and left off. The arithmetic
+        // is completely different here: on the CPU the skip saves per-bond
+        // work proportional to what it skips, on the GPU it saves a fixed cost
+        // that dwarfs the work.
+        const uint64_t solveSerial = m_solver.solveSerial();
+        const bool healthChanged =
+            m_bsHealthShadow.size() != m_bsBondNode0.size()
+            || memcmp(m_bsHealthShadow.data(), bondHealth,
+                      sizeof(float) * m_bsHealthShadow.size()) != 0;
+        const bool materialsChanged =
+            m_bsMaterialShadow != m_bsMaterialLimits;
+        const bool unchanged =
+            m_bsCacheValid && !healthChanged && !materialsChanged
+            && !m_bsCsrUploadDirty && solveSerial == m_bsCacheSolveSerial;
+        if (unchanged)
+        {
+            m_overstressedBondCount = m_bsCacheOverstressed;
+            if (!m_nodeOverstressed.empty())
+            {
+                memcpy(m_nodeOverstressed.begin(), m_bsCacheMask.data(),
+                       m_nodeOverstressed.size());
+            }
+            m_bsGpuStressNormal = nullptr;
+            m_bsGpuStressShear = nullptr;
+            m_bsGpuNormal = nullptr;
+            m_bsGpuCentroid = nullptr;
+            m_bsGpuActive = true;
+            m_bsGpuRemovals = m_bsCacheRemovals;
+            ++m_bsSkippedLaunches;
+            return true;
+        }
+
         ExtStressGpuBondStressTopology csr{};
         fillBondStressTopology(csr);
         if (csr.groupCount == 0)
@@ -2493,6 +2563,10 @@ public:
             m_bsPhHost += t.bondStressHostMs;
             m_bsPhPrep += t.bondStressPrepMs;
             m_bsPhEnq += t.bondStressEnqueueMs;
+            m_bsPrEmpty += t.bondStressProbeEmptyMs;
+            m_bsPrKernel += t.bondStressProbeKernelMs;
+            m_bsPrKernel2 += t.bondStressProbeKernel2Ms;
+            m_bsPrCopy += t.bondStressProbeCopyMs;
             m_bsPhUp += t.bondStressBytesUp;
             m_bsPhDown += t.bondStressBytesDown;
             ++m_bsPhCalls;
@@ -2501,6 +2575,16 @@ public:
         m_bsGpuRemovals.assign(
             result.bondIndicesToRemove,
             result.bondIndicesToRemove + result.removeCount);
+
+        // Snapshot the inputs this answer belongs to, and the answer itself.
+        m_bsHealthShadow.assign(bondHealth, bondHealth + m_bsBondNode0.size());
+        m_bsMaterialShadow = m_bsMaterialLimits;
+        m_bsCacheSolveSerial = solveSerial;
+        m_bsCacheOverstressed = m_overstressedBondCount;
+        m_bsCacheMask.assign(
+            m_nodeOverstressed.begin(), m_nodeOverstressed.begin() + m_nodeOverstressed.size());
+        m_bsCacheRemovals = m_bsGpuRemovals;
+        m_bsCacheValid = true;
         return true;
 #else
         NV_UNUSED(bondHealth);

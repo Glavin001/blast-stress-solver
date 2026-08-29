@@ -126,6 +126,10 @@ struct ExtStressGpuTelemetry
     float bondStressSyncMs{0.0f};
     float bondStressHostMs{0.0f};
     float bondStressPrepMs{0.0f};
+    float bondStressProbeEmptyMs{0.0f};
+    float bondStressProbeKernelMs{0.0f};
+    float bondStressProbeKernel2Ms{0.0f};
+    float bondStressProbeCopyMs{0.0f};
     float bondStressEnqueueMs{0.0f};
     std::uint64_t bondStressBytesUp{0};
     std::uint64_t bondStressBytesDown{0};
