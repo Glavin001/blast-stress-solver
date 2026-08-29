@@ -621,6 +621,15 @@ public:
     /// Verify-mode audit of the parallel bond-stress walk: group comparisons
     /// performed, and orderings that disagreed. Mismatches must be zero; zero
     /// CHECKS means the audit never ran and is inconclusive, not a pass.
+    /**
+    How often the device bond-stress walk answered from cache because none of
+    its inputs had moved, and how often it actually launched. Their ratio is
+    the skip rate, which is what decides whether the walk costs anything at
+    all on a settled structure.
+    */
+    virtual uint64_t                        getBondStressGpuSkipped() const = 0;
+    virtual uint64_t                        getBondStressGpuRuns() const = 0;
+
     virtual uint64_t                        getBondStressParallelChecks() const = 0;
     virtual uint64_t                        getBondStressParallelMismatches() const = 0;
     virtual uint32_t                        getGpuImpulseCopyCount() const = 0;

@@ -365,6 +365,8 @@ void ext_stress_solver_bond_stress_strip(ExtStressSolverHandle* handle, uint32_t
 void ext_stress_solver_bond_stress_complete(ExtStressSolverHandle* handle);
 uint32_t ext_stress_solver_bond_stress_strip_count(const ExtStressSolverHandle* handle);
 uint64_t ext_stress_solver_bond_stress_groups_skipped(const ExtStressSolverHandle* handle);
+uint64_t ext_stress_solver_bond_stress_gpu_skipped(const ExtStressSolverHandle* handle);
+uint64_t ext_stress_solver_bond_stress_gpu_runs(const ExtStressSolverHandle* handle);
 uint64_t ext_stress_solver_bond_stress_parallel_checks(const ExtStressSolverHandle* handle);
 uint64_t ext_stress_solver_bond_stress_parallel_mismatches(const ExtStressSolverHandle* handle);
 float ext_stress_solver_host_walk_in_milliseconds(const ExtStressSolverHandle* handle);

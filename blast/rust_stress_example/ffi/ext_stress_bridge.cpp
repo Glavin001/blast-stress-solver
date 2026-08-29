@@ -1554,6 +1554,20 @@ ext_stress_solver_bond_stress_groups_skipped(const ExtStressSolverHandle* handle
 }
 
 extern "C" uint64_t
+ext_stress_solver_bond_stress_gpu_skipped(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressGpuSkipped() : 0U;
+}
+
+extern "C" uint64_t
+ext_stress_solver_bond_stress_gpu_runs(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getBondStressGpuRuns() : 0U;
+}
+
+extern "C" uint64_t
 ext_stress_solver_bond_stress_parallel_checks(const ExtStressSolverHandle* handlePtr)
 {
     const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);

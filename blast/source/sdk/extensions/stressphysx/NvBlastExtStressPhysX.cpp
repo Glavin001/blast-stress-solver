@@ -1237,6 +1237,10 @@ public:
             ext_stress_solver_impulse_copy_milliseconds(m_solver);
         m_telemetry.bondStressGroupsSkipped =
             ext_stress_solver_bond_stress_groups_skipped(m_solver);
+        m_telemetry.bondStressGpuSkipped =
+            ext_stress_solver_bond_stress_gpu_skipped(m_solver);
+        m_telemetry.bondStressGpuRuns =
+            ext_stress_solver_bond_stress_gpu_runs(m_solver);
         m_telemetry.bondStressParallelChecks =
             ext_stress_solver_bond_stress_parallel_checks(m_solver);
         m_telemetry.bondStressParallelMismatches =

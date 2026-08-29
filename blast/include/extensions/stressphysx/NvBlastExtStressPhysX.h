@@ -349,6 +349,11 @@ struct ExtStressPhysXTelemetry
     uint64_t bondStressGroupsSkipped{0};
     /// Parallel-walk order audit; default-initialised so a build that never
     /// runs verify publishes zeros rather than garbage.
+    /// Device bond-stress walk: cache hits and actual launches. Explicit {0}
+    /// like everything else here -- a field without one has reported 4.5e18
+    /// in this struct before.
+    uint64_t bondStressGpuSkipped{0};
+    uint64_t bondStressGpuRuns{0};
     uint64_t bondStressParallelChecks{0};
     uint64_t bondStressParallelMismatches{0};
     double stressHostWalkInMilliseconds;

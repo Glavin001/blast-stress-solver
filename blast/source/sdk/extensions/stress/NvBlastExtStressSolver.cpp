@@ -1979,10 +1979,12 @@ public:
                 fprintf(stderr,
                         "[bs-phase] calls=%llu per-call ms: upload %.3f kernel %.3f "
                         "readback %.3f | prep %.3f enqueue %.3f sync %.3f | host total %.3f "
-                        "| skipped %llu/%llu launches | up %.2f MB down %.2f MB | PROBE empty %.3f nullkernel1 %.3f nullkernel2 %.3f copy4B %.3f\n",
+                        "| skipped %llu of %llu | up %.2f MB down %.2f MB | PROBE empty %.3f nullkernel1 %.3f nullkernel2 %.3f copy4B %.3f\n",
                         (unsigned long long)m_bsPhCalls,
                         m_bsPhUpload / c, m_bsPhKernel / c, m_bsPhRead / c,
                         m_bsPhPrep / c, m_bsPhEnq / c, m_bsPhSync / c, m_bsPhHost / c,
+                        (unsigned long long)m_bsSkippedLaunches,
+                        (unsigned long long)(m_bsSkippedLaunches + m_bsPhCalls),
                         double(m_bsPhUp) / c / 1048576.0,
                         double(m_bsPhDown) / c / 1048576.0,
                         m_bsPrEmpty / c, m_bsPrKernel / c, m_bsPrKernel2 / c, m_bsPrCopy / c);
@@ -3040,6 +3042,17 @@ public:
 #endif
     }
 
+    /// The device walk's two outcomes, reported so the skip rate is visible
+    /// from a live report instead of only on stderr.
+    ///
+    /// skipped = answered from cache because every input was unchanged, no
+    ///           kernel launched at all
+    /// runs    = actually launched
+    /// The two are disjoint and sum to the ticks the device path was taken;
+    /// m_bsGpuRuns is deliberately NOT used here because it counts both.
+    uint64_t getBondStressGpuSkipped() const { return m_bsSkippedLaunches; }
+    uint64_t getBondStressGpuRuns() const { return m_bsPhCalls; }
+
     uint64_t getBondStressGpuChecks() const { return m_bsGpuChecks; }
     uint64_t getBondStressGpuMismatches() const { return m_bsGpuMismatches; }
 
@@ -3720,6 +3733,16 @@ public:
     virtual uint32_t                        getBondStressStripCount() const override
     {
         return m_graphProcessor->bondStressStripCount();
+    }
+
+    virtual uint64_t                        getBondStressGpuSkipped() const override
+    {
+        return m_graphProcessor->getBondStressGpuSkipped();
+    }
+
+    virtual uint64_t                        getBondStressGpuRuns() const override
+    {
+        return m_graphProcessor->getBondStressGpuRuns();
     }
 
     virtual uint64_t                        getBondStressParallelChecks() const override
