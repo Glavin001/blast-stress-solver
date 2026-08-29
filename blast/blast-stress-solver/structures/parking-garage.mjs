@@ -21,6 +21,11 @@ export const GARAGE = {
   levels: 5,
   levelHeight: 3.1,
   slabThickness: 0.3,
+  // 0.55, and widening it does NOT help, which is worth recording. A joint's
+  // capacity here is its bond area, so a fatter column looked like the way to
+  // strengthen the slab connection -- but a fatter column is also heavier, and
+  // its own joints carry that. 0.64 m took intact breakage from 70 bonds to
+  // 226, and 0.70 put a column through the stair core.
   columnSize: 0.55,
   bayX: 7.6,
   bayZ: 8.0,
@@ -52,6 +57,13 @@ export const GARAGE = {
   // Sized to deliver the real 3.2x instead. At 1.0 m the pad reads as a
   // column capital rather than a drop panel, which is the same detail at the
   // other end of its size range and honest about what it is doing.
+  // A flared column head -- the classic mushroom-slab capital, and here it is
+  // load-bearing in a very literal sense. The drop panel bonds to the slab over
+  // its whole 2.4 m face (5.76 m^2), but the COLUMN bonds to the panel over its
+  // own 0.55 m section (0.30 m^2). That joint is the weak link, and it is the
+  // one that failed under live load. Flaring the head widens exactly it.
+  capitalSize: 1.3,
+  capitalHeight: 0.35,
   dropPanelSize: 2.4,      // plan size of the thickened pad
   dropPanelThickness: 0.2, // extra depth below the slab soffit
   // Cars. A parking deck is designed for 2.5 kPa of live load, and leaving it
@@ -64,21 +76,36 @@ export const GARAGE = {
   // 2.5 kPa is 2500 / (0.30 * 9.81) = 850 kg/m^3 on top of concrete's 2400,
   // so 35% more weight -- and that is the difference between joints at 2.4x
   // their elastic limit and joints past the 3x that fails them.
-  // 0 for now, and the mechanism is the deliverable rather than the number.
+  // 0, and the number is the finding rather than the mechanism.
   //
-  // 2500 Pa is the real design value and it is what SHOULD be here: without it
-  // the columns sit at 6% of capacity, which is why six of them can hold the
-  // whole building and removing 90% of the grid changes nothing. With it, the
-  // punching zone finally governs -- column-to-slab becomes the top joint class
-  // by a wide margin, which is exactly the failure mode a flat plate has.
+  // 2500 Pa is the real design value and it is what SHOULD be here. Switched on
+  // it does exactly what the theory predicts -- column-to-slab becomes the
+  // governing joint class, which is punching shear on a flat plate, the failure
+  // mode this building should have. But the connection cannot carry it: 70 to
+  // 145 bonds go and the garage does not settle.
   //
-  // It is off because the connection cannot yet carry it: 107 bonds go and the
-  // garage does not settle. That is the honest reading -- this geometry, with
-  // realistic concrete, is not sized for its own design live load. Fixing it is
-  // a sizing iteration on the column head (a larger drop panel, a wider column,
-  // or a shear-reinforced connection), not another material number.
+  // Two sizings were tried against that and neither worked. A column CAPITAL
+  // (kept below, it is a real detail and it helps) widens capital-to-panel but
+  // not column-to-capital, which is the joint that fails. A fatter column
+  // widens that joint and is also heavier, so its own joints carry more: 0.64 m
+  // took intact breakage from 70 bonds to 226.
   //
-  // Set to 2500 to resume that work; everything downstream already handles it.
+  // What that points at is the model rather than the garage. Capacity here is
+  // bond AREA, so every way of strengthening a connection also adds weight to
+  // it, and the two nearly cancel. Real punching capacity grows with the
+  // PERIMETER at the panel edge, which is why a real drop panel earns its
+  // keep and a modelled one does not. That is the solver change written up in
+  // garage-design.md, and it is what this needs before live load can go on.
+  //
+  // Leaving it out is why the columns read as barely working: at self weight
+  // alone they sit at 6% of capacity, so six of them can carry the whole
+  // building and removing 90% of the grid changes nothing visible. With it,
+  // column-to-slab becomes the governing joint class -- punching shear on a
+  // flat plate, which is the failure mode this building should have.
+  //
+  // On a 300 mm slab this is 850 kg/m^3 on top of concrete's 2400: 35% more
+  // weight, carried as density rather than as thousands of car bodies, which
+  // is how a design check does it too.
   liveLoadPa: 0,
   // The gravity and material this design is checked against. Solving
   // sigma = 0.75*rho*g*L^2/t for the span returns 8.0 m here, which is the bay
@@ -159,8 +186,14 @@ export function buildParkingGarage(cfg = {}) {
         // The column stops at the drop panel's soffit; the panel carries the
         // last 200 mm up to the deck. Running it to deckBase instead puts the
         // two inside each other -- 725 shared-volume pairs, caught by the gate.
+        const colTop = deckBase(k) - dpT - C.capitalHeight;
         b.box({ type: 'column', material: 'reinforced-concrete',
-          min: [x - cs, lo, z - cs], max: [x + cs, deckBase(k) - dpT, z + cs] });
+          min: [x - cs, lo, z - cs], max: [x + cs, colTop, z + cs] });
+        // The capital, flaring the head into the drop panel above it.
+        const cap = C.capitalSize / 2;
+        b.box({ type: 'column', material: 'reinforced-concrete',
+          min: [x - cap, colTop, z - cap],
+          max: [x + cap, deckBase(k) - dpT, z + cap] });
         // The drop panel sits directly under the deck this column supports,
         // spreading the punching perimeter before the load reaches the plate.
         const dp = C.dropPanelSize / 2;
