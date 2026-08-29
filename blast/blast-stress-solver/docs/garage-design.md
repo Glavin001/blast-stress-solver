@@ -347,3 +347,38 @@ visits.
 Concretely, in a stripped garage: pick a bond the report shows above 1.0, and
 check `isNodeOverstressed` for both its nodes and whether its group was skipped
 that tick. If the group is clean while the bond is hot, that is the bug.
+
+### The gate hypothesis is WRONG -- tested and falsified
+
+`BLAST_FRACTURE_NODE_SKIP=0` already exists and restores the full walk. With it
+off, the stripped garage behaves identically: 90% of columns cut, 0.00 m sag,
+0 bonds broken, peak still 2.85. So the damage path IS visiting these bonds.
+The gate is not the reason they survive.
+
+Which leaves the arithmetic, and it is worth writing out because it is where the
+next person should start:
+
+  - a joint reports 2.9x elastic. At the shipped band of 3, fatal is 3x elastic,
+    so it sits just UNDER fatal
+  - stressMultiplier = (2.9 - 1)/(3 - 1) = 0.95, so it takes gradual damage
+    rather than breaking outright
+  - gradual damage reduces health, health is area, stress is force/area -- so
+    as it damages its stress should RISE, cross 3x, and then break outright
+  - arrest floors health at 10% of original, which would put stress at ~29x
+    elastic, far past fatal
+
+So either the stress is not rising as health falls, or health is not falling.
+Both are checkable in one place: print a single bond's health and stress on
+consecutive ticks while it sits above its elastic limit. If health is flat, the
+damage is not being applied; if health falls and stress does not follow, the
+stress is being computed against the static area rather than the remaining
+health.
+
+That second one is worth suspecting: `getBondUtilisations` and the strip walk
+both take an area argument, and the GPU upload comment in
+NvBlastExtStressSolver.cpp notes that health seeds from area and that "bonds
+partially damaged before a topology rebuild re-seed at full area here". If the
+stress used for damage is computed against the ASSET area rather than remaining
+health, no amount of damage would ever raise it, and a bond just under fatal
+would sit there forever taking 0.95-multiplier damage against a floor -- which
+is exactly the observed behaviour.
