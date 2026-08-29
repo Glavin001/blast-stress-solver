@@ -109,3 +109,47 @@ capacity grows with the PERIMETER at the panel edge and not with the pad's
 area. That over-credit is why sizing the panel produced non-monotonic results
 across 1.0, 1.6 and 2.4 m, and it is a solver change rather than an authoring
 one.
+
+## Third lever tried: a beam-and-slab deck. Also not sufficient.
+
+Beams are the textbook answer at this load, and they are the only lever that
+leaves the column grid where parking needs it -- 7.5 m minimum for an aisle --
+while shortening what the SLAB has to span. Parameterised the same way:
+
+    intermediate beams per bay = ceil(bay / maxSlabSpan) - 1
+
+which returns **0 at Earth gravity** (a flat plate, the original design) and
+**1 at 20 m/s^2**, putting the slab on a 4.0 m span where it develops 1.9 MPa
+against concrete's 3.8. Two details fell out of it that are worth keeping:
+
+  - drop panels belong ONLY to the flat-plate design. Once a deck has beams
+    they frame into the column head and deliver load in bearing, so there is no
+    punching perimeter left to thicken -- and a pad there occupies the same
+    space as the beam crossing it (745 shared-volume pairs).
+  - the intermediate beams must be segmented at each primary, or four beams
+    meet at a point and put themselves inside each other. Same crossing
+    mistake as 432 Park's first beam grid, 1,434 pairs.
+
+It still does not stand: 4,693 bonds, and slab-to-slab is STILL the dominant
+class at 3,400. So the deck seams crack whether the slab spans 8.0 m or 4.0 m,
+which means the flexural span is not what is driving them -- something else in
+the deck is generating that tension, and finding it is where the next attempt
+should start rather than reaching for a fourth lever.
+
+## Where this leaves the decision
+
+Three levers tried against realistic concrete, all measured, none sufficient:
+
+    thicker plate    344 -> 998 bonds     worse; the plate is its own load
+    tighter grid     drop panel through the ramp bay; garage unparkable
+    beam-and-slab    4,693 bonds; slab-to-slab still dominant
+
+The shipped garage keeps drop panels and the current material table, and passes
+its gate. The realistic table is a one-line change away and makes the garage
+fail correctly (40 / 74 / 154 bonds at 25 / 50 / 75% of columns cut, then
+collapse at 90%) at the cost of not standing intact.
+
+The alternative worth weighing: every building in this set is correctly
+designed for 9.81, and 20 m/s^2 was chosen for how the PLAYER moves, not for
+the structures. VIBE_WORLD_GRAVITY=9.81 makes the whole problem disappear
+without a line of structural work.
