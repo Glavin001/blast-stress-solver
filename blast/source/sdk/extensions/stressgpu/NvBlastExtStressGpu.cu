@@ -293,6 +293,18 @@ static bool fullLaunchCapacity()
 /// cudaGraphExecUpdate patches. Only three things change the NODE SET:
 /// warmStart (it adds/removes the gather+subtract pair), applyDamage and
 /// maxIterations; the latter two are constant in practice.
+/// Keep the captured graph's NODE SET independent of warmStart, so a
+/// warm-start flip is a parameter change the exec can absorb instead of a
+/// rebuild. BLAST_GPU_STABLE_GRAPH=0 restores the branch.
+static bool stableGraphEnabled()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_GPU_STABLE_GRAPH");
+        return raw == nullptr || raw[0] != '0';
+    }();
+    return enabled;
+}
+
 static bool graphUpdateEnabled()
 {
     static const bool enabled = [] {
@@ -3993,7 +4005,27 @@ uploadIslands();
             reciprocalAngularImpulseScale,
             warmStart);
         m_kernelProfile.end(m_stream);
-        if (warmStart)
+        // Deliberately NOT guarded on warmStart. These two are a no-op on a
+        // cold start, exactly: initializeSolve has just written impulses = {},
+        // gatherRightMultiply WRITES each active node's slot rather than
+        // accumulating into it (see the comment in rightMultiply), so
+        // m_projectedDirection comes out zero, and subtractResidual then
+        // subtracts zero from the residual.
+        //
+        // Running them unconditionally is what makes warmStart a pure kernel
+        // ARGUMENT rather than a change to the graph's node set. That is worth
+        // two no-op kernels on cold-start ticks: with the branch in place, a
+        // warm-start flip forced a full graph re-instantiation, and
+        // BLAST_GPU_WHOLE_RESET_ON_TOPOLOGY flips it on every fracture tick --
+        // measured at 33.6% of solves even after cudaGraphExecUpdate had
+        // removed every other recapture driver.
+        //
+        // That flag cannot simply be turned off to avoid this: it is load
+        // bearing for the scene. Without it the suite fails T2 "one shot
+        // pulverizes" (3726 bonds vs a <=2028 band), T2 bodies (1087 vs <=707)
+        // and T4 awake-declined (0.42 vs <=0.10). So the graph has to tolerate
+        // the flip instead.
+        if (warmStart || stableGraphEnabled())
         {
             rightMultiply(m_impulses, m_projectedDirection, islandSkip);
             m_kernelProfile.begin("subtractResidual", m_stream);
@@ -4204,7 +4236,7 @@ uploadIslands();
     {
         return m_graphExec != nullptr
             && m_graph != nullptr
-            && m_graphWarmStart == warmStart
+            && (stableGraphEnabled() || m_graphWarmStart == warmStart)
             && m_graphParams.maxIterations == params.maxIterations
             && m_graphParams.applyDamage == params.applyDamage;
     }
