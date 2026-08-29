@@ -278,6 +278,30 @@ static bool fullLaunchCapacity()
     return enabled;
 }
 
+/// Patch the instantiated graph in place instead of re-instantiating it.
+/// BLAST_GPU_GRAPH_UPDATE=0 restores destroy + cudaGraphInstantiate.
+///
+/// Measured: the graph was being re-instantiated on 80% of solves at 0.644 ms
+/// each -- 0.516 ms/solve of pure host overhead, MORE than the mid-enqueue
+/// sync beside it. applyTopologyChange destroyed it whenever grid sizes or the
+/// per-island memset width changed, and graphMatches forces it again whenever
+/// the baked launch caps drift outside a 4x band.
+///
+/// None of that is structural. Every device pointer is allocated once in the
+/// constructor and never moves, so a fracture tick changes kernel gridDim, a
+/// few scalar arguments and one memset width -- exactly what
+/// cudaGraphExecUpdate patches. Only three things change the NODE SET:
+/// warmStart (it adds/removes the gather+subtract pair), applyDamage and
+/// maxIterations; the latter two are constant in practice.
+static bool graphUpdateEnabled()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_GPU_GRAPH_UPDATE");
+        return raw == nullptr || raw[0] != '0';
+    }();
+    return enabled;
+}
+
 static bool wholeResetOnTopology()
 {
     static const bool enabled = [] {
@@ -1774,14 +1798,21 @@ uploadIslands();
         {
             fprintf(stderr,
                     "[gpu-graph] solves=%u listRefresh=%u listSkip=%u (%.1f%% refreshed) "
-                    "graphRecapture=%u (%.2f%% of solves) midSync=%.1f ms total "
-                    "(%.4f ms/solve)\n",
+                    "graphRecapture=%u (%.2f%% of solves) midSync=%.4f ms/solve "
+                    "| recapture %.4f ms/solve (%.3f each) "
+                    "| graphUpdate=%u %.4f ms/solve (%.3f each)\n",
                     m_statSolves, m_statListRefreshes, m_statListSkips,
                     100.0 * double(m_statListRefreshes)
                         / double(m_statListRefreshes + m_statListSkips + 1u),
                     m_statGraphRecaptures,
                     100.0 * double(m_statGraphRecaptures) / double(m_statSolves),
-                    m_statMidSyncMs, m_statMidSyncMs / double(m_statSolves));
+                    m_statMidSyncMs / double(m_statSolves),
+                    (m_statCaptureMs + m_statInstantiateMs) / double(m_statSolves),
+                    (m_statCaptureMs + m_statInstantiateMs)
+                        / double(m_statGraphRecaptures + 1u),
+                    m_statGraphUpdates,
+                    m_statUpdateMs / double(m_statSolves),
+                    m_statUpdateMs / double(m_statGraphUpdates + 1u));
         }
         return true;
     }
@@ -3094,16 +3125,24 @@ computeIslands();
 uploadIslands();
         uploadNodeBondCsr();
         // Grid sizes and the per-island memset lengths are baked into the
-        // captured graph, and both just changed.
-        if (m_graphExec)
+        // captured graph, and both just changed -- but they are node
+        // PARAMETERS, not structure, so the exec can be patched rather than
+        // rebuilt. Destroying it here is what made every fracture tick pay a
+        // full re-instantiation. executeSolve now decides, and still falls back
+        // to destroy + instantiate if the patch will not take.
+        m_graphParamsDirty = true;
+        if (!graphUpdateEnabled())
         {
-            checkCuda(cudaGraphExecDestroy(m_graphExec), "destroy solver graph exec");
-            m_graphExec = nullptr;
-        }
-        if (m_graph)
-        {
-            checkCuda(cudaGraphDestroy(m_graph), "destroy solver graph");
-            m_graph = nullptr;
+            if (m_graphExec)
+            {
+                checkCuda(cudaGraphExecDestroy(m_graphExec), "destroy solver graph exec");
+                m_graphExec = nullptr;
+            }
+            if (m_graph)
+            {
+                checkCuda(cudaGraphDestroy(m_graph), "destroy solver graph");
+                m_graph = nullptr;
+            }
         }
         if (wholeResetOnTopology())
         {
@@ -4156,6 +4195,20 @@ uploadIslands();
         return std::min(cap, full);
     }
 
+    /// The subset of graphMatches that changes the graph's NODE SET rather
+    /// than its node parameters. When this holds, a changed solve can be
+    /// patched into the existing exec instead of rebuilt. Deliberately excludes
+    /// skipSettledIslands: it only selects whether the kernels receive
+    /// m_islandSkip or nullptr, and a pointer arg is a parameter like any other.
+    bool graphTopologyMatches(const ExtStressGpuSolveParams& params, bool warmStart) const
+    {
+        return m_graphExec != nullptr
+            && m_graph != nullptr
+            && m_graphWarmStart == warmStart
+            && m_graphParams.maxIterations == params.maxIterations
+            && m_graphParams.applyDamage == params.applyDamage;
+    }
+
     bool graphMatches(const ExtStressGpuSolveParams& params, bool warmStart) const
     {
         return m_graphExec
@@ -4201,12 +4254,49 @@ uploadIslands();
             ++m_profiledSolves;
             return;
         }
-        if (!graphMatches(params, warmStart))
+        if (m_graphParamsDirty || !graphMatches(params, warmStart))
         {
+            m_graphParamsDirty = false;
             m_graphBondCap = fullLaunchCapacity()
                 ? m_bondCount : launchCapacity(m_activeBondCount, m_bondCount);
             m_graphNodeCap = fullLaunchCapacity()
                 ? m_nodeCount : launchCapacity(m_activeNodeCount, m_nodeCount);
+            if (graphUpdateEnabled() && graphTopologyMatches(params, warmStart))
+            {
+                const auto updateStart = std::chrono::steady_clock::now();
+                cudaGraph_t fresh = nullptr;
+                bool captured =
+                    cudaStreamBeginCapture(m_stream, cudaStreamCaptureModeThreadLocal)
+                    == cudaSuccess;
+                if (captured)
+                {
+                    launchSolve(params);
+                    captured = cudaStreamEndCapture(m_stream, &fresh) == cudaSuccess
+                        && fresh != nullptr;
+                }
+                if (captured)
+                {
+                    cudaGraphExecUpdateResultInfo info{};
+                    const cudaError_t rc = cudaGraphExecUpdate(m_graphExec, fresh, &info);
+                    if (rc == cudaSuccess && info.result == cudaGraphExecUpdateSuccess)
+                    {
+                        cudaGraphDestroy(m_graph);
+                        m_graph = fresh;
+                        m_graphParams = params;
+                        m_graphWarmStart = warmStart;
+                        ++m_statGraphUpdates;
+                        m_statUpdateMs += std::chrono::duration<double, std::milli>(
+                                              std::chrono::steady_clock::now()
+                                              - updateStart).count();
+                        checkCuda(cudaGraphLaunch(m_graphExec, m_stream),
+                                  "launch patched solver graph");
+                        return;
+                    }
+                    cudaGraphDestroy(fresh);
+                }
+                // Do not let a failed attempt poison the fallback's error state.
+                cudaGetLastError();
+            }
             if (m_graphExec)
             {
                 checkCuda(cudaGraphExecDestroy(m_graphExec), "destroy old solver graph exec");
@@ -4217,6 +4307,7 @@ uploadIslands();
                 checkCuda(cudaGraphDestroy(m_graph), "destroy old solver graph");
                 m_graph = nullptr;
             }
+            const auto recaptureStart = std::chrono::steady_clock::now();
             checkCuda(
                 cudaStreamBeginCapture(m_stream, cudaStreamCaptureModeThreadLocal),
                 "begin solver graph capture");
@@ -4224,10 +4315,15 @@ uploadIslands();
             checkCuda(
                 cudaStreamEndCapture(m_stream, &m_graph),
                 "end solver graph capture");
+            const auto captureDone = std::chrono::steady_clock::now();
             checkCuda(
                 (++m_statGraphRecaptures,
                  cudaGraphInstantiate(&m_graphExec, m_graph, 0)),
                 "instantiate solver graph");
+            m_statCaptureMs += std::chrono::duration<double, std::milli>(
+                                   captureDone - recaptureStart).count();
+            m_statInstantiateMs += std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - captureDone).count();
             m_graphParams = params;
             m_graphWarmStart = warmStart;
         }
@@ -4393,6 +4489,11 @@ uploadIslands();
     std::uint32_t m_statListSkips{0};
     std::uint32_t m_statGraphRecaptures{0};
     double m_statMidSyncMs{0.0};
+    double m_statCaptureMs{0.0};
+    double m_statInstantiateMs{0.0};
+    std::uint32_t m_statGraphUpdates{0};
+    double m_statUpdateMs{0.0};
+    bool m_graphParamsDirty{false};
 
     // Device bond-stress walk. Capacities grow only.
     std::uint32_t* m_bsGroupBegin{nullptr};
