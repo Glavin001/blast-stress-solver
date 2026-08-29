@@ -85,6 +85,20 @@ export function buildPetronas(cfg = {}) {
       b.box({ type: 'foundation', material: 'footing-anchor',
         min: [x - 1.0, -C.footingDepth, z - 1.0], max: [x + 1.0, 0, z + 1.0],
         fixed: true, fracture: false });
+
+      // And under the perimeter ring, at the BASE tier's radius. Without
+      // these the new perimeter columns had nothing to stand on but the
+      // podium slab, and adding them made the load path WORSE rather than
+      // better -- 65.3% of the weight reaching a support fell to 59.3%,
+      // because a column that ends on a plate is one more thing that plate is
+      // carrying.
+      const baseTierR = C.radius * (1 - C.lobeAmplitude) - 1.2;
+      if (baseTierR > colR + 2.0) {
+        const [px, pz] = P(baseTierR, t);
+        b.box({ type: 'foundation', material: 'footing-anchor',
+          min: [px - 1.0, -C.footingDepth, pz - 1.0], max: [px + 1.0, 0, pz + 1.0],
+          fixed: true, fracture: false });
+      }
     }
 
     // A podium ring under the whole plan, sitting on the footings — which stop
@@ -145,12 +159,37 @@ export function buildPetronas(cfg = {}) {
       });
       staircase(b, { at: stairAt, y0, y1: slabTop(k), axis: 'x', material: 'reinforced-concrete', newelPost: false });
 
-      // Columns for this storey.
+      // Columns for this storey: an inner ring, and a perimeter ring that
+      // steps in with the setbacks.
+      //
+      // There was only the inner ring, at colR = 10.5 m, deliberately placed
+      // inside the SMALLEST setback so it could stack the whole height. That
+      // left every floor plate spanning 4.5 m from the core to it and then
+      // CANTILEVERING 9.0 m past it to the facade at 19.5 m. A cantilever's
+      // moment is wL^2/2, so on a 0.32 m plate that is 334 kN.m/m against a
+      // section modulus of 0.0171 -- 19.6 MPa on a 14.4 MPa tension limit.
+      // Over the limit standing still, before anyone loads it, which is why
+      // the build's own walk found only 65% of the weight reaching a support
+      // and the tower kept breaking bonds five minutes in.
+      //
+      // The real towers carry their floors on a perimeter ring that steps in
+      // at each setback, and that is what this is: a ring at the tier's own
+      // radius, present only while the facade is still outside it. The plate
+      // then spans 4.5 m in and about 4 m out instead of hanging 9 m in air.
       for (let i = 0; i < C.segments; i += 1) {
         const t = (2 * Math.PI * i) / C.segments;
         const [x, z] = P(colR, t);
         b.box({ type: 'column', material: 'reinforced-concrete',
           min: [x - cs, y0, z - cs], max: [x + cs, slabBase(k), z + cs] });
+
+        // Perimeter ring, on the segment boundary, just inside this tier's
+        // own lobe minimum so it never pokes through the facade it carries.
+        const tierR = meanR(k) * (1 - C.lobeAmplitude) - 1.2;
+        if (tierR > colR + 2.0) {
+          const [px, pz] = P(tierR, t);
+          b.box({ type: 'column', material: 'reinforced-concrete',
+            min: [px - cs, y0, pz - cs], max: [px + cs, slabBase(k), pz + cs] });
+        }
       }
 
       // ── the floor: a ring of trapezoids from the core out to the lobes ───
