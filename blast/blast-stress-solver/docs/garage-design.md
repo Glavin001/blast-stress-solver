@@ -153,3 +153,43 @@ The alternative worth weighing: every building in this set is correctly
 designed for 9.81, and 20 m/s^2 was chosen for how the PLAYER moves, not for
 the structures. VIBE_WORLD_GRAVITY=9.81 makes the whole problem disappear
 without a line of structural work.
+
+## The number that resolves it
+
+Realistic concrete at the DESIGN gravity, 9.81, still breaks 194 bonds. So it
+is not simply that this world is heavy. The flexural check says why:
+
+    g = 9.81, L = 8.0 m, t = 0.30 m   ->   sigma = 3.77 MPa
+    plain concrete in tension                     3.80 MPa
+
+The deck is designed to 99% of its limit, with no safety factor at all. Any
+dynamic transient takes it over, which is exactly what 194 bonds of settling
+damage is. Real design carries 1.5 or more.
+
+Put the safety factor in and solve for the bay:
+
+    g       safety   bay
+    9.81      1.0    8.0 m      <- what is authored
+    9.81      1.5    6.6 m
+    20        1.0    5.6 m
+    20        1.5    4.6 m
+
+**A parking bay needs 7.5 m** for an aisle plus spaces. So with plain concrete
+there is no bay that is both parkable and safe, at either gravity. That is not
+a bug in the garage; it is why real garages are not built from plain concrete.
+They are reinforced, and the rebar carries the tension across every crack.
+
+Which is the actual finding. This model has no reinforcement: a fracture seam
+is plain concrete, so either it gets concrete's 3.8 MPa and no realistic garage
+can span a parking bay, or it keeps 14.4 MPa -- rebar's continuity, smeared
+into the concrete -- and nothing ever cracks or punches. Both are wrong in
+opposite directions, and no material number fixes it because the missing thing
+is not a number.
+
+What would: a seam that carries tension past cracking at a REDUCED but non-zero
+strength, which is what a reinforced crack does -- concrete lets go at 3.8 MPa
+and the steel across it keeps carrying to yield. That is the elastic-to-fatal
+band this solver already has, used properly: elastic at concrete's cracking
+stress, fatal at the reinforcement's capacity, with the band between them wide
+rather than the 3x it is now. It is a materials change, it is expressible
+today, and it is the first thing to try next.
