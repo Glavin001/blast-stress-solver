@@ -1862,6 +1862,16 @@ uploadIslands();
         m_statPlanMs += m_telemetry.hostPlanMilliseconds;
         m_statFinishMs += m_telemetry.hostFinishMilliseconds;
         m_statWaitMs += m_telemetry.hostSyncMilliseconds - m_statLastMidSync;
+        // Convergence, not just cost. The whole question about the incremental
+        // topology path is whether keeping a stale warm start leaves the solve
+        // UNCONVERGED at the iteration cap -- an unconverged stress field is
+        // what decides which bonds break, so it is a correctness signal, not a
+        // performance one.
+        m_statIterations += m_telemetry.iterations;
+        if (!m_telemetry.converged)
+        {
+            ++m_statUnconverged;
+        }
         if (graphStatsEnabled() && (++m_statSolves % 600u) == 0u)
         {
             fprintf(stderr,
@@ -1891,7 +1901,8 @@ uploadIslands();
                     "[%u calls, %.3f each: islands=%.3f csr=%.3f group=%.3f "
                     "upload=%.3f memset=%.3f | %.2f MB in %u copies, "
                     "stageMemcpy=%.3f, %u growths, %.2f GB/s]) "
-                    "wait=%.4f finish=%.4f ms/solve\n",
+                    "wait=%.4f finish=%.4f ms/solve "
+                    "| iters=%.1f/solve unconverged=%u (%.1f%% of solves)\n",
                     m_statPlanMs / double(m_statSolves),
                     m_statUpdateMs / double(m_statSolves),
                     m_statMidSyncMs / double(m_statSolves),
@@ -1913,7 +1924,10 @@ uploadIslands();
                     (double(m_statTopoBytes) / 1.0e9)
                         / ((m_statTopoUploadMs > 0.0 ? m_statTopoUploadMs : 1.0) / 1000.0),
                     m_statWaitMs / double(m_statSolves),
-                    m_statFinishMs / double(m_statSolves));
+                    m_statFinishMs / double(m_statSolves),
+                    double(m_statIterations) / double(m_statSolves),
+                    m_statUnconverged,
+                    100.0 * double(m_statUnconverged) / double(m_statSolves));
         }
         return true;
     }
@@ -4702,6 +4716,8 @@ private:
     std::uint32_t m_statGraphRecaptures{0};
     double m_statMidSyncMs{0.0};
     double m_statPlanMs{0.0};
+    std::uint64_t m_statIterations{0};
+    std::uint32_t m_statUnconverged{0};
     double m_statFinishMs{0.0};
     double m_statWaitMs{0.0};
     double m_statLastMidSync{0.0};
