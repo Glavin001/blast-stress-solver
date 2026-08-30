@@ -1100,6 +1100,7 @@ public:
             // The ONLY place localVel is ever written. That is what lets the
             // walk-in below skip itself on a quiet tick.
             m_velocitiesTouched = true;
+            m_localVelDirty = true;
         }
     }
 
@@ -1574,6 +1575,7 @@ public:
     float m_hostWalkInMilliseconds{0.0f};
     // Walk-in skip state. See the comment at the walk-in in solve().
     bool m_velocitiesTouched{true};
+    bool m_localVelDirty{true};
     size_t m_walkInNodeCount{0};
     uint64_t m_walkInSkipped{0};
     float m_hostResetMilliseconds{0.0f};
@@ -1621,10 +1623,20 @@ private:
 
     void resetVelocities()
     {
+        // Zeroing localVel is only necessary if something wrote it, and
+        // addNodeForce is the only thing that ever does. On a quiet tick they
+        // are all already zero, and this pass is a full sweep of ~87,000 nodes
+        // to write zeros over zeros -- which became the single largest idle
+        // cost (1.07 ms) once gravity and the walk-in stopped dominating.
+        if (!m_localVelDirty)
+        {
+            return;
+        }
         for (auto& node : m_nodesData)
         {
             node.localVel = NvVec3(NvZero);
         }
+        m_localVelDirty = false;
     }
 
     void resetCrushState()

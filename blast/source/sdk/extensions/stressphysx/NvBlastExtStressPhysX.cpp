@@ -787,14 +787,27 @@ public:
             const char* raw = std::getenv("BLAST_GRAVITY_SKIP_SINGLETON");
             return raw == nullptr || std::string(raw)[0] != '0';
         }();
-        // The skip needs the PREVIOUS tick to have applied gravity for these
-        // same poses, so one unchanged tick in isolation is not enough: the
-        // first quiet tick still applies, and only the ones after it skip.
+        // m_loadsValid means "the solver already holds gravity loads computed
+        // for exactly this snapshot". It goes true when we apply and STAYS
+        // true while the snapshot is unchanged, because the solver keeps its
+        // velocity array between ticks -- reapplying identical loads to
+        // identical poses cannot change anything.
+        //
+        // It previously flipped -- `m_lastSnapshotApplied = !skipLoads` --
+        // which quietly built an ALTERNATING skip: apply, skip, apply, skip.
+        // It looked like it worked (idle did get faster) and it left exactly
+        // half the benefit on the floor. The tell was that 50.0% of idle ticks
+        // were expensive while nothing physical correlated with which ones --
+        // no contact, no wake, no pose change, no body count change. A 50%
+        // split with no physical correlate is a state machine, not a scene.
         const bool unchanged = gravityQuietSkipEnabled() && snapshotUnchanged(bodies, bodyCount);
-        const bool skipLoads = unchanged && m_lastSnapshotApplied;
+        const bool skipLoads = unchanged && m_loadsValid;
         m_lastSnapshot.assign(bodies, bodies + bodyCount);
         m_lastSnapshotCount = bodyCount;
-        m_lastSnapshotApplied = !skipLoads;
+        if (!skipLoads)
+        {
+            m_loadsValid = true;   // about to apply, for these exact poses
+        }
         if (skipLoads)
         {
             ++m_telemetry.gravityQuietSkips;
@@ -4178,7 +4191,7 @@ private:
     // and comparing it is free next to the ~87,000 node writes it avoids.
     std::vector<ExtStressPhysXBodySnapshot> m_lastSnapshot;
     uint32_t m_lastSnapshotCount{0};
-    bool m_lastSnapshotApplied{false};
+    bool m_loadsValid{false};
     std::vector<ExtStressPhysXSplitContinuity> m_continuity;
     std::vector<ResimBodySnapshot> m_resimSnapshot;
     std::unordered_map<ExtStressPhysXId, uint32_t> m_resimIndexByBodyId;
