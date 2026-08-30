@@ -2846,16 +2846,37 @@ private:
         const std::size_t n = m_islandCount;
         m_statResGrad.resize(n);
         m_statResDelta.resize(n);
+        m_statResActive.resize(n);
         if (cudaMemcpy(m_statResGrad.data(), m_gradientSquared,
                        sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess ||
             cudaMemcpy(m_statResDelta.data(), m_deltaSquared,
-                       sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess)
+                       sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(m_statResActive.data(), m_islandActive,
+                       sizeof(std::uint32_t) * n, cudaMemcpyDeviceToHost) != cudaSuccess)
         {
             cudaGetLastError();
             return;
         }
         for (std::size_t i = 0; i < n; ++i)
         {
+            // The population is "islands this solve SEEDED", i.e. not skipped.
+            //
+            // Two wrong filters were tried first and both are instructive.
+            // Filtering on nothing counts skipped islands, whose deltaSquared
+            // and gradientSquared still hold values from whenever they last
+            // ran -- that measures history, and it flatters whichever arm
+            // skips more (the warm-started one). Filtering on islandActive==1
+            // is circular in the other direction: checkConvergencePerIsland
+            // CLEARS islandActive when an island converges, so the survivors
+            // are by definition the ones that failed, and the answer is always
+            // "100% over tolerance".
+            //
+            // islandSkip is the honest marker: it says what this solve was
+            // asked to do, before it knew how it would go.
+            if (m_hostIslandSkip != nullptr && m_hostIslandSkip[i] != 0u)
+            {
+                continue;
+            }
             const float d = m_statResDelta[i];
             const float g = m_statResGrad[i];
             if (!(d > 0.0f) || !(g >= 0.0f))
@@ -4771,6 +4792,7 @@ private:
     std::uint32_t m_statUnconverged{0};
     std::vector<float> m_statResGrad;
     std::vector<float> m_statResDelta;
+    std::vector<std::uint32_t> m_statResActive;
     double m_statResSum{0.0};
     double m_statResMax{0.0};
     std::uint64_t m_statResCount{0};
