@@ -113,7 +113,12 @@ if(BLAST_ENABLE_CUDA_STRESS)
     add_library(NvBlastExtStressGpu STATIC
         "${BLAST_ROOT}/source/sdk/extensions/stressgpu/NvBlastExtStressGpu.cu")
     target_include_directories(NvBlastExtStressGpu PUBLIC
-        "${BLAST_ROOT}/include/extensions/stressgpu")
+        "${BLAST_ROOT}/include/extensions/stressgpu"
+        # NvBlastExtStressGpu.cu includes NvBlastExtStressFormula.h, the shared
+        # host/device stress equation, which lives with the CPU solver's
+        # headers. Without this the demo's test targets cannot build the CUDA
+        # solver at all.
+        "${BLAST_ROOT}/include/extensions/stress")
     set_target_properties(NvBlastExtStressGpu PROPERTIES
         CUDA_ARCHITECTURES native
         POSITION_INDEPENDENT_CODE ON)

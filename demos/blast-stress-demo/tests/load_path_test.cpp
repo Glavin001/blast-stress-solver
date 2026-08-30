@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -410,7 +411,15 @@ int main()
     try
     {
         SceneCapacity capacity;
-        PhysXScene context(PhysicsMode::Cpu, false, capacity, nullptr);
+        // Mode is selectable so the SAME physical invariants can be checked
+        // against both backends. Hardcoding Cpu meant the GPU path was never
+        // held to them -- which is exactly how a solver that reads stress
+        // uniformly low would pass every existing gate.
+        const char* modeEnv = std::getenv("BLAST_TEST_PHYSICS_MODE");
+        const bool useGpu = modeEnv != nullptr && std::string(modeEnv) == "gpu";
+        std::printf("physics mode: %s\n", useGpu ? "gpu" : "cpu");
+        PhysXScene context(
+            useGpu ? PhysicsMode::Gpu : PhysicsMode::Cpu, false, capacity, nullptr);
         context.scene().setGravity(kGravity);
         testSelfWeightIsMeasurable(context);
         testMaterialsDecoupleStrengthFromStress(context);
