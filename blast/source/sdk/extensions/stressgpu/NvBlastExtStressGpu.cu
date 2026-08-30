@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Nv
@@ -1571,6 +1572,52 @@ bool bondStressProbe()
     return on;
 }
 
+/// std::vector allocator backed by cudaMallocHost.
+///
+/// The topology upload was a DOUBLE copy: computeIslands and buildNodeBondCsr
+/// filled pageable std::vectors, then those were memcpy'd into a pinned staging
+/// arena, then DMA'd. Measured, the DMA enqueue cost 0.09 ms and the host
+/// memcpy 1.52 ms -- the copy, not the transfer, was the whole cost. Backing
+/// the vectors with pinned memory deletes the middle step: the host code writes
+/// where the DMA reads.
+///
+/// Worth recording why the more obvious idea was NOT built. Uploading only the
+/// changed bytes sounds strictly better, but 5.048 MB of the 5.31 MB is dirty
+/// every fracture tick -- computeIslands renumbers island ids wholesale -- so
+/// there is no narrow dirty range to exploit. That was measured first.
+template <typename T>
+struct PinnedAllocator
+{
+    using value_type = T;
+    PinnedAllocator() noexcept = default;
+    template <typename U>
+    PinnedAllocator(const PinnedAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t n)
+    {
+        void* p = nullptr;
+        if (n != 0 && cudaMallocHost(&p, n * sizeof(T)) != cudaSuccess)
+        {
+            throw std::bad_alloc();
+        }
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, std::size_t) noexcept
+    {
+        if (p != nullptr)
+        {
+            cudaFreeHost(p);
+        }
+    }
+    template <typename U>
+    bool operator==(const PinnedAllocator<U>&) const noexcept { return true; }
+    template <typename U>
+    bool operator!=(const PinnedAllocator<U>&) const noexcept { return false; }
+};
+
+template <typename T>
+using PinnedVector = std::vector<T, PinnedAllocator<T>>;
+
 class ExtStressGpuSolverImpl final : public ExtStressGpuSolver
 {
 public:
@@ -1634,10 +1681,12 @@ uploadIslands();
         cudaEventDestroy(m_solveStart);
         cudaEventDestroy(m_solveStop);
         cudaEventDestroy(m_statusReady);
+        cudaEventDestroy(m_topoUploadDone);
         cudaEventDestroy(m_downloadStart);
         cudaEventDestroy(m_downloadStop);
         cudaStreamDestroy(m_stream);
         freeBondStress();
+        cudaFreeHost(m_topoStaging);
         cudaFreeHost(m_hostStatus);
         cudaFreeHost(m_hostBrokenCount);
         cudaFreeHost(m_hostIslandConvergedPinned);
@@ -1730,10 +1779,14 @@ uploadIslands();
         }
         const auto waitStart = HostClock::now();
         checkCuda(cudaEventSynchronize(m_statusReady), "wait for stress solve");
-        m_telemetry.hostSyncMilliseconds += hostMs(waitStart);
+        const float solveWaitMs = hostMs(waitStart);
+        m_telemetry.hostSyncMilliseconds += solveWaitMs;
+        m_statWaitMs += solveWaitMs;
         const auto finishStart = HostClock::now();
         finishSolve();
         m_telemetry.hostFinishMilliseconds = hostMs(finishStart);
+        m_statPlanMs += m_telemetry.hostPlanMilliseconds;
+        m_statFinishMs += m_telemetry.hostFinishMilliseconds;
         return true;
     }
 
@@ -1806,6 +1859,9 @@ uploadIslands();
         finishSolve();
         finishImpulseReadback(bondImpulses, compacted);
         m_telemetry.hostFinishMilliseconds = hostMs(finishStart);
+        m_statPlanMs += m_telemetry.hostPlanMilliseconds;
+        m_statFinishMs += m_telemetry.hostFinishMilliseconds;
+        m_statWaitMs += m_telemetry.hostSyncMilliseconds - m_statLastMidSync;
         if (graphStatsEnabled() && (++m_statSolves % 600u) == 0u)
         {
             fprintf(stderr,
@@ -1825,6 +1881,39 @@ uploadIslands();
                     m_statGraphUpdates,
                     m_statUpdateMs / double(m_statSolves),
                     m_statUpdateMs / double(m_statGraphUpdates + 1u));
+            // Where the HOST time actually goes, split from where it merely
+            // waits. Only `plan` and `finish` are reclaimable by writing
+            // faster host code; `wait` is the device computing, and shrinking
+            // it means less device work or more overlap, not tighter host code.
+            fprintf(stderr,
+                    "[gpu-host] plan=%.4f (graphUpdate=%.4f, midSync=%.4f, "
+                    "other=%.4f | planSkip=%.4f refresh=%.4f topo=%.4f "
+                    "[%u calls, %.3f each: islands=%.3f csr=%.3f group=%.3f "
+                    "upload=%.3f memset=%.3f | %.2f MB in %u copies, "
+                    "stageMemcpy=%.3f, %u growths, %.2f GB/s]) "
+                    "wait=%.4f finish=%.4f ms/solve\n",
+                    m_statPlanMs / double(m_statSolves),
+                    m_statUpdateMs / double(m_statSolves),
+                    m_statMidSyncMs / double(m_statSolves),
+                    (m_statPlanMs - m_statUpdateMs) / double(m_statSolves),
+                    m_statPlanSkipMs / double(m_statSolves),
+                    m_statRefreshMs / double(m_statSolves),
+                    m_statTopoMs / double(m_statSolves),
+                    m_statTopoCalls,
+                    m_statTopoMs / double(m_statTopoCalls + 1u),
+                    m_statTopoIslandsMs / double(m_statTopoCalls + 1u),
+                    m_statTopoCsrMs / double(m_statTopoCalls + 1u),
+                    m_statTopoGroupMs / double(m_statTopoCalls + 1u),
+                    m_statTopoUploadMs / double(m_statTopoCalls + 1u),
+                    m_statTopoMemsetMs / double(m_statTopoCalls + 1u),
+                    double(m_statTopoBytes) / double(m_statTopoCalls + 1u) / 1048576.0,
+                    m_statTopoCopies / (m_statTopoCalls + 1u),
+                    m_statStageCopyMs / double(m_statTopoCalls + 1u),
+                    m_statTopoGrowths,
+                    (double(m_statTopoBytes) / 1.0e9)
+                        / ((m_statTopoUploadMs > 0.0 ? m_statTopoUploadMs : 1.0) / 1000.0),
+                    m_statWaitMs / double(m_statSolves),
+                    m_statFinishMs / double(m_statSolves));
         }
         return true;
     }
@@ -2384,6 +2473,97 @@ uploadIslands();
         return true;
     }
 
+    /// Stage a host buffer through pinned memory and enqueue an ASYNC H2D copy
+    /// on the solver stream.
+    ///
+    /// The topology uploads were blocking `cudaMemcpy` straight out of
+    /// `std::vector`, i.e. out of PAGEABLE memory, which cannot DMA: the driver
+    /// bounces it through its own staging buffer a chunk at a time and the
+    /// transfer runs at roughly 0.9 GB/s instead of the ~12 GB/s the link is
+    /// good for. At ~2.6 MB per fracture tick that is ~2.2 ms of the host
+    /// simply waiting, and it was 64% of all reclaimable host time in the
+    /// solve. Exactly the same trap, and the same fix, as the bond-stress CSR.
+    ///
+    /// Lifetime: the staged bytes must outlive the async copy. The arena is
+    /// only ever rewound at the START of applyTopologyChange, and every solve
+    /// waits on m_statusReady before the next one begins, so a copy enqueued in
+    /// one topology change has necessarily completed before the arena is reused
+    /// in the next. Growth is the one case that could overlap a live copy, so
+    /// it synchronises first.
+    /// Default ON. Off-switch so the pinned/async path can be A/B'd against
+    /// the original blocking one without a rebuild.
+    static bool pinnedTopologyUploadEnabled()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_TOPO_PINNED");
+            return raw == nullptr || std::string(raw)[0] != '0';
+        }();
+        return enabled;
+    }
+
+    void stageUpload(void* dst, const void* src, std::size_t bytes, const char* name)
+    {
+        if (bytes == 0)
+        {
+            return;
+        }
+        if (!pinnedTopologyUploadEnabled())
+        {
+            // Faithfully reproduce the ORIGINAL cost structure for A/B: a
+            // BLOCKING copy out of PAGEABLE memory. Copying via a pageable
+            // bounce is necessary because the sources are pinned now, and a
+            // blocking copy from pinned memory is a different (much faster)
+            // thing than the one this change replaced. An arm that does not
+            // reproduce the old behaviour measures nothing.
+            if (m_pageableBounce.size() < bytes)
+            {
+                m_pageableBounce.resize(bytes);
+            }
+            std::memcpy(m_pageableBounce.data(), src, bytes);
+            checkCuda(
+                cudaMemcpy(dst, m_pageableBounce.data(), bytes, cudaMemcpyHostToDevice),
+                name);
+            return;
+        }
+        if (m_topoStagingUsed + bytes > m_topoStagingBytes)
+        {
+            checkCuda(cudaStreamSynchronize(m_stream), "sync before staging growth");
+            const std::size_t want = (m_topoStagingUsed + bytes) * 2u;
+            if (m_topoStaging)
+            {
+                cudaFreeHost(m_topoStaging);
+                m_topoStaging = nullptr;
+            }
+            checkCuda(cudaMallocHost(&m_topoStaging, want), "alloc topology staging");
+            ++m_statTopoGrowths;
+            m_topoStagingBytes = want;
+            m_topoStagingUsed = 0;
+        }
+        m_statTopoBytes += bytes;
+        ++m_statTopoCopies;
+        // If the source is ALREADY pinned, DMA straight out of it: no staging
+        // copy at all. cudaHostGetDevicePointer succeeds only for memory the
+        // driver has registered, which is exactly the PinnedVector case, so
+        // this is a reliable test rather than a guess.
+        void* devicePtr = nullptr;
+        if (cudaHostGetDevicePointer(&devicePtr, const_cast<void*>(src), 0) == cudaSuccess)
+        {
+            checkCuda(
+                cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, m_stream),
+                name);
+            return;
+        }
+        cudaGetLastError();   // clear the probe's error state
+        char* slot = static_cast<char*>(m_topoStaging) + m_topoStagingUsed;
+        const auto cpStart = StatClock::now();
+        std::memcpy(slot, src, bytes);
+        m_statStageCopyMs += statMs(cpStart);
+        m_topoStagingUsed += bytes;
+        checkCuda(
+            cudaMemcpyAsync(dst, slot, bytes, cudaMemcpyHostToDevice, m_stream),
+            name);
+    }
+
     template <typename T>
     void uploadBondStress(T* dst, const T* src, std::uint32_t count, const char* name)
     {
@@ -2599,7 +2779,10 @@ private:
         }
         if (m_topologyDirty)
         {
+            const auto topoStart = StatClock::now();
             applyTopologyChange();
+            m_statTopoMs += statMs(topoStart);
+            ++m_statTopoCalls;
         }
         if (m_bondCount == 0)
         {
@@ -2637,7 +2820,9 @@ private:
         // same question and get asked once.
         if (skipping)
         {
+            const auto skipStart = StatClock::now();
             planSettledSkip(nodeVelocities);
+            m_statPlanSkipMs += statMs(skipStart);
         }
         else
         {
@@ -2699,7 +2884,9 @@ private:
 
         // After the mask upload (compaction reads it), before the graph
         // launch (the kernels read the lists).
+        const auto refreshStart = StatClock::now();
         refreshActiveLists(skipping);
+        m_statRefreshMs += statMs(refreshStart);
 
         checkCuda(cudaEventRecord(m_solveStart, m_stream), "record solve start");
         executeSolve(params);
@@ -2821,6 +3008,7 @@ private:
                     .count();
             m_activeListSyncMilliseconds += static_cast<float>(midSync);
             m_statMidSyncMs += midSync;
+            m_statLastMidSync = midSync;
         }
         if (!fullLaunchCapacity())
         {
@@ -3106,8 +3294,11 @@ private:
         }
     }
 
-    template <typename T>
-    static void swapWithLast(std::vector<T>& values, std::uint32_t index, std::uint32_t last)
+    // Allocator-generic: the topology arrays are PinnedVector, not
+    // std::vector, so a signature naming the default allocator no longer
+    // matches them.
+    template <typename T, typename Alloc>
+    static void swapWithLast(std::vector<T, Alloc>& values, std::uint32_t index, std::uint32_t last)
     {
         values[index] = values[last];
         values.resize(last);
@@ -3127,15 +3318,38 @@ private:
     void applyTopologyChange()
     {
         m_topologyDirty = false;
+        m_topoStagingUsed = 0;
+        // The host topology arrays are pinned and DMA'd from directly, and the
+        // rebuilds below RESIZE them -- which frees that pinned memory. If a
+        // copy enqueued last tick were still in flight, that is a use-after-
+        // free the driver would read straight through.
+        //
+        // In practice every solve waits on m_statusReady first, so the copies
+        // are long done. "In practice" is not good enough for a dangling DMA:
+        // the no-op solve path returns early without waiting, so the guarantee
+        // has a hole in it. Waiting on the upload event closes it, and costs
+        // nothing when the work has already completed.
+        if (m_topoUploadsPending)
+        {
+            checkCuda(cudaEventSynchronize(m_topoUploadDone), "wait topology uploads");
+            m_topoUploadsPending = false;
+        }
         // The island partition is about to be remapped; the compacted lists
         // index into the OLD partition and must be rebuilt before next solve.
         m_activeListsDirty = true;
-computeIslands();
+        auto tstep = StatClock::now();
+        computeIslands();
+        m_statTopoIslandsMs += statMs(tstep); tstep = StatClock::now();
         buildNodeBondCsr();
+        m_statTopoCsrMs += statMs(tstep); tstep = StatClock::now();
         groupBondsByIsland();
+        m_statTopoGroupMs += statMs(tstep); tstep = StatClock::now();
         uploadTopology();
-uploadIslands();
+        uploadIslands();
         uploadNodeBondCsr();
+        checkCuda(cudaEventRecord(m_topoUploadDone, m_stream), "record topology uploads");
+        m_topoUploadsPending = true;
+        m_statTopoUploadMs += statMs(tstep);
         // Grid sizes and the per-island memset lengths are baked into the
         // captured graph, and both just changed -- but they are node
         // PARAMETERS, not structure, so the exec can be patched rather than
@@ -3158,9 +3372,17 @@ uploadIslands();
         }
         if (wholeResetOnTopology())
         {
+            const auto memsetStart = StatClock::now();
+            // Async, on the solver stream, NOT the synchronous form. Plain
+            // cudaMemset runs on the legacy default stream, which implicitly
+            // synchronises with every other stream on the device -- so it
+            // would have blocked on the topology uploads enqueued just above
+            // and handed back exactly the stall they were made async to avoid.
             checkCuda(
-                cudaMemset(m_impulses, 0, sizeof(AngLin) * m_bondCount),
+                cudaMemsetAsync(
+                    m_impulses, 0, sizeof(AngLin) * m_bondCount, m_stream),
                 "reset warm start after topology change");
+            m_statTopoMemsetMs += statMs(memsetStart);
             m_hasWarmStart = false;
             m_settledBaselineValid = false;
             m_pendingImpulseSwaps.clear();
@@ -3181,11 +3403,12 @@ uploadIslands();
                 if (swap.first != swap.second)
                 {
                     checkCuda(
-                        cudaMemcpy(
+                        cudaMemcpyAsync(
                             m_impulses + swap.first,
                             m_impulses + swap.second,
                             sizeof(AngLin),
-                            cudaMemcpyDeviceToDevice),
+                            cudaMemcpyDeviceToDevice,
+                            m_stream),
                         "replay impulse swap");
                 }
             }
@@ -3558,6 +3781,7 @@ uploadIslands();
         checkCuda(cudaEventCreate(&m_solveStart), "create solve start event");
         checkCuda(cudaEventCreate(&m_solveStop), "create solve stop event");
         checkCuda(cudaEventCreate(&m_statusReady), "create status-ready event");
+        checkCuda(cudaEventCreate(&m_topoUploadDone), "create topology-upload event");
         checkCuda(cudaEventCreate(&m_downloadStart), "create download start event");
         checkCuda(cudaEventCreate(&m_downloadStop), "create download stop event");
         checkCuda(cudaMemset(m_impulses, 0, sizeof(AngLin) * m_bondCount), "clear impulses");
@@ -3748,122 +3972,32 @@ uploadIslands();
         {
             return;
         }
-        checkCuda(
-            cudaMemcpy(
-                m_nodeBondBegin,
-                m_hostNodeBondBegin.data(),
-                sizeof(std::uint32_t) * m_hostNodeBondBegin.size(),
-                cudaMemcpyHostToDevice),
-            "upload node-bond csr offsets");
+        stageUpload(m_nodeBondBegin, m_hostNodeBondBegin.data(), sizeof(std::uint32_t) * m_hostNodeBondBegin.size(), "upload node-bond csr offsets");
         if (!m_hostNodeBondRef.empty())
         {
-            checkCuda(
-                cudaMemcpy(
-                    m_nodeBondRef,
-                    m_hostNodeBondRef.data(),
-                    sizeof(std::uint32_t) * m_hostNodeBondRef.size(),
-                    cudaMemcpyHostToDevice),
-                "upload node-bond csr refs");
+            stageUpload(m_nodeBondRef, m_hostNodeBondRef.data(), sizeof(std::uint32_t) * m_hostNodeBondRef.size(), "upload node-bond csr refs");
         }
     }
 
     void uploadIslands()
     {
-        checkCuda(
-            cudaMemcpy(
-                m_bondIsland,
-                m_hostBondIsland.data(),
-                sizeof(std::uint32_t) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload bond island ids");
-        checkCuda(
-            cudaMemcpy(
-                m_nodeIsland,
-                m_hostNodeIsland.data(),
-                sizeof(std::uint32_t) * m_nodeCount,
-                cudaMemcpyHostToDevice),
-            "upload node island ids");
+        stageUpload(m_bondIsland, m_hostBondIsland.data(), sizeof(std::uint32_t) * m_bondCount, "upload bond island ids");
+        stageUpload(m_nodeIsland, m_hostNodeIsland.data(), sizeof(std::uint32_t) * m_nodeCount, "upload node island ids");
     }
 
     void uploadTopology()
     {
-        checkCuda(
-            cudaMemcpy(
-                m_node0,
-                m_hostNode0.data(),
-                sizeof(std::uint32_t) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload node0");
-        checkCuda(
-            cudaMemcpy(
-                m_node1,
-                m_hostNode1.data(),
-                sizeof(std::uint32_t) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload node1");
-        checkCuda(
-            cudaMemcpy(
-                m_offset0,
-                m_hostOffset0.data(),
-                sizeof(Vec4) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload offset0");
-        checkCuda(
-            cudaMemcpy(
-                m_offset1,
-                m_hostOffset1.data(),
-                sizeof(Vec4) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload offset1");
-        checkCuda(
-            cudaMemcpy(
-                m_inertia,
-                m_hostInertia.data(),
-                sizeof(Inertia) * m_nodeCount,
-                cudaMemcpyHostToDevice),
-            "upload inertia");
-        checkCuda(
-            cudaMemcpy(
-                m_normals,
-                m_hostNormals.data(),
-                sizeof(Vec4) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload normals");
-        checkCuda(
-            cudaMemcpy(
-                m_areas,
-                m_hostAreas.data(),
-                sizeof(float) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload areas");
-        checkCuda(
-            cudaMemcpy(
-                m_nodeDistances,
-                m_hostNodeDistances.data(),
-                sizeof(float) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload node distances");
-        checkCuda(
-            cudaMemcpy(
-                m_health,
-                m_hostHealth.data(),
-                sizeof(float) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload health");
-        checkCuda(
-            cudaMemcpy(
-                m_bondMaterials,
-                m_hostBondMaterials.data(),
-                sizeof(std::uint32_t) * m_bondCount,
-                cudaMemcpyHostToDevice),
-            "upload bond materials");
-        checkCuda(
-            cudaMemcpy(
-                m_materials,
-                m_hostMaterials.data(),
-                sizeof(ExtStressGpuMaterial) * m_materialCount,
-                cudaMemcpyHostToDevice),
-            "upload material table");
+        stageUpload(m_node0, m_hostNode0.data(), sizeof(std::uint32_t) * m_bondCount, "upload node0");
+        stageUpload(m_node1, m_hostNode1.data(), sizeof(std::uint32_t) * m_bondCount, "upload node1");
+        stageUpload(m_offset0, m_hostOffset0.data(), sizeof(Vec4) * m_bondCount, "upload offset0");
+        stageUpload(m_offset1, m_hostOffset1.data(), sizeof(Vec4) * m_bondCount, "upload offset1");
+        stageUpload(m_inertia, m_hostInertia.data(), sizeof(Inertia) * m_nodeCount, "upload inertia");
+        stageUpload(m_normals, m_hostNormals.data(), sizeof(Vec4) * m_bondCount, "upload normals");
+        stageUpload(m_areas, m_hostAreas.data(), sizeof(float) * m_bondCount, "upload areas");
+        stageUpload(m_nodeDistances, m_hostNodeDistances.data(), sizeof(float) * m_bondCount, "upload node distances");
+        stageUpload(m_health, m_hostHealth.data(), sizeof(float) * m_bondCount, "upload health");
+        stageUpload(m_bondMaterials, m_hostBondMaterials.data(), sizeof(std::uint32_t) * m_bondCount, "upload bond materials");
+        stageUpload(m_materials, m_hostMaterials.data(), sizeof(ExtStressGpuMaterial) * m_materialCount, "upload material table");
     }
 
     /// Per-island reduction. Replaces the whole-graph cub::DeviceReduce, which
@@ -4370,17 +4504,17 @@ uploadIslands();
     bool m_hasWarmStart{false};
     ExtStressGpuTelemetry m_telemetry{};
 
-    std::vector<std::uint32_t> m_hostNode0;
-    std::vector<std::uint32_t> m_hostNode1;
-    std::vector<Vec4> m_hostOffset0;
-    std::vector<Vec4> m_hostOffset1;
-    std::vector<Inertia> m_hostInertia;
-    std::vector<Vec4> m_hostNormals;
-    std::vector<float> m_hostAreas;
-    std::vector<float> m_hostNodeDistances;
-    std::vector<float> m_hostHealth;
-    std::vector<std::uint32_t> m_hostBondMaterials;
-    std::vector<ExtStressGpuMaterial> m_hostMaterials;
+    PinnedVector<std::uint32_t> m_hostNode0;
+    PinnedVector<std::uint32_t> m_hostNode1;
+    PinnedVector<Vec4> m_hostOffset0;
+    PinnedVector<Vec4> m_hostOffset1;
+    PinnedVector<Inertia> m_hostInertia;
+    PinnedVector<Vec4> m_hostNormals;
+    PinnedVector<float> m_hostAreas;
+    PinnedVector<float> m_hostNodeDistances;
+    PinnedVector<float> m_hostHealth;
+    PinnedVector<std::uint32_t> m_hostBondMaterials;
+    PinnedVector<ExtStressGpuMaterial> m_hostMaterials;
 
     std::uint32_t* m_node0{nullptr};
     std::uint32_t* m_node1{nullptr};
@@ -4461,10 +4595,10 @@ uploadIslands();
     std::vector<std::uint32_t> m_hostRootIsland;
     /// G1: node -> incident-bond CSR (offsets, and refs packing bond index +
     /// endpoint bit). Host-built at every topology change, uploaded once.
-    std::vector<std::uint32_t> m_hostNodeBondBegin;
-    std::vector<std::uint32_t> m_hostNodeBondRef;
-    std::vector<std::uint32_t> m_hostBondIsland;
-    std::vector<std::uint32_t> m_hostNodeIsland;
+    PinnedVector<std::uint32_t> m_hostNodeBondBegin;
+    PinnedVector<std::uint32_t> m_hostNodeBondRef;
+    PinnedVector<std::uint32_t> m_hostBondIsland;
+    PinnedVector<std::uint32_t> m_hostNodeIsland;
     float* m_projectedDirectionSquared{nullptr};
     float* m_deltaSquared{nullptr};
     float* m_previousGradientSquared{nullptr};
@@ -4521,6 +4655,38 @@ uploadIslands();
     std::uint32_t m_statListSkips{0};
     std::uint32_t m_statGraphRecaptures{0};
     double m_statMidSyncMs{0.0};
+    double m_statPlanMs{0.0};
+    double m_statFinishMs{0.0};
+    double m_statWaitMs{0.0};
+    double m_statLastMidSync{0.0};
+
+    /// Class-scope host timer. solve() has its own local HostClock/hostMs
+    /// lambda; enqueueSolve needs the same thing and cannot see them.
+    using StatClock = std::chrono::steady_clock;
+    static double statMs(StatClock::time_point from)
+    {
+        return std::chrono::duration<double, std::milli>(StatClock::now() - from)
+            .count();
+    }
+    double m_statPlanSkipMs{0.0};
+    double m_statTopoMs{0.0};
+    double m_statTopoIslandsMs{0.0};
+    double m_statTopoCsrMs{0.0};
+    double m_statTopoGroupMs{0.0};
+    double m_statTopoUploadMs{0.0};
+    double m_statTopoMemsetMs{0.0};
+    void* m_topoStaging{nullptr};
+    std::size_t m_topoStagingBytes{0};
+    std::size_t m_topoStagingUsed{0};
+    cudaEvent_t m_topoUploadDone{nullptr};
+    bool m_topoUploadsPending{false};
+    std::vector<char> m_pageableBounce;
+    std::uint64_t m_statTopoBytes{0};
+    std::uint32_t m_statTopoCopies{0};
+    std::uint32_t m_statTopoGrowths{0};
+    double m_statStageCopyMs{0.0};
+    std::uint32_t m_statTopoCalls{0};
+    double m_statRefreshMs{0.0};
     double m_statCaptureMs{0.0};
     double m_statInstantiateMs{0.0};
     std::uint32_t m_statGraphUpdates{0};
