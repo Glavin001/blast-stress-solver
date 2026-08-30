@@ -1872,6 +1872,20 @@ uploadIslands();
         {
             ++m_statUnconverged;
         }
+        // HOW FAR from converged, not just whether. The convergence test is
+        // residual^2 <= tolerance^2 per island, so sqrt(gradientSq/deltaSq) is
+        // the factor by which an island misses its own tolerance: 1.0 is
+        // exactly converged, 10.0 means the residual is ten times the target.
+        //
+        // This is the number that answers "how much accuracy is the iteration
+        // cap costing us". Bonds-broken cannot answer it -- breakage is a
+        // threshold crossing on top of a chaotic cascade, so it amplifies a
+        // small stress error into a large outcome difference and tells you
+        // nothing about the size of the error itself.
+        if (graphStatsEnabled() && m_islandCount > 0)
+        {
+            accumulateResidualStats();
+        }
         if (graphStatsEnabled() && (++m_statSolves % 600u) == 0u)
         {
             fprintf(stderr,
@@ -1902,7 +1916,8 @@ uploadIslands();
                     "upload=%.3f memset=%.3f | %.2f MB in %u copies, "
                     "stageMemcpy=%.3f, %u growths, %.2f GB/s]) "
                     "wait=%.4f finish=%.4f ms/solve "
-                    "| iters=%.1f/solve unconverged=%u (%.1f%% of solves)\n",
+                    "| iters=%.1f/solve unconverged=%u (%.1f%% of solves) "
+                    "| residual/tolerance: mean=%.2fx max=%.2fx, %.1f%% of islands over tol\n",
                     m_statPlanMs / double(m_statSolves),
                     m_statUpdateMs / double(m_statSolves),
                     m_statMidSyncMs / double(m_statSolves),
@@ -1927,7 +1942,12 @@ uploadIslands();
                     m_statFinishMs / double(m_statSolves),
                     double(m_statIterations) / double(m_statSolves),
                     m_statUnconverged,
-                    100.0 * double(m_statUnconverged) / double(m_statSolves));
+                    100.0 * double(m_statUnconverged) / double(m_statSolves),
+                    m_statResCount ? m_statResSum / double(m_statResCount) : 0.0,
+                    m_statResMax,
+                    m_statResCount
+                        ? 100.0 * double(m_statResOverTol) / double(m_statResCount)
+                        : 0.0);
         }
         return true;
     }
@@ -2819,6 +2839,37 @@ uploadIslands();
     }
 
 private:
+    /// Read back per-island residual^2 and tolerance^2 and record how far past
+    /// tolerance the solve stopped. Diagnostic only; gated on graph stats.
+    void accumulateResidualStats()
+    {
+        const std::size_t n = m_islandCount;
+        m_statResGrad.resize(n);
+        m_statResDelta.resize(n);
+        if (cudaMemcpy(m_statResGrad.data(), m_gradientSquared,
+                       sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(m_statResDelta.data(), m_deltaSquared,
+                       sizeof(float) * n, cudaMemcpyDeviceToHost) != cudaSuccess)
+        {
+            cudaGetLastError();
+            return;
+        }
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const float d = m_statResDelta[i];
+            const float g = m_statResGrad[i];
+            if (!(d > 0.0f) || !(g >= 0.0f))
+            {
+                continue;   // island carries no target: not part of this solve
+            }
+            const double ratio = std::sqrt(double(g) / double(d));
+            m_statResSum += ratio;
+            ++m_statResCount;
+            if (ratio > m_statResMax) { m_statResMax = ratio; }
+            if (ratio > 1.0) { ++m_statResOverTol; }
+        }
+    }
+
     bool enqueueSolve(
         const ExtStressGpuImpulse* nodeVelocities,
         const ExtStressGpuSolveParams& params)
@@ -4718,6 +4769,12 @@ private:
     double m_statPlanMs{0.0};
     std::uint64_t m_statIterations{0};
     std::uint32_t m_statUnconverged{0};
+    std::vector<float> m_statResGrad;
+    std::vector<float> m_statResDelta;
+    double m_statResSum{0.0};
+    double m_statResMax{0.0};
+    std::uint64_t m_statResCount{0};
+    std::uint64_t m_statResOverTol{0};
     double m_statFinishMs{0.0};
     double m_statWaitMs{0.0};
     double m_statLastMidSync{0.0};
