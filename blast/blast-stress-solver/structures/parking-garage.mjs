@@ -14,6 +14,8 @@
  */
 import { ScenePackBuilder } from './lib/pack.mjs';
 import { staircase, slabWithOpening, roofSlope } from './lib/elements.mjs';
+import { MATERIAL_INDEX, MATERIALS } from './lib/materials.mjs';
+import { checkFramedDeck } from './lib/design.mjs';
 
 export const GARAGE = {
   width: 46.0,          // X
@@ -169,8 +171,50 @@ export function liveLoadDensityScale({ liveLoadPa, slabThickness, gravity, concr
   return 1 + added / concreteDensity;
 }
 
+/** Service-level tensile capacity of a material, in Pa: where it cracks. */
+function cracksAt(name) {
+  const m = MATERIALS[MATERIAL_INDEX[name]];
+  if (!m) throw new Error(`no material "${name}"`);
+  // Asserted, not defaulted. A misspelt field here returns undefined, every
+  // comparison against NaN is false, and the check silently passes everything
+  // -- which is exactly what it did on the first run, accepting a 600 mm beam
+  // at 45 MPa without a word.
+  if (!(m.tensionElastic > 0)) throw new Error(`material "${name}" has no tensionElastic`);
+  return m.tensionElastic;
+}
+
 export function buildParkingGarage(cfg = {}) {
   const C = { ...GARAGE, ...cfg };
+
+  // Does the framing still check out?
+  //
+  // Run here, at build time, by the same formulas that produced these numbers,
+  // so a change to a span, a section, gravity or a material fails at the source
+  // with the required value in the message -- rather than twenty minutes later
+  // as a count of broken bonds in a simulation, which is how every one of these
+  // members was sized the first time.
+  //
+  // The deck spans between SECONDARIES, not between columns; the mains span the
+  // full bay. Getting that wrong is what made the first framed version crack.
+  const secondarySpacing = C.bayZ / 4;
+  const framing = checkFramedDeck('parking-garage', {
+    deckSpan: secondarySpacing,
+    deckThickness: C.slabThickness,
+    deckAllowable: cracksAt('reinforced-concrete'),
+    beamSpan: C.bayZ,
+    beamWidth: C.deckBeamWidth,
+    beamDepth: C.deckBeamDepth,
+    beamTributary: C.bayX,
+    beamAllowable: cracksAt('prestressed-concrete'),
+    density: C.concreteDensity,
+    gravity: C.gravity,
+    liveLoadPa: C.liveLoadPa,
+  });
+  if (process.env.GARAGE_DESIGN) {
+    console.log(`  design  deck ${(framing.deckStress / 1e6).toFixed(2)} MPa, `
+      + `beam ${(framing.beamStress / 1e6).toFixed(2)} MPa, `
+      + `beam self-weight share ${(framing.beamSelfShare * 100).toFixed(0)}%`);
+  }
   const b = new ScenePackBuilder({
     key: 'parking_garage',
     title: 'Parking garage — flat plates on a sparse grid',

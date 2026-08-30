@@ -83,10 +83,25 @@ const argv = process.argv.slice(2);
 const names = [];
 let vibeLand = null;
 let autobond = true;
+// `--set key=value`, repeatable: override one of the structure's config
+// constants for this build. Every builder already takes a cfg object and
+// merges it over its defaults, so this needs no per-structure support -- and
+// it is what makes sweeping a parameter possible without editing the source
+// between runs. See sweep.mjs.
+const overrides = {};
 for (let i = 0; i < argv.length; i++) {
   if (argv[i] === '--emit-vibe-land') { vibeLand = argv[++i]; continue; }
   if (argv[i] === '--no-autobond') { autobond = false; continue; }
+  if (argv[i] === '--set') {
+    const [k, v] = String(argv[++i]).split('=');
+    if (v === undefined) throw new Error(`--set wants key=value, got "${k}"`);
+    overrides[k] = Number.isNaN(Number(v)) ? v : Number(v);
+    continue;
+  }
   names.push(argv[i]);
+}
+if (Object.keys(overrides).length) {
+  console.log(`  overrides ${Object.entries(overrides).map(([k, v]) => `${k}=${v}`).join(' ')}`);
 }
 /**
  * Built only when asked for by name.
@@ -121,7 +136,7 @@ if (vibeLand) outDirs.push(path.resolve(vibeLand, 'destruction/assets/scenes'));
 let failed = 0;
 for (const name of selected) {
   const started = process.hrtime.bigint();
-  const { pack: result, builder } = STRUCTURES[name]();
+  const { pack: result, builder } = STRUCTURES[name](overrides);
   const ms = Number(process.hrtime.bigint() - started) / 1e6;
   const s = result.scenario;
 

@@ -470,6 +470,54 @@ function verify(pack, name) {
     }
     const delivered = totalWeight > 0 ? atSupports / totalWeight : 1;
     r.note(`load reaching the supports: ${(delivered * 100).toFixed(1)}% of ${Math.round(totalWeight / 9810)} t`);
+
+    // Self-weight share, by role: is this member strength-limited or
+    // mass-limited?
+    //
+    // The single most expensive thing not measured in this project. The parking
+    // garage's 16 m beams were deepened from 1.5 m to 1.7 m to buy bending
+    // capacity, and broken bonds went from 9 to 2,235 -- because a beam at that
+    // span is carrying mostly ITSELF, so section adds weight as fast as it adds
+    // strength. Four separate attempts to fix that structure by adding material
+    // failed for the same reason, and the reason was one ratio nobody had.
+    //
+    // This is a warning sign rather than a law: the higher it is, the less a
+    // given percentage of extra depth returns, and past roughly a third the
+    // cheaper levers are span, load, or a stronger material at the same size --
+    // which for a long span in concrete means prestress, and is exactly why
+    // real garages use it.
+    // Measured as what the role DELIVERS downward, not what the walk
+    // accumulates through it: `carried` is cumulative and grows with chunk
+    // count, so summing it over a role dilutes the ratio into meaninglessness.
+    // The load leaving a role at its underside is a real quantity.
+    const selfOf = new Map();
+    const outOf = new Map();
+    for (let i = 0; i < N; i += 1) {
+      if (s.nodes[i].mass <= 0) continue;
+      const role = s.nodeTypes?.[i] ?? '?';
+      selfOf.set(role, (selfOf.get(role) ?? 0) + s.nodes[i].mass * 9.81);
+      for (const e of adj[i]) {
+        if ((s.nodeTypes?.[e.to] ?? '?') === role) continue;
+        if (ys[e.to] >= ys[i]) continue;   // downward only: this is load leaving
+        outOf.set(role, (outOf.get(role) ?? 0) + rest.bondLoad[e.bond]);
+      }
+    }
+    const shares = [...selfOf.entries()]
+      .filter(([role]) => (outOf.get(role) ?? 0) > 0)
+      .map(([role, self]) => [role, self / (outOf.get(role) + self), self])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5);
+    if (shares.length) {
+      r.note(`self-weight share of what each role delivers: ${shares
+        .map(([role, f, self]) => `${role} ${(f * 100).toFixed(0)}% (${Math.round(self / 9810)} t)`)
+        .join(', ')}`);
+      const heavy = shares.filter(([, f]) => f > 0.3);
+      if (heavy.length) {
+        r.caution(`${heavy.map(([role]) => role).join(', ')} spend over 30% of their `
+          + `capacity on their own weight, so added section has diminishing `
+          + `returns — prefer changing the span, the load, or the material`);
+      }
+    }
     // Reported, not gated — and the number matters when reading everything
     // above it.
     //
