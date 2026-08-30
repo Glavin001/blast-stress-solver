@@ -54,6 +54,59 @@ export const SKYLINE = [
   { build: buildHouse2, at: [34, 0, 74] },
 ];
 
+/**
+ * Only the structures that pass their own stability audit.
+ *
+ * `skyline` is every authored structure, which means it is also every authored
+ * FAILURE: petronas never settles, and algedra-tower sheds glazing and has no
+ * stability gate at all. A scene meant to be walked around and shot at should
+ * not contain buildings that fall down on their own -- the player cannot tell
+ * a bug from a feature, and neither can anyone reading a recording of it.
+ *
+ * Kept as a subset of SKYLINE, at the same coordinates, so the two cannot
+ * drift: the spacing there is already proven to keep every structure out of
+ * every other one's reach when it falls.
+ *
+ * Membership is a MEASUREMENT, not an opinion. Re-derive it with
+ * `structure-audit` over the set rather than editing this list from memory.
+ */
+// Pack keys, which use underscores -- `parking_garage`, not the
+// `parking-garage` the scene FILE is named. The count guard below caught that
+// on the first run rather than silently shipping an empty skyline.
+const STANDS = new Set(['park_432', 'parking_garage', 'villa_savoye', 'house_1story', 'house_2story']);
+
+/** Keyed by pack key, so a caller can ask what a subset would do. */
+export const SKYLINE_BY_KEY = new Map(SKYLINE.map((p) => [p.build().pack.key, p]));
+
+export const SKYLINE_STABLE = SKYLINE.filter(({ build }) => {
+  // The builders are named functions, not tagged, so ask the pack what it is.
+  // Cheap enough once at build time and it cannot go stale the way a hand-kept
+  // parallel list would.
+  const { pack } = build();
+  return STANDS.has(pack.key ?? pack.scenario?.key ?? '');
+});
+
+export function buildStableSkyline(cfg = {}) {
+  // `--set exclude=park_432,petronas` drops structures from the scene.
+  //
+  // Here because structures verified ALONE can still fail TOGETHER: this set
+  // sheds 943 bonds merged and zero apiece, and the only way to find out which
+  // one brings that is to leave it out and re-measure.
+  const drop = new Set(String(cfg.exclude ?? '').split(',').filter(Boolean));
+  if (drop.size) {
+    const kept = SKYLINE_STABLE.filter(({ build }) => !drop.has(build().pack.key));
+    return merge(kept, 'skyline-stable',
+      `Skyline — stable set without ${[...drop].join(', ')}`, [0, 30, 0], 420);
+  }
+  if (SKYLINE_STABLE.length !== STANDS.size) {
+    throw new Error(
+      `stable skyline matched ${SKYLINE_STABLE.length} of ${STANDS.size} structures — `
+      + 'a key in STANDS no longer names a pack in SKYLINE');
+  }
+  return merge(SKYLINE_STABLE, 'skyline-stable',
+    'Skyline — every structure that stands on its own', [0, 30, 0], 420);
+}
+
 export function buildSkyline() {
   return merge(SKYLINE, 'skyline', 'Skyline — every authored structure', [0, 30, 0], 420);
 }

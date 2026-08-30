@@ -26,7 +26,7 @@ import { buildPark432 } from './park-432.mjs';
 import { buildParkingGarage } from './parking-garage.mjs';
 import { buildPetronas } from './petronas.mjs';
 import { buildMinasTirith } from './minas-tirith.mjs';
-import { buildNeighbourhood, buildSkyline } from './neighbourhood.mjs';
+import { buildNeighbourhood, buildSkyline, buildStableSkyline } from './neighbourhood.mjs';
 import {
   buildRigCantilever, buildRigColumn, buildRigGarage, buildRigPane,
   buildRigPortal, buildRigToppled, buildRigWall,
@@ -51,6 +51,7 @@ const STRUCTURES = {
   'minas-tirith': buildMinasTirith,
   // All three in one scene, for looking at or playing in.
   neighbourhood: buildNeighbourhood,
+  'skyline-stable': buildStableSkyline,
   skyline: buildSkyline,
   // Test rigs: small structures that each answer one structural question, so
   // a scenario suite can run in minutes instead of hours. See rigs.mjs.
