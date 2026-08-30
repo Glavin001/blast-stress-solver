@@ -725,8 +725,31 @@ public:
         return enabled;
     }
 
-    /// True when this tick's body snapshot is identical to last tick's and no
-    /// contact landed, i.e. nothing about the stress inputs can have changed.
+    /// True when this tick's stress inputs are provably bit-identical to last
+    /// tick's, so recomputing them cannot change a single bit.
+    ///
+    /// This is memoization on an exact key, not an approximation and not a
+    /// tolerance. The argument is a closed enumeration of what can write the
+    /// per-node load array `localVel`, which is the solver's entire input:
+    ///
+    ///   1. contact forces  -- submitted only when m_contactNodeIndices is
+    ///                         non-empty, checked below;
+    ///   2. gravity         -- a pure function of worldGravity (constant) and
+    ///                         snapshot.globalPose.q, both in the key;
+    ///   3. centrifugal     -- a pure function of the pose and
+    ///                         snapshot.angularVelocity, both in the key.
+    ///
+    /// There is no fourth writer: addNodeForce is the only function in the
+    /// solver that assigns localVel, and these three are the only callers the
+    /// adapter has. Everything else that acts on the city -- a shot, a player
+    /// impulse -- goes through PhysX, which moves bodies, which changes the
+    /// pose in the key and disengages the skip on the very next tick.
+    ///
+    /// So if the key matches, the loads this tick WOULD BE the same bits the
+    /// solver is already holding. Nothing is being approximated away and no
+    /// force is being dropped: the elastic response, the stress state and the
+    /// fracture threshold are all evaluated exactly as they would have been.
+    /// The only thing skipped is recomputing a value that is already correct.
     ///
     /// Comparing 108 poses to decide this costs nothing; what it buys is
     /// skipping gravity application across ~87,000 nodes. On an idle city that
@@ -741,7 +764,13 @@ public:
     /// has not moved.
     bool snapshotUnchanged(const ExtStressPhysXBodySnapshot* bodies, uint32_t bodyCount)
     {
-        if (!m_contactedActors.empty() || bodyCount != m_lastSnapshotCount)
+        // Both contact sets, because they are not the same set and only one
+        // of them gates force submission. m_contactNodeIndices is what
+        // actually guards add_all_forces; m_contactedActors is the woken-body
+        // set. Requiring both empty is the exact condition plus a margin,
+        // rather than a proxy that happens to correlate.
+        if (!m_contactNodeIndices.empty() || !m_contactedActors.empty() ||
+            bodyCount != m_lastSnapshotCount)
         {
             return false;
         }
