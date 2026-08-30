@@ -2490,15 +2490,40 @@ uploadIslands();
     /// one topology change has necessarily completed before the arena is reused
     /// in the next. Growth is the one case that could overlap a live copy, so
     /// it synchronises first.
-    /// Default ON. Off-switch so the pinned/async path can be A/B'd against
-    /// the original blocking one without a rebuild.
-    static bool pinnedTopologyUploadEnabled()
+    /// How the topology arrays reach the device. Three real modes, because the
+    /// obvious two were not enough to find the right answer.
+    ///
+    ///   pageable : the original -- blocking cudaMemcpy out of pageable
+    ///              std::vector, ~0.9 GB/s, 2.6 ms/solve of pure host stall.
+    ///   async    : pinned-backed arrays, copies enqueued on the solver stream.
+    ///              Host plan time 3.87 -> 1.99 ms/solve, and MEASURABLY WORSE
+    ///              overall: the 5.3 MB transfer then overlaps the CG kernels
+    ///              and competes with them for memory bandwidth, which cost
+    ///              8.25% of device solve time (p=0.021, 16 pairs). The host
+    ///              time it saved just became host WAITING, because this phase
+    ///              is device-bound.
+    ///   sync     : pinned-backed arrays, blocking copy. Keeps the win that
+    ///              mattered -- no staging memcpy, and pinned memory DMAs at
+    ///              full rate instead of being bounced -- while finishing the
+    ///              transfer before the solve is enqueued, so it never steals
+    ///              bandwidth from the kernels.
+    ///
+    /// Default `sync`: it is the only one of the three that reduces cost
+    /// without moving it somewhere else.
+    enum class TopoUploadMode { Pageable, Async, Sync };
+    static TopoUploadMode topoUploadMode()
     {
-        static const bool enabled = [] {
-            const char* raw = std::getenv("BLAST_TOPO_PINNED");
-            return raw == nullptr || std::string(raw)[0] != '0';
+        static const TopoUploadMode mode = [] {
+            const char* raw = std::getenv("BLAST_TOPO_UPLOAD");
+            if (raw != nullptr)
+            {
+                const std::string value(raw);
+                if (value == "pageable") { return TopoUploadMode::Pageable; }
+                if (value == "async")    { return TopoUploadMode::Async; }
+            }
+            return TopoUploadMode::Sync;
         }();
-        return enabled;
+        return mode;
     }
 
     void stageUpload(void* dst, const void* src, std::size_t bytes, const char* name)
@@ -2507,7 +2532,7 @@ uploadIslands();
         {
             return;
         }
-        if (!pinnedTopologyUploadEnabled())
+        if (topoUploadMode() == TopoUploadMode::Pageable)
         {
             // Faithfully reproduce the ORIGINAL cost structure for A/B: a
             // BLOCKING copy out of PAGEABLE memory. Copying via a pageable
@@ -2548,6 +2573,17 @@ uploadIslands();
         void* devicePtr = nullptr;
         if (cudaHostGetDevicePointer(&devicePtr, const_cast<void*>(src), 0) == cudaSuccess)
         {
+            // Async on the SOLVER stream in both modes. A blocking cudaMemcpy
+            // would run on the legacy default stream, which implicitly
+            // synchronises with every stream on the device -- so each of the
+            // fifteen copies would wait for whatever the GPU already had
+            // queued. Measured, that made "sync" mode 1.99 ms of mostly
+            // waiting, against 0.08 ms for the same bytes enqueued async.
+            //
+            // Sync mode differs only in WHEN it waits: once, after all fifteen
+            // are enqueued (see applyTopologyChange), so the transfer is
+            // complete before the solve kernels are enqueued and cannot
+            // compete with them for memory bandwidth.
             checkCuda(
                 cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, m_stream),
                 name);
@@ -3349,6 +3385,16 @@ private:
         uploadNodeBondCsr();
         checkCuda(cudaEventRecord(m_topoUploadDone, m_stream), "record topology uploads");
         m_topoUploadsPending = true;
+        if (topoUploadMode() == TopoUploadMode::Sync)
+        {
+            // Drain the transfers here, ONCE, so they finish before the solve
+            // is enqueued. Letting them ride alongside the CG kernels cost
+            // 8.25% of device solve time (p=0.021, 16 pairs) -- the host time
+            // it saved merely became host waiting, because this phase is
+            // device-bound.
+            checkCuda(cudaStreamSynchronize(m_stream), "drain topology uploads");
+            m_topoUploadsPending = false;
+        }
         m_statTopoUploadMs += statMs(tstep);
         // Grid sizes and the per-island memset lengths are baked into the
         // captured graph, and both just changed -- but they are node
