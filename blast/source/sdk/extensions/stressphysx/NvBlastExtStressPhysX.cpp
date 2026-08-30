@@ -474,6 +474,33 @@ public:
                 INVALID_INDEX,
                 "The C stress-solver bridge could not create its family.");
         }
+        // Make the GPU stress solver reachable from any consumer, including the
+        // invariant tests in demos/blast-stress-demo/tests.
+        //
+        // It was previously reachable only from the vibe-land bridge, which
+        // meant the SHIPPING solver was the one no physical-invariant test
+        // could touch: load_path_test's own header warns that a solver reading
+        // stress uniformly low "silently turns a destruction demo into an
+        // indestructible one while every damage gate still reports success",
+        // and that is exactly the failure mode nothing was watching for.
+        if (const char* gpuEnv = std::getenv("BLAST_STRESS_GPU"))
+        {
+            if (gpuEnv[0] != '0')
+            {
+                ext_stress_solver_set_gpu_minimum_bond_count(m_solver, 0u);
+                const uint8_t ok = ext_stress_solver_set_gpu_accelerated(m_solver, 1u);
+                // Report what actually happened, not what was requested.
+                // setGpuAccelerated is a no-op returning false when the library
+                // was built without NVBLAST_ENABLE_CUDA_STRESS, and a test that
+                // silently ran the CPU solver in both arms would "pass" while
+                // proving nothing -- that exact mistake has already been made
+                // once in this codebase.
+                std::fprintf(stderr,
+                             "[stress] BLAST_STRESS_GPU requested: set=%u active=%u\n",
+                             unsigned(ok),
+                             unsigned(ext_stress_solver_get_gpu_accelerated(m_solver)));
+            }
+        }
         ext_stress_solver_set_island_aware(m_solver, m_settings.islandAware ? 1 : 0);
         ext_stress_solver_set_skip_settled(m_solver, m_settings.skipSettledIslands ? 1 : 0);
         ext_stress_solver_set_skip_stable_unconverged(
@@ -1350,6 +1377,16 @@ public:
     /// split paths so the two cannot report different things.
     void collectSolveTelemetry()
     {
+        // The GPU solver is created LAZILY on first solve, so probing right
+        // after setGpuAccelerated always reports inactive. Report once from
+        // here, where the answer is real.
+        if (!m_gpuProbeDone)
+        {
+            m_gpuProbeDone = true;
+            std::fprintf(stderr,
+                         "[stress] gpu accelerated after first solve: %u\n",
+                         unsigned(ext_stress_solver_get_gpu_accelerated(m_solver)));
+        }
         m_telemetry.overstressedBondCount =
             ext_stress_solver_overstressed_bond_count(m_solver);
         m_telemetry.solverIslandCount = ext_stress_solver_island_count(m_solver);
@@ -4218,6 +4255,7 @@ private:
     // Previous tick's body snapshot, for the quiet-tick gravity skip. Sized by
     // body count (~108 for the downtown city), not by node count, so holding
     // and comparing it is free next to the ~87,000 node writes it avoids.
+    bool m_gpuProbeDone{false};
     std::vector<ExtStressPhysXBodySnapshot> m_lastSnapshot;
     uint32_t m_lastSnapshotCount{0};
     bool m_loadsValid{false};
