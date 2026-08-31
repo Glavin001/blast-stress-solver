@@ -474,37 +474,29 @@ public:
                 INVALID_INDEX,
                 "The C stress-solver bridge could not create its family.");
         }
-        // Make the GPU stress solver reachable from any consumer, including the
-        // invariant tests in demos/blast-stress-demo/tests.
-        //
-        // It was previously reachable only from the vibe-land bridge, which
-        // meant the SHIPPING solver was the one no physical-invariant test
-        // could touch: load_path_test's own header warns that a solver reading
-        // stress uniformly low "silently turns a destruction demo into an
-        // indestructible one while every damage gate still reports success",
-        // and that is exactly the failure mode nothing was watching for.
-        if (const char* gpuEnv = std::getenv("BLAST_STRESS_GPU"))
-        {
-            if (gpuEnv[0] != '0')
-            {
-                ext_stress_solver_set_gpu_minimum_bond_count(m_solver, 0u);
-                const uint8_t ok = ext_stress_solver_set_gpu_accelerated(m_solver, 1u);
-                // Report what actually happened, not what was requested.
-                // setGpuAccelerated is a no-op returning false when the library
-                // was built without NVBLAST_ENABLE_CUDA_STRESS, and a test that
-                // silently ran the CPU solver in both arms would "pass" while
-                // proving nothing -- that exact mistake has already been made
-                // once in this codebase.
-                std::fprintf(stderr,
-                             "[stress] BLAST_STRESS_GPU requested: set=%u active=%u\n",
-                             unsigned(ok),
-                             unsigned(ext_stress_solver_get_gpu_accelerated(m_solver)));
-            }
-        }
         ext_stress_solver_set_island_aware(m_solver, m_settings.islandAware ? 1 : 0);
         ext_stress_solver_set_skip_settled(m_solver, m_settings.skipSettledIslands ? 1 : 0);
         ext_stress_solver_set_skip_stable_unconverged(
             m_solver, m_settings.skipStableUnconverged ? 1 : 0);
+        // Env override so the GPU stress solver -- the one that actually
+        // ships -- can be exercised by tests that build their own descriptor.
+        // It must be applied HERE, before the block below reads it: the
+        // solver's GPU backend is chosen from the descriptor at creation, so
+        // calling setGpuAccelerated afterwards reports success and changes
+        // nothing (measured: set=1, active=0).
+        //
+        // Requires PhysicsMode::Gpu as well, because the CUDA context comes
+        // from the PhysX scene's context manager.
+        if (const char* gpuEnv = std::getenv("BLAST_STRESS_GPU"))
+        {
+            m_settings.gpuStressSolver = (gpuEnv[0] != '0');
+            // gpuStressMinimumBondCount defaults to 4096, so on a test-sized
+            // scene the GPU backend correctly declines to engage and every
+            // "GPU" run silently measures the CPU solver instead. That is not
+            // a bug in the threshold -- it is why a test asking for the GPU
+            // must also lower it.
+            m_settings.gpuStressMinimumBondCount = 0u;
+        }
         if (m_settings.gpuStressSolver)
         {
             physx::PxCudaContextManager* cudaManager = m_scene.getCudaContextManager();
