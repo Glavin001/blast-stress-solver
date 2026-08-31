@@ -1495,6 +1495,14 @@ ext_stress_solver_get_gpu_accelerated(const ExtStressSolverHandle* handlePtr)
     return (handle && handle->solver && handle->solver->getGpuAccelerated()) ? 1U : 0U;
 }
 
+extern "C" const char*
+ext_stress_solver_gpu_inactive_reason(const ExtStressSolverHandle* handlePtr)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    return (handle && handle->solver) ? handle->solver->getGpuInactiveReason()
+                                      : "no solver";
+}
+
 extern "C" float
 ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handlePtr)
 {

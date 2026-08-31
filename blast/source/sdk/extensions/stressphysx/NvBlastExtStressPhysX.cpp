@@ -490,12 +490,16 @@ public:
         if (const char* gpuEnv = std::getenv("BLAST_STRESS_GPU"))
         {
             m_settings.gpuStressSolver = (gpuEnv[0] != '0');
-            // gpuStressMinimumBondCount defaults to 4096, so on a test-sized
-            // scene the GPU backend correctly declines to engage and every
-            // "GPU" run silently measures the CPU solver instead. That is not
-            // a bug in the threshold -- it is why a test asking for the GPU
-            // must also lower it.
-            m_settings.gpuStressMinimumBondCount = 0u;
+        }
+        // Separate knob on purpose. gpuStressMinimumBondCount defaults to 4096,
+        // which is right for production and above any test-scene size, so a
+        // test that asks for the GPU and nothing else still gets the CPU. That
+        // combination is now WARNED about rather than silent, so the two are
+        // kept independent: you can reproduce the trap deliberately.
+        if (const char* minEnv = std::getenv("BLAST_STRESS_GPU_MIN_BONDS"))
+        {
+            m_settings.gpuStressMinimumBondCount =
+                static_cast<uint32_t>(std::strtoul(minEnv, nullptr, 10));
         }
         if (m_settings.gpuStressSolver)
         {
@@ -1369,15 +1373,24 @@ public:
     /// split paths so the two cannot report different things.
     void collectSolveTelemetry()
     {
-        // The GPU solver is created LAZILY on first solve, so probing right
-        // after setGpuAccelerated always reports inactive. Report once from
-        // here, where the answer is real.
-        if (!m_gpuProbeDone)
+        // A GPU request that quietly ran on the CPU is the most expensive
+        // failure mode here: every timing, every A/B, and every "the invariant
+        // test passes on GPU" claim is then about the wrong solver. The
+        // backend only exists after the first solve, so this is the earliest
+        // point the question can be answered honestly.
+        if (!m_gpuVerified)
         {
-            m_gpuProbeDone = true;
-            std::fprintf(stderr,
-                         "[stress] gpu accelerated after first solve: %u\n",
-                         unsigned(ext_stress_solver_get_gpu_accelerated(m_solver)));
+            m_gpuVerified = true;
+            if (m_settings.gpuStressSolver
+                && !ext_stress_solver_get_gpu_accelerated(m_solver))
+            {
+                const char* why = ext_stress_solver_gpu_inactive_reason(m_solver);
+                std::fprintf(stderr,
+                             "[NvBlastExtStressPhysX] WARNING: gpuStressSolver was "
+                             "requested but the CUDA backend is NOT running -- this is "
+                             "the CPU solver. Reason: %s\n",
+                             why ? why : "unknown");
+            }
         }
         m_telemetry.overstressedBondCount =
             ext_stress_solver_overstressed_bond_count(m_solver);
@@ -4247,7 +4260,7 @@ private:
     // Previous tick's body snapshot, for the quiet-tick gravity skip. Sized by
     // body count (~108 for the downtown city), not by node count, so holding
     // and comparing it is free next to the ~87,000 node writes it avoids.
-    bool m_gpuProbeDone{false};
+    bool m_gpuVerified{false};
     std::vector<ExtStressPhysXBodySnapshot> m_lastSnapshot;
     uint32_t m_lastSnapshotCount{0};
     bool m_loadsValid{false};

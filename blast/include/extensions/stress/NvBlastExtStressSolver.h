@@ -587,6 +587,18 @@ public:
     virtual void                            setGpuCudaContext(void* cudaContext) = 0;
     virtual void                            setGpuMinimumBondCount(uint32_t bondCount) = 0;
     virtual bool                            getGpuAccelerated() const = 0;
+
+    /**
+    Why the CUDA backend is not running, or nullptr when it is.
+
+    setGpuAccelerated() returning true means the REQUEST was accepted, not that
+    the GPU is in use: the backend is rebuilt on the next prepare and can still
+    decline -- below gpuStressMinimumBondCount (4096 by default, above most
+    test scenes), no CUDA context, an empty family, or a build without
+    NVBLAST_ENABLE_CUDA_STRESS. Pair every request with this to avoid silently
+    measuring the CPU solver while believing you are on the GPU.
+    */
+    virtual const char*                     getGpuInactiveReason() const = 0;
     virtual float                           getGpuSolveMilliseconds() const = 0;
 
     /// Host wall time inside the GPU solve, split into work and waiting.

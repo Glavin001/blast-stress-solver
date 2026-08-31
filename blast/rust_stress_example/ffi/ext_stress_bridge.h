@@ -358,6 +358,8 @@ uint8_t ext_stress_solver_set_gpu_accelerated(ExtStressSolverHandle* handle, uin
 void ext_stress_solver_set_gpu_cuda_context(ExtStressSolverHandle* handle, void* cuda_context);
 void ext_stress_solver_set_gpu_minimum_bond_count(ExtStressSolverHandle* handle, uint32_t bond_count);
 uint8_t ext_stress_solver_get_gpu_accelerated(const ExtStressSolverHandle* handle);
+/// Why the CUDA backend is not running, or nullptr when it is.
+const char* ext_stress_solver_gpu_inactive_reason(const ExtStressSolverHandle* handle);
 float ext_stress_solver_gpu_solve_milliseconds(const ExtStressSolverHandle* handle);
 float ext_stress_solver_impulse_copy_milliseconds(const ExtStressSolverHandle* handle);
 void ext_stress_solver_set_defer_bond_stress(ExtStressSolverHandle* handle, uint8_t defer);

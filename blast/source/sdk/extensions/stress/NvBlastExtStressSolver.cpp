@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -175,6 +176,27 @@ public:
             m_gpuSolver->release();
             m_gpuSolver = nullptr;
         }
+        // Record why the GPU backend is or is not live. Every branch below
+        // used to be silent, so "I asked for the GPU and got the CPU" was
+        // indistinguishable from "I asked for the GPU and got it" without a
+        // debugger.
+        if (!m_gpuRequested)
+        {
+            m_gpuInactiveReason = "not requested (setGpuAccelerated was never called with true)";
+        }
+        else if (m_nodes.empty())
+        {
+            m_gpuInactiveReason = "the family has no nodes";
+        }
+        else if (m_bonds.size() < m_gpuMinimumBondCount)
+        {
+            snprintf(m_gpuReasonBuf, sizeof(m_gpuReasonBuf),
+                     "bond count %u is below gpuStressMinimumBondCount %u "
+                     "(raise the bond count or lower the threshold; it defaults to 4096, "
+                     "which is deliberately above test-scene sizes)",
+                     unsigned(m_bonds.size()), unsigned(m_gpuMinimumBondCount));
+            m_gpuInactiveReason = m_gpuReasonBuf;
+        }
         if (m_gpuRequested
             && !m_nodes.empty()
             && m_bonds.size() >= m_gpuMinimumBondCount)
@@ -237,6 +259,10 @@ public:
                 m_gpuMaterials.data(),
                 static_cast<uint32_t>(m_gpuMaterials.size()),
                 m_gpuCudaContext);
+            m_gpuInactiveReason = (m_gpuSolver != nullptr)
+                ? nullptr
+                : "ExtStressGpuSolver::create returned null "
+                  "(no CUDA device, no context set via setGpuCudaContext, or allocation failed)";
             m_gpuVelocities.resize(m_nodes.size());
             m_gpuImpulses.resize(m_bonds.size());
             m_gpuIslandsSkipped = 0;
@@ -245,15 +271,33 @@ public:
 #endif
     }
 
+    /// Request the CUDA backend. The return value means "the request was
+    /// accepted", NOT "the GPU is now in use": the backend is (re)built on the
+    /// next prepare, and can still decline -- below the minimum bond count, no
+    /// CUDA context, an empty family. Ask getGpuAccelerated() for what is
+    /// actually running and getGpuInactiveReason() for why, rather than
+    /// assuming this returning true means anything happened.
     bool setGpuAccelerated(bool enabled)
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
         m_gpuRequested = enabled;
         m_forceColdStart = true;
+        if (!enabled)
+        {
+            m_gpuInactiveReason = "not requested (setGpuAccelerated was called with false)";
+        }
         return true;
 #else
+        m_gpuInactiveReason =
+            "this build has no CUDA stress solver (NVBLAST_ENABLE_CUDA_STRESS undefined)";
         return !enabled;
 #endif
+    }
+
+    /// Null when the CUDA backend is live; otherwise a human-readable reason.
+    const char* getGpuInactiveReason() const
+    {
+        return m_gpuInactiveReason;
     }
 
     void setGpuCudaContext(void* cudaContext)
@@ -761,6 +805,9 @@ private:
     uint32_t                    m_materialCount{0};
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
     bool                                m_gpuRequested{false};
+    const char*                         m_gpuInactiveReason{
+        "not requested (setGpuAccelerated was never called with true)"};
+    char                                m_gpuReasonBuf[256]{};
     void*                               m_gpuCudaContext{nullptr};
     uint32_t                            m_gpuMinimumBondCount{4096};
     ExtStressGpuSolver*                 m_gpuSolver{nullptr};
@@ -989,6 +1036,7 @@ public:
     }
 
     bool getGpuAccelerated() const { return m_solver.getGpuAccelerated(); }
+    const char* getGpuInactiveReason() const { return m_solver.getGpuInactiveReason(); }
     float getGpuSolveMilliseconds() const { return m_solver.getGpuSolveMilliseconds(); }
     float getGpuHostWorkMilliseconds() const { return m_solver.getGpuHostWorkMilliseconds(); }
     float getGpuImpulseCopyMilliseconds() const { return m_solver.getGpuImpulseCopyMilliseconds(); }
@@ -3740,6 +3788,11 @@ public:
     virtual void                            setGpuMinimumBondCount(uint32_t bondCount) override
     {
         m_graphProcessor->setGpuMinimumBondCount(bondCount);
+    }
+
+    virtual const char*                     getGpuInactiveReason() const override
+    {
+        return m_graphProcessor->getGpuInactiveReason();
     }
 
     virtual bool                            getGpuAccelerated() const override
