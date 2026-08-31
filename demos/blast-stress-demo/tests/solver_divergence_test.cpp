@@ -131,6 +131,22 @@ ExtStressPhysXDestructible* createColumn(
     desc.bonds = stack.bonds.data();
     desc.bondCount = static_cast<std::uint32_t>(stack.bonds.size());
     desc.worldTransform = PxTransform(origin);
+    // Iteration budget is the variable under test: CG propagates roughly one
+    // graph hop per iteration, so if the divergence depth tracks this number,
+    // truncation is the cause rather than a fixed limit somewhere.
+    if (const char* itEnv = std::getenv("BLAST_TEST_ITERS"))
+    {
+        desc.settings.maxSolverIterationsPerFrame =
+            static_cast<uint32_t>(std::strtoul(itEnv, nullptr, 10));
+    }
+    // unconvergedExtraUpdates: extra solver batches while the solve has not
+    // converged. Its own doc calls this a CORRECTNESS setting, and the plateau
+    // this probe measures is precisely what it exists to prevent.
+    if (const char* exEnv = std::getenv("BLAST_TEST_EXTRA_UPDATES"))
+    {
+        desc.settings.unconvergedExtraUpdates =
+            static_cast<uint32_t>(std::strtoul(exEnv, nullptr, 10));
+    }
     desc.settings.applyExcessForces = false;
     desc.settings.minimumSeparationVelocity = 0.0f;
     desc.stressMaterials = materials.data();
