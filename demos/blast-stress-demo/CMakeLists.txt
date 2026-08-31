@@ -511,4 +511,21 @@ if(BLAST_ENABLE_CUDA_STRESS)
     target_link_libraries(gpu_stress_benchmark PRIVATE
         NvBlastExtStressGpu
         blast_stress_core)
+
+    # The real-pack topology stress suite. Links the same ScenePack
+    # loader the demo uses, so the graph it solves is production's graph rather
+    # than a synthetic model of it -- which is what makes its island histogram
+    # usable as a design input. Needs PhysX headers only for PxVec3 in the
+    # loader's structs; it creates no PhysX scene.
+    add_executable(gpu_stress_suite tests/gpu_stress_suite.cpp scene_pack.cpp)
+    target_include_directories(gpu_stress_suite PRIVATE
+        "${BLAST_ROOT}/include/extensions/stressgpu"
+        "${BLAST_ROOT}/source/shared"
+        "${BLAST_ROOT}/source/shared/stress_solver"
+        "${BLAST_ROOT}/include/shared/NvFoundation"
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${PHYSX_ROOT}/include")
+    target_link_libraries(gpu_stress_suite PRIVATE
+        NvBlastExtStressGpu
+        blast_stress_core)
 endif()

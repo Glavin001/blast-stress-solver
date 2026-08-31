@@ -231,7 +231,126 @@ static bool islandTraceEnabled()
     return enabled;
 }
 
-static bool graphStatsEnabled()
+static /// Device-side early exit via a CUDA graph conditional while-node.
+///
+/// On by default: it is a strict improvement whenever the solve converges
+/// before its budget, and identical work when it does not. `BLAST_GPU_COND_LOOP=0`
+/// restores the unrolled loop for A/B measurement. Requires CUDA 12.3+ for
+/// cudaGraphCondTypeWhile; the toolkit here is 12.8. If any part of the setup
+/// is unsupported at runtime the code falls back to the unrolled form, so this
+/// can never change the answer -- only the cost.
+bool conditionalLoopEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_GPU_COND_LOOP");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
+/// Iterations per condition check in the conditional CG loop. See
+/// launchConditionalLoopCaptured for why this is not 1.
+std::uint32_t conditionalLoopChunk()
+{
+    static const std::uint32_t chunk = []() {
+        const char* raw = std::getenv("BLAST_GPU_COND_CHUNK");
+        const long parsed = raw ? std::atol(raw) : 0;
+        return parsed > 0 ? static_cast<std::uint32_t>(std::min(parsed, 64L)) : 2u;
+    }();
+    return chunk;
+}
+
+/// Rebuild the island partition only when a removal actually disconnected
+/// something. `BLAST_GPU_DEFER_REPARTITION=0` restores the unconditional
+/// rebuild for A/B measurement.
+/// Sparse topology upload. `BLAST_GPU_DELTA_UPLOAD=0` forces the whole-array
+/// upload, for A/B and as a safety valve.
+/// Node-space CGLS: solve for mu with lambda = lambda0 + W mu instead of
+/// carrying bond-length vectors through the loop. Default ON.
+///
+/// Measured on the city scenario: 1.31x at 298k bonds and 1.98x at 1.19M bonds
+/// -- the win grows with scale because it is fundamentally about the working
+/// set fitting the L2, and the bond-length vectors are what pushed it out.
+/// `BLAST_GPU_NODE_SPACE=0` restores the bond-space loop.
+/// Block-Jacobi (6x6 per node) preconditioning of the node-space iteration.
+/// Default OFF: derivation says it costs 2 matvecs/iteration against a 1.5-3x
+/// iteration reduction, i.e. a wash, and this flag exists to MEASURE that
+/// rather than assume it. Also the smoother a multigrid V-cycle would need.
+bool jacobiEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_GPU_JACOBI");
+        return raw != nullptr && std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
+/// Skip within-solve converged islands in the matvec. A/B switch: it saves the
+/// matvec work but costs one scattered load per node, so which way it pays
+/// depends on how many islands converge early.
+bool skipConvergedEnabled()
+{
+    static const bool e = []() { const char* r = std::getenv("BLAST_GPU_SKIP_CONVERGED"); return r == nullptr || std::string(r) != "0"; }();
+    return e;
+}
+
+bool nodeSpaceEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_GPU_NODE_SPACE");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
+/// Relabel a separated piece locally instead of repartitioning the whole graph.
+///
+/// DEFAULT OFF: it is a large cost win (fracture tick 3.40 -> 2.23 ms) that
+/// measurably changes the physics -- residual/tolerance went 1.05x -> 5.06x,
+/// islands over tolerance 1.6% -> 10.5%, and 12% more bonds broke over the same
+/// 1200-tick demolition. Something about the incrementally-maintained partition
+/// is not equivalent to the rebuilt one and it is not yet understood, so the
+/// verified path stays the default. `BLAST_GPU_LOCAL_SPLIT=1` enables it for
+/// investigation.
+/// Assert the incremental partition against a full rebuild every tick. Debug
+/// only: it does the very work the incremental path exists to avoid.
+bool verifyPartitionEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_GPU_VERIFY_PARTITION");
+        return raw != nullptr && std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
+bool localSplitRelabelEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_GPU_LOCAL_SPLIT");
+        return raw != nullptr && std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
+bool deltaUploadEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_GPU_DELTA_UPLOAD");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
+bool deferRepartitionEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_GPU_DEFER_REPARTITION");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
+bool graphStatsEnabled()
 {
     static const bool enabled = [] {
         const char* raw = std::getenv("BLAST_GPU_GRAPH_STATS");
@@ -360,6 +479,28 @@ struct SolveStatus
 /// Bonds/nodes that belong to no solvable island (static-static bonds, and
 /// static nodes, which are fixed boundaries carrying no coupling).
 static constexpr std::uint32_t kNoIsland = 0xFFFFFFFFu;
+
+/// Padded per-island reduction accumulators, as a power-of-two shift. The
+/// stride is fixed at compile time so the indexing is a shift rather than a
+/// multiply, and so the scratch allocation never has to be resized; the number
+/// of slots ACTUALLY summed is chosen per call and is <= 1 << this.
+static constexpr std::uint32_t kReductionSlotShiftMax = 5;   // 32 slots
+static constexpr std::uint32_t kReductionSlotsMax = 1u << kReductionSlotShiftMax;
+
+/// How often node-space CGLS recomputes q = L pi explicitly rather than
+/// advancing it by recurrence. See nodeSpaceMatvec's refresh mode.
+///
+/// Measured at 8 it cost ~6% of the solve and recovered only ~2% of the
+/// residual gap against the CPU reference, so the recurrence is NOT the main
+/// source of that gap -- worth knowing before spending more on it. Kept at 16
+/// as cheap insurance for very long solves, where drift does compound.
+static constexpr std::uint32_t kQRefresh = 16u;
+
+/// A node->bond CSR entry whose bond is gone. The CSR is patched in place on a
+/// removal rather than rebuilt, so a node's run keeps its length and the
+/// vacated slots are tombstoned. 0xFFFFFFFF cannot collide with a live ref
+/// (bond index is masked to 31 bits) and is one compare to test.
+static constexpr std::uint32_t kDeadBondRef = 0xFFFFFFFFu;
 
 /**
  * Settled-island skipping: is this BOND's work already done?
@@ -502,16 +643,20 @@ __global__ void initializeSolve(
         const Inertia value = inertia[index];
         const ExtStressGpuImpulse velocity = input[index];
         AngLin b{};
-        const float angularDenominator = value.angular > 0.0f ? value.angular : 1.0f;
-        const float linearDenominator = value.linear > 0.0f ? value.linear : 1.0f;
+        // Reciprocate ONCE. This was six float divisions per node, and the
+        // compiler cannot hoist them because the denominators are data --
+        // even though under equalizeMasses they are only ever 0 or 1.
+        const float invAngular = value.angular > 0.0f ? 1.0f / value.angular : 1.0f;
+        const float invLinear =
+            value.linear > 0.0f ? reciprocalLengthScale / value.linear : reciprocalLengthScale;
         b.angular = makeVec(
-            -velocity.angular.x / angularDenominator,
-            -velocity.angular.y / angularDenominator,
-            -velocity.angular.z / angularDenominator);
+            -velocity.angular.x * invAngular,
+            -velocity.angular.y * invAngular,
+            -velocity.angular.z * invAngular);
         b.linear = makeVec(
-            -reciprocalLengthScale * velocity.linear.x / linearDenominator,
-            -reciprocalLengthScale * velocity.linear.y / linearDenominator,
-            -reciprocalLengthScale * velocity.linear.z / linearDenominator);
+            -velocity.linear.x * invLinear,
+            -velocity.linear.y * invLinear,
+            -velocity.linear.z * invLinear);
         rhs[index] = b;
         residual[index] = b;
         }
@@ -525,16 +670,21 @@ __global__ void initializeSolve(
         const std::uint32_t index = activeBonds[slot];
         if (!bondSettled(islandSkip, bondIsland[index]))
         {
-        if (warmStart)
+        // NOTHING to do on a warm start. Impulses are stored in SOLVER-SCALED
+        // units on the device and never round-tripped: this used to multiply
+        // every bond by 1/scale here so unscaleImpulses could multiply it back
+        // at the end of the solve -- a full read-modify-write over every bond,
+        // twice per solve, purely to undo itself. It was 70% of the fixed
+        // overhead, which is itself a third of the solve.
+        //
+        // Keeping them scaled also removes a real numerical wart: x*(1/s)
+        // followed by x*s is not the identity in float, so the old round-trip
+        // walked a warm-started island's stress by an ulp per tick forever.
+        (void)reciprocalAngularImpulseScale;
+        (void)reciprocalLinearImpulseScale;
+        if (!warmStart)
         {
-            impulses[index].angular =
-                mul(impulses[index].angular, reciprocalAngularImpulseScale);
-            impulses[index].linear =
-                mul(impulses[index].linear, reciprocalLinearImpulseScale);
-        }
-        else
-        {
-            impulses[index] = {};
+            impulses[index] = AngLin{};
         }
         }
     }
@@ -635,6 +785,10 @@ __global__ void gatherRightMultiply(
     for (std::uint32_t i = begin; i < end; ++i)
     {
         const std::uint32_t ref = nodeBondRef[i];
+        if (ref == kDeadBondRef)
+        {
+            continue;   // tombstone from an in-place removal
+        }
         const std::uint32_t bond = ref & 0x7FFFFFFFu;
         const bool isSecond = (ref & 0x80000000u) != 0u;
         if (health[bond] <= 0.0f)
@@ -800,31 +954,646 @@ __global__ void setTolerancePerIsland(
     islandConverged[id] = 0;
 }
 
-__global__ void initializeStatus(SolveStatus* status, std::uint32_t maxIterations)
+__global__ void initializeStatus(
+    SolveStatus* status, std::uint32_t* iteration, std::uint32_t maxIterations)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0)
     {
         status->active = 1;
         status->iterations = maxIterations;
         status->converged = 0;
+        // The loop counter lives on the device so the CG body can be ONE graph
+        // node executed repeatedly, instead of maxIterations copies of it.
+        *iteration = 0u;
     }
 }
 
-/// Per-island sum of squared magnitudes.
+
+
+/// ---------------------------------------------------------------------------
+/// NODE-SPACE CGLS
+///
+/// The bond-space form solves  C^T D C lambda = -C^T D v  by CGNR on the factor
+/// B = D C, carrying three BOND-length vectors (gradient, direction, impulses)
+/// through every iteration. Substituting
+///
+///     lambda = lambda0 + W mu,      W := B^T = C^T D,   L := W^T W = D C C^T D
+///
+/// eliminates the bond-space vectors z, p and s ALGEBRAICALLY -- this is an
+/// identity, not an approximation, and every scalar (z_sq, beta, alpha) is
+/// unchanged. `r` in cgnr.h is already a node vector, so rho == r literally.
+///
+///     w  = L rho      and, from the same pass, z_sq = ||W rho||^2 = sum ||t_j||^2
+///     beta = z_sq / z_sq_prev
+///     pi = rho + beta pi ;  q = w + beta q          (q == L pi, by linearity)
+///     alpha = z_sq / ||q||^2
+///     mu += alpha pi ;      rho -= alpha q
+///     ... and once, at the end, lambda = lambda0 + W mu
+///
+/// Why bother: the hot loop drops from ~112 B/bond to ~48 B/bond, because
+/// `gradient` and `direction` cease to exist. At 671k bonds the old working set
+/// no longer fits the 4090's 72 MB L2 and per-bond cost rises 72%; this brings
+/// it back inside.
+///
+/// THREE TRAPS, all of which produce plausible-looking wrong answers:
+///
+/// 1. THIS IS NOT PLAIN CG ON L. Plain CG uses numerator rho^T rho; the correct
+///    one is rho^T L rho = ||W rho||^2. null(L) is the rigid-body mode of any
+///    island not anchored to a static node -- the stress suite measures 29,041
+///    of those in one scene. With rho^T rho both alpha and beta inflate and the
+///    residual test stalls forever on every free-floating fragment.
+/// 2. z_sq MUST COUNT EACH BOND EXACTLY ONCE. Canonical owner: the node-0 side,
+///    or the dynamic endpoint when node 0 is static. Double counting scales
+///    alpha, beta and delta consistently, so it still converges -- just slower.
+///    An endpoint test will not catch it.
+/// 3. q = w + beta q IS A RECURRENCE where s = Bp was a fresh application. That
+///    is the pipelined-CG trade; refresh q = L pi explicitly every kQRefresh
+///    iterations.
+/// ---------------------------------------------------------------------------
+
+/// w = L rho, fused: the bond-space intermediate t_j is recomputed at each
+/// endpoint rather than stored. The workload is ~2 flops/byte on a machine that
+/// does 80, so recomputing is free and it removes a whole bond-length vector
+/// from the loop.
+__global__ void nodeSpaceMatvec(
+    AngLin* w,
+    const AngLin* rho,
+    const Inertia* inertia,
+    const std::uint32_t* nodeBondBegin,
+    const std::uint32_t* nodeBondRef,
+    const std::uint32_t* node0,
+    const std::uint32_t* node1,
+    const Vec4* offset0,
+    const Vec4* offset1,
+    const float* health,
+    const std::uint32_t* bondIsland,
+    const std::uint32_t* islandSkip,
+    const std::uint32_t* nodeIsland,
+    const std::uint32_t* islandActive,
+    bool skipConverged,
+    float* zSqSlots,
+    std::uint32_t slotCount,
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeCounts,
+    // Refresh mode: when non-zero, this launch only does work on iterations
+    // divisible by `refreshEvery`, and skips the z_sq accumulation. That is the
+    // periodic explicit recomputation of q = L pi which keeps the recurrence
+    // q = w + beta q from drifting (the pipelined-CG trade).
+    const std::uint32_t* iterationPtr,
+    std::uint32_t refreshEvery)
+{
+    if (refreshEvery != 0u && (*iterationPtr % refreshEvery) != 0u)
+    {
+        return;
+    }
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[1])
+    {
+        return;
+    }
+    const std::uint32_t node = activeNodes[slot];
+    // An island that reached tolerance EARLIER IN THIS SOLVE is done: its pi,
+    // q, mu and rho are frozen by the islandActive guard in the update kernels,
+    // so the w and z_sq computed for it here would be written and never read.
+    // The cross-tick islandSkip mask does not cover this -- that one only
+    // retires islands that were already settled when the solve began. Islands
+    // converge at very different rates once a scene is fragmented, so at
+    // realistic island counts this is a large fraction of the matvec.
+    // Read the island once and reuse it for the z_sq atomic below: the guard
+    // then costs a single extra scattered load, not two.
+    const std::uint32_t myIsland = nodeIsland[node];
+    if (skipConverged && myIsland != kNoIsland && islandActive != nullptr
+        && !islandActive[myIsland])
+    {
+        return;
+    }
+    const Inertia inv = inertia[node];
+    if (inv.angular == 0.0f && inv.linear == 0.0f)
+    {
+        // Static: annihilated on both sides of L, so its row is identically
+        // zero. Also the high-degree terrain node, which would otherwise walk
+        // thousands of bonds to produce zero.
+        w[node].angular = Vec4{0.0f, 0.0f, 0.0f, 0.0f};
+        w[node].linear = Vec4{0.0f, 0.0f, 0.0f, 0.0f};
+        return;
+    }
+
+    const AngLin selfRho = rho[node];
+    const Vec4 selfAng = mul(selfRho.angular, inv.angular);
+    const Vec4 selfLin = mul(selfRho.linear, inv.linear);
+
+    Vec4 accAng{0.0f, 0.0f, 0.0f, 0.0f};
+    Vec4 accLin{0.0f, 0.0f, 0.0f, 0.0f};
+    float zSq = 0.0f;
+
+    const std::uint32_t begin = nodeBondBegin[node];
+    const std::uint32_t end = nodeBondBegin[node + 1];
+    for (std::uint32_t i = begin; i < end; ++i)
+    {
+        const std::uint32_t ref = nodeBondRef[i];
+        if (ref == kDeadBondRef)
+        {
+            continue;   // tombstone from an in-place removal
+        }
+        const std::uint32_t bond = ref & 0x7FFFFFFFu;
+        const bool isSecond = (ref & 0x80000000u) != 0u;
+        if (health[bond] <= 0.0f || bondSettled(islandSkip, bondIsland[bond]))
+        {
+            continue;
+        }
+        const std::uint32_t other = isSecond ? node0[bond] : node1[bond];
+        const Inertia otherInv = inertia[other];
+        const AngLin otherRho = rho[other];
+        const Vec4 otherAng = mul(otherRho.angular, otherInv.angular);
+        const Vec4 otherLin = mul(otherRho.linear, otherInv.linear);
+
+        // t_j = (C^T D rho)_j, with node 0 first regardless of which side we
+        // are on -- the sign convention is a property of the bond, not of the
+        // walker.
+        const Vec4 a0 = isSecond ? otherAng : selfAng;
+        const Vec4 l0 = isSecond ? otherLin : selfLin;
+        const Vec4 a1 = isSecond ? selfAng : otherAng;
+        const Vec4 l1 = isSecond ? selfLin : otherLin;
+        const Vec4 o0 = offset0[bond];
+        const Vec4 o1 = offset1[bond];
+
+        const Vec4 tAng = sub(a0, a1);
+        const Vec4 tLin =
+            add(sub(l0, l1), sub(cross(o0, a0), cross(o1, a1)));
+
+        // Own the bond from the node-0 side, or from the dynamic side when
+        // node 0 is static (that side never runs). Exactly once, either way.
+        const bool node0Dynamic =
+            !(inertia[node0[bond]].angular == 0.0f && inertia[node0[bond]].linear == 0.0f);
+        const bool owns = isSecond ? !node0Dynamic : true;
+        if (owns)
+        {
+            zSq += tAng.x * tAng.x + tAng.y * tAng.y + tAng.z * tAng.z
+                 + tLin.x * tLin.x + tLin.y * tLin.y + tLin.z * tLin.z;
+        }
+
+        // (D C t)_node, the same accumulation gatherRightMultiply performs.
+        if (!isSecond)
+        {
+            accAng = add(accAng, sub(tAng, cross(o0, tLin)));
+            accLin = add(accLin, tLin);
+        }
+        else
+        {
+            accAng = add(accAng, sub(cross(o1, tLin), tAng));
+            accLin = sub(accLin, tLin);
+        }
+    }
+
+    w[node].angular = mul(accAng, inv.angular);
+    w[node].linear = mul(accLin, inv.linear);
+
+    if (zSqSlots != nullptr && zSq > 0.0f && myIsland != kNoIsland)
+    {
+        atomicAdd(&zSqSlots[myIsland * slotCount + (slot & (slotCount - 1u))], zSq);
+    }
+}
+
+/// Assemble and invert the 6x6 diagonal block of L per node: block-Jacobi.
+///
+/// L = D C C^T D, so the diagonal block at node i is D_i (sum over incident
+/// bonds of A A^T) D_i, where A = [[I, -[r]x],[0, I]] is that bond's coupling
+/// block. A A^T works out to
+///
+///     A A^T = [[ I - [r]x [r]x ,  -[r]x ],
+///              [   +[r]x        ,    I   ]]
+///
+/// and since [r]x [r]x = r r^T - |r|^2 I, the top-left is I - r r^T + |r|^2 I.
+/// Note BOTH the sign of that product and the ASYMMETRY of the off-diagonal
+/// blocks (-[r]x above, +[r]x below, because [r]x^T = -[r]x). Getting either
+/// wrong makes the block non-SPD and the preconditioned iteration diverges
+/// outright -- measured, first attempt: residual 9e+04 against 2.6e-02.
+///
+/// Correctness safety: if the assembled block will not factor, this stores the
+/// IDENTITY for that node. A preconditioner that degenerates to no
+/// preconditioner is still a valid preconditioner -- it costs iterations, never
+/// the answer -- so no input can make this produce a wrong solve.
+__global__ void nodeSpaceBuildJacobi(
+    float* inverse,                  // 36 floats per node, row major
+    const Inertia* inertia,
+    const std::uint32_t* nodeBondBegin,
+    const std::uint32_t* nodeBondRef,
+    const std::uint32_t* node0,
+    const std::uint32_t* node1,
+    const Vec4* offset0,
+    const Vec4* offset1,
+    const float* health,
+    std::uint32_t nodeCount,
+    std::uint32_t bondCount)
+{
+    const std::uint32_t node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= nodeCount)
+    {
+        return;
+    }
+    float m[36];
+    for (int i = 0; i < 36; ++i) m[i] = 0.0f;
+
+    const Inertia inv = inertia[node];
+    const bool dynamic = !(inv.angular == 0.0f && inv.linear == 0.0f);
+    if (dynamic)
+    {
+        for (std::uint32_t i = nodeBondBegin[node]; i < nodeBondBegin[node + 1]; ++i)
+        {
+            const std::uint32_t ref = nodeBondRef[i];
+            if (ref == kDeadBondRef) continue;
+            const std::uint32_t bond = ref & 0x7FFFFFFFu;
+            if (bond >= bondCount || health[bond] <= 0.0f) continue;
+            const Vec4 r = (ref & 0x80000000u) ? offset1[bond] : offset0[bond];
+            const float rx = r.x, ry = r.y, rz = r.z;
+            const float r2 = rx * rx + ry * ry + rz * rz;
+            // top-left: I - r r^T + |r|^2 I
+            m[0*6+0] += 1.0f - rx*rx + r2;  m[0*6+1] += -rx*ry;  m[0*6+2] += -rx*rz;
+            m[1*6+0] += -ry*rx;  m[1*6+1] += 1.0f - ry*ry + r2;  m[1*6+2] += -ry*rz;
+            m[2*6+0] += -rz*rx;  m[2*6+1] += -rz*ry;  m[2*6+2] += 1.0f - rz*rz + r2;
+            // off-diagonal: -[r]x above the diagonal, +[r]x below.
+            const float sx[9] = {0.0f, -rz, ry,  rz, 0.0f, -rx,  -ry, rx, 0.0f};
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b)
+                {
+                    m[(a)*6 + (3+b)] += -sx[a*3+b];
+                    m[(3+a)*6 + (b)] += +sx[a*3+b];
+                }
+            // bottom-right: I
+            m[3*6+3] += 1.0f;  m[4*6+4] += 1.0f;  m[5*6+5] += 1.0f;
+        }
+        // Apply the 0/1 inertia mask on both sides, as L does.
+        for (int a = 0; a < 6; ++a)
+            for (int b = 0; b < 6; ++b)
+            {
+                const float da = (a < 3) ? inv.angular : inv.linear;
+                const float db = (b < 3) ? inv.angular : inv.linear;
+                m[a*6+b] *= da * db;
+            }
+    }
+
+    // Gauss-Jordan with partial pivoting into `out`, starting from identity.
+    float out[36];
+    for (int i = 0; i < 36; ++i) out[i] = 0.0f;
+    for (int i = 0; i < 6; ++i) out[i*6+i] = 1.0f;
+
+    bool ok = dynamic;
+    if (ok)
+    {
+        for (int col = 0; col < 6 && ok; ++col)
+        {
+            int piv = col;
+            float best = fabsf(m[col*6+col]);
+            for (int r2i = col + 1; r2i < 6; ++r2i)
+            {
+                const float v = fabsf(m[r2i*6+col]);
+                if (v > best) { best = v; piv = r2i; }
+            }
+            if (!(best > 1e-12f)) { ok = false; break; }
+            if (piv != col)
+                for (int c = 0; c < 6; ++c)
+                {
+                    float t = m[col*6+c]; m[col*6+c] = m[piv*6+c]; m[piv*6+c] = t;
+                    t = out[col*6+c]; out[col*6+c] = out[piv*6+c]; out[piv*6+c] = t;
+                }
+            const float inv0 = 1.0f / m[col*6+col];
+            for (int c = 0; c < 6; ++c) { m[col*6+c] *= inv0; out[col*6+c] *= inv0; }
+            for (int r2i = 0; r2i < 6; ++r2i)
+            {
+                if (r2i == col) continue;
+                const float f = m[r2i*6+col];
+                if (f == 0.0f) continue;
+                for (int c = 0; c < 6; ++c)
+                { m[r2i*6+c] -= f * m[col*6+c]; out[r2i*6+c] -= f * out[col*6+c]; }
+            }
+        }
+        for (int i = 0; i < 36 && ok; ++i) if (!isfinite(out[i])) ok = false;
+    }
+    if (!ok)
+    {
+        for (int i = 0; i < 36; ++i) out[i] = 0.0f;
+        for (int i = 0; i < 6; ++i) out[i*6+i] = 1.0f;   // identity fallback
+    }
+    for (int i = 0; i < 36; ++i) inverse[node * 36 + i] = out[i];
+}
+
+/// g = N w, and gamma = w^T g accumulated per island.
+__global__ void nodeSpaceApplyJacobi(
+    AngLin* g,
+    const AngLin* w,
+    const float* inverse,
+    const std::uint32_t* nodeIsland,
+    const std::uint32_t* islandActive,
+    float* gammaSlots,
+    std::uint32_t slotCount,
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeCounts)
+{
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[1]) return;
+    const std::uint32_t node = activeNodes[slot];
+    const std::uint32_t island = nodeIsland[node];
+    if (island == kNoIsland || !islandActive[island]) return;
+
+    const float wv[6] = {w[node].angular.x, w[node].angular.y, w[node].angular.z,
+                         w[node].linear.x, w[node].linear.y, w[node].linear.z};
+    const float* M = inverse + node * 36;
+    // N MUST BE APPLIED TWICE.
+    //
+    // CGLS wants P ~ S^+ in bond space. With P = W N B and B(W rho) = L rho,
+    // P s = W N L rho, so matching S^+ needs N L = L^+, i.e. N ~ L^-2 -- NOT
+    // L^-1. Applying an L^-1 approximation once yields P ~ I, which is the
+    // UNPRECONDITIONED operator back again, except perturbed by the
+    // approximation error -- a noisy identity, strictly worse than identity.
+    // Measured with a single apply: residual 1.52e+00 against 2.59e-02
+    // unpreconditioned, stable across three unrelated bug fixes, which is what
+    // finally identified this as structural rather than a memory bug.
+    float half[6];
+    for (int a = 0; a < 6; ++a)
+    {
+        float acc = 0.0f;
+        for (int b = 0; b < 6; ++b) acc += M[a*6+b] * wv[b];
+        half[a] = acc;
+    }
+    float gv[6];
+    for (int a = 0; a < 6; ++a)
+    {
+        float acc = 0.0f;
+        for (int b = 0; b < 6; ++b) acc += M[a*6+b] * half[b];
+        gv[a] = acc;
+    }
+    g[node].angular = Vec4{gv[0], gv[1], gv[2], 0.0f};
+    g[node].linear = Vec4{gv[3], gv[4], gv[5], 0.0f};
+    float gamma = 0.0f;
+    for (int a = 0; a < 6; ++a) gamma += wv[a] * gv[a];
+    atomicAdd(&gammaSlots[island * slotCount + (slot & (slotCount - 1u))], gamma);
+}
+
+/// pi = rho + beta pi ;  q = w + beta q, and ||q||^2 accumulated in the same
+/// pass.
+///
+/// This kernel already has the new q in registers, so reducing it here removes
+/// a whole separate pass that re-read q from memory (32 B/node) plus its kernel
+/// launch, every iteration.
+__global__ void nodeSpaceUpdateDirection(
+    AngLin* pi,
+    AngLin* q,
+    const AngLin* rho,
+    const AngLin* w,
+    const float* zSq,
+    const float* zSqPrev,
+    const std::uint32_t* nodeIsland,
+    const std::uint32_t* islandActive,
+    float* qSqSlots,
+    std::uint32_t slotCount,
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeCounts)
+{
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[1])
+    {
+        return;
+    }
+    const std::uint32_t node = activeNodes[slot];
+    const std::uint32_t island = nodeIsland[node];
+    if (island == kNoIsland || !islandActive[island])
+    {
+        return;
+    }
+    const float denominator = zSqPrev[island];
+    const float beta = denominator > 0.0f ? zSq[island] / denominator : 0.0f;
+    // `rho` is the preconditioned direction source: it is rho itself when
+    // unpreconditioned, and g = N w when preconditioned.
+    pi[node].angular = add(rho[node].angular, mul(pi[node].angular, beta));
+    pi[node].linear = add(rho[node].linear, mul(pi[node].linear, beta));
+    const Vec4 qa = add(w[node].angular, mul(q[node].angular, beta));
+    const Vec4 ql = add(w[node].linear, mul(q[node].linear, beta));
+    q[node].angular = qa;
+    q[node].linear = ql;
+    const float qSq = qa.x * qa.x + qa.y * qa.y + qa.z * qa.z
+                    + ql.x * ql.x + ql.y * ql.y + ql.z * ql.z;
+    atomicAdd(&qSqSlots[island * slotCount + (slot & (slotCount - 1u))], qSq);
+}
+
+/// mu += alpha pi ;  rho -= alpha q
+__global__ void nodeSpaceUpdateSolution(
+    const std::uint32_t* iterationPtr,
+    std::uint32_t maxIterations,
+    AngLin* mu,
+    AngLin* rho,
+    const AngLin* pi,
+    const AngLin* q,
+    const float* zSq,
+    const float* qSq,
+    const std::uint32_t* nodeIsland,
+    const std::uint32_t* islandActive,
+    const std::uint32_t* activeNodes,
+    const std::uint32_t* activeCounts)
+{
+    if (*iterationPtr > maxIterations)
+    {
+        return;   // chunked-loop overshoot guard; see the bond-space twin
+    }
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[1])
+    {
+        return;
+    }
+    const std::uint32_t node = activeNodes[slot];
+    const std::uint32_t island = nodeIsland[node];
+    if (island == kNoIsland || !islandActive[island])
+    {
+        return;
+    }
+    const float denominator = qSq[island];
+    if (!(denominator > 0.0f) || !isfinite(denominator))
+    {
+        return;
+    }
+    const float alpha = zSq[island] / denominator;
+    mu[node].angular = add(mu[node].angular, mul(pi[node].angular, alpha));
+    mu[node].linear = add(mu[node].linear, mul(pi[node].linear, alpha));
+    rho[node].angular = sub(rho[node].angular, mul(q[node].angular, alpha));
+    rho[node].linear = sub(rho[node].linear, mul(q[node].linear, alpha));
+}
+
+/// lambda += W mu, i.e. one C^T D pass, run once at the end of the solve.
+__global__ void nodeSpaceApplySolution(
+    AngLin* impulses,
+    const AngLin* mu,
+    const Inertia* inertia,
+    const std::uint32_t* node0,
+    const std::uint32_t* node1,
+    const Vec4* offset0,
+    const Vec4* offset1,
+    const float* health,
+    const std::uint32_t* bondIsland,
+    const std::uint32_t* islandSkip,
+    const std::uint32_t* activeBonds,
+    const std::uint32_t* activeCounts)
+{
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= activeCounts[0])
+    {
+        return;
+    }
+    const std::uint32_t bond = activeBonds[slot];
+    if (bondSettled(islandSkip, bondIsland[bond]))
+    {
+        return;
+    }
+    if (health[bond] <= 0.0f)
+    {
+        impulses[bond] = AngLin{};
+        return;
+    }
+    const std::uint32_t first = node0[bond];
+    const std::uint32_t second = node1[bond];
+    AngLin x0 = mu[first];
+    AngLin x1 = mu[second];
+    x0.angular = mul(x0.angular, inertia[first].angular);
+    x0.linear = mul(x0.linear, inertia[first].linear);
+    x1.angular = mul(x1.angular, inertia[second].angular);
+    x1.linear = mul(x1.linear, inertia[second].linear);
+
+    const Vec4 tAng = sub(x0.angular, x1.angular);
+    const Vec4 tLin = add(
+        sub(x0.linear, x1.linear),
+        sub(cross(offset0[bond], x0.angular), cross(offset1[bond], x1.angular)));
+    impulses[bond].angular = add(impulses[bond].angular, tAng);
+    impulses[bond].linear = add(impulses[bond].linear, tLin);
+}
+
+/// Zero the node-space accumulators that must start each solve at zero.
+__global__ void nodeSpaceReset(
+    AngLin* mu,
+    AngLin* pi,
+    AngLin* q,
+    AngLin* g,
+    std::uint32_t nodeCount)
+{
+    // Over ALL nodes, not the active list. The matvec reads its neighbour's
+    // value at every half-edge including static ones, where it is multiplied by
+    // a zero inertia -- and 0 * NaN is NaN, so an uninitialised slot that the
+    // active list never covers still poisons the result. Measured: it turned a
+    // 2.5e-02 residual into 1.5e+00.
+    const std::uint32_t node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= nodeCount)
+    {
+        return;
+    }
+    mu[node] = AngLin{};
+    pi[node] = AngLin{};
+    q[node] = AngLin{};
+    g[node] = AngLin{};
+}
+
+/// Apply patched node->bond CSR entries. Four slots per removal instead of
+/// re-uploading the whole 2*bondCount reference array.
+__global__ void scatterNodeBondRefs(
+    const std::uint32_t* slots,
+    const std::uint32_t* values,
+    std::uint32_t count,
+    std::uint32_t* nodeBondRef)
+{
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+    {
+        nodeBondRef[slots[i]] = values[i];
+    }
+}
+
+/// One bond's full topology record, for the sparse upload path.
+struct alignas(16) BondDelta
+{
+    Vec4 offset0;
+    Vec4 offset1;
+    Vec4 normal;
+    std::uint32_t node0;
+    std::uint32_t node1;
+    std::uint32_t material;
+    std::uint32_t island;
+    float area;
+    float nodeDistance;
+    float health;
+    float pad;
+};
+
+/// Apply a sparse topology update.
+///
+/// removeBond is swap-with-last, so a removal rewrites exactly ONE live slot
+/// (the removed index, which receives the former last bond); everything past
+/// the new bond count is simply never read again. The whole-array re-upload
+/// this replaces moved ~16 MB per fracture tick to change a few hundred bonds.
+__global__ void scatterBondTopology(
+    const std::uint32_t* slots,
+    const BondDelta* values,
+    std::uint32_t count,
+    std::uint32_t* node0,
+    std::uint32_t* node1,
+    Vec4* offset0,
+    Vec4* offset1,
+    Vec4* normals,
+    float* areas,
+    float* nodeDistances,
+    float* health,
+    std::uint32_t* materials,
+    std::uint32_t* island)
+{
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count)
+    {
+        return;
+    }
+    const std::uint32_t b = slots[i];
+    const BondDelta v = values[i];
+    node0[b] = v.node0;
+    node1[b] = v.node1;
+    offset0[b] = v.offset0;
+    offset1[b] = v.offset1;
+    normals[b] = v.normal;
+    areas[b] = v.area;
+    nodeDistances[b] = v.nodeDistance;
+    health[b] = v.health;
+    materials[b] = v.material;
+    island[b] = v.island;
+}
+
+/// Per-island sum of squared magnitudes, accumulated into PADDED slots.
 ///
 /// Islands are disconnected components, so their conjugate-gradient scalars
 /// must be independent: a shared alpha/beta compromises every island toward
 /// the average, and a shared convergence test lets a large well-conditioned
-/// island hide a small badly-solved one. atomicAdd rather than a segmented
-/// library reduce because bonds and nodes are not stored island-contiguous.
+/// island hide a small badly-solved one. Bonds and nodes are not stored
+/// island-contiguous, so a segmented library reduce is not available and this
+/// has to be an atomic scatter.
+///
+/// The naive form -- one atomicAdd per element onto ONE accumulator per island
+/// -- was measured at 76% of the entire solve (6.88 ms of 9.04 ms, 106 us per
+/// launch, twice per CG iteration) on the 298k-bond city. The cause is
+/// contention, not bandwidth: 298k atomics onto 108 addresses is 2,760-way
+/// serialization per address, while the two matvecs either side of it run at
+/// 2-3 TB/s because the working set is L2-resident.
+///
+/// So give each island `slots` accumulators and hash the element onto one by
+/// its thread index. Consecutive lanes in a warp land on consecutive slots, so
+/// a warp's 32 atomics go to 32 distinct addresses and never serialize against
+/// each other. `finalizeIslandReduction` then sums the slots.
+///
+/// `slots` is chosen per call from the average island occupancy, because the
+/// padding is a pure loss in the regime it is not needed for: a fully
+/// fractured city is ~96k islands of ~4 elements, where contention is already
+/// nil and a wide second pass would cost more than the atomics it saves.
+/// See ExtStressGpuSolverImpl::reductionSlots.
 __global__ void accumulateSquaredByIsland(
     const AngLin* values,
     const std::uint32_t* island,
     const std::uint32_t* islandSkip,
-    float* perIsland,
+    float* perIslandSlots,
     const std::uint32_t* activeList,
     const std::uint32_t* activeCounts,
-    std::uint32_t whichCount)
+    std::uint32_t whichCount,
+    std::uint32_t slotCount)
 {
     const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= activeCounts[whichCount])
@@ -846,7 +1615,34 @@ __global__ void accumulateSquaredByIsland(
         value.angular.x * value.angular.x + value.angular.y * value.angular.y +
         value.angular.z * value.angular.z + value.linear.x * value.linear.x +
         value.linear.y * value.linear.y + value.linear.z * value.linear.z;
-    atomicAdd(&perIsland[id], squared);
+    atomicAdd(&perIslandSlots[id * slotCount + (slot & (slotCount - 1u))], squared);
+}
+
+/// Collapse the padded slots to one value per island.
+///
+/// One thread per island, reading `slots` contiguous floats. At 108 islands
+/// and 32 slots that is 13.8 KB -- far below the cost of the contention it
+/// removes. Summation order is fixed (ascending slot), so this pass is
+/// deterministic; the atomics that produced the slots are not, which is why
+/// bit-exact reproducibility has to wait for island-contiguous ordering.
+__global__ void finalizeIslandReduction(
+    const float* perIslandSlots,
+    float* result,
+    std::uint32_t islandCount,
+    std::uint32_t slots)
+{
+    const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= islandCount)
+    {
+        return;
+    }
+    const float* base = perIslandSlots + static_cast<std::size_t>(id) * slots;
+    float sum = 0.0f;
+    for (std::uint32_t i = 0; i < slots; ++i)
+    {
+        sum += base[i];
+    }
+    result[id] = sum;
 }
 
 /// One thread per island: retire islands that have reached tolerance. An
@@ -865,6 +1661,127 @@ __global__ void accumulateSquaredByIsland(
 /// shared counter: with ~8 blocks at city scale the final sum is trivial for
 /// the latch kernel, it needs no reset beforehand, and it is exact and
 /// order-independent by construction rather than by argument.
+/// Slot-sum + convergence test + block tally, in one launch.
+///
+/// These were three separate island-grid kernels. At realistic island counts
+/// that is almost pure launch overhead: 1,243 islands is five blocks of work,
+/// and the three kernels measured 3.5-4.6 us EACH per launch against ~10-25 us
+/// for the kernels that do real work. Fusing the pairs that were already
+/// adjacent and share a grid shape removes two launches per CG iteration.
+__global__ void finalizeAndCheckConvergence(
+    const float* perIslandSlots,
+    float* result,
+    std::uint32_t slots,
+    std::uint32_t* islandActive,
+    std::uint32_t* islandConverged,
+    const float* deltaSquared,
+    std::uint32_t* blockActiveCounts,
+    std::uint32_t islandCount)
+{
+    __shared__ std::uint32_t partial[kBlockSize];
+    const std::uint32_t tid = threadIdx.x;
+    const std::uint32_t id = blockIdx.x * blockDim.x + tid;
+
+    float sum = 0.0f;
+    if (id < islandCount)
+    {
+        const float* base = perIslandSlots + static_cast<std::size_t>(id) * slots;
+        for (std::uint32_t i = 0; i < slots; ++i)
+        {
+            sum += base[i];
+        }
+        result[id] = sum;
+    }
+
+    std::uint32_t active = 0;
+    if (id < islandCount && islandActive[id])
+    {
+        if (sum <= deltaSquared[id])
+        {
+            islandActive[id] = 0;
+            islandConverged[id] = 1;
+        }
+        else
+        {
+            active = 1;
+        }
+    }
+    partial[tid] = active;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0)
+    {
+        blockActiveCounts[blockIdx.x] = partial[0];
+    }
+}
+
+/// Slot-sum + degenerate retirement + loop control, in one launch.
+__global__ void finalizeAndRetire(
+    const float* perIslandSlots,
+    float* result,
+    std::uint32_t slots,
+    std::uint32_t* islandActive,
+    float* previousNumerator,
+    const float* numerator,
+    SolveStatus* status,
+    const std::uint32_t* blockActiveCounts,
+    std::uint32_t blockCount,
+    std::uint32_t* iterationPtr,
+    std::uint32_t islandCount,
+    cudaGraphConditionalHandle loopHandle,
+    std::uint32_t maxIterations)
+{
+    const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id < islandCount)
+    {
+        const float* base = perIslandSlots + static_cast<std::size_t>(id) * slots;
+        float sum = 0.0f;
+        for (std::uint32_t i = 0; i < slots; ++i)
+        {
+            sum += base[i];
+        }
+        result[id] = sum;
+        if (islandActive[id])
+        {
+            if (!(sum > 0.0f) || !isfinite(sum))
+            {
+                islandActive[id] = 0;
+            }
+            previousNumerator[id] = numerator[id];
+        }
+    }
+
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        const std::uint32_t iteration = *iterationPtr;
+        std::uint32_t active = 0;
+        for (std::uint32_t i = 0; i < blockCount; ++i)
+        {
+            active += blockActiveCounts[i];
+        }
+        status->active = active;
+        if (active == 0 && !status->converged)
+        {
+            status->converged = 1;
+            status->iterations = iteration;
+        }
+        const std::uint32_t next = iteration + 1u;
+        *iterationPtr = next;
+        if (loopHandle != 0)
+        {
+            cudaGraphSetConditional(
+                loopHandle, (active != 0u && next < maxIterations) ? 1u : 0u);
+        }
+    }
+}
+
 __global__ void checkConvergencePerIsland(
     std::uint32_t* islandActive,
     std::uint32_t* islandConverged,
@@ -1014,8 +1931,9 @@ __global__ void updateDirectionPerIsland(
     const std::uint32_t* islandActive,
     const std::uint32_t* activeBonds,
     const std::uint32_t* activeCounts,
-    std::uint32_t iteration)
+    const std::uint32_t* iterationPtr)
 {
+    const std::uint32_t iteration = *iterationPtr;
     const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= activeCounts[0])
     {
@@ -1056,6 +1974,8 @@ __global__ void saveGradientSquaredPerIsland(
 /// Each island advances by its own step size. A degenerate island (zero or
 /// non-finite denominator) retires itself without disturbing the others.
 __global__ void updateSolutionAndResidualPerIsland(
+    const std::uint32_t* iterationPtr,
+    std::uint32_t maxIterations,
     AngLin* solution,
     AngLin* residual,
     const AngLin* direction,
@@ -1069,6 +1989,17 @@ __global__ void updateSolutionAndResidualPerIsland(
     const std::uint32_t* activeNodes,
     const std::uint32_t* activeCounts)
 {
+    // Chunked loop control (see launchConditionalLoopCaptured): the while-node
+    // condition is evaluated every kChunk iterations, so the body can overshoot
+    // the budget by up to kChunk-1 iterations. This is the one kernel that
+    // mutates the solution, so guarding it here makes the overshoot a pure
+    // no-op and keeps the chunked, unchunked and unrolled paths bit-identical.
+    // Every other per-iteration buffer is scratch that only feeds this kernel.
+    if (*iterationPtr > maxIterations)
+    {
+        return;
+    }
+
     const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot < activeCounts[0])
     {
@@ -1124,8 +2055,14 @@ __global__ void retireDegenerateIslands(
     SolveStatus* status,
     const std::uint32_t* blockActiveCounts,
     std::uint32_t blockCount,
-    std::uint32_t iteration,
-    std::uint32_t islandCount)
+    std::uint32_t* iterationPtr,
+    std::uint32_t islandCount,
+    // Loop control, folded in here rather than run as its own kernel: this is
+    // already the one place that knows how many islands are still active, and
+    // at ~30k islands an extra launch per iteration cost ~8% of the intact
+    // city's solve for a value that was sitting in a register.
+    cudaGraphConditionalHandle loopHandle,
+    std::uint32_t maxIterations)
 {
     const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id < islandCount)
@@ -1147,6 +2084,10 @@ __global__ void retireDegenerateIslands(
 
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
+        // Only this thread touches the counter, and only after every other
+        // kernel in the iteration has read it, so the read-modify-write needs
+        // no synchronisation.
+        const std::uint32_t iteration = *iterationPtr;
         std::uint32_t active = 0;
         for (std::uint32_t i = 0; i < blockCount; ++i)
         {
@@ -1157,6 +2098,17 @@ __global__ void retireDegenerateIslands(
         {
             status->converged = 1;
             status->iterations = iteration;
+        }
+        const std::uint32_t next = iteration + 1u;
+        *iterationPtr = next;
+        if (loopHandle != 0)
+        {
+            // Non-zero keeps the enclosing cudaGraphCondTypeWhile node looping.
+            // `active` is this iteration's count, not last iteration's, which
+            // is why folding the decision in here is also more accurate than
+            // the separate kernel it replaces.
+            cudaGraphSetConditional(
+                loopHandle, (active != 0u && next < maxIterations) ? 1u : 0u);
         }
     }
 }
@@ -1263,7 +2215,9 @@ __global__ void applyStressDamage(
     float* health,
     std::uint32_t* brokenBonds,
     std::uint32_t* brokenCount,
-    std::uint32_t bondCount)
+    std::uint32_t bondCount,
+    float linearImpulseScale,
+    float angularImpulseScale)
 {
     const std::uint32_t bond = blockIdx.x * blockDim.x + threadIdx.x;
     if (bond >= bondCount || health[bond] <= 0.0f)
@@ -1271,7 +2225,11 @@ __global__ void applyStressDamage(
         return;
     }
 
-    const AngLin impulse = impulses[bond];
+    // Device impulses are solver-scaled; convert to physical units here. Two
+    // multiplies on a value this kernel already has in registers.
+    AngLin impulse = impulses[bond];
+    impulse.angular = mul(impulse.angular, angularImpulseScale);
+    impulse.linear = mul(impulse.linear, linearImpulseScale);
     const Vec4 normal = normals[bond];
     const float area = areas[bond];
     const float distance = nodeDistances[bond];
@@ -1362,6 +2320,8 @@ __global__ void bondStressWalk(
     const float* bondNodeDisp,
     const float* health,
     const AngLin* impulses,
+    float bsLinearScale,
+    float bsAngularScale,
     const float* materialElasticLimits,
     std::uint32_t materialCount,
     float unbreakableLimit,
@@ -1483,7 +2443,10 @@ __global__ void bondStressWalk(
     float stressShear = 0.0f;
     if (totalArea > 0.0f && totalArea < unbreakableLimit)
     {
-        const AngLin impulse = impulses[g];
+        // Solver-scaled -> physical, same as applyStressDamage.
+        AngLin impulse = impulses[g];
+        impulse.angular = mul(impulse.angular, bsAngularScale);
+        impulse.linear = mul(impulse.linear, bsLinearScale);
         const float nodeDist =
             sqrtf(extStressDot(ExtStressVec3{dx, dy, dz}, ExtStressVec3{dx, dy, dz}));
         extStressCalcBondStress(
@@ -1691,6 +2654,7 @@ uploadIslands();
         cudaEventDestroy(m_downloadStart);
         cudaEventDestroy(m_downloadStop);
         cudaStreamDestroy(m_stream);
+        if (m_bodyStream) { cudaStreamDestroy(m_bodyStream); m_bodyStream = nullptr; }
         freeBondStress();
         cudaFreeHost(m_topoStaging);
         cudaFreeHost(m_hostStatus);
@@ -1725,6 +2689,23 @@ uploadIslands();
         cudaFree(m_nodeIsland);
         cudaFree(m_projectedDirectionSquared);
         cudaFree(m_gradientSquared);
+        cudaFree(m_reduceSlots);
+        cudaFree(m_iteration);
+        cudaFree(m_devDeltaSlots);
+        cudaFree(m_devDeltaValues);
+        cudaFree(m_nsPi);
+        cudaFree(m_nsQ);
+        cudaFree(m_nsW);
+        cudaFree(m_nsMu);
+        cudaFree(m_nsG);
+        cudaFree(m_nsW2);
+        cudaFree(m_nsJacobi);
+        cudaFree(m_nsGamma);
+        cudaFree(m_nsGammaPrev);
+        cudaFree(m_devRefSlots);
+        cudaFree(m_devRefValues);
+        cudaFree(m_devNodeIslandSlots);
+        cudaFree(m_devNodeIslandValues);
         cudaFree(m_reductionInput);
         cudaFree(m_projectedDirection);
         cudaFree(m_residual);
@@ -1755,6 +2736,84 @@ uploadIslands();
             m_kernelProfile.dump("eager launches, no CUDA graph", m_profiledSolves);
         }
         delete this;
+    }
+
+    /// Periodic BLAST_GPU_GRAPH_STATS dump.
+    ///
+    /// Called from BOTH solve entry points. It used to live inline in
+    /// solveAndReadbackImpulses only, so any caller using the plain solve()
+    /// path -- which is what a headless harness naturally uses -- got no host
+    /// breakdown at all, and the absence looked like "the stats are off"
+    /// rather than "you are on the other entry point".
+    void maybeDumpStats()
+    {
+        if (graphStatsEnabled() && m_islandCount > 0)
+        {
+            accumulateResidualStats();
+        }
+        if (graphStatsEnabled() && (++m_statSolves % 600u) == 0u)
+        {
+            fprintf(stderr,
+                    "[gpu-graph] solves=%u listRefresh=%u listSkip=%u (%.1f%% refreshed) "
+                    "graphRecapture=%u (%.2f%% of solves) midSync=%.4f ms/solve "
+                    "| recapture %.4f ms/solve (%.3f each) "
+                    "| graphUpdate=%u %.4f ms/solve (%.3f each)\n",
+                    m_statSolves, m_statListRefreshes, m_statListSkips,
+                    100.0 * double(m_statListRefreshes)
+                        / double(m_statListRefreshes + m_statListSkips + 1u),
+                    m_statGraphRecaptures,
+                    100.0 * double(m_statGraphRecaptures) / double(m_statSolves),
+                    m_statMidSyncMs / double(m_statSolves),
+                    (m_statCaptureMs + m_statInstantiateMs) / double(m_statSolves),
+                    (m_statCaptureMs + m_statInstantiateMs)
+                        / double(m_statGraphRecaptures + 1u),
+                    m_statGraphUpdates,
+                    m_statUpdateMs / double(m_statSolves),
+                    m_statUpdateMs / double(m_statGraphUpdates + 1u));
+            // Where the HOST time actually goes, split from where it merely
+            // waits. Only `plan` and `finish` are reclaimable by writing
+            // faster host code; `wait` is the device computing, and shrinking
+            // it means less device work or more overlap, not tighter host code.
+            fprintf(stderr,
+                    "[gpu-host] plan=%.4f (graphUpdate=%.4f, midSync=%.4f, "
+                    "other=%.4f | planSkip=%.4f refresh=%.4f topo=%.4f "
+                    "[%u calls, %.3f each: islands=%.3f csr=%.3f group=%.3f "
+                    "upload=%.3f memset=%.3f | %.2f MB in %u copies, "
+                    "stageMemcpy=%.3f, %u growths, %.2f GB/s]) "
+                    "wait=%.4f finish=%.4f ms/solve "
+                    "| iters=%.1f/solve unconverged=%u (%.1f%% of solves) "
+                    "| residual/tolerance: mean=%.2fx max=%.2fx, %.1f%% of islands over tol\n",
+                    m_statPlanMs / double(m_statSolves),
+                    m_statUpdateMs / double(m_statSolves),
+                    m_statMidSyncMs / double(m_statSolves),
+                    (m_statPlanMs - m_statUpdateMs) / double(m_statSolves),
+                    m_statPlanSkipMs / double(m_statSolves),
+                    m_statRefreshMs / double(m_statSolves),
+                    m_statTopoMs / double(m_statSolves),
+                    m_statTopoCalls,
+                    m_statTopoMs / double(m_statTopoCalls + 1u),
+                    m_statTopoIslandsMs / double(m_statTopoCalls + 1u),
+                    m_statTopoCsrMs / double(m_statTopoCalls + 1u),
+                    m_statTopoGroupMs / double(m_statTopoCalls + 1u),
+                    m_statTopoUploadMs / double(m_statTopoCalls + 1u),
+                    m_statTopoMemsetMs / double(m_statTopoCalls + 1u),
+                    double(m_statTopoBytes) / double(m_statTopoCalls + 1u) / 1048576.0,
+                    m_statTopoCopies / (m_statTopoCalls + 1u),
+                    m_statStageCopyMs / double(m_statTopoCalls + 1u),
+                    m_statTopoGrowths,
+                    (double(m_statTopoBytes) / 1.0e9)
+                        / ((m_statTopoUploadMs > 0.0 ? m_statTopoUploadMs : 1.0) / 1000.0),
+                    m_statWaitMs / double(m_statSolves),
+                    m_statFinishMs / double(m_statSolves),
+                    double(m_statIterations) / double(m_statSolves),
+                    m_statUnconverged,
+                    100.0 * double(m_statUnconverged) / double(m_statSolves),
+                    m_statResCount ? m_statResSum / double(m_statResCount) : 0.0,
+                    m_statResMax,
+                    m_statResCount
+                        ? 100.0 * double(m_statResOverTol) / double(m_statResCount)
+                        : 0.0);
+        }
     }
 
     bool solve(
@@ -1793,6 +2852,7 @@ uploadIslands();
         m_telemetry.hostFinishMilliseconds = hostMs(finishStart);
         m_statPlanMs += m_telemetry.hostPlanMilliseconds;
         m_statFinishMs += m_telemetry.hostFinishMilliseconds;
+        maybeDumpStats();
         return true;
     }
 
@@ -1888,73 +2948,7 @@ uploadIslands();
         // threshold crossing on top of a chaotic cascade, so it amplifies a
         // small stress error into a large outcome difference and tells you
         // nothing about the size of the error itself.
-        if (graphStatsEnabled() && m_islandCount > 0)
-        {
-            accumulateResidualStats();
-        }
-        if (graphStatsEnabled() && (++m_statSolves % 600u) == 0u)
-        {
-            fprintf(stderr,
-                    "[gpu-graph] solves=%u listRefresh=%u listSkip=%u (%.1f%% refreshed) "
-                    "graphRecapture=%u (%.2f%% of solves) midSync=%.4f ms/solve "
-                    "| recapture %.4f ms/solve (%.3f each) "
-                    "| graphUpdate=%u %.4f ms/solve (%.3f each)\n",
-                    m_statSolves, m_statListRefreshes, m_statListSkips,
-                    100.0 * double(m_statListRefreshes)
-                        / double(m_statListRefreshes + m_statListSkips + 1u),
-                    m_statGraphRecaptures,
-                    100.0 * double(m_statGraphRecaptures) / double(m_statSolves),
-                    m_statMidSyncMs / double(m_statSolves),
-                    (m_statCaptureMs + m_statInstantiateMs) / double(m_statSolves),
-                    (m_statCaptureMs + m_statInstantiateMs)
-                        / double(m_statGraphRecaptures + 1u),
-                    m_statGraphUpdates,
-                    m_statUpdateMs / double(m_statSolves),
-                    m_statUpdateMs / double(m_statGraphUpdates + 1u));
-            // Where the HOST time actually goes, split from where it merely
-            // waits. Only `plan` and `finish` are reclaimable by writing
-            // faster host code; `wait` is the device computing, and shrinking
-            // it means less device work or more overlap, not tighter host code.
-            fprintf(stderr,
-                    "[gpu-host] plan=%.4f (graphUpdate=%.4f, midSync=%.4f, "
-                    "other=%.4f | planSkip=%.4f refresh=%.4f topo=%.4f "
-                    "[%u calls, %.3f each: islands=%.3f csr=%.3f group=%.3f "
-                    "upload=%.3f memset=%.3f | %.2f MB in %u copies, "
-                    "stageMemcpy=%.3f, %u growths, %.2f GB/s]) "
-                    "wait=%.4f finish=%.4f ms/solve "
-                    "| iters=%.1f/solve unconverged=%u (%.1f%% of solves) "
-                    "| residual/tolerance: mean=%.2fx max=%.2fx, %.1f%% of islands over tol\n",
-                    m_statPlanMs / double(m_statSolves),
-                    m_statUpdateMs / double(m_statSolves),
-                    m_statMidSyncMs / double(m_statSolves),
-                    (m_statPlanMs - m_statUpdateMs) / double(m_statSolves),
-                    m_statPlanSkipMs / double(m_statSolves),
-                    m_statRefreshMs / double(m_statSolves),
-                    m_statTopoMs / double(m_statSolves),
-                    m_statTopoCalls,
-                    m_statTopoMs / double(m_statTopoCalls + 1u),
-                    m_statTopoIslandsMs / double(m_statTopoCalls + 1u),
-                    m_statTopoCsrMs / double(m_statTopoCalls + 1u),
-                    m_statTopoGroupMs / double(m_statTopoCalls + 1u),
-                    m_statTopoUploadMs / double(m_statTopoCalls + 1u),
-                    m_statTopoMemsetMs / double(m_statTopoCalls + 1u),
-                    double(m_statTopoBytes) / double(m_statTopoCalls + 1u) / 1048576.0,
-                    m_statTopoCopies / (m_statTopoCalls + 1u),
-                    m_statStageCopyMs / double(m_statTopoCalls + 1u),
-                    m_statTopoGrowths,
-                    (double(m_statTopoBytes) / 1.0e9)
-                        / ((m_statTopoUploadMs > 0.0 ? m_statTopoUploadMs : 1.0) / 1000.0),
-                    m_statWaitMs / double(m_statSolves),
-                    m_statFinishMs / double(m_statSolves),
-                    double(m_statIterations) / double(m_statSolves),
-                    m_statUnconverged,
-                    100.0 * double(m_statUnconverged) / double(m_statSolves),
-                    m_statResCount ? m_statResSum / double(m_statResCount) : 0.0,
-                    m_statResMax,
-                    m_statResCount
-                        ? 100.0 * double(m_statResOverTol) / double(m_statResCount)
-                        : 0.0);
-        }
+        maybeDumpStats();
         return true;
     }
 
@@ -2023,6 +3017,8 @@ uploadIslands();
         // island ids get remapped by the repartition this removal triggers.
         m_forceDirtyNodes.push_back(m_hostNode0[bondIndex]);
         m_forceDirtyNodes.push_back(m_hostNode1[bondIndex]);
+        // Captured here, before swapWithLast overwrites slot `bondIndex`.
+        m_splitChecks.push_back({m_hostNode0[bondIndex], m_hostNode1[bondIndex]});
         // Device impulses must follow the same permutation as the host arrays;
         // replayed in order in applyTopologyChange.
         m_pendingImpulseSwaps.emplace_back(bondIndex, last);
@@ -2035,6 +3031,23 @@ uploadIslands();
         swapWithLast(m_hostNodeDistances, bondIndex, last);
         swapWithLast(m_hostHealth, bondIndex, last);
         swapWithLast(m_hostBondMaterials, bondIndex, last);
+        // The island label travels with the bond, so the existing partition
+        // stays self-consistent without being recomputed. That is what lets
+        // the repartition be deferred (see shouldRepartition).
+        if (bondIndex < m_hostBondIsland.size() && last < m_hostBondIsland.size())
+        {
+            m_hostBondIsland[bondIndex] = m_hostBondIsland[last];
+        }
+        // m_bondsByIsland indexes bonds, and two of them just moved.
+        m_bondsByIslandValid = false;
+        ++m_removalsSinceRepartition;
+        // Exactly one live slot changed: `bondIndex` now holds what `last`
+        // held. Slots at or past the new bond count are never read again.
+        if (bondIndex != last)
+        {
+            m_changedBondSlots.push_back(bondIndex);
+        }
+        patchCsrForRemoval(bondIndex, last);
         m_bondCount = last;
         m_topologyDirty = true;
         return true;
@@ -2380,7 +3393,10 @@ uploadIslands();
                 m_bsGroupBegin, m_bsGroupSize, m_bsMemberBlastBond,
                 m_bsBondNode0, m_bsBondNode1, m_bsBondMaterial,
                 m_bsBondNormal, m_bsBondCentroid, m_bsBondNodeDisp,
-                m_bsHealth, m_impulses, m_bsMaterialLimits, csr.materialCount,
+                m_bsHealth, m_impulses,
+                m_lengthScale * m_massScale,
+                m_lengthScale * m_lengthScale * m_massScale,
+                m_bsMaterialLimits, csr.materialCount,
                 unbreakableLimit, groups,
                 m_bsGroupStressNormal, m_bsGroupStressShear,
                 m_bsGroupNormal, m_bsGroupCentroid,
@@ -2548,8 +3564,19 @@ uploadIslands();
     ///              transfer before the solve is enqueued, so it never steals
     ///              bandwidth from the kernels.
     ///
-    /// Default `sync`: it is the only one of the three that reduces cost
-    /// without moving it somewhere else.
+    /// Default `async` (was `sync`). The measurement above that rejected async
+    /// -- 8.25% of device solve time lost to the transfer competing with the CG
+    /// kernels for bandwidth -- was taken against a CG loop that has since got
+    /// roughly 4x cheaper (padded per-island reductions, device-side early
+    /// exit). The competing kernels are now short enough that overlapping wins:
+    /// re-measured on a 600-tick demolition at 298k bonds, the fracture tick
+    /// goes 5.92 -> 5.47 ms wall, async faster in 3/3 paired runs. Host plan
+    /// falls 3.59 -> 2.76 ms and roughly half of that does reappear as host
+    /// waiting, exactly as the original note predicted -- but only half, so the
+    /// trade is now net positive rather than net negative.
+    ///
+    /// This is worth re-checking whenever the device solve changes materially
+    /// again; it has already flipped once.
     enum class TopoUploadMode { Pageable, Async, Sync };
     static TopoUploadMode topoUploadMode()
     {
@@ -2560,8 +3587,9 @@ uploadIslands();
                 const std::string value(raw);
                 if (value == "pageable") { return TopoUploadMode::Pageable; }
                 if (value == "async")    { return TopoUploadMode::Async; }
+                if (value == "sync")     { return TopoUploadMode::Sync; }
             }
-            return TopoUploadMode::Sync;
+            return TopoUploadMode::Async;
         }();
         return mode;
     }
@@ -3246,9 +4274,30 @@ private:
                 ++skipped;
                 continue;
             }
-            for (std::uint32_t t = m_islandBondBegin[k]; t < m_islandBondBegin[k + 1]; ++t)
+            if (m_bondsByIslandValid)
             {
-                m_changedBonds.push_back(m_bondsByIsland[t]);
+                for (std::uint32_t t = m_islandBondBegin[k]; t < m_islandBondBegin[k + 1]; ++t)
+                {
+                    m_changedBonds.push_back(m_bondsByIsland[t]);
+                }
+            }
+        }
+        if (!m_bondsByIslandValid)
+        {
+            // Bonds moved under the island->bond index since it was built, so
+            // enumerate from the labels instead, which removeBond keeps
+            // current. One pass over bonds rather than a gather per island: no
+            // worse than the gather in exactly the case this runs -- a tick on
+            // which something broke, where little or nothing is skippable
+            // anyway -- and it lets the repartition be deferred.
+            m_changedBonds.clear();
+            for (std::uint32_t b = 0; b < m_bondCount; ++b)
+            {
+                const std::uint32_t island = m_hostBondIsland[b];
+                if (island != kNoIsland && m_hostIslandSkip[island] == 0u)
+                {
+                    m_changedBonds.push_back(b);
+                }
             }
         }
         m_telemetry.islandsSkipped = skipped;
@@ -3525,16 +4574,79 @@ private:
         // The island partition is about to be remapped; the compacted lists
         // index into the OLD partition and must be rebuilt before next solve.
         m_activeListsDirty = true;
+        m_jacobiBuilt = false;   // topology moved: the diagonal blocks are stale
         auto tstep = StatClock::now();
-        computeIslands();
-        m_statTopoIslandsMs += statMs(tstep); tstep = StatClock::now();
-        buildNodeBondCsr();
+        // Repartitioning is O(nodes + bonds) of pointer-chasing union-find and
+        // measured 2.2 ms per fracture tick at 298k bonds -- the single largest
+        // cost in the whole tick, device work included. It is also usually
+        // unnecessary, because REMOVING A BOND CAN ONLY SPLIT AN ISLAND, NEVER
+        // MERGE ONE, and solving two disconnected components as one island is
+        // exact: the operator is block-diagonal across them, so the CG iterates
+        // are identical. Only the convergence test and the skip granularity are
+        // shared, which costs at most a few extra iterations for whichever
+        // component converges first.
+        //
+        // So carry the stale, coarser partition and rebuild on a budget. The
+        // labels stay self-consistent because removeBond moves a bond's island
+        // label with it.
+        // CSR first: the split test walks it, and it has to describe the graph
+        // AFTER this tick's removals. Usually it already does, because
+        // removeBond patched it in place -- rebuild only once the tombstones
+        // have accumulated enough to be worth compacting away.
+        const bool csrPatched = m_csrValid && csrPatchAcceptable();
+        if (!csrPatched)
+        {
+            buildNodeBondCsr();
+        }
         m_statTopoCsrMs += statMs(tstep); tstep = StatClock::now();
-        groupBondsByIsland();
+        const bool repartition = shouldRepartition();
+        if (repartition)
+        {
+            computeIslands();
+            m_islandCountAtRebuild = m_islandCount;
+            m_removalsSinceRepartition = 0;
+            // computeIslands rewrote every label, so any deltas queued by a
+            // local relabel are stale -- the full upload below carries them.
+            m_changedNodeIslandSlots.clear();
+            m_changedBondSlots.clear();
+        }
+        m_splitChecks.clear();
+        m_statTopoIslandsMs += statMs(tstep); tstep = StatClock::now();
+        if (repartition)
+        {
+            groupBondsByIsland();
+            m_bondsByIslandValid = true;
+        }
         m_statTopoGroupMs += statMs(tstep); tstep = StatClock::now();
-        uploadTopology();
-        uploadIslands();
-        uploadNodeBondCsr();
+        // The bond arrays change in a handful of slots per tick; the island
+        // arrays only change at all when the partition was rebuilt. Fall back
+        // to the full upload whenever the sparse path declines.
+        const bool sparse =
+            !repartition && uploadNodeIslandDelta() && uploadTopologyDelta();
+        if (!sparse)
+        {
+            uploadTopology();
+            uploadIslands();
+        }
+        else if (!m_inertiaUploaded)
+        {
+            // Per-node inertia is fixed by prepare(); it was being re-sent on
+            // every fracture tick for nothing.
+            stageUpload(m_inertia, m_hostInertia.data(),
+                        sizeof(Inertia) * m_nodeCount, "upload inertia");
+            m_inertiaUploaded = true;
+        }
+        m_changedBondSlots.clear();
+        m_changedNodeIslandSlots.clear();
+        if (csrPatched && uploadCsrDelta())
+        {
+            // nodeBondBegin is untouched by a patch: runs keep their length.
+        }
+        else
+        {
+            uploadNodeBondCsr();
+        }
+        m_changedRefSlots.clear();
         checkCuda(cudaEventRecord(m_topoUploadDone, m_stream), "record topology uploads");
         m_topoUploadsPending = true;
         if (topoUploadMode() == TopoUploadMode::Sync)
@@ -3612,15 +4724,459 @@ private:
             }
             m_pendingImpulseSwaps.clear();
         }
-        // Island ids were remapped by the repartition either way; converged
-        // flags are keyed by id and must not survive it. Under
-        // skipStableUnconverged this does not block skipping; under
-        // converged-required semantics it conservatively forces a re-solve.
-        m_hostIslandConverged.assign(m_islandCapacity, 0u);
-        std::fill(m_hostIslandSkip, m_hostIslandSkip + m_islandCapacity, 0u);
-        checkCuda(
-            cudaMemset(m_islandConverged, 0, sizeof(std::uint32_t) * m_islandCapacity),
-            "clear island converged flags");
+        // Converged flags are keyed by island id, so they cannot survive a
+        // renumbering -- but they CAN survive a tick that did not renumber.
+        // That distinction matters a lot: wiping unconditionally meant one bond
+        // breaking anywhere disabled the settled skip for the entire scene on
+        // the next tick, so a long demolition never got to skip anything.
+        // The islands actually touched by this tick's removals are dirtied
+        // separately, through m_forceDirtyNodes.
+        if (repartition)
+        {
+            m_hostIslandConverged.assign(m_islandCapacity, 0u);
+            std::fill(m_hostIslandSkip, m_hostIslandSkip + m_islandCapacity, 0u);
+            // Async on the solver stream: the plain form runs on the legacy
+            // default stream and implicitly synchronises every stream on the
+            // device, including the topology uploads enqueued just above.
+            checkCuda(
+                cudaMemsetAsync(
+                    m_islandConverged, 0,
+                    sizeof(std::uint32_t) * m_islandCapacity, m_stream),
+                "clear island converged flags");
+        }
+    }
+
+    /// Is the patched CSR still worth using, or have the tombstones piled up?
+    ///
+    /// Dead entries cost the matvec a load and a compare each; compacting them
+    /// away costs a full rebuild. 12.5% is where the rebuild starts paying.
+    bool csrPatchAcceptable() const
+    {
+        const std::size_t total = m_hostNodeBondRef.size();
+        return total != 0 && m_deadRefCount * 8u < total;
+    }
+
+    /// Upload just the CSR slots a patch touched.
+    bool uploadCsrDelta()
+    {
+        const std::uint32_t count =
+            static_cast<std::uint32_t>(m_changedRefSlots.size());
+        if (count == 0)
+        {
+            return true;
+        }
+        if (count * 8u >= m_hostNodeBondRef.size() || !deltaUploadEnabled())
+        {
+            return false;
+        }
+        if (count > m_refDeltaCapacity)
+        {
+            const std::uint32_t want =
+                std::max(count, m_refDeltaCapacity ? m_refDeltaCapacity * 2u : 2048u);
+            cudaFree(m_devRefSlots);
+            cudaFree(m_devRefValues);
+            if (cudaMalloc(&m_devRefSlots, sizeof(std::uint32_t) * want) != cudaSuccess
+                || cudaMalloc(&m_devRefValues, sizeof(std::uint32_t) * want) != cudaSuccess)
+            {
+                cudaGetLastError();
+                m_refDeltaCapacity = 0;
+                return false;
+            }
+            m_refDeltaCapacity = want;
+        }
+        m_refSlots.resize(count);
+        m_refValues.resize(count);
+        for (std::uint32_t i = 0; i < count; ++i)
+        {
+            const std::uint32_t pos = m_changedRefSlots[i];
+            m_refSlots[i] = pos;
+            m_refValues[i] = m_hostNodeBondRef[pos];
+        }
+        stageUpload(m_devRefSlots, m_refSlots.data(),
+                    sizeof(std::uint32_t) * count, "upload csr delta slots");
+        stageUpload(m_devRefValues, m_refValues.data(),
+                    sizeof(std::uint32_t) * count, "upload csr delta values");
+        scatterNodeBondRefs<<<(count + kBlockSize - 1) / kBlockSize, kBlockSize, 0, m_stream>>>(
+            m_devRefSlots, m_devRefValues, count, m_nodeBondRef);
+        return true;
+    }
+
+    /// Upload only the node island labels a local split rewrote.
+    bool uploadNodeIslandDelta()
+    {
+        const std::uint32_t count =
+            static_cast<std::uint32_t>(m_changedNodeIslandSlots.size());
+        if (count == 0)
+        {
+            return true;
+        }
+        if (count * 8u >= m_nodeCount || !deltaUploadEnabled())
+        {
+            return false;
+        }
+        if (count > m_nodeIslandDeltaCapacity)
+        {
+            const std::uint32_t want = std::max(
+                count, m_nodeIslandDeltaCapacity ? m_nodeIslandDeltaCapacity * 2u : 2048u);
+            cudaFree(m_devNodeIslandSlots);
+            cudaFree(m_devNodeIslandValues);
+            if (cudaMalloc(&m_devNodeIslandSlots, sizeof(std::uint32_t) * want) != cudaSuccess
+                || cudaMalloc(&m_devNodeIslandValues, sizeof(std::uint32_t) * want) != cudaSuccess)
+            {
+                cudaGetLastError();
+                m_nodeIslandDeltaCapacity = 0;
+                return false;
+            }
+            m_nodeIslandDeltaCapacity = want;
+        }
+        m_nodeIslandSlots.resize(count);
+        m_nodeIslandValues.resize(count);
+        for (std::uint32_t i = 0; i < count; ++i)
+        {
+            const std::uint32_t node = m_changedNodeIslandSlots[i];
+            m_nodeIslandSlots[i] = node;
+            m_nodeIslandValues[i] = m_hostNodeIsland[node];
+        }
+        stageUpload(m_devNodeIslandSlots, m_nodeIslandSlots.data(),
+                    sizeof(std::uint32_t) * count, "upload node island delta slots");
+        stageUpload(m_devNodeIslandValues, m_nodeIslandValues.data(),
+                    sizeof(std::uint32_t) * count, "upload node island delta values");
+        scatterNodeBondRefs<<<(count + kBlockSize - 1) / kBlockSize, kBlockSize, 0, m_stream>>>(
+            m_devNodeIslandSlots, m_devNodeIslandValues, count, m_nodeIsland);
+        return true;
+    }
+
+    /// Rebuild the island partition, or carry the stale one another tick?
+    ///
+    /// Carrying it is always CORRECT (see applyTopologyChange); it only costs
+    /// skip granularity, because two components that have actually separated
+    /// keep sharing one convergence flag and one skip decision. Rebuild once
+    /// that has had a chance to matter -- measured against the alternative of
+    /// rebuilding every tick, which spends 2.2 ms to sharpen a partition that
+    /// is usually unchanged.
+    bool shouldRepartition()
+    {
+        // `<`, not `!=`: removeBond shrinks m_bondCount without shrinking the
+        // label array, so a stale array is legitimately LONGER than the graph.
+        if (m_islandCount == 0 || m_hostBondIsland.size() < m_bondCount)
+        {
+            return true;   // never partitioned, or the labels do not cover the graph
+        }
+        // Local relabelling never reuses an id, so the count drifts above the
+        // true island number and every per-island array, memset and serial tail
+        // scales with the drift. Compact it once it has grown materially.
+        if (m_islandCount > m_islandCountAtRebuild + m_islandCountAtRebuild / 4u + 64u)
+        {
+            return true;
+        }
+        if (!deferRepartitionEnabled())
+        {
+            return true;   // A/B control: rebuild every fracture tick, as before
+        }
+        return applyRemovalSplits();
+    }
+
+    /// Did any of this tick's removals actually disconnect something?
+    ///
+    /// Removing one edge can only ever separate the two sides of THAT edge, so
+    /// "did the partition change" is exactly "are these two endpoints still
+    /// connected to each other". If they are, the component is unchanged and
+    /// the existing labels remain the true partition -- not an approximation of
+    /// it. That is what makes deferring the rebuild free of quality cost.
+    ///
+    /// Deferring on a fixed budget instead was measurably wrong: it let two
+    /// components that HAD separated keep sharing one convergence test, so a
+    /// large component's tolerance hid a small under-solved one and the
+    /// residual went from 0.63x tolerance to 22x, with 42% of islands over.
+    ///
+    /// The walk is bounded; exhausting the budget reports "split" and forces a
+    /// rebuild, which is the conservative direction.
+    /// Handle this tick's removals: detect splits, and relabel them LOCALLY
+    /// when the separated piece is small. Returns true if a full repartition is
+    /// still required.
+    ///
+    /// Removing one edge can only separate the two sides of THAT edge, so a
+    /// bounded walk from one endpoint answers both questions at once: if it
+    /// reaches the other endpoint the component is unchanged; if it exhausts
+    /// naturally the visited set IS the separated piece, and giving that piece a
+    /// fresh island id is the entire partition update. A chunk falling off a
+    /// building costs work proportional to the chunk, not to the city.
+    ///
+    /// Falling back to a full rebuild is always safe -- it is what this
+    /// replaces -- so every uncertain case returns true.
+    bool applyRemovalSplits()
+    {
+        constexpr std::uint32_t kVisitBudget = 512u;
+        const auto isStatic = [&](std::uint32_t node) {
+            return !(m_hostInertia[node].linear > 0.0f);
+        };
+        m_splitVisited.resize(m_nodeCount, 0u);
+        m_affectedIslands.clear();
+        for (const auto& pair : m_splitChecks)
+        {
+            const std::uint32_t from = pair.first;
+            const std::uint32_t to = pair.second;
+            if (from >= m_nodeCount || to >= m_nodeCount)
+            {
+                return true;
+            }
+            // A bond with a static endpoint was already a cut in the partition.
+            if (isStatic(from) || isStatic(to))
+            {
+                continue;
+            }
+            if (++m_splitStamp == 0u)
+            {
+                std::fill(m_splitVisited.begin(), m_splitVisited.end(), 0u);
+                m_splitStamp = 1u;
+            }
+            m_splitQueue.clear();
+            m_splitQueue.push_back(from);
+            m_splitVisited[from] = m_splitStamp;
+            bool reconnected = false;
+            for (std::size_t qi = 0; qi < m_splitQueue.size() && !reconnected; ++qi)
+            {
+                if (m_splitQueue.size() > kVisitBudget)
+                {
+                    return true;   // piece too big to relabel cheaply
+                }
+                const std::uint32_t node = m_splitQueue[qi];
+                for (std::uint32_t i = m_hostNodeBondBegin[node];
+                     i < m_hostNodeBondBegin[node + 1]; ++i)
+                {
+                    const std::uint32_t ref = m_hostNodeBondRef[i];
+                    if (ref == kDeadBondRef)
+                    {
+                        continue;
+                    }
+                    const std::uint32_t bond = ref & 0x7FFFFFFFu;
+                    if (bond >= m_bondCount)
+                    {
+                        continue;
+                    }
+                    const std::uint32_t other =
+                        (ref & 0x80000000u) ? m_hostNode0[bond] : m_hostNode1[bond];
+                    if (other >= m_nodeCount || isStatic(other))
+                    {
+                        continue;   // static nodes cut the graph, as in the union rule
+                    }
+                    if (other == to)
+                    {
+                        reconnected = true;
+                        break;
+                    }
+                    if (m_splitVisited[other] != m_splitStamp)
+                    {
+                        m_splitVisited[other] = m_splitStamp;
+                        m_splitQueue.push_back(other);
+                    }
+                }
+            }
+            if (reconnected)
+            {
+                continue;   // no split: the labels are still the true partition
+            }
+            if (!localSplitRelabelEnabled() || m_islandCount >= m_islandCapacity)
+            {
+                return true;   // fall back to a full repartition
+            }
+
+            // A split. Do NOT relabel just this side.
+            //
+            // Relabelling only the BFS-source component is wrong when an island
+            // splits three or more ways: the source side gets a fresh id, but
+            // the REMAINDER can be two disjoint pieces still sharing the old
+            // id. They then share one convergence test, and a large piece's
+            // tolerance hides a small under-solved one -- measured as
+            // residual/tolerance 1.05x -> 5.06x and 12% more bonds broken.
+            //
+            // Instead, recompute the partition for the affected island only.
+            // That is O(that island), not O(the city).
+            m_affectedIslands.push_back(m_hostNodeIsland[from]);
+            ++m_statLocalSplits;
+        }
+        return m_affectedIslands.empty() ? false : !rebuildAffectedIslands();
+    }
+
+    /// Diagnostic: is the incrementally-maintained partition IDENTICAL, as a
+    /// partition, to what a full computeIslands would produce right now?
+    ///
+    /// This is the probe that settles whether an observed behaviour difference
+    /// is a real partition error or just chaotic amplification of a changed
+    /// reduction order. Ids are allowed to differ; only the equivalence classes
+    /// must match, so it checks for a bijection both ways.
+    ///
+    /// Destroys and restores the partition around a full rebuild, so it is
+    /// strictly a debug path (BLAST_GPU_VERIFY_PARTITION=1).
+    void verifyPartitionAgainstRebuild()
+    {
+        m_verifyNodeIsland.assign(m_hostNodeIsland.begin(), m_hostNodeIsland.end());
+        m_verifyBondIsland.assign(m_hostBondIsland.begin(), m_hostBondIsland.end());
+        const std::uint32_t incrementalCount = m_islandCount;
+
+        computeIslands();   // overwrites the labels with the reference partition
+
+        std::map<std::uint32_t, std::uint32_t> incToRef, refToInc;
+        std::uint64_t mismatches = 0;
+        for (std::uint32_t n = 0; n < m_nodeCount; ++n)
+        {
+            const std::uint32_t inc = m_verifyNodeIsland[n];
+            const std::uint32_t ref = m_hostNodeIsland[n];
+            if ((inc == kNoIsland) != (ref == kNoIsland)) { ++mismatches; continue; }
+            if (inc == kNoIsland) { continue; }
+            auto a = incToRef.emplace(inc, ref);
+            if (!a.second && a.first->second != ref) { ++mismatches; }
+            auto b = refToInc.emplace(ref, inc);
+            if (!b.second && b.first->second != inc) { ++mismatches; }
+        }
+        std::uint64_t bondMismatches = 0;
+        for (std::uint32_t b = 0; b < m_bondCount; ++b)
+        {
+            const std::uint32_t inc = m_verifyBondIsland[b];
+            const std::uint32_t ref = m_hostBondIsland[b];
+            if ((inc == kNoIsland) != (ref == kNoIsland)) { ++bondMismatches; continue; }
+            if (inc == kNoIsland) { continue; }
+            auto it = incToRef.find(inc);
+            if (it == incToRef.end() || it->second != ref) { ++bondMismatches; }
+        }
+        if (mismatches || bondMismatches || ++m_verifyCalls % 200u == 0u)
+        {
+            std::fprintf(stderr,
+                "[partition-verify] call=%llu incrementalIslands=%u referenceIslands=%u "
+                "nodeMismatches=%llu bondMismatches=%llu\n",
+                static_cast<unsigned long long>(m_verifyCalls),
+                incrementalCount, m_islandCount,
+                static_cast<unsigned long long>(mismatches),
+                static_cast<unsigned long long>(bondMismatches));
+        }
+
+        // Put the incremental partition back so the run continues to measure it.
+        m_hostNodeIsland.assign(m_verifyNodeIsland.begin(), m_verifyNodeIsland.end());
+        m_hostBondIsland.assign(m_verifyBondIsland.begin(), m_verifyBondIsland.end());
+        m_islandCount = incrementalCount;
+    }
+
+    /// Recompute connected components for just the islands a removal split.
+    ///
+    /// Correct by construction: every node of an affected island is re-derived
+    /// from scratch, so no two disconnected pieces can be left sharing an id.
+    /// Returns false if it declines (too much of the graph affected), leaving
+    /// the caller to do a full repartition.
+    bool rebuildAffectedIslands()
+    {
+        const auto isStatic = [&](std::uint32_t node) {
+            return !(m_hostInertia[node].linear > 0.0f);
+        };
+        std::sort(m_affectedIslands.begin(), m_affectedIslands.end());
+        m_affectedIslands.erase(
+            std::unique(m_affectedIslands.begin(), m_affectedIslands.end()),
+            m_affectedIslands.end());
+
+        // Gather the affected islands' nodes. One pass over nodes; the union
+        // work below is proportional to those islands, not to the graph.
+        m_affectedNodes.clear();
+        for (std::uint32_t n = 0; n < m_nodeCount; ++n)
+        {
+            if (isStatic(n))
+            {
+                continue;
+            }
+            const std::uint32_t island = m_hostNodeIsland[n];
+            if (island != kNoIsland
+                && std::binary_search(m_affectedIslands.begin(), m_affectedIslands.end(), island))
+            {
+                m_affectedNodes.push_back(n);
+            }
+        }
+        // If the affected islands are most of the graph, a full rebuild is both
+        // simpler and no more expensive.
+        if (m_affectedNodes.size() * 2u >= m_nodeCount)
+        {
+            return false;
+        }
+
+        for (std::uint32_t n : m_affectedNodes)
+        {
+            m_hostParent[n] = n;
+        }
+        for (std::uint32_t n : m_affectedNodes)
+        {
+            for (std::uint32_t i = m_hostNodeBondBegin[n]; i < m_hostNodeBondBegin[n + 1]; ++i)
+            {
+                const std::uint32_t ref = m_hostNodeBondRef[i];
+                if (ref == kDeadBondRef)
+                {
+                    continue;
+                }
+                const std::uint32_t bond = ref & 0x7FFFFFFFu;
+                if (bond >= m_bondCount)
+                {
+                    continue;
+                }
+                const std::uint32_t other =
+                    (ref & 0x80000000u) ? m_hostNode0[bond] : m_hostNode1[bond];
+                if (other >= m_nodeCount || isStatic(other))
+                {
+                    continue;   // static nodes cut, exactly as computeIslands does
+                }
+                unite(n, other);
+            }
+        }
+
+        // Reuse the affected ids first so the island count does not drift.
+        std::size_t nextReuse = 0;
+        m_rootRemap.clear();
+        for (std::uint32_t n : m_affectedNodes)
+        {
+            const std::uint32_t root = findRoot(n);
+            auto it = m_rootRemap.find(root);
+            std::uint32_t id;
+            if (it == m_rootRemap.end())
+            {
+                if (nextReuse < m_affectedIslands.size())
+                {
+                    id = m_affectedIslands[nextReuse++];
+                }
+                else if (m_islandCount < m_islandCapacity)
+                {
+                    id = m_islandCount++;
+                }
+                else
+                {
+                    return false;   // out of id space; a full rebuild compacts it
+                }
+                m_rootRemap.emplace(root, id);
+                if (id < m_islandCapacity)
+                {
+                    // Every piece here changed shape; none may be skipped on trust.
+                    m_hostIslandConverged[id] = 0u;
+                    m_hostIslandSkip[id] = 0u;
+                }
+            }
+            else
+            {
+                id = it->second;
+            }
+            m_hostNodeIsland[n] = id;
+            m_changedNodeIslandSlots.push_back(n);
+            for (std::uint32_t i = m_hostNodeBondBegin[n]; i < m_hostNodeBondBegin[n + 1]; ++i)
+            {
+                const std::uint32_t ref = m_hostNodeBondRef[i];
+                if (ref == kDeadBondRef)
+                {
+                    continue;
+                }
+                const std::uint32_t bond = ref & 0x7FFFFFFFu;
+                if (bond >= m_bondCount)
+                {
+                    continue;
+                }
+                m_hostBondIsland[bond] = id;
+                m_changedBondSlots.push_back(bond);
+            }
+        }
+        m_bondsByIslandValid = false;
+        return true;
     }
 
     /// Forget that anything is settled. Used whenever the impulses the
@@ -3695,14 +5251,26 @@ private:
                 m_downloadStop),
             "measure impulse readback");
         const std::uint32_t count = static_cast<std::uint32_t>(m_changedBonds.size());
+        const float linearScale = m_lengthScale * m_massScale;
+        const float angularScale = m_lengthScale * linearScale;
         for (std::uint32_t j = 0; j < count; ++j)
         {
             const std::uint32_t bond = m_changedBonds[j];
             const AngLin& value = m_hostImpulses[compacted ? j : bond];
+            // Device impulses are solver-scaled; this loop already touches
+            // every changed bond for the 32 B -> 24 B repack, so converting to
+            // physical units here is six multiplies on data already in cache.
+            // Doing it on the device instead would need a full-array pass on
+            // the non-compacted path -- which is the path taken after every
+            // fracture tick, where it would cost as much as it saves.
             bondImpulses[bond].angular =
-                {value.angular.x, value.angular.y, value.angular.z};
+                {value.angular.x * angularScale,
+                 value.angular.y * angularScale,
+                 value.angular.z * angularScale};
             bondImpulses[bond].linear =
-                {value.linear.x, value.linear.y, value.linear.z};
+                {value.linear.x * linearScale,
+                 value.linear.y * linearScale,
+                 value.linear.z * linearScale};
         }
         m_telemetry.deviceToHostBytes +=
             sizeof(AngLin) * static_cast<std::uint64_t>(count);
@@ -3890,6 +5458,26 @@ private:
         // the full-rebuild cost back in through the side door.
         m_islandCapacity = std::max(m_nodeCount, 1u);
         allocateDevice(m_gradientSquared, m_islandCapacity, "allocate gradient norm");
+        allocateDevice(m_iteration, 1, "allocate device iteration counter");
+        // Node-space CGLS working set. Node-length, so ~1/3 of the bond-length
+        // vectors they replace.
+        allocateDevice(m_nsPi, m_nodeCount, "allocate node-space direction");
+        allocateDevice(m_nsQ, m_nodeCount, "allocate node-space projected direction");
+        allocateDevice(m_nsW, m_nodeCount, "allocate node-space matvec output");
+        allocateDevice(m_nsMu, m_nodeCount, "allocate node-space correction");
+        allocateDevice(m_nsG, m_nodeCount, "allocate node-space preconditioned residual");
+        allocateDevice(m_nsW2, m_nodeCount, "allocate node-space second matvec output");
+        allocateDevice(m_nsJacobi, static_cast<std::size_t>(m_nodeCount) * 36,
+                       "allocate node-space block-Jacobi inverses");
+        allocateDevice(m_nsGamma, m_islandCapacity, "allocate node-space gamma");
+        allocateDevice(m_nsGammaPrev, m_islandCapacity, "allocate node-space gamma prev");
+        // Padded accumulators for the per-island reduction. One buffer serves
+        // every reduction because each is finalized into its own result array
+        // before the next one starts.
+        allocateDevice(
+            m_reduceSlots,
+            static_cast<std::size_t>(m_islandCapacity) * kReductionSlotsMax,
+            "allocate padded island reduction slots");
         allocateDevice(
             m_projectedDirectionSquared, m_islandCapacity, "allocate projected norm");
         allocateDevice(m_deltaSquared, m_islandCapacity, "allocate tolerance");
@@ -3974,6 +5562,12 @@ private:
         checkCuda(
             cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking),
             "create solver stream");
+        // Capture-only: the conditional loop body is captured onto this stream
+        // into the while-node's body graph. Nothing is ever launched on it
+        // outside capture.
+        checkCuda(
+            cudaStreamCreateWithFlags(&m_bodyStream, cudaStreamNonBlocking),
+            "create conditional body capture stream");
         checkCuda(cudaEventCreate(&m_uploadStart), "create upload start event");
         checkCuda(cudaEventCreate(&m_uploadStop), "create upload stop event");
         checkCuda(cudaEventCreate(&m_solveStart), "create solve start event");
@@ -4021,8 +5615,9 @@ private:
             m_islandBondBegin[k + 1] += m_islandBondBegin[k];
         }
         m_bondsByIsland.resize(m_islandBondBegin[m_islandCount]);
-        std::vector<std::uint32_t> cursor(
+        m_groupCursor.assign(
             m_islandBondBegin.begin(), m_islandBondBegin.end());
+        std::vector<std::uint32_t>& cursor = m_groupCursor;
         for (std::uint32_t b = 0; b < m_bondCount; ++b)
         {
             const std::uint32_t island = m_hostBondIsland[b];
@@ -4067,8 +5662,20 @@ private:
             unite(n0, n1);
         }
 
-        m_hostRootIsland.assign(m_nodeCount, kNoIsland);
-        m_hostBondIsland.assign(m_bondCount, kNoIsland);
+        // Generation stamping instead of re-filling the id map: this used to
+        // clear three arrays totalling ~1.6 MB on every fracture tick, all of
+        // which are then overwritten by the loops below. Only m_hostRootIsland
+        // is read before it is written, and a stamp answers "written this
+        // rebuild?" without touching memory proportional to the graph.
+        if (++m_rootIslandGeneration == 0u)
+        {
+            // Wrapped: the stamps would alias the new generation.
+            std::fill(m_hostRootStamp.begin(), m_hostRootStamp.end(), 0u);
+            m_rootIslandGeneration = 1u;
+        }
+        m_hostRootIsland.resize(m_nodeCount);
+        m_hostRootStamp.resize(m_nodeCount, 0u);
+        m_hostBondIsland.resize(m_bondCount);
         m_islandCount = 0;
         for (std::uint32_t b = 0; b < m_bondCount; ++b)
         {
@@ -4076,17 +5683,20 @@ private:
             const std::uint32_t n1 = m_hostNode1[b];
             if (n0 >= m_nodeCount || n1 >= m_nodeCount)
             {
+                m_hostBondIsland[b] = kNoIsland;
                 continue;
             }
             const bool s0 = isStatic(n0);
             const bool s1 = isStatic(n1);
             if (s0 && s1)
             {
-                continue; // degenerate static-static bond: no coupling
+                m_hostBondIsland[b] = kNoIsland; // degenerate: no coupling
+                continue;
             }
             const std::uint32_t rep = findRoot(s0 ? n1 : n0);
-            if (m_hostRootIsland[rep] == kNoIsland)
+            if (m_hostRootStamp[rep] != m_rootIslandGeneration)
             {
+                m_hostRootStamp[rep] = m_rootIslandGeneration;
                 m_hostRootIsland[rep] = m_islandCount++;
             }
             m_hostBondIsland[b] = m_hostRootIsland[rep];
@@ -4094,13 +5704,19 @@ private:
 
         // Static nodes stay unassigned: they are boundaries, excluded from the
         // per-island residual just as they are from the CPU sub-systems.
-        m_hostNodeIsland.assign(m_nodeCount, kNoIsland);
+        m_hostNodeIsland.resize(m_nodeCount);
         for (std::uint32_t i = 0; i < m_nodeCount; ++i)
         {
-            if (!isStatic(i))
+            if (isStatic(i))
             {
-                m_hostNodeIsland[i] = m_hostRootIsland[findRoot(i)];
+                m_hostNodeIsland[i] = kNoIsland;
+                continue;
             }
+            const std::uint32_t rep = findRoot(i);
+            // A dynamic node with no surviving bond never had an id created
+            // for it, and must stay unassigned exactly as before.
+            m_hostNodeIsland[i] = m_hostRootStamp[rep] == m_rootIslandGeneration
+                ? m_hostRootIsland[rep] : kNoIsland;
         }
         if (m_islandCount == 0)
         {
@@ -4151,16 +5767,65 @@ private:
         {
             m_hostNodeBondBegin[node + 1] += m_hostNodeBondBegin[node];
         }
-        m_hostNodeBondRef.assign(m_hostNodeBondBegin[m_nodeCount], 0u);
-        std::vector<std::uint32_t> cursor(
+        // resize, not assign: every slot is written by the scatter below, so
+        // the value-fill was ~2.4 MB of pointless stores per fracture tick.
+        m_hostNodeBondRef.resize(m_hostNodeBondBegin[m_nodeCount]);
+        // Reused across ticks; this was a fresh heap allocation every rebuild.
+        m_csrCursor.assign(
             m_hostNodeBondBegin.begin(), m_hostNodeBondBegin.end());
+        std::vector<std::uint32_t>& cursor = m_csrCursor;
         // Ascending bond order within each node's list: the sum order is then
         // a pure function of topology, which is what makes the gather
         // reproducible run to run.
+        // Remember where each bond's two refs landed, so a removal can patch
+        // them in O(1) instead of rebuilding the whole CSR.
+        m_hostBondRefPos.resize(2u * static_cast<std::size_t>(m_bondCount));
         for (std::uint32_t bond = 0; bond < m_bondCount; ++bond)
         {
-            m_hostNodeBondRef[cursor[m_hostNode0[bond]]++] = bond;
-            m_hostNodeBondRef[cursor[m_hostNode1[bond]]++] = bond | 0x80000000u;
+            const std::uint32_t p0 = cursor[m_hostNode0[bond]]++;
+            const std::uint32_t p1 = cursor[m_hostNode1[bond]]++;
+            m_hostNodeBondRef[p0] = bond;
+            m_hostNodeBondRef[p1] = bond | 0x80000000u;
+            m_hostBondRefPos[2u * bond] = p0;
+            m_hostBondRefPos[2u * bond + 1u] = p1;
+        }
+        m_deadRefCount = 0;
+        m_csrValid = true;
+        m_changedRefSlots.clear();
+    }
+
+    /// Patch the CSR for one swap-with-last removal, in place.
+    ///
+    /// Node degrees change but their CSR RUNS do not move, so tombstoning the
+    /// removed bond's two entries and retargeting the moved bond's two entries
+    /// is the whole update -- four slots, versus rebuilding 2*bondCount entries
+    /// and re-uploading them (measured 0.82 ms per fracture tick at 298k bonds).
+    void patchCsrForRemoval(std::uint32_t removed, std::uint32_t last)
+    {
+        if (!m_csrValid || 2u * static_cast<std::size_t>(last) + 1u >= m_hostBondRefPos.size())
+        {
+            m_csrValid = false;
+            return;
+        }
+        const std::uint32_t deadA = m_hostBondRefPos[2u * removed];
+        const std::uint32_t deadB = m_hostBondRefPos[2u * removed + 1u];
+        m_hostNodeBondRef[deadA] = kDeadBondRef;
+        m_hostNodeBondRef[deadB] = kDeadBondRef;
+        m_changedRefSlots.push_back(deadA);
+        m_changedRefSlots.push_back(deadB);
+        m_deadRefCount += 2;
+
+        if (last != removed)
+        {
+            const std::uint32_t moveA = m_hostBondRefPos[2u * last];
+            const std::uint32_t moveB = m_hostBondRefPos[2u * last + 1u];
+            // Keep the endpoint bit; only the bond index changes.
+            m_hostNodeBondRef[moveA] = removed;
+            m_hostNodeBondRef[moveB] = removed | 0x80000000u;
+            m_changedRefSlots.push_back(moveA);
+            m_changedRefSlots.push_back(moveB);
+            m_hostBondRefPos[2u * removed] = moveA;
+            m_hostBondRefPos[2u * removed + 1u] = moveB;
         }
     }
 
@@ -4175,6 +5840,79 @@ private:
         {
             stageUpload(m_nodeBondRef, m_hostNodeBondRef.data(), sizeof(std::uint32_t) * m_hostNodeBondRef.size(), "upload node-bond csr refs");
         }
+    }
+
+    /// Sparse alternative to uploadTopology + uploadIslands.
+    ///
+    /// Returns false when the change set is too large to be worth it, or does
+    /// not cover everything that moved -- the caller then does the full upload.
+    /// Correctness never depends on this returning true.
+    bool uploadTopologyDelta()
+    {
+        const std::uint32_t count =
+            static_cast<std::uint32_t>(m_changedBondSlots.size());
+        if (count == 0)
+        {
+            return true;   // nothing moved; the device already matches
+        }
+        // Below ~1/8 of the graph the sparse path wins; above it the gather,
+        // the extra kernel and the indirection cost more than a clean stream.
+        if (count * 8u >= m_bondCount || !deltaUploadEnabled())
+        {
+            return false;
+        }
+        if (count > m_deltaCapacity)
+        {
+            const std::uint32_t want = std::max(count, m_deltaCapacity ? m_deltaCapacity * 2u : 1024u);
+            cudaFree(m_devDeltaSlots);
+            cudaFree(m_devDeltaValues);
+            if (cudaMalloc(&m_devDeltaSlots, sizeof(std::uint32_t) * want) != cudaSuccess
+                || cudaMalloc(&m_devDeltaValues, sizeof(BondDelta) * want) != cudaSuccess)
+            {
+                cudaGetLastError();
+                m_deltaCapacity = 0;
+                return false;
+            }
+            m_deltaCapacity = want;
+        }
+        m_deltaSlots.resize(count);
+        m_deltaValues.resize(count);
+        for (std::uint32_t i = 0; i < count; ++i)
+        {
+            const std::uint32_t b = m_changedBondSlots[i];
+            if (b >= m_bondCount)
+            {
+                // The slot was itself removed later in the same tick; it is
+                // past the live range now, so nothing needs to reach the device.
+                m_deltaSlots[i] = 0u;
+                m_deltaValues[i] = BondDelta{};
+                m_deltaValues[i].island = kNoIsland;
+                m_deltaSlots[i] = m_bondCount ? m_bondCount - 1u : 0u;
+                continue;
+            }
+            m_deltaSlots[i] = b;
+            BondDelta& v = m_deltaValues[i];
+            v.offset0 = m_hostOffset0[b];
+            v.offset1 = m_hostOffset1[b];
+            v.normal = m_hostNormals[b];
+            v.node0 = m_hostNode0[b];
+            v.node1 = m_hostNode1[b];
+            v.material = m_hostBondMaterials[b];
+            v.island = b < m_hostBondIsland.size() ? m_hostBondIsland[b] : kNoIsland;
+            v.area = m_hostAreas[b];
+            v.nodeDistance = m_hostNodeDistances[b];
+            v.health = m_hostHealth[b];
+            v.pad = 0.0f;
+        }
+        stageUpload(m_devDeltaSlots, m_deltaSlots.data(),
+                    sizeof(std::uint32_t) * count, "upload delta slots");
+        stageUpload(m_devDeltaValues, m_deltaValues.data(),
+                    sizeof(BondDelta) * count, "upload delta values");
+        scatterBondTopology<<<(count + kBlockSize - 1) / kBlockSize, kBlockSize, 0, m_stream>>>(
+            m_devDeltaSlots, m_devDeltaValues, count,
+            m_node0, m_node1, m_offset0, m_offset1, m_normals,
+            m_areas, m_nodeDistances, m_health, m_bondMaterials, m_bondIsland);
+        return true;
     }
 
     void uploadIslands()
@@ -4203,6 +5941,7 @@ private:
     /// residual that could not distinguish a converged island from a starved
     /// one.
     void reduceByIsland(
+        cudaStream_t stream,
         const AngLin* values,
         const std::uint32_t* island,
         const std::uint32_t* islandSkip,
@@ -4211,26 +5950,67 @@ private:
         std::uint32_t launchCap,
         float* result)
     {
+        const std::uint32_t slots = reductionSlots(launchCap);
         checkCuda(
-            cudaMemsetAsync(result, 0, sizeof(float) * m_islandCount, m_stream),
+            cudaMemsetAsync(
+                m_reduceSlots,
+                0,
+                sizeof(float) * static_cast<std::size_t>(m_islandCount) * slots,
+                stream),
             "clear per-island reduction");
-        m_kernelProfile.begin("accumulateSquaredByIsland", m_stream);
+        m_kernelProfile.begin("accumulateSquaredByIsland", stream);
         accumulateSquaredByIsland<<<
             (launchCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
-            m_stream>>>(
+            stream>>>(
             values,
             island,
             islandSkip,
-            result,
+            m_reduceSlots,
             activeList,
             m_activeCounts,
-            whichCount);
-        m_kernelProfile.end(m_stream);
+            whichCount,
+            slots);
+        m_kernelProfile.end(stream);
+        m_kernelProfile.begin("finalizeIslandReduction", stream);
+        finalizeIslandReduction<<<
+            (m_islandCount + kBlockSize - 1) / kBlockSize,
+            kBlockSize,
+            0,
+            stream>>>(m_reduceSlots, result, m_islandCount, slots);
+        m_kernelProfile.end(stream);
     }
 
-    void rightMultiply(const AngLin* bonds, AngLin* nodes, const std::uint32_t* islandSkip)
+    /// How many accumulators to spread each island's atomics across.
+    ///
+    /// Padding buys contention relief proportional to the slot count and costs
+    /// a second pass proportional to islandCount * slots. It is worth it only
+    /// when islands are large: at ~2,760 elements per island (the intact city)
+    /// 32 slots turn 2,760-way serialization into 86-way; at ~4 elements per
+    /// island (fully fractured) there is no contention to relieve and the wide
+    /// second pass would be pure loss. Round down to a power of two so the
+    /// kernel can mask instead of divide.
+    std::uint32_t reductionSlots(std::uint32_t elements) const
+    {
+        if (m_islandCount == 0)
+        {
+            return 1u;
+        }
+        const std::uint32_t perIsland = elements / m_islandCount;
+        std::uint32_t slots = 1u;
+        // One slot per 8 elements, so a slot is never contended by fewer
+        // atomics than the second pass costs to read it back.
+        while (slots < kReductionSlotsMax && slots * 8u < perIsland)
+        {
+            slots <<= 1u;
+        }
+        return slots;
+    }
+
+    void rightMultiply(
+        cudaStream_t stream, const AngLin* bonds, AngLin* nodes,
+        const std::uint32_t* islandSkip)
     {
         if (gatherRightMultiplyEnabled())
         {
@@ -4238,12 +6018,12 @@ private:
             // either: the inverse-inertia scale is folded into the write. Two
             // graph nodes become one, and twelve global float atomics per
             // bond become zero.
-            m_kernelProfile.begin("gatherRightMultiply", m_stream);
+            m_kernelProfile.begin("gatherRightMultiply", stream);
             gatherRightMultiply<<<
                 (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize,
                 0,
-                m_stream>>>(
+                stream>>>(
                 nodes,
                 bonds,
                 m_nodeBondBegin,
@@ -4256,7 +6036,7 @@ private:
                 m_inertia,
                 m_activeNodes,
                 m_activeCounts);
-            m_kernelProfile.end(m_stream);
+            m_kernelProfile.end(stream);
             return;
         }
         checkCuda(
@@ -4264,14 +6044,14 @@ private:
                 nodes,
                 0,
                 sizeof(AngLin) * m_nodeCount,
-                m_stream),
+                stream),
             "clear node product");
-        m_kernelProfile.begin("couplingRightMultiply", m_stream);
+        m_kernelProfile.begin("couplingRightMultiply", stream);
         couplingRightMultiply<<<
             (m_graphBondCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
-            m_stream>>>(
+            stream>>>(
             nodes,
             bonds,
             m_node0,
@@ -4283,18 +6063,18 @@ private:
             islandSkip,
             m_activeBonds,
             m_activeCounts);
-        m_kernelProfile.end(m_stream);
-        m_kernelProfile.begin("scaleNodes", m_stream);
+        m_kernelProfile.end(stream);
+        m_kernelProfile.begin("scaleNodes", stream);
         scaleNodes<<<
             (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
             kBlockSize,
             0,
-            m_stream>>>(
+            stream>>>(
             nodes,
             m_inertia,
             m_activeNodes,
             m_activeCounts);
-        m_kernelProfile.end(m_stream);
+        m_kernelProfile.end(stream);
     }
 
     /// Sum of |impulse| over all bonds, read back from the device.
@@ -4312,10 +6092,360 @@ private:
         double total = 0.0;
         for (const AngLin& v : m_dbgImpulses)
         {
-            total += std::fabs(double(v.linear.x)) + std::fabs(double(v.linear.y))
-                   + std::fabs(double(v.linear.z));
+            total += (std::fabs(double(v.linear.x)) + std::fabs(double(v.linear.y))
+                   + std::fabs(double(v.linear.z))) * double(m_lengthScale * m_massScale);
         }
         return total;
+    }
+
+    /// One CG iteration. Parameterised on the stream so it can be captured
+    /// either into the main graph (unrolled fallback) or into a conditional
+    /// while-node's body graph, which is what gives device-side early exit.
+    /// One node-space CGLS iteration. Same scalars, same stopping test, one
+    /// fewer per-island reduction, and no bond-length vector in the loop.
+    void launchNodeSpaceIteration(
+        const ExtStressGpuSolveParams& params,
+        const std::uint32_t* islandSkip,
+        cudaStream_t stream,
+        cudaGraphConditionalHandle loopHandle)
+    {
+        const std::uint32_t nodeBlocks =
+            (m_graphNodeCap + kBlockSize - 1) / kBlockSize;
+        const std::uint32_t islandBlocks =
+            (m_islandCount + kBlockSize - 1) / kBlockSize;
+        const std::uint32_t slots = reductionSlots(m_graphNodeCap);
+
+        // w = L rho, and z_sq = ||W rho||^2 out of the same pass.
+        checkCuda(
+            cudaMemsetAsync(
+                m_reduceSlots, 0,
+                sizeof(float) * static_cast<std::size_t>(m_islandCount) * slots, stream),
+            "clear node-space z_sq");
+        m_kernelProfile.begin("nodeSpaceMatvec", stream);
+        nodeSpaceMatvec<<<nodeBlocks, kBlockSize, 0, stream>>>(
+            m_nsW, m_residual, m_inertia, m_nodeBondBegin, m_nodeBondRef,
+            m_node0, m_node1, m_offset0, m_offset1, m_health,
+            m_bondIsland, islandSkip, m_nodeIsland, m_islandActive, skipConvergedEnabled(),
+            m_reduceSlots, slots, m_activeNodes, m_activeCounts,
+            m_iteration, 0u);
+        m_kernelProfile.end(stream);
+        m_kernelProfile.begin("finalizeAndCheckConvergence", stream);
+        finalizeAndCheckConvergence<<<islandBlocks, kBlockSize, 0, stream>>>(
+            m_reduceSlots, m_gradientSquared, slots,
+            m_islandActive, m_islandConverged, m_deltaSquared,
+            m_blockActiveCounts, m_islandCount);
+        m_kernelProfile.end(stream);
+
+        // Preconditioned form: the direction is built from g = N w rather than
+        // from rho, the numerator becomes gamma = w^T g, and q therefore needs
+        // its own matvec (L g) because it can no longer reuse w. That second
+        // matvec is the price of preconditioning here -- see the derivation in
+        // the plan; it is why block-Jacobi has to more than halve the iteration
+        // count merely to break even.
+        const AngLin* directionSource = m_residual;
+        const float* numerator = m_gradientSquared;
+        float* numeratorPrev = m_previousGradientSquared;
+        if (jacobiEnabled())
+        {
+            checkCuda(
+                cudaMemsetAsync(
+                    m_reduceSlots, 0,
+                    sizeof(float) * static_cast<std::size_t>(m_islandCount) * slots, stream),
+                "clear node-space gamma");
+            m_kernelProfile.begin("nodeSpaceApplyJacobi", stream);
+            nodeSpaceApplyJacobi<<<nodeBlocks, kBlockSize, 0, stream>>>(
+                m_nsG, m_nsW, m_nsJacobi, m_nodeIsland, m_islandActive,
+                m_reduceSlots, slots, m_activeNodes, m_activeCounts);
+            m_kernelProfile.end(stream);
+            m_kernelProfile.begin("finalizeIslandReduction", stream);
+            finalizeIslandReduction<<<islandBlocks, kBlockSize, 0, stream>>>(
+                m_reduceSlots, m_nsGamma, m_islandCount, slots);
+            m_kernelProfile.end(stream);
+            directionSource = m_nsG;
+            numerator = m_nsGamma;
+            numeratorPrev = m_nsGammaPrev;
+
+            // q's own matvec: L g, written into m_nsW2.
+            m_kernelProfile.begin("nodeSpaceMatvecG", stream);
+            nodeSpaceMatvec<<<nodeBlocks, kBlockSize, 0, stream>>>(
+                m_nsW2, m_nsG, m_inertia, m_nodeBondBegin, m_nodeBondRef,
+                m_node0, m_node1, m_offset0, m_offset1, m_health,
+                m_bondIsland, islandSkip, m_nodeIsland, m_islandActive, skipConvergedEnabled(),
+                nullptr, slots, m_activeNodes, m_activeCounts,
+                m_iteration, 0u);
+            m_kernelProfile.end(stream);
+        }
+        checkCuda(
+            cudaMemsetAsync(
+                m_reduceSlots, 0,
+                sizeof(float) * static_cast<std::size_t>(m_islandCount) * slots, stream),
+            "clear node-space q_sq");
+        m_kernelProfile.begin("nodeSpaceUpdateDirection", stream);
+        nodeSpaceUpdateDirection<<<nodeBlocks, kBlockSize, 0, stream>>>(
+            m_nsPi, m_nsQ, directionSource, jacobiEnabled() ? m_nsW2 : m_nsW,
+            numerator, numeratorPrev,
+            m_nodeIsland, m_islandActive, m_reduceSlots, slots,
+            m_activeNodes, m_activeCounts);
+        m_kernelProfile.end(stream);
+
+        // NOTE: the periodic explicit refresh of q = L pi was removed here.
+        // Once ||q||^2 is accumulated by the direction update that WRITES q, a
+        // later refresh would replace q while leaving its norm stale, so alpha
+        // would be computed from a vector that no longer exists. It was also
+        // not earning its place: at every-8 it cost ~6% of the solve and closed
+        // only ~2% of the residual gap against the CPU, which is what showed
+        // the recurrence is not the main source of that gap.
+        // ||q||^2 was accumulated by the direction update itself; just collapse
+        // the padded slots.
+        m_kernelProfile.begin("finalizeAndRetire", stream);
+        finalizeAndRetire<<<islandBlocks, kBlockSize, 0, stream>>>(
+            m_reduceSlots, m_projectedDirectionSquared, slots,
+            m_islandActive, numeratorPrev, numerator,
+            m_status, m_blockActiveCounts, islandBlocks,
+            m_iteration, m_islandCount, loopHandle, params.maxIterations);
+        m_kernelProfile.end(stream);
+
+        m_kernelProfile.begin("nodeSpaceUpdateSolution", stream);
+        nodeSpaceUpdateSolution<<<nodeBlocks, kBlockSize, 0, stream>>>(
+            m_iteration, params.maxIterations, m_nsMu, m_residual, m_nsPi, m_nsQ,
+            numerator, m_projectedDirectionSquared,
+            m_nodeIsland, m_islandActive, m_activeNodes, m_activeCounts);
+        m_kernelProfile.end(stream);
+    }
+
+    void launchIterationBody(
+        const ExtStressGpuSolveParams& params,
+        const std::uint32_t* islandSkip,
+        std::uint32_t maxCap,
+        cudaStream_t stream,
+        cudaGraphConditionalHandle loopHandle)
+    {
+        if (nodeSpaceEnabled())
+        {
+            launchNodeSpaceIteration(params, islandSkip, stream, loopHandle);
+            return;
+        }
+
+            m_kernelProfile.begin("couplingLeftMultiply", stream);
+            couplingLeftMultiply<<<
+                (m_graphBondCap + kBlockSize - 1) / kBlockSize,
+                kBlockSize,
+                0,
+                stream>>>(
+                m_gradient,
+                m_residual,
+                m_inertia,
+                m_node0,
+                m_node1,
+                m_offset0,
+                m_offset1,
+                m_health,
+                m_bondIsland,
+                islandSkip,
+                m_activeBonds,
+                m_activeCounts);
+            m_kernelProfile.end(stream);
+            const std::uint32_t islandBlocks =
+                (m_islandCount + kBlockSize - 1) / kBlockSize;
+            reduceByIsland(stream, 
+                m_gradient, m_bondIsland, islandSkip, m_activeBonds, 0u,
+                m_graphBondCap, m_gradientSquared);
+            m_kernelProfile.begin("checkConvergencePerIsland", stream);
+            checkConvergencePerIsland<<<islandBlocks, kBlockSize, 0, stream>>>(
+                m_islandActive,
+                m_islandConverged,
+                m_gradientSquared,
+                m_deltaSquared,
+                m_blockActiveCounts,
+                m_islandCount);
+            m_kernelProfile.end(stream);
+            m_kernelProfile.begin("updateDirectionPerIsland", stream);
+            updateDirectionPerIsland<<<
+                (m_graphBondCap + kBlockSize - 1) / kBlockSize,
+                kBlockSize,
+                0,
+                stream>>>(
+                m_direction,
+                m_gradient,
+                m_gradientSquared,
+                m_previousGradientSquared,
+                m_bondIsland,
+                m_islandActive,
+                m_activeBonds,
+                m_activeCounts,
+                m_iteration);
+            m_kernelProfile.end(stream);
+
+            rightMultiply(stream, m_direction, m_projectedDirection, islandSkip);
+            reduceByIsland(stream, 
+                m_projectedDirection,
+                m_nodeIsland,
+                islandSkip,
+                m_activeNodes,
+                1u,
+                m_graphNodeCap,
+                m_projectedDirectionSquared);
+            m_kernelProfile.begin("retireDegenerateIslands", stream);
+            retireDegenerateIslands<<<islandBlocks, kBlockSize, 0, stream>>>(
+                m_islandActive,
+                m_projectedDirectionSquared,
+                m_previousGradientSquared,
+                m_gradientSquared,
+                m_status,
+                m_blockActiveCounts,
+                islandBlocks,
+                m_iteration,
+                m_islandCount,
+                loopHandle,
+                params.maxIterations);
+            m_kernelProfile.end(stream);
+            m_kernelProfile.begin("updateSolutionAndResidualPerIsland", stream);
+            updateSolutionAndResidualPerIsland<<<
+                (maxCap + kBlockSize - 1) / kBlockSize,
+                kBlockSize,
+                0,
+                stream>>>(
+                m_iteration,
+                params.maxIterations,
+                m_impulses,
+                m_residual,
+                m_direction,
+                m_projectedDirection,
+                m_gradientSquared,
+                m_projectedDirectionSquared,
+                m_islandActive,
+                m_bondIsland,
+                m_nodeIsland,
+                m_activeBonds,
+                m_activeNodes,
+                m_activeCounts);
+            m_kernelProfile.end(stream);
+            }
+
+    /// Run the CG loop, with device-side early exit when it is available.
+    ///
+    /// Two shapes, and the difference is the whole point:
+    ///
+    /// - CONDITIONAL (preferred): one `cudaGraphCondTypeWhile` node whose body
+    ///   is a single copy of the iteration. The device decides each round
+    ///   whether to go again, so a scene whose islands all converged at
+    ///   iteration 3 costs three iterations, not maxIterations. Requires that
+    ///   we are inside stream capture, which is the normal path.
+    ///
+    /// - UNROLLED (fallback): maxIterations copies of the body, as before.
+    ///   Used when not capturing (the eager kernel-profile path), and when the
+    ///   conditional path is switched off. Bit-identical results, just slower
+    ///   whenever the solve converges early.
+    ///
+    /// Both call the same launchIterationBody, so there is one implementation
+    /// of the iteration and no chance of the two shapes drifting apart.
+    void launchConditionalLoop(
+        const ExtStressGpuSolveParams& params,
+        const std::uint32_t* islandSkip,
+        std::uint32_t maxCap)
+    {
+        if (conditionalLoopEnabled())
+        {
+            cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+            unsigned long long captureId = 0;
+            cudaGraph_t capturing = nullptr;
+            const cudaGraphNode_t* deps = nullptr;
+            std::size_t depCount = 0;
+            if (cudaStreamGetCaptureInfo(
+                    m_stream, &captureStatus, &captureId, &capturing, &deps, &depCount)
+                    == cudaSuccess
+                && captureStatus == cudaStreamCaptureStatusActive
+                && capturing != nullptr)
+            {
+                if (launchConditionalLoopCaptured(
+                        params, islandSkip, maxCap, capturing, deps, depCount))
+                {
+                    return;
+                }
+                // Fall through to the unrolled form. Any failure here is a
+                // performance regression, never a wrong answer, because the
+                // two shapes compute the same thing.
+                cudaGetLastError();
+            }
+        }
+
+        for (std::uint32_t iteration = 0; iteration < params.maxIterations; ++iteration)
+        {
+            // The unrolled form still reads the counter from device memory, so
+            // the two paths share one kernel signature. Bump it per copy.
+            launchIterationBody(params, islandSkip, maxCap, m_stream, 0);
+        }
+    }
+
+    /// Build the while-node. Returns false if anything is unsupported, leaving
+    /// the caller to use the unrolled form.
+    bool launchConditionalLoopCaptured(
+        const ExtStressGpuSolveParams& params,
+        const std::uint32_t* islandSkip,
+        std::uint32_t maxCap,
+        cudaGraph_t capturing,
+        const cudaGraphNode_t* deps,
+        std::size_t depCount)
+    {
+        cudaGraphConditionalHandle handle = 0;
+        // Default 1: the body must run at least once, exactly like a do/while.
+        // A solve that is already converged still has to produce its outputs.
+        if (cudaGraphConditionalHandleCreate(
+                &handle, capturing, 1, cudaGraphCondAssignDefault) != cudaSuccess)
+        {
+            return false;
+        }
+
+        cudaGraphNodeParams nodeParams{};
+        nodeParams.type = cudaGraphNodeTypeConditional;
+        nodeParams.conditional.handle = handle;
+        nodeParams.conditional.type = cudaGraphCondTypeWhile;
+        nodeParams.conditional.size = 1;
+
+        cudaGraphNode_t whileNode = nullptr;
+        if (cudaGraphAddNode(&whileNode, capturing, deps, depCount, &nodeParams)
+                != cudaSuccess
+            || nodeParams.conditional.phGraph_out == nullptr)
+        {
+            return false;
+        }
+
+        // Everything captured after this point must depend on the while node,
+        // or the epilogue would be free to run alongside the loop.
+        if (cudaStreamUpdateCaptureDependencies(
+                m_stream, &whileNode, 1, cudaStreamSetCaptureDependencies) != cudaSuccess)
+        {
+            return false;
+        }
+
+        cudaGraph_t body = nodeParams.conditional.phGraph_out[0];
+        if (cudaStreamBeginCaptureToGraph(
+                m_bodyStream, body, nullptr, nullptr, 0,
+                cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+        {
+            return false;
+        }
+
+        // Check the condition every kChunk iterations instead of every one.
+        // The while-node's per-execution dispatch cost showed up as a stable
+        // +3.7% on scenes that run their full budget (0/7 pairs faster,
+        // counterbalanced n=8); amortising it over a chunk removes most of
+        // that while still exiting ~8x earlier than the budget on scenes that
+        // converge immediately. Exactness comes from the guard in
+        // updateSolutionAndResidualPerIsland, so kChunk is purely a cost knob.
+        const std::uint32_t chunk = conditionalLoopChunk();
+        for (std::uint32_t k = 0; k < chunk; ++k)
+        {
+            launchIterationBody(params, islandSkip, maxCap, m_bodyStream, handle);
+        }
+
+        cudaGraph_t bodyOut = nullptr;
+        if (cudaStreamEndCapture(m_bodyStream, &bodyOut) != cudaSuccess)
+        {
+            return false;
+        }
+        ++m_statConditionalLoops;
+        return true;
     }
 
     void launchSolve(const ExtStressGpuSolveParams& params)
@@ -4381,7 +6511,7 @@ private:
         // the flip instead.
         if (warmStart || stableGraphEnabled())
         {
-            rightMultiply(m_impulses, m_projectedDirection, islandSkip);
+            rightMultiply(m_stream, m_impulses, m_projectedDirection, islandSkip);
             m_kernelProfile.begin("subtractResidual", m_stream);
             subtractResidual<<<
                 (m_graphNodeCap + kBlockSize - 1) / kBlockSize,
@@ -4396,6 +6526,7 @@ private:
         // graph's: a small island next to a heavily loaded one would otherwise
         // inherit a threshold it can never meaningfully meet.
         reduceByIsland(
+            m_stream,
             m_rhs, m_nodeIsland, islandSkip, m_activeNodes, 1u, m_graphNodeCap,
             m_gradientSquared);
         m_kernelProfile.begin("setTolerancePerIsland", m_stream);
@@ -4413,119 +6544,73 @@ private:
             m_islandCount);
         m_kernelProfile.end(m_stream);
         m_kernelProfile.begin("initializeStatus", m_stream);
-        initializeStatus<<<1, 1, 0, m_stream>>>(m_status, params.maxIterations);
+        initializeStatus<<<1, 1, 0, m_stream>>>(
+            m_status, m_iteration, params.maxIterations);
         m_kernelProfile.end(m_stream);
 
-        for (std::uint32_t iteration = 0; iteration < params.maxIterations; ++iteration)
+        if (nodeSpaceEnabled() && jacobiEnabled() && !m_jacobiBuilt)
         {
-            m_kernelProfile.begin("couplingLeftMultiply", m_stream);
-            couplingLeftMultiply<<<
-                (m_graphBondCap + kBlockSize - 1) / kBlockSize,
-                kBlockSize,
-                0,
-                m_stream>>>(
-                m_gradient,
-                m_residual,
-                m_inertia,
-                m_node0,
-                m_node1,
-                m_offset0,
-                m_offset1,
-                m_health,
-                m_bondIsland,
-                islandSkip,
-                m_activeBonds,
-                m_activeCounts);
+            m_kernelProfile.begin("nodeSpaceBuildJacobi", m_stream);
+            nodeSpaceBuildJacobi<<<
+                (m_nodeCount + kBlockSize - 1) / kBlockSize, kBlockSize, 0, m_stream>>>(
+                m_nsJacobi, m_inertia, m_nodeBondBegin, m_nodeBondRef,
+                m_node0, m_node1, m_offset0, m_offset1, m_health,
+                m_nodeCount, m_bondCount);
             m_kernelProfile.end(m_stream);
-            const std::uint32_t islandBlocks =
-                (m_islandCount + kBlockSize - 1) / kBlockSize;
-            reduceByIsland(
-                m_gradient, m_bondIsland, islandSkip, m_activeBonds, 0u,
-                m_graphBondCap, m_gradientSquared);
-            m_kernelProfile.begin("checkConvergencePerIsland", m_stream);
-            checkConvergencePerIsland<<<islandBlocks, kBlockSize, 0, m_stream>>>(
-                m_islandActive,
-                m_islandConverged,
-                m_gradientSquared,
-                m_deltaSquared,
-                m_blockActiveCounts,
-                m_islandCount);
-            m_kernelProfile.end(m_stream);
-            m_kernelProfile.begin("updateDirectionPerIsland", m_stream);
-            updateDirectionPerIsland<<<
-                (m_graphBondCap + kBlockSize - 1) / kBlockSize,
-                kBlockSize,
-                0,
-                m_stream>>>(
-                m_direction,
-                m_gradient,
-                m_gradientSquared,
-                m_previousGradientSquared,
-                m_bondIsland,
-                m_islandActive,
-                m_activeBonds,
-                m_activeCounts,
-                iteration);
-            m_kernelProfile.end(m_stream);
-
-            rightMultiply(m_direction, m_projectedDirection, islandSkip);
-            reduceByIsland(
-                m_projectedDirection,
-                m_nodeIsland,
-                islandSkip,
-                m_activeNodes,
-                1u,
-                m_graphNodeCap,
-                m_projectedDirectionSquared);
-            m_kernelProfile.begin("retireDegenerateIslands", m_stream);
-            retireDegenerateIslands<<<islandBlocks, kBlockSize, 0, m_stream>>>(
-                m_islandActive,
-                m_projectedDirectionSquared,
-                m_previousGradientSquared,
-                m_gradientSquared,
-                m_status,
-                m_blockActiveCounts,
-                islandBlocks,
-                iteration,
-                m_islandCount);
-            m_kernelProfile.end(m_stream);
-            m_kernelProfile.begin("updateSolutionAndResidualPerIsland", m_stream);
-            updateSolutionAndResidualPerIsland<<<
-                (maxCap + kBlockSize - 1) / kBlockSize,
-                kBlockSize,
-                0,
-                m_stream>>>(
-                m_impulses,
-                m_residual,
-                m_direction,
-                m_projectedDirection,
-                m_gradientSquared,
-                m_projectedDirectionSquared,
-                m_islandActive,
-                m_bondIsland,
-                m_nodeIsland,
-                m_activeBonds,
-                m_activeNodes,
-                m_activeCounts);
+            m_jacobiBuilt = true;
+        }
+        if (nodeSpaceEnabled() && jacobiEnabled())
+        {
+            // gamma_prev must be zero at iteration 0 so beta is zero there.
+            // Left uninitialised it is whatever the allocator handed back, and
+            // if those bits happen to be NaN then beta is NaN, pi = g + NaN*0
+            // is NaN, and mu accumulates the poison for the rest of the solve.
+            // The unpreconditioned path never showed this because it reuses
+            // m_previousGradientSquared, which earlier solves have already
+            // filled with real values.
+            checkCuda(
+                cudaMemsetAsync(m_nsGammaPrev, 0,
+                                sizeof(float) * m_islandCapacity, m_stream),
+                "clear node-space gamma prev");
+            checkCuda(
+                cudaMemsetAsync(m_nsGamma, 0,
+                                sizeof(float) * m_islandCapacity, m_stream),
+                "clear node-space gamma");
+        }
+        if (nodeSpaceEnabled())
+        {
+            // mu accumulates the whole correction, so it must start at zero
+            // every solve; pi and q are recurrences and must not inherit the
+            // previous solve's Krylov state.
+            m_kernelProfile.begin("nodeSpaceReset", m_stream);
+            nodeSpaceReset<<<
+                (m_nodeCount + kBlockSize - 1) / kBlockSize,
+                kBlockSize, 0, m_stream>>>(
+                m_nsMu, m_nsPi, m_nsQ, m_nsG, m_nodeCount);
             m_kernelProfile.end(m_stream);
         }
 
-        const float linearScale = m_lengthScale * m_massScale;
-        const float angularScale = m_lengthScale * linearScale;
-        m_kernelProfile.begin("unscaleImpulses", m_stream);
-        unscaleImpulses<<<
-            (m_graphBondCap + kBlockSize - 1) / kBlockSize,
-            kBlockSize,
-            0,
-            m_stream>>>(
-            m_impulses,
-            m_bondIsland,
-            islandSkip,
-            m_activeBonds,
-            m_activeCounts,
-            linearScale,
-            angularScale);
-        m_kernelProfile.end(m_stream);
+        launchConditionalLoop(params, islandSkip, maxCap);
+
+        if (nodeSpaceEnabled())
+        {
+            // lambda = lambda0 + W mu. One C^T D pass over bonds, once per
+            // solve, instead of a bond-length update every iteration.
+            m_kernelProfile.begin("nodeSpaceApplySolution", m_stream);
+            nodeSpaceApplySolution<<<
+                (m_graphBondCap + kBlockSize - 1) / kBlockSize,
+                kBlockSize, 0, m_stream>>>(
+                m_impulses, m_nsMu, m_inertia, m_node0, m_node1,
+                m_offset0, m_offset1, m_health, m_bondIsland, islandSkip,
+                m_activeBonds, m_activeCounts);
+            m_kernelProfile.end(m_stream);
+        }
+
+
+        // No unscale pass. Impulses stay in solver-scaled units on the device;
+        // the three places that read them for the OUTSIDE world apply the scale
+        // themselves (applyStressDamage, bondStressWalk, and the host repack in
+        // finishImpulseReadback). See initializeSolve.
         checkCuda(
             cudaMemsetAsync(
                 m_brokenCount,
@@ -4557,7 +6642,9 @@ private:
                 m_health,
                 m_brokenBonds,
                 m_brokenCount,
-                m_bondCount);
+                m_bondCount,
+                m_lengthScale * m_massScale,
+                m_lengthScale * m_lengthScale * m_massScale);
             m_kernelProfile.end(m_stream);
         }
     }
@@ -4764,6 +6851,69 @@ private:
     AngLin* m_projectedDirection{nullptr};
     float* m_reductionInput{nullptr};
     float* m_gradientSquared{nullptr};
+    /// Padded scratch for the per-island reduction; see accumulateSquaredByIsland.
+    float* m_reduceSlots{nullptr};
+    /// Device-side CG loop counter; advanced by retireDegenerateIslands.
+    std::uint32_t* m_iteration{nullptr};
+    /// Scratch reused across topology rebuilds; see computeIslands /
+    /// buildNodeBondCsr / groupBondsByIsland.
+    std::vector<std::uint32_t> m_hostRootStamp;
+    std::uint32_t m_rootIslandGeneration{0};
+    std::vector<std::uint32_t> m_csrCursor;
+    std::vector<std::uint32_t> m_groupCursor;
+    /// Bond removals since the island partition was last rebuilt.
+    std::uint32_t m_removalsSinceRepartition{0};
+    /// False when swap-with-last moved bonds out from under m_bondsByIsland.
+    bool m_bondsByIslandValid{true};
+    /// Endpoint pairs of the bonds removed since the last topology apply.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> m_splitChecks;
+    std::vector<std::uint32_t> m_splitVisited;
+    std::vector<std::uint32_t> m_splitQueue;
+    std::uint32_t m_splitStamp{0};
+    /// Bond slots rewritten since the last topology upload.
+    std::vector<std::uint32_t> m_changedBondSlots;
+    PinnedVector<std::uint32_t> m_deltaSlots;
+    PinnedVector<BondDelta> m_deltaValues;
+    std::uint32_t* m_devDeltaSlots{nullptr};
+    BondDelta* m_devDeltaValues{nullptr};
+    std::uint32_t m_deltaCapacity{0};
+    /// Per-node inertia never changes after prepare(); upload it once.
+    bool m_inertiaUploaded{false};
+    AngLin* m_nsPi{nullptr};
+    AngLin* m_nsQ{nullptr};
+    AngLin* m_nsW{nullptr};
+    AngLin* m_nsMu{nullptr};
+    AngLin* m_nsG{nullptr};
+    AngLin* m_nsW2{nullptr};
+    float* m_nsJacobi{nullptr};
+    float* m_nsGamma{nullptr};
+    float* m_nsGammaPrev{nullptr};
+    bool m_jacobiBuilt{false};
+    /// Position of each bond's two CSR refs; lets a removal patch in O(1).
+    std::vector<std::uint32_t> m_hostBondRefPos;
+    std::vector<std::uint32_t> m_changedRefSlots;
+    PinnedVector<std::uint32_t> m_refSlots;
+    PinnedVector<std::uint32_t> m_refValues;
+    std::uint32_t* m_devRefSlots{nullptr};
+    std::uint32_t* m_devRefValues{nullptr};
+    std::uint32_t m_refDeltaCapacity{0};
+    std::size_t m_deadRefCount{0};
+    bool m_csrValid{false};
+    std::vector<std::uint32_t> m_changedNodeIslandSlots;
+    PinnedVector<std::uint32_t> m_nodeIslandSlots;
+    PinnedVector<std::uint32_t> m_nodeIslandValues;
+    std::uint32_t* m_devNodeIslandSlots{nullptr};
+    std::uint32_t* m_devNodeIslandValues{nullptr};
+    std::uint32_t m_nodeIslandDeltaCapacity{0};
+    std::uint64_t m_statLocalSplits{0};
+    std::uint32_t m_islandCountAtRebuild{0};
+    std::vector<std::uint32_t> m_affectedIslands;
+    std::vector<std::uint32_t> m_affectedNodes;
+    std::map<std::uint32_t, std::uint32_t> m_rootRemap;
+    std::vector<std::uint32_t> m_verifyNodeIsland;
+    std::vector<std::uint32_t> m_verifyBondIsland;
+    std::uint64_t m_verifyCalls{0};
+    std::uint64_t m_statConditionalLoops{0};
     /// Per-island conjugate-gradient state. Islands are disconnected
     /// components: they must converge and step independently, matching the CPU
     /// solver's per-island sub-solves.
@@ -4849,6 +6999,8 @@ private:
     cudaEvent_t m_downloadStart{};
     cudaEvent_t m_downloadStop{};
     cudaStream_t m_stream{};
+    /// Capture-only stream for the conditional loop body graph.
+    cudaStream_t m_bodyStream{};
     cudaGraph_t m_graph{};
     cudaGraphExec_t m_graphExec{};
     ExtStressGpuSolveParams m_graphParams{};

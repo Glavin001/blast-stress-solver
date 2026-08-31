@@ -532,11 +532,19 @@ ScenePack loadScenePack(const std::string& path)
     pack.title = string(root.at("title"), "title");
 
     const Json& defaults = root.at("defaults");
-    const Json& projectile = defaults.at("projectile");
-    pack.projectileRadius = number(projectile.at("radius"), "radius");
-    pack.projectileMass = number(projectile.at("mass"), "mass");
-    pack.projectileSpeed = number(projectile.at("speed"), "speed");
-    pack.projectileTtlSeconds = optionalNumber(projectile, "ttlMs", 8000.0f) / 1000.0f;
+    // `projectile` is optional: it describes how the DEMO shoots at a pack, not
+    // anything about the structure. Packs produced by the game's own pipeline
+    // (assets/mini-city/fractured-downtown.json) carry only `solver`, and they
+    // are perfectly valid structural packs. ScenePack already declares in-class
+    // defaults for all four fields, which is the contract this honours.
+    if (defaults.object.find("projectile") != defaults.object.end())
+    {
+        const Json& projectile = defaults.at("projectile");
+        pack.projectileRadius = number(projectile.at("radius"), "radius");
+        pack.projectileMass = number(projectile.at("mass"), "mass");
+        pack.projectileSpeed = number(projectile.at("speed"), "speed");
+        pack.projectileTtlSeconds = optionalNumber(projectile, "ttlMs", 8000.0f) / 1000.0f;
+    }
 
     const Json& solver = defaults.at("solver");
     pack.gravity = number(solver.at("gravity"), "gravity");
@@ -688,10 +696,15 @@ ScenePack loadScenePack(const std::string& path)
         pack.materials.push_back(SceneMaterial{"unstated", pack.stressLimits});
     }
 
-    const Json& physics = defaults.at("physics");
-    pack.friction = number(physics.at("friction"), "friction");
-    pack.restitution = number(physics.at("restitution"), "restitution");
-    pack.contactForceScale = number(physics.at("contactForceScale"), "contactForceScale");
+    // Optional for the same reason as `projectile` above: contact response is
+    // a property of the runtime driving the pack, not of the structure.
+    if (defaults.object.find("physics") != defaults.object.end())
+    {
+        const Json& physics = defaults.at("physics");
+        pack.friction = number(physics.at("friction"), "friction");
+        pack.restitution = number(physics.at("restitution"), "restitution");
+        pack.contactForceScale = number(physics.at("contactForceScale"), "contactForceScale");
+    }
 
     const Json& scenario = root.at("scenario");
     const Json& nodes = scenario.at("nodes");

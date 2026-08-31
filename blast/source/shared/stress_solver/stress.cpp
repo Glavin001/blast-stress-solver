@@ -84,7 +84,15 @@ StressProcessor::prepare(const SolverNodeS* nodes, uint32_t N_nodes, const Solve
     m_couplings.resize(N_bonds);
     m_rhs.resize(N_nodes);
     m_B_scratch.resize(N_nodes);
-    m_solver_cache.resize(s_use_simd ? CGNR_SIMD().required_cache_size(N_nodes, N_bonds) : CGNR_SISD().required_cache_size(N_nodes, N_bonds));
+    // required_cache_size returns BYTES (cgnr.h: 2*(M+N+1)*sizeof(Elem)), but
+    // POD_Buffer<AngLin6>::resize takes ELEMENTS -- so this was over-allocating
+    // by sizeof(AngLin6) = 32x, about 727 MB at city scale. The element count
+    // CGNR actually carves up is 2 scalars + z[N] + p[N] + r[M] + s[M], i.e.
+    // exactly 2*(M+N+1) elements.
+    const size_t cache_bytes = s_use_simd
+        ? CGNR_SIMD().required_cache_size(N_nodes, N_bonds)
+        : CGNR_SISD().required_cache_size(N_nodes, N_bonds);
+    m_solver_cache.resize(cache_bytes / sizeof(AngLin6));
     m_can_resume = false;
     m_skipValid = false;        // topology changed: drop the settled-state baseline so a fresh one is rebuilt
     m_islandTopoValid = false;  // topology changed: rebuild the island grouping cache on the next island solve
