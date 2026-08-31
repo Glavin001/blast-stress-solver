@@ -652,6 +652,20 @@ public:
             // 2.4 ms over a few hundred islands, but not at city scale where
             // nearly every island is a settled debris cluster.
             gpuParams.skipSettledIslands = skipSettled && warmStart;
+            if (std::getenv("BLAST_WARMSTART_TRACE"))
+            {
+                static uint32_t traceTick = 0;
+                if (traceTick < 40)
+                {
+                    std::fprintf(stderr,
+                                 "[warmstart] tick=%u warmStart=%d forceCold=%d "
+                                 "converged=%d inputsChanged=%d iters=%u\n",
+                                 traceTick, int(gpuParams.warmStart),
+                                 int(m_forceColdStart), int(m_converged),
+                                 int(m_inputsChanged), unsigned(iterationCount));
+                }
+                ++traceTick;
+            }
             gpuParams.skipStableUnconverged = m_skipStableUnconverged;
             if (m_gpuSolver->solveAndReadbackImpulses(
                     m_gpuVelocities.data(),
