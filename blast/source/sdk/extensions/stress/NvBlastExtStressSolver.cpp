@@ -817,11 +817,15 @@ private:
     // damage-kernel seed. Not consumed by the CPU solve.
     const ExtStressMaterial*    m_materials{nullptr};
     uint32_t                    m_materialCount{0};
-#if defined(NVBLAST_ENABLE_CUDA_STRESS)
-    bool                                m_gpuRequested{false};
+    // Declared unconditionally: getGpuInactiveReason() and the non-CUDA branch
+    // of setGpuAccelerated() both report through it, and both exist in builds
+    // without NVBLAST_ENABLE_CUDA_STRESS -- where "why is the GPU not running"
+    // is exactly the question a caller needs answered.
     const char*                         m_gpuInactiveReason{
         "not requested (setGpuAccelerated was never called with true)"};
     char                                m_gpuReasonBuf[256]{};
+#if defined(NVBLAST_ENABLE_CUDA_STRESS)
+    bool                                m_gpuRequested{false};
     void*                               m_gpuCudaContext{nullptr};
     uint32_t                            m_gpuMinimumBondCount{4096};
     ExtStressGpuSolver*                 m_gpuSolver{nullptr};
