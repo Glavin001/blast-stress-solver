@@ -223,6 +223,25 @@ target_link_libraries(load_path_test PRIVATE
     ${PHYSX_LINK_LIBS})
 add_test(NAME blast_stress_load_path COMMAND load_path_test)
 
+# Depth-scaling probe for CPU/GPU stress divergence. Not registered with ctest:
+# it prints a stress field to be diffed between solvers rather than asserting.
+add_executable(solver_divergence_test
+    tests/solver_divergence_test.cpp
+    physx_scene.cpp)
+target_include_directories(solver_divergence_test PRIVATE
+    "${BLAST_ROOT}/include"
+    "${BLAST_ROOT}/include/lowlevel"
+    "${BLAST_ROOT}/include/shared/NvFoundation"
+    "${BLAST_ROOT}/include/extensions/stressphysx"
+    "${PHYSX_ROOT}/include")
+target_compile_definitions(solver_divergence_test PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(solver_divergence_test PRIVATE
+    "-Wl,-rpath,${PHYSX_LIB_DIR}"
+    "-Wl,--gc-sections")
+target_link_libraries(solver_divergence_test PRIVATE
+    NvBlastExtStressPhysX
+    ${PHYSX_LINK_LIBS})
+
 add_executable(resim_punchthrough_test
     tests/resim_punchthrough_test.cpp
     physx_scene.cpp)
