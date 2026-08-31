@@ -225,6 +225,12 @@ static bool gatherRightMultiplyEnabled()
 /// how often the captured graph is re-instantiated, and what the mid-enqueue
 /// sync costs. Pure diagnostics. Guessing these three wrong is how a sound
 /// idea gets implemented badly and then measured as a regression.
+static bool islandTraceEnabled()
+{
+    static const bool enabled = std::getenv("BLAST_ISLAND_TRACE") != nullptr;
+    return enabled;
+}
+
 static bool graphStatsEnabled()
 {
     static const bool enabled = [] {
@@ -2899,6 +2905,16 @@ private:
         {
             return false;
         }
+        // Sampled HERE, not in launchSolve: that runs inside CUDA graph
+        // capture, where a synchronous memcpy is illegal and returns 900
+        // (operation not permitted while capturing) -- which corrupts the
+        // capture rather than just failing the read.
+        if (islandTraceEnabled())
+        {
+            checkCuda(cudaStreamSynchronize(m_stream), "island trace pre-sync");
+            m_dbgSumBefore = debugImpulseMagnitude();
+            m_dbgWarm = params.warmStart && m_hasWarmStart;
+        }
         if (m_topologyDirty)
         {
             const auto topoStart = StatClock::now();
@@ -3201,9 +3217,29 @@ private:
         std::uint32_t skipped = 0;
         for (std::uint32_t k = 0; k < m_islandCount; ++k)
         {
+            // An island may be skipped only once it has CONVERGED. Skipping a
+            // stable-but-unconverged island freezes it at whatever partial
+            // answer the iteration budget happened to reach, permanently.
+            //
+            // That was the depth-truncation defect. Conjugate gradient
+            // propagates load roughly one graph hop per iteration, so a
+            // structure deeper than the budget cannot finish in one solve. It
+            // would then go quiet -- inputs unchanged -- and be skipped for
+            // ever, pinned at exactly `iterations` panels' worth of load.
+            // Measured on a column: footing stress plateaued at exactly
+            // 25 panels at 25 iterations and 50 at 50, bit-identical from depth
+            // 48 to 128. A 10-floor building is far deeper than that, so the
+            // city read as unloaded and stood up under the GPU solver while the
+            // CPU solver -- whose skip has always required convergence --
+            // collapsed it. One cause, both symptoms.
+            //
+            // `skipStableUnconverged` was meant to stop unconverged islands
+            // re-solving for ever at rest. It cannot do that safely: they never
+            // converge BECAUSE they are skipped. The way out is the documented
+            // one -- pursue convergence (unconvergedExtraUpdates), converge in
+            // the first second, and skip at ~zero cost thereafter.
             const bool skip =
-                haveBaseline && !m_islandDirty[k]
-                && (m_skipStableUnconverged || m_hostIslandConverged[k] != 0u);
+                haveBaseline && !m_islandDirty[k] && m_hostIslandConverged[k] != 0u;
             m_hostIslandSkip[k] = skip ? 1u : 0u;
             if (skip)
             {
@@ -3354,6 +3390,36 @@ private:
             "measure stress solve");
         m_telemetry.iterations = m_hostStatus->iterations;
         m_telemetry.converged = m_hostStatus->converged != 0;
+        if (islandTraceEnabled())
+        {
+            const double after = debugImpulseMagnitude();
+            m_dbgActive.resize(m_islandCount);
+            m_dbgConverged.resize(m_islandCount);
+            cudaMemcpy(m_dbgActive.data(), m_islandActive,
+                       sizeof(std::uint32_t) * m_islandCount, cudaMemcpyDeviceToHost);
+            cudaMemcpy(m_dbgConverged.data(), m_islandConverged,
+                       sizeof(std::uint32_t) * m_islandCount, cudaMemcpyDeviceToHost);
+            cudaGetLastError();
+            std::uint32_t active = 0, conv = 0;
+            for (std::uint32_t i = 0; i < m_islandCount; ++i)
+            {
+                active += (m_dbgActive[i] != 0u) ? 1u : 0u;
+                conv += (m_dbgConverged[i] != 0u) ? 1u : 0u;
+            }
+            static std::uint32_t dbgTick = 0;
+            if (dbgTick < 60)
+            {
+                std::fprintf(stderr,
+                             "[island] tick=%-3u warm=%d iters=%-3u conv=%d "
+                             "|x|before=%.6f |x|after=%.6f delta=%.6f "
+                             "islands=%u active_end=%u converged_end=%u\n",
+                             dbgTick, int(m_dbgWarm), unsigned(m_hostStatus->iterations),
+                             int(m_hostStatus->converged != 0),
+                             m_dbgSumBefore, after, after - m_dbgSumBefore,
+                             unsigned(m_islandCount), unsigned(active), unsigned(conv));
+            }
+            ++dbgTick;
+        }
         m_hasWarmStart = true;
         // Carry each solved island's convergence forward as next frame's
         // permission to skip. A skipped island reports nothing, and must not:
@@ -4231,9 +4297,31 @@ private:
         m_kernelProfile.end(m_stream);
     }
 
+    /// Sum of |impulse| over all bonds, read back from the device.
+    /// Debug only: a full D2H copy, gated on BLAST_ISLAND_TRACE.
+    double debugImpulseMagnitude()
+    {
+        m_dbgImpulses.resize(m_bondCount);
+        if (cudaMemcpy(m_dbgImpulses.data(), m_impulses,
+                       sizeof(AngLin) * m_bondCount,
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+        {
+            cudaGetLastError();
+            return -1.0;
+        }
+        double total = 0.0;
+        for (const AngLin& v : m_dbgImpulses)
+        {
+            total += std::fabs(double(v.linear.x)) + std::fabs(double(v.linear.y))
+                   + std::fabs(double(v.linear.z));
+        }
+        return total;
+    }
+
     void launchSolve(const ExtStressGpuSolveParams& params)
     {
         const bool warmStart = params.warmStart && m_hasWarmStart;
+
         const float reciprocalLengthScale = 1.0f / m_lengthScale;
         const float reciprocalMassScale = 1.0f / m_massScale;
         const float reciprocalLinearImpulseScale =
@@ -4634,6 +4722,11 @@ private:
     float m_massScale{1.0f};
     float m_lengthScale{1.0f};
     bool m_hasWarmStart{false};
+    std::vector<AngLin> m_dbgImpulses;
+    std::vector<std::uint32_t> m_dbgActive;
+    std::vector<std::uint32_t> m_dbgConverged;
+    double m_dbgSumBefore{0.0};
+    bool m_dbgWarm{false};
     ExtStressGpuTelemetry m_telemetry{};
 
     PinnedVector<std::uint32_t> m_hostNode0;

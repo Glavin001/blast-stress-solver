@@ -147,6 +147,13 @@ ExtStressPhysXDestructible* createColumn(
         desc.settings.unconvergedExtraUpdates =
             static_cast<uint32_t>(std::strtoul(exEnv, nullptr, 10));
     }
+    // The suspected defect: a stable-but-UNCONVERGED island is skipped
+    // permanently, freezing a deep structure at whatever the iteration budget
+    // reached on its single solve.
+    if (const char* ssEnv = std::getenv("BLAST_TEST_SKIP_STABLE"))
+    {
+        desc.settings.skipStableUnconverged = (ssEnv[0] != '0');
+    }
     desc.settings.applyExcessForces = false;
     desc.settings.minimumSeparationVelocity = 0.0f;
     desc.stressMaterials = materials.data();
