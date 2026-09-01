@@ -716,6 +716,26 @@ public:
         return true;
     }
 
+    bool isNodeBondless(uint32_t nodeIndex) const override
+    {
+        // Must mirror queueContact's skip EXACTLY, including its gates: if
+        // skipping is disabled, or the flat array is disabled, the answer has
+        // to be "not bondless" so the caller takes the normal path and
+        // queueContact makes the real decision.
+        if (!skipBondlessContacts() || !flatBondlessFlags())
+        {
+            return false;
+        }
+        return nodeIndex < m_nodeBondless.size() && m_nodeBondless[nodeIndex] != 0;
+    }
+
+    /// Contacts the HOST skipped on our behalf, so the published
+    /// bondlessContactsSkipped stays comparable across the change.
+    void noteBondlessSkipped(uint32_t count) override
+    {
+        m_telemetry.bondlessContactsSkipped += count;
+    }
+
     uint32_t nodeForShape(const PxShape* shape) const override
     {
         if (shape == nullptr)

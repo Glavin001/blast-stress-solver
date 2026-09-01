@@ -701,6 +701,30 @@ public:
      */
     virtual uint32_t nodeForShape(const physx::PxShape* shape) const = 0;
     /**
+     * True if a contact on this node would be DROPPED by queueContact as
+     * bondless -- the node's body holds exactly one node, so nothing in it
+     * can break and no bond of its can be overstressed.
+     *
+     * Exposed for the same reason as nodeForShape: queueContact already makes
+     * this decision, but only after the host has built the contact struct,
+     * converted two vectors and crossed a virtual call -- and it answers
+     * "drop" for a measured 65% of queued contacts, every contact POINT of
+     * every manifold. A host that asks once per manifold skips all of that
+     * for the whole manifold. Value-identical: it is the same predicate
+     * queueContact evaluates, so skipping cannot change which contacts reach
+     * the solver, only what it costs to discover they do not.
+     *
+     * Valid until the next endTick(), like nodeForShape. Returns false for an
+     * out-of-range node so an unknown index takes the normal path.
+     */
+    virtual bool isNodeBondless(uint32_t nodeIndex) const = 0;
+    /**
+     * Record contacts the host dropped using isNodeBondless, so the
+     * bondlessContactsSkipped telemetry keeps counting the same thing whether
+     * the skip happened here or in the caller.
+     */
+    virtual void noteBondlessSkipped(uint32_t count) = 0;
+    /**
      * Three-phase tick API for batching independent destructibles. beginTick()
      * and endTick() access PhysX and must run serially after fetchResults().
      * solveTick() only updates this destructible's stress solver and may run
