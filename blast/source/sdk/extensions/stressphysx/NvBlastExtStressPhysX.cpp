@@ -587,6 +587,7 @@ public:
             // the whole-map rebuild in rebuildLookupTables (see there).
             m_bodyToId.emplace(body->body, body->bodyId);
             m_actorBodies.emplace(body->actorIndex, std::move(body));
+            m_bondlessDirty = true;
         m_sortedBodiesValid = false;
         }
 
@@ -1313,6 +1314,15 @@ public:
     /// nodes, which is sequential. The alternative -- asking per contact --
     /// is two dependent random derefs times the contact count, and the
     /// contact count is two orders of magnitude larger than the body count.
+    static bool verifyBondlessFlags()
+    {
+        static const bool on = [] {
+            const char* raw = std::getenv("BLAST_VERIFY_BONDLESS_FLAGS");
+            return raw != nullptr && std::string(raw) == "1";
+        }();
+        return on;
+    }
+
     void refreshNodeBondless()
     {
         if (!skipBondlessContacts() || !flatBondlessFlags())
@@ -1879,7 +1889,22 @@ public:
         //
         // A contact wrongly classed as bondless is DROPPED before the solver
         // sees it, so the failure was lost load on freshly fractured chunks.
-        refreshNodeBondless();
+        if (m_bondlessDirty)
+        {
+            refreshNodeBondless();
+            m_bondlessDirty = false;
+        }
+        else if (verifyBondlessFlags())
+        {
+            const std::vector<uint8_t> lazy = m_nodeBondless;
+            refreshNodeBondless();
+            if (lazy != m_nodeBondless)
+            {
+                std::fprintf(stderr,
+                             "[blast] bondless flags drifted: composition "
+                             "changed without marking m_bondlessDirty\n");
+            }
+        }
         m_tickPhase = TickPhase::Idle;
         return true;
     }
@@ -3631,6 +3656,7 @@ private:
             std::remove(body->nodes.begin(), body->nodes.end(),
                         static_cast<uint32_t>(&node - m_nodes.data())),
             body->nodes.end());
+        m_bondlessDirty = true;
         node.body = nullptr;
 
         if (body->nodes.empty())
@@ -3676,6 +3702,7 @@ private:
                     found->second->body = nullptr;
                 }
                 m_actorBodies.erase(found);
+                m_bondlessDirty = true;
         m_sortedBodiesValid = false;
                 ++m_telemetry.bodiesRecycled;
             }
@@ -3775,6 +3802,7 @@ private:
         const ParentMotion& parent = parentMotionFound->second;
         std::unique_ptr<BodyState> parentBody = std::move(parentBodyFound->second);
         m_actorBodies.erase(parentBodyFound);
+        m_bondlessDirty = true;
         // E3: the parent's PxRigidDynamic may be reused by a child below with
         // a different bodyId, so its stale entry must go now; every child —
         // reused pointer included — re-registers at the emplace site.
@@ -3868,6 +3896,7 @@ private:
                 }
             }
             child.body->nodes = plan.nodes;
+            m_bondlessDirty = true;
             child.body->localComValid = false;  // membership changed
             assigned.push_back(std::move(child));
         }
@@ -4038,6 +4067,7 @@ private:
                 m_bodyToId[child.body->body] = child.body->bodyId;
             }
             m_actorBodies.emplace(child.body->actorIndex, std::move(child.body));
+            m_bondlessDirty = true;
         m_sortedBodiesValid = false;
         }
         ++m_telemetry.splits;
@@ -4178,6 +4208,7 @@ private:
                 }
             }
             m_actorBodies.clear();
+            m_bondlessDirty = true;
         m_sortedBodiesValid = false;
         }
 
@@ -4217,6 +4248,21 @@ private:
     /// See refreshNodeBondless(): one byte per node, replacing two dependent
     /// pointer chases on the per-contact hot path.
     std::vector<uint8_t> m_nodeBondless;
+    /// m_nodeBondless is a function of BODY COMPOSITION only (which bodies
+    /// exist, and which of them hold exactly one node). It was rebuilt at the
+    /// end of EVERY endTick -- an O(nodes) assign (96,420 at grid 2) plus a
+    /// full O(bodies) hash-map walk -- whether or not anything fractured.
+    ///
+    /// That is why `end` cost the same on quiet ticks as on fracture ticks:
+    /// measured 3.81 ms quiet vs 3.69 ms fracture across 1,053/1,045 ticks of
+    /// `demolition`, and 1.05 ms on a completely static city. It is not a
+    /// fracture walk that sometimes costs a lot; it was an every-tick walk.
+    ///
+    /// Set wherever composition changes (body created, retired, or a body's
+    /// node set resized). Starts true so the first tick always builds.
+    /// BLAST_VERIFY_BONDLESS_FLAGS=1 rebuilds unconditionally and reports any
+    /// tick where the lazy flags differ from a full rebuild.
+    bool m_bondlessDirty = true;
     std::vector<ExtStressPhysXBondDesc> m_bonds;
     /// Reused across ticks. These are sized by BOND count, and fracture() ran
     /// on every tick with an overstressed bond -- so a downtown-scale graph
