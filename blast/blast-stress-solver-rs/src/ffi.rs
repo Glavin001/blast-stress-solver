@@ -137,6 +137,8 @@ pub(crate) struct FfiExtStressNodeDesc {
     pub centroid: Vec3,
     pub mass: f32,
     pub volume: f32,
+    /// Rotational inertia (kg m^2) from the chunk's real shape; 0 = sphere fallback.
+    pub inertia: f32,
 }
 
 #[repr(C)]
@@ -172,6 +174,10 @@ pub(crate) struct FfiExtStressMaterialDesc {
     pub tension_fatal_limit: f32,
     pub shear_elastic_limit: f32,
     pub shear_fatal_limit: f32,
+    /// Pa. Young's modulus: stiffness, not strength. 0 = 30 GPa reference.
+    pub elastic_modulus_pa: f32,
+    /// Fraction of original bond area damage will not go below. 0 = runaway.
+    pub residual_area_fraction: f32,
     /// Pa. `<= 0` disables crushing for this material.
     pub crush_cap_pressure: f32,
     /// Pa. Drucker-Prager intercept at p = 0.
@@ -202,6 +208,8 @@ impl Default for FfiExtStressMaterialDesc {
             tension_fatal_limit: -1.0,
             shear_elastic_limit: -1.0,
             shear_fatal_limit: -1.0,
+            elastic_modulus_pa: 0.0,
+            residual_area_fraction: 0.0,
             crush_cap_pressure: 0.0,
             crush_cohesion: 0.0,
             crush_friction_slope: 0.0,

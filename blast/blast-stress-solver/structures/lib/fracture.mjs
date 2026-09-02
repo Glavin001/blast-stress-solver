@@ -38,6 +38,7 @@ const MAX_CHUNK_VOLUME = {
   steel: 2.5,
   'wood-frame': 1.2,
   'reinforced-concrete': 3.5,
+  'prestressed-concrete': 3.5,
   'concrete-slab': 3.5,
   'facade-panel': 1.2,
   'facade-clip': 1.2,
@@ -74,6 +75,7 @@ const RULES = {
   // scale for one building. Big plates genuinely break into big pieces, and the
   // max clamp is what stops a large surface becoming a thousand of them.
   'reinforced-concrete': { cellArea: 2.00, min: 2, max: 10 },
+  'prestressed-concrete': { cellArea: 2.00, min: 2, max: 10 },
   'concrete-slab': { cellArea: 2.50, min: 2, max: 8 },
   'wood-frame': { cellArea: 0.80, min: 2, max: 6 },
   'footing-anchor': { cellArea: 0.60, min: 2, max: 6 },
@@ -83,6 +85,30 @@ const RULES = {
   'facade-panel': { cellArea: 0.45, min: 2, max: 12 },
   'facade-clip': { cellArea: 0.45, min: 2, max: 12 },
 };
+
+/**
+ * Shard cap for the members that CARRY the building, by role rather than
+ * material.
+ *
+ * A column and a floor plate are both reinforced concrete and want completely
+ * different treatment, because they sit differently in the load path. Every
+ * cut across a column adds a joint that the whole weight above has to cross,
+ * and the cost of that is measurable: settling time tracks the number of
+ * bonds between an anchored chunk and the farthest one, not the chunk count.
+ * The parking garage settles in four seconds over a 19-hop path; 432 Park does
+ * not settle at all over 67.
+ *
+ * So the vertical load path gets the coarsest fracture that still breaks. TWO
+ * is the floor and the target: one piece cannot break at all -- it can only be
+ * shoved, and an unbreakable column is a worse bug than a slow one -- while
+ * two gives a column a place to fail and costs a single joint.
+ *
+ * Deliberately a SOFT cap. Anything can be split further later if a collapse
+ * reads badly; the point is that finer is a decision to make on purpose rather
+ * than the default for members where it is most expensive.
+ */
+const LOAD_PATH_ROLES = new Set(['column', 'beam', 'foundation']);
+const LOAD_PATH_MAX = 2;
 
 export function fractureRule(materialName) {
   const r = RULES[materialName];
@@ -117,8 +143,13 @@ export function cellVolumeFor(materialName, fractured = true) {
   return cap * Math.min(fractureRule(materialName).max, 3);
 }
 
-export function shardsFor(materialName, faceArea, cellVolume = 0) {
-  const { cellArea, min, max } = fractureRule(materialName);
+export function shardsFor(materialName, faceArea, cellVolume = 0, role = null) {
+  const { cellArea, min } = fractureRule(materialName);
+  // Load-bearing members take the role cap rather than the material's, which
+  // is what keeps a column two chunks tall instead of six.
+  const max = LOAD_PATH_ROLES.has(role)
+    ? Math.min(fractureRule(materialName).max, LOAD_PATH_MAX)
+    : fractureRule(materialName).max;
   const byArea = Math.round(faceArea / cellArea);
   // The volume cap is a floor on the count, not just a ceiling: a cell must be
   // cut into at least enough pieces that none of them exceeds it.
@@ -127,6 +158,12 @@ export function shardsFor(materialName, faceArea, cellVolume = 0) {
   const byVolume = cellVolume > 0
     ? Math.ceil((cellVolume * 1.4) / maxChunkVolume(materialName))
     : 0;
+  // On a load-path member the cap wins over the volume floor: the floor exists
+  // so no shard exceeds the monolith limit, and a column that trips it wants a
+  // smaller column rather than more joints under the building.
+  if (LOAD_PATH_ROLES.has(role)) {
+    return Math.max(Math.min(min, max), Math.min(max, Math.max(byArea, byVolume ? 2 : 0)));
+  }
   return Math.max(min, byVolume, Math.min(max, byArea));
 }
 

@@ -208,6 +208,8 @@ inline ExtStressSolverSettings toSettings(const ExtStressSolverSettingsDesc* set
 inline ExtStressMaterial toMaterial(const ExtStressMaterialDesc& desc)
 {
     ExtStressMaterial material;
+    material.elasticModulusPa = desc.elastic_modulus_pa;
+    material.residualAreaFraction = desc.residual_area_fraction;
     material.compressionElasticLimit = desc.compression_elastic_limit;
     material.compressionFatalLimit = desc.compression_fatal_limit;
     material.tensionElasticLimit = desc.tension_elastic_limit;
@@ -584,6 +586,10 @@ ext_stress_solver_create(const ExtStressNodeDesc* nodes,
                                         nodeDesc.mass,
                                         nodeDesc.volume > 0.0f ? nodeDesc.volume : std::max(nodeDesc.mass, 1.0f),
                                         toNvcVec3(nodeDesc.centroid));
+            if (nodeDesc.inertia > 0.0f)
+            {
+                handle->solver->setNodeGeometricInertia(graphIndex, nodeDesc.inertia);
+            }
         }
     }
 
@@ -1413,6 +1419,16 @@ ext_stress_solver_get_island_aware(const ExtStressSolverHandle* handlePtr)
 {
     const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
     return (handle && handle->solver && handle->solver->getIslandAware()) ? 1U : 0U;
+}
+
+extern "C" void
+ext_stress_solver_set_delta_time(ExtStressSolverHandle* handlePtr, float delta_time)
+{
+    auto* handle = reinterpret_cast<ExtStressSolverHandleImpl*>(handlePtr);
+    if (handle && handle->solver)
+    {
+        handle->solver->setDeltaTime(delta_time);
+    }
 }
 
 extern "C" void

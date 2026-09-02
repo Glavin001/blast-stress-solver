@@ -27,6 +27,7 @@ export const DENSITY = {
   stone: 2600,
   steel: 7850,
   'reinforced-concrete': 2400,
+  'prestressed-concrete': 2400,
   'concrete-slab': 2400,
   'wood-frame': 600,
   'facade-panel': 2000,
@@ -45,6 +46,36 @@ export const DENSITY = {
  * A negative tension/shear would mean "inherit compression" to the parser; we
  * always write explicit numbers so the pack reads the same as it behaves.
  */
+//
+// ## Tension is a REINFORCED capacity
+//
+// These fractions were set when bending was folded into the axial stress and
+// checked against the compression limit, so the tension numbers were never
+// really exercised and drifted toward plain-concrete cracking stress (~3 MPa).
+// Now that a bending moment correctly produces tension on one face, tension is
+// the mode that governs every slab, beam and cantilever in the set — and the
+// right figure for a JOINT IN A REINFORCED FRAME is not plain concrete's. What
+// carries tension across a construction joint in a real building is the steel
+// through it; that is the entire purpose of reinforcement. Modelling these
+// joints at plain-concrete tension would model a building nobody would be
+// allowed to occupy.
+//
+// Calibrated so an intact structure standing still sits near 0.4 of its
+// elastic limit: enough headroom that redistributing load off a lost column
+// does not immediately fail the survivors, little enough that losing a whole
+// side of them does. Measured per rig by `measure_rest_utilisation`.
+//
+// ## The light structures needed raising too
+//
+// Bending is now scaled by a section modulus, and a section modulus grows as
+// the joint gets SMALL: the amplification is 6/sqrt(area), so a 0.02 m^2 joint
+// between a floor slab and a timber post feels bending forty times more
+// strongly than it used to. That is the right direction physically -- a slender
+// member is weak in bending -- but at the old figures it tipped the two houses
+// into shedding bonds under their own weight. The masonry and timber elastic
+// limits are therefore roughly doubled; they were conservative to begin with
+// (the note on wood-frame below records the same argument being had once
+// already) and the at-rest invariant is not negotiable.
 const SPEC = [
   // name                  elastic  band  tensionFrac shearFrac
   // Band 3, not 10. The band is how far past yield a material goes before it
@@ -53,21 +84,52 @@ const SPEC = [
   // essentially in one piece. Reinforced concrete is not that ductile — it
   // cracks. 3 keeps a frame that yields visibly before it fails while letting
   // an impact of that size do real damage.
-  ['reinforced-concrete',   48e6,    3,    0.125,      0.24],
-  ['concrete-slab',         12e6,    2.5,  0.10,       0.13],
-  ['stone',                 20e6,    3,    0.04,       0.10],
+  // Tension and shear as CONCRETE, not as concrete-with-rebar-across-every-seam.
+  //
+  // A fracture seam has no steel crossing it, so 14.4 MPa of tension and 19.2
+  // of shear described a continuity that is not there -- and with them a deck
+  // could not crack along its hogging lines and a column head could not punch
+  // through a slab, which are the two things a parking garage does. A garage
+  // stripped of 90% of its ground columns sagged 0.00 m.
+  //
+  // 3.8 MPa is plain concrete in tension. 6.1 MPa is derived, not picked: real
+  // punching capacity is 0.35*sqrt(f'c) = 2.07 MPa over the 0.89 m^2 punching
+  // perimeter, and this model's bond is the 0.30 m^2 column face, so the same
+  // capacity concentrates 2.9x when expressed through it.
+  //
+  // Only usable because damage now ARRESTS at residualAreaFraction. Without
+  // that, 3.8 MPa cracked every deck under its own weight.
+  ['reinforced-concrete',   48e6,    3,    0.08,       0.126],
+  // Prestressed, for the 16 m garage beams and nothing else.
+  //
+  // Not a stronger concrete -- the same 48 MPa -- but a PRE-COMPRESSED one.
+  // Prestress works by putting the section into compression before any load
+  // arrives, so applied tension has to cancel that before the concrete sees
+  // any: an effective cracking stress of 11 MPa against plain concrete's 3.8.
+  // 0.28 is that 13.4 MPa over the 48 -- the upper end of the real range, and
+  // where the garage stops shedding bonds to stand up. At 0.23 it settled but
+  // still lost three.
+  //
+  // This is here because the model proved the point the hard way. A 16 m span
+  // in plain reinforced concrete cracked at 1.6x its elastic limit, and
+  // deepening the beam made it WORSE, not better, because past that span the
+  // beam is mostly carrying itself. That is precisely the span where real
+  // garages stop pouring beams and start stressing them.
+  ['prestressed-concrete',  48e6,    3,    0.28,       0.24],
+  ['concrete-slab',         28e6,    2.5,  0.25,       0.28],
+  ['stone',                 34e6,    3,    0.09,       0.18],
   // Masonry, not the brick unit. A fired brick reaches 20-50 MPa on its own;
   // a wall of them bedded in mortar fails at a fraction of that, and fails in
   // tension at almost nothing. The stronger figure left a house able to be
   // dropped on its side from 18 m and settle with 19 pieces off it — stress
   // from an impact scales with the mass above it, so a light structure needs
   // genuinely weak materials or nothing touches it.
-  ['brick',                  7e6,    2.5,  0.05,       0.12],
+  ['brick',                 16e6,    2.5,  0.11,       0.22],
   ['steel',                180e6,   12,    1.00,       0.60],
   // Softwood loaded ALONG the grain, which is how a post works: ~30-45 MPa.
   // The 8 MPa figure that looks right for timber is compression ACROSS the
   // grain, and using it put a house post at 138% of yield standing still.
-  ['wood-frame',            18e6,    2.5,  0.20,       0.15],
+  ['wood-frame',            36e6,    2.5,  0.40,       0.28],
   // Glass: BRITTLE, not weak. Band 1.05 means ~5% from yield to failure, so a
   // struck pane lets go at once instead of draining a damage pool for six
   // seconds while nothing visibly moves — that narrow band is the whole
@@ -78,22 +140,22 @@ const SPEC = [
   // themselves out of the building under their own settling transients before
   // anyone shot at anything. Glass is enormously strong in compression
   // (~1 GPa); what makes it fragile is that it will not yield.
-  ['glass',                 60e6,    1.05, 0.02,       0.05],
+  ['glass',                 60e6,    1.05, 0.05,       0.09],
   // The seam holding a pane in its frame: a structural gasket. Weaker than the
   // pane and equally brittle, so the window pops OUT of the opening rather than
   // tearing the frame with it — but still an order of magnitude stronger than
   // the 2 MPa it started at, which could not hold a pane up.
-  ['glazing-clip',          14e6,    1.05, 0.10,       0.20],
+  ['glazing-clip',          14e6,    1.05, 0.20,       0.34],
   // ── cladding ────────────────────────────────────────────────────────────
   // Non-structural: spandrels, parapets, infill panels, the free facade. An
   // order of magnitude weaker than the frame behind it and deliberately
   // brittle (band 1.2), so a hit takes panels off without touching the
   // structure — which is what a facade does, and what makes a building
   // readable to shoot at.
-  ['facade-panel',          12e6,    1.2,  0.10,       0.17],
+  ['facade-panel',          12e6,    1.2,  0.20,       0.29],
   // The fixing between a panel and the frame. Weaker again, so a panel comes
   // AWAY whole before it cracks up, and cracks up when it lands.
-  ['facade-clip',            8e6,    1.2,  0.13,       0.21],
+  ['facade-clip',            8e6,    1.2,  0.26,       0.36],
   ['footing-anchor',        1.0e8,  10,    0.13,       0.50],
   // The White City's masonry. Structurally the same as `stone` -- this exists
   // for its LOOK. `stone` resolves to the `stone_wall_02` texture, whose mean
@@ -113,6 +175,7 @@ const LOOK = {
   // beige that reads as a multi-storey car park, and Poly Haven's
   // "white_plaster" is a mid-tone tan.
   'reinforced-concrete': { color: '#e9e7e2', textureKey: 'white-concrete', roughness: 0.82, metalness: 0.0 },
+  'prestressed-concrete': { color: '#e4e1db', textureKey: 'white-concrete', roughness: 0.80, metalness: 0.0 },
   'concrete-slab':       { color: '#c9c6bf', textureKey: 'concrete-floor', roughness: 0.95, metalness: 0.0 },
   stone:                 { color: '#9b9287', textureKey: 'stone',   roughness: 0.92, metalness: 0.0 },
   brick:                 { color: '#9c5b45', textureKey: 'brick',   roughness: 0.90, metalness: 0.0 },
@@ -135,6 +198,74 @@ const LOOK = {
   'white-stone':         { color: '#f2efe8', textureKey: 'white-concrete', roughness: 0.88, metalness: 0.0 },
 };
 
+// Young's modulus, Pa -- STIFFNESS, the property that decides how load is
+// SHARED between parallel paths (k = EA/L), as opposed to the strength limits
+// that decide when a joint breaks. Handbook values, not tuning knobs:
+// concrete ~30 GPa, steel ~200, stone masonry ~15, brick masonry ~5, softwood
+// along the grain ~10, glass ~70. The clip and facade entries are joints and
+// gaskets rather than solids, and their LOW stiffness is the physics: a soft
+// fixing sheds load to the structure behind it instead of carrying the wall.
+const MODULUS = {
+  'reinforced-concrete': 30e9,
+  'prestressed-concrete': 30e9,
+  'concrete-slab': 27e9,
+  stone: 15e9,
+  'white-stone': 15e9,
+  brick: 5e9,
+  steel: 200e9,
+  'wood-frame': 10e9,
+  glass: 70e9,
+  'glazing-clip': 2e9,
+  'facade-panel': 8e9,
+  'facade-clip': 1e9,
+  'footing-anchor': 30e9,
+};
+
+/**
+ * How much of a joint's section survives after it has cracked, as a fraction.
+ *
+ * This is REINFORCEMENT, expressed as the thing reinforcement actually does. A
+ * reinforced crack opens to a width the steel can hold and then stops; it is a
+ * stable state, not a stage of failure, and concrete past its tensile strength
+ * with rebar across it stands for decades.
+ *
+ * Without it, damage accrues for as long as stress exceeds the elastic limit,
+ * so any joint sitting even slightly over eventually sheds. That is right for
+ * a material with no reserve and wrong for every reinforced one: a parking
+ * deck at 1.1x its cracking stress lost its seams whatever the fatal limit
+ * said, and no combination of limits fixed it, because what was missing was
+ * arrest rather than a threshold.
+ *
+ * 0 is the runaway, and it is correct for everything unreinforced -- masonry,
+ * glass, a stone bed joint, a facade clip.
+ */
+const RESIDUAL = {
+  // A tenth, not a half.
+  //
+  // The residual is what the STEEL can carry, expressed as an equivalent area
+  // of the gross section. Slab and column reinforcement is around 1% of the
+  // section by area at roughly ten times concrete's strength, so it stands in
+  // for about a tenth of the gross -- not half.
+  //
+  // Half was tried and it is why nothing broke. Arrest puts a ceiling on
+  // stress at 1/residual times whatever the joint carried before it cracked;
+  // at 0.5 that ceiling is 2x, which lands just under the fatal limit at 3x,
+  // so every overloaded joint in the garage pinned at 2.95-3.00 and none of
+  // them ever went. At 0.1 the ceiling is 10x, which is past fatal, so a joint
+  // that is genuinely overloaded still fails -- while one that is merely
+  // cracked stops, which is the whole point.
+  'reinforced-concrete': 0.10,
+  // Prestressing steel is a higher proportion of the section and is stressed
+  // far harder, so more of the beam survives cracking as a tie.
+  'prestressed-concrete': 0.16,
+  'concrete-slab': 0.09,
+  // Structural steel yields rather than parting, and it IS the section.
+  steel: 0.6,
+  // Timber splits along the grain and the fibres bridge for a while.
+  'wood-frame': 0.08,
+  // Everything else runs away, which is what unreinforced material does.
+};
+
 function entry(name, elastic, band, tensionFrac, shearFrac) {
   const t = elastic * tensionFrac;
   const s = elastic * shearFrac;
@@ -143,6 +274,8 @@ function entry(name, elastic, band, tensionFrac, shearFrac) {
     compressionElastic: elastic, compressionFatal: elastic * band,
     tensionElastic: t, tensionFatal: t * band,
     shearElastic: s, shearFatal: s * band,
+    elasticModulus: MODULUS[name] ?? 30e9,
+    residualAreaFraction: RESIDUAL[name] ?? 0,
     ...LOOK[name],
     density: DENSITY[name],
   };

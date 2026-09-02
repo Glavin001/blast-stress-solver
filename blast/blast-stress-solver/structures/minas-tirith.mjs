@@ -364,10 +364,33 @@ export function buildMinasTirith(cfg = {}) {
       put(rMid - 0.25, rMid + 0.25, fa, fb, top - 0.7, top, 'beam', 'wood-frame');
     }
     void rMid;
+
+    // A wall plate: timber bedded along the wall head, which the roof lands on
+    // instead of landing on the masonry.
+    //
+    // This is a MATERIAL fix, not a stiffness one. A bond takes the weaker of
+    // the two materials it joins, so roof-on-wall resolved to white-stone --
+    // and white-stone's tension limit is 0.8 MPa, because that is what masonry
+    // actually is. Bonds resist moment, a roof bearing sags and rotates, and
+    // that rotation put the joint in tension it had no business carrying:
+    // roof-to-wall was the hottest class in the whole city at 2.9x, in tension
+    // and compression at the same interface, which is a bending couple.
+    //
+    // Landing the roof on timber makes the same joint wood-to-wood at 14.4 MPa
+    // and leaves the plate-to-masonry joint in pure bearing over the full wall
+    // head, which is the one thing masonry is good at. It is also exactly what
+    // a wall plate is for in a real building.
+    const PLATE = 0.12;
+    const plate = (rA, rB, from, to) =>
+      put(rA, rB, from, to, top, top + PLATE, 'beam', 'wood-frame');
+    plate(rIn, rOut, t0, t0 + dRad);
+    plate(rIn, rOut, t1 - dRad, t1);
+    plate(rOut - wallT, rOut, fa, fb);
+    plate(rIn, rIn + wallT, fa, fb);
     // Thin. Now that the beams carry it in ~3 m panels the roof's own span is
     // trivial, and every extra centimetre is dead load on those beams: at
     // 0.4 m it weighed 240 kg/m^2 and was pulling them down with it.
-    put(rIn, rOut, t0, t1, top, top + 0.22, 'roof', 'wood-frame');
+    put(rIn, rOut, t0, t1, top + PLATE, top + PLATE + 0.22, 'roof', 'wood-frame');
   };
 
   for (let k = 1; k < C.tiers; k += 1) {

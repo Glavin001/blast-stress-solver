@@ -698,6 +698,7 @@ __global__ void couplingRightMultiply(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     const std::uint32_t* activeBonds,
@@ -722,7 +723,13 @@ __global__ void couplingRightMultiply(
         return;
     }
 
-    const AngLin impulse = bonds[bond];
+    // Column scale: the operator is C*S, one multiply per bond.
+    AngLin impulse = bonds[bond];
+    {
+        const float s_j = colScale[bond];
+        impulse.angular = mul(impulse.angular, s_j);
+        impulse.linear = mul(impulse.linear, s_j);
+    }
     const Vec4 node0Angular = sub(impulse.angular, cross(offset0[bond], impulse.linear));
     const Vec4 node1Angular = sub(cross(offset1[bond], impulse.linear), impulse.angular);
     atomicAddVec(nodes[node0[bond]].angular, node0Angular);
@@ -750,6 +757,7 @@ __global__ void gatherRightMultiply(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     const Inertia* inertia,
@@ -799,7 +807,12 @@ __global__ void gatherRightMultiply(
         {
             continue;
         }
-        const AngLin impulse = bonds[bond];
+        AngLin impulse = bonds[bond];
+        {
+            const float s_j = colScale[bond];
+            impulse.angular = mul(impulse.angular, s_j);
+            impulse.linear = mul(impulse.linear, s_j);
+        }
         if (!isSecond)
         {
             angular = add(angular, sub(impulse.angular, cross(offset0[bond], impulse.linear)));
@@ -860,6 +873,7 @@ __global__ void couplingLeftMultiply(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     const std::uint32_t* activeBonds,
@@ -895,6 +909,12 @@ __global__ void couplingLeftMultiply(
     result.linear = add(
         sub(x0.linear, x1.linear),
         sub(cross(offset0[bond], x0.angular), cross(offset1[bond], x1.angular)));
+    // Transpose of the column scale: y = S * C^T * (...).
+    {
+        const float s_j = colScale[bond];
+        result.angular = mul(result.angular, s_j);
+        result.linear = mul(result.linear, s_j);
+    }
     bonds[bond] = result;
 }
 
@@ -1026,6 +1046,7 @@ __global__ void nodeSpaceMatvec(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     const std::uint32_t* nodeIsland,
@@ -1117,9 +1138,16 @@ __global__ void nodeSpaceMatvec(
         const Vec4 o0 = offset0[bond];
         const Vec4 o1 = offset1[bond];
 
-        const Vec4 tAng = sub(a0, a1);
+        // Column scaling: the operator is L_S = D C S^2 C^T D, where S is the
+        // per-bond compliance weight (Young's modulus) the CPU processor
+        // solves with. The bond-space intermediate is y_j = s_j t_j, the
+        // numerator is ||y||^2, and the node accumulation applies S once more
+        // on the way back -- so the whole bond term carries s_j^2.
+        const float s_j = colScale[bond];
+        const float s2 = s_j * s_j;
+        const Vec4 tAng = mul(sub(a0, a1), s2);
         const Vec4 tLin =
-            add(sub(l0, l1), sub(cross(o0, a0), cross(o1, a1)));
+            mul(add(sub(l0, l1), sub(cross(o0, a0), cross(o1, a1))), s2);
 
         // Own the bond from the node-0 side, or from the dynamic side when
         // node 0 is static (that side never runs). Exactly once, either way.
@@ -1128,11 +1156,12 @@ __global__ void nodeSpaceMatvec(
         const bool owns = isSecond ? !node0Dynamic : true;
         if (owns)
         {
-            zSq += tAng.x * tAng.x + tAng.y * tAng.y + tAng.z * tAng.z
-                 + tLin.x * tLin.x + tLin.y * tLin.y + tLin.z * tLin.z;
+            // ||s_j t_j||^2 == |s_j^2 t_j|^2 / s_j^2
+            zSq += (tAng.x * tAng.x + tAng.y * tAng.y + tAng.z * tAng.z
+                 + tLin.x * tLin.x + tLin.y * tLin.y + tLin.z * tLin.z) / s2;
         }
 
-        // (D C t)_node, the same accumulation gatherRightMultiply performs.
+        // (D C S^2 t)_node, the same accumulation gatherRightMultiply performs.
         if (!isSecond)
         {
             accAng = add(accAng, sub(tAng, cross(o0, tLin)));
@@ -1183,6 +1212,7 @@ __global__ void nodeSpaceBuildJacobi(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     std::uint32_t nodeCount,
     std::uint32_t bondCount)
 {
@@ -1207,20 +1237,22 @@ __global__ void nodeSpaceBuildJacobi(
             const Vec4 r = (ref & 0x80000000u) ? offset1[bond] : offset0[bond];
             const float rx = r.x, ry = r.y, rz = r.z;
             const float r2 = rx * rx + ry * ry + rz * rz;
+            // Column scale enters the diagonal block as s_j^2 (L_S = D C S^2 C^T D).
+            const float w = colScale[bond] * colScale[bond];
             // top-left: I - r r^T + |r|^2 I
-            m[0*6+0] += 1.0f - rx*rx + r2;  m[0*6+1] += -rx*ry;  m[0*6+2] += -rx*rz;
-            m[1*6+0] += -ry*rx;  m[1*6+1] += 1.0f - ry*ry + r2;  m[1*6+2] += -ry*rz;
-            m[2*6+0] += -rz*rx;  m[2*6+1] += -rz*ry;  m[2*6+2] += 1.0f - rz*rz + r2;
+            m[0*6+0] += w * (1.0f - rx*rx + r2);  m[0*6+1] += w * (-rx*ry);  m[0*6+2] += w * (-rx*rz);
+            m[1*6+0] += w * (-ry*rx);  m[1*6+1] += w * (1.0f - ry*ry + r2);  m[1*6+2] += w * (-ry*rz);
+            m[2*6+0] += w * (-rz*rx);  m[2*6+1] += w * (-rz*ry);  m[2*6+2] += w * (1.0f - rz*rz + r2);
             // off-diagonal: -[r]x above the diagonal, +[r]x below.
             const float sx[9] = {0.0f, -rz, ry,  rz, 0.0f, -rx,  -ry, rx, 0.0f};
             for (int a = 0; a < 3; ++a)
                 for (int b = 0; b < 3; ++b)
                 {
-                    m[(a)*6 + (3+b)] += -sx[a*3+b];
-                    m[(3+a)*6 + (b)] += +sx[a*3+b];
+                    m[(a)*6 + (3+b)] += -w * sx[a*3+b];
+                    m[(3+a)*6 + (b)] += +w * sx[a*3+b];
                 }
             // bottom-right: I
-            m[3*6+3] += 1.0f;  m[4*6+4] += 1.0f;  m[5*6+5] += 1.0f;
+            m[3*6+3] += w;  m[4*6+4] += w;  m[5*6+5] += w;
         }
         // Apply the 0/1 inertia mask on both sides, as L does.
         for (int a = 0; a < 6; ++a)
@@ -1427,6 +1459,7 @@ __global__ void nodeSpaceApplySolution(
     const Vec4* offset0,
     const Vec4* offset1,
     const float* health,
+    const float* colScale,
     const std::uint32_t* bondIsland,
     const std::uint32_t* islandSkip,
     const std::uint32_t* activeBonds,
@@ -1456,10 +1489,12 @@ __global__ void nodeSpaceApplySolution(
     x1.angular = mul(x1.angular, inertia[second].angular);
     x1.linear = mul(x1.linear, inertia[second].linear);
 
-    const Vec4 tAng = sub(x0.angular, x1.angular);
-    const Vec4 tLin = add(
+    // J' = J'0 + S C^T D mu: one column-scale multiply per bond.
+    const float s_j = colScale[bond];
+    const Vec4 tAng = mul(sub(x0.angular, x1.angular), s_j);
+    const Vec4 tLin = mul(add(
         sub(x0.linear, x1.linear),
-        sub(cross(offset0[bond], x0.angular), cross(offset1[bond], x1.angular)));
+        sub(cross(offset0[bond], x0.angular), cross(offset1[bond], x1.angular))), s_j);
     impulses[bond].angular = add(impulses[bond].angular, tAng);
     impulses[bond].linear = add(impulses[bond].linear, tLin);
 }
@@ -1516,7 +1551,7 @@ struct alignas(16) BondDelta
     float area;
     float nodeDistance;
     float health;
-    float pad;
+    float colScale;
 };
 
 /// Apply a sparse topology update.
@@ -1537,6 +1572,7 @@ __global__ void scatterBondTopology(
     float* areas,
     float* nodeDistances,
     float* health,
+    float* colScales,
     std::uint32_t* materials,
     std::uint32_t* island)
 {
@@ -1547,6 +1583,7 @@ __global__ void scatterBondTopology(
     }
     const std::uint32_t b = slots[i];
     const BondDelta v = values[i];
+    colScales[b] = v.colScale;
     node0[b] = v.node0;
     node1[b] = v.node1;
     offset0[b] = v.offset0;
@@ -2113,28 +2150,6 @@ __global__ void retireDegenerateIslands(
     }
 }
 
-__global__ void unscaleImpulses(
-    AngLin* impulses,
-    const std::uint32_t* bondIsland,
-    const std::uint32_t* islandSkip,
-    const std::uint32_t* activeBonds,
-    const std::uint32_t* activeCounts,
-    float linearScale,
-    float angularScale)
-{
-    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (slot >= activeCounts[0])
-    {
-        return;
-    }
-    const std::uint32_t index = activeBonds[slot];
-    if (!bondSettled(islandSkip, bondIsland[index]))
-    {
-        impulses[index].angular = mul(impulses[index].angular, angularScale);
-        impulses[index].linear = mul(impulses[index].linear, linearScale);
-    }
-}
-
 /// Pack the impulses of the islands that were actually solved into a dense
 /// block, so the device-to-host copy and the host's conversion loop cost what
 /// changed rather than what exists.
@@ -2205,7 +2220,9 @@ __global__ void flagActiveNodes(
 }
 
 __global__ void applyStressDamage(
+    float bendGainMax,
     const AngLin* impulses,
+    const float* colScale,
     const Vec4* normals,
     const float* areas,
     const float* nodeDistances,
@@ -2228,18 +2245,19 @@ __global__ void applyStressDamage(
     // Device impulses are solver-scaled; convert to physical units here. Two
     // multiplies on a value this kernel already has in registers.
     AngLin impulse = impulses[bond];
-    impulse.angular = mul(impulse.angular, angularImpulseScale);
-    impulse.linear = mul(impulse.linear, linearImpulseScale);
+    const float s_j = colScale[bond];
+    impulse.angular = mul(impulse.angular, angularImpulseScale * s_j);
+    impulse.linear = mul(impulse.linear, linearImpulseScale * s_j);
     const Vec4 normal = normals[bond];
     const float area = areas[bond];
     const float distance = nodeDistances[bond];
     // Same body as the host walk -- see NvBlastExtStressFormula.h.
-    float stressNormal, stressShear;
+    float stressNormal, stressShear, stressBend;
     extStressCalcBondStress(
         ExtStressVec3{impulse.linear.x, impulse.linear.y, impulse.linear.z},
         ExtStressVec3{impulse.angular.x, impulse.angular.y, impulse.angular.z},
         ExtStressVec3{normal.x, normal.y, normal.z},
-        area, distance, stressNormal, stressShear);
+        area, distance, bendGainMax, stressNormal, stressShear, stressBend);
 
     // Each bond fails against its OWN material. The table is tiny and
     // L2-resident; a plain global read is sufficient.
@@ -2309,6 +2327,7 @@ __global__ void applyStressDamage(
 /// node displacement are only divided through when the total area can take
 /// damage.
 __global__ void bondStressWalk(
+    float bendGainMax,
     const std::uint32_t* groupBegin,
     const std::uint32_t* groupSize,
     const std::uint32_t* memberBlastBond,
@@ -2320,6 +2339,7 @@ __global__ void bondStressWalk(
     const float* bondNodeDisp,
     const float* health,
     const AngLin* impulses,
+    const float* colScale,
     float bsLinearScale,
     float bsAngularScale,
     const float* materialElasticLimits,
@@ -2441,19 +2461,21 @@ __global__ void bondStressWalk(
 
     float stressNormal = 0.0f;
     float stressShear = 0.0f;
+    float stressBend = 0.0f;
     if (totalArea > 0.0f && totalArea < unbreakableLimit)
     {
         // Solver-scaled -> physical, same as applyStressDamage.
         AngLin impulse = impulses[g];
-        impulse.angular = mul(impulse.angular, bsAngularScale);
-        impulse.linear = mul(impulse.linear, bsLinearScale);
+        const float s_g = colScale[g];
+        impulse.angular = mul(impulse.angular, bsAngularScale * s_g);
+        impulse.linear = mul(impulse.linear, bsLinearScale * s_g);
         const float nodeDist =
             sqrtf(extStressDot(ExtStressVec3{dx, dy, dz}, ExtStressVec3{dx, dy, dz}));
         extStressCalcBondStress(
             ExtStressVec3{impulse.linear.x, impulse.linear.y, impulse.linear.z},
             ExtStressVec3{impulse.angular.x, impulse.angular.y, impulse.angular.z},
             ExtStressVec3{nx, ny, nz},
-            totalArea, nodeDist, stressNormal, stressShear);
+            totalArea, nodeDist, bendGainMax, stressNormal, stressShear, stressBend);
     }
 
     groupStressNormal[g] = stressNormal;
@@ -2717,6 +2739,7 @@ uploadIslands();
         cudaFree(m_brokenCount);
         cudaFree(m_brokenBonds);
         cudaFree(m_health);
+        cudaFree(m_colScales);
         cudaFree(m_nodeDistances);
         cudaFree(m_materials);
         cudaFree(m_bondMaterials);
@@ -3028,6 +3051,7 @@ uploadIslands();
         swapWithLast(m_hostOffset1, bondIndex, last);
         swapWithLast(m_hostNormals, bondIndex, last);
         swapWithLast(m_hostAreas, bondIndex, last);
+        swapWithLast(m_hostColScale, bondIndex, last);
         swapWithLast(m_hostNodeDistances, bondIndex, last);
         swapWithLast(m_hostHealth, bondIndex, last);
         swapWithLast(m_hostBondMaterials, bondIndex, last);
@@ -3390,10 +3414,11 @@ uploadIslands();
             const std::uint32_t block = 128;
             const std::uint32_t grid = (groups + block - 1) / block;
             bondStressWalk<<<grid, block, 0, m_bsStream>>>(
+                m_bendGainMax,
                 m_bsGroupBegin, m_bsGroupSize, m_bsMemberBlastBond,
                 m_bsBondNode0, m_bsBondNode1, m_bsBondMaterial,
                 m_bsBondNormal, m_bsBondCentroid, m_bsBondNodeDisp,
-                m_bsHealth, m_impulses,
+                m_bsHealth, m_impulses, m_colScales,
                 m_lengthScale * m_massScale,
                 m_lengthScale * m_lengthScale * m_massScale,
                 m_bsMaterialLimits, csr.materialCount,
@@ -3929,6 +3954,10 @@ private:
         const ExtStressGpuImpulse* nodeVelocities,
         const ExtStressGpuSolveParams& params)
     {
+        // Latch the bending policy the host resolved, so every kernel this
+        // solve launches uses the same one the CPU walk does.
+        m_bendGainMax = params.bendGainMax;
+
         if (!nodeVelocities || params.maxIterations == 0)
         {
             return false;
@@ -5257,6 +5286,8 @@ private:
         {
             const std::uint32_t bond = m_changedBonds[j];
             const AngLin& value = m_hostImpulses[compacted ? j : bond];
+            // Device impulses are also column-scaled (J' = J / colScale).
+            const float s_j = m_hostColScale[bond];
             // Device impulses are solver-scaled; this loop already touches
             // every changed bond for the 32 B -> 24 B repack, so converting to
             // physical units here is six multiplies on data already in cache.
@@ -5264,13 +5295,13 @@ private:
             // the non-compacted path -- which is the path taken after every
             // fracture tick, where it would cost as much as it saves.
             bondImpulses[bond].angular =
-                {value.angular.x * angularScale,
-                 value.angular.y * angularScale,
-                 value.angular.z * angularScale};
+                {value.angular.x * angularScale * s_j,
+                 value.angular.y * angularScale * s_j,
+                 value.angular.z * angularScale * s_j};
             bondImpulses[bond].linear =
-                {value.linear.x * linearScale,
-                 value.linear.y * linearScale,
-                 value.linear.z * linearScale};
+                {value.linear.x * linearScale * s_j,
+                 value.linear.y * linearScale * s_j,
+                 value.linear.z * linearScale * s_j};
         }
         m_telemetry.deviceToHostBytes +=
             sizeof(AngLin) * static_cast<std::uint64_t>(count);
@@ -5285,6 +5316,7 @@ private:
         m_hostInertia.resize(m_nodeCount);
         m_hostNormals.resize(m_bondCount);
         m_hostAreas.resize(m_bondCount);
+        m_hostColScale.resize(m_bondCount);
         m_hostNodeDistances.resize(m_bondCount);
         m_hostHealth.resize(m_bondCount);
         m_hostBondMaterials.resize(m_bondCount);
@@ -5351,6 +5383,7 @@ private:
             }
             m_hostNormals[i] = normal;
             m_hostAreas[i] = bonds[i].area > 0.0f ? bonds[i].area : 1.0f;
+            m_hostColScale[i] = bonds[i].colScale > 0.0f ? bonds[i].colScale : 1.0f;
             m_hostNodeDistances[i] = distance > 1.0e-6f ? distance : 1.0f;
             m_hostHealth[i] = std::max(0.0f, bonds[i].health);
             m_hostBondMaterials[i] =
@@ -5431,6 +5464,7 @@ private:
         allocateDevice(m_inertia, m_nodeCount, "allocate inertia");
         allocateDevice(m_normals, m_bondCount, "allocate normals");
         allocateDevice(m_areas, m_bondCount, "allocate areas");
+        allocateDevice(m_colScales, m_bondCount, "allocate compliance weights");
         allocateDevice(m_bondMaterials, m_bondCount, "allocate bond materials");
         allocateDevice(m_materials, m_materialCount, "allocate material table");
         allocateDevice(m_nodeDistances, m_bondCount, "allocate node distances");
@@ -5902,7 +5936,7 @@ private:
             v.area = m_hostAreas[b];
             v.nodeDistance = m_hostNodeDistances[b];
             v.health = m_hostHealth[b];
-            v.pad = 0.0f;
+            v.colScale = m_hostColScale[b];
         }
         stageUpload(m_devDeltaSlots, m_deltaSlots.data(),
                     sizeof(std::uint32_t) * count, "upload delta slots");
@@ -5911,7 +5945,7 @@ private:
         scatterBondTopology<<<(count + kBlockSize - 1) / kBlockSize, kBlockSize, 0, m_stream>>>(
             m_devDeltaSlots, m_devDeltaValues, count,
             m_node0, m_node1, m_offset0, m_offset1, m_normals,
-            m_areas, m_nodeDistances, m_health, m_bondMaterials, m_bondIsland);
+            m_areas, m_nodeDistances, m_health, m_colScales, m_bondMaterials, m_bondIsland);
         return true;
     }
 
@@ -5930,6 +5964,7 @@ private:
         stageUpload(m_inertia, m_hostInertia.data(), sizeof(Inertia) * m_nodeCount, "upload inertia");
         stageUpload(m_normals, m_hostNormals.data(), sizeof(Vec4) * m_bondCount, "upload normals");
         stageUpload(m_areas, m_hostAreas.data(), sizeof(float) * m_bondCount, "upload areas");
+        stageUpload(m_colScales, m_hostColScale.data(), sizeof(float) * m_bondCount, "upload compliance weights");
         stageUpload(m_nodeDistances, m_hostNodeDistances.data(), sizeof(float) * m_bondCount, "upload node distances");
         stageUpload(m_health, m_hostHealth.data(), sizeof(float) * m_bondCount, "upload health");
         stageUpload(m_bondMaterials, m_hostBondMaterials.data(), sizeof(std::uint32_t) * m_bondCount, "upload bond materials");
@@ -6031,6 +6066,7 @@ private:
                 m_offset0,
                 m_offset1,
                 m_health,
+                m_colScales,
                 m_bondIsland,
                 islandSkip,
                 m_inertia,
@@ -6059,6 +6095,7 @@ private:
             m_offset0,
             m_offset1,
             m_health,
+            m_colScales,
             m_bondIsland,
             islandSkip,
             m_activeBonds,
@@ -6124,7 +6161,7 @@ private:
         m_kernelProfile.begin("nodeSpaceMatvec", stream);
         nodeSpaceMatvec<<<nodeBlocks, kBlockSize, 0, stream>>>(
             m_nsW, m_residual, m_inertia, m_nodeBondBegin, m_nodeBondRef,
-            m_node0, m_node1, m_offset0, m_offset1, m_health,
+            m_node0, m_node1, m_offset0, m_offset1, m_health, m_colScales,
             m_bondIsland, islandSkip, m_nodeIsland, m_islandActive, skipConvergedEnabled(),
             m_reduceSlots, slots, m_activeNodes, m_activeCounts,
             m_iteration, 0u);
@@ -6169,7 +6206,7 @@ private:
             m_kernelProfile.begin("nodeSpaceMatvecG", stream);
             nodeSpaceMatvec<<<nodeBlocks, kBlockSize, 0, stream>>>(
                 m_nsW2, m_nsG, m_inertia, m_nodeBondBegin, m_nodeBondRef,
-                m_node0, m_node1, m_offset0, m_offset1, m_health,
+                m_node0, m_node1, m_offset0, m_offset1, m_health, m_colScales,
                 m_bondIsland, islandSkip, m_nodeIsland, m_islandActive, skipConvergedEnabled(),
                 nullptr, slots, m_activeNodes, m_activeCounts,
                 m_iteration, 0u);
@@ -6240,6 +6277,7 @@ private:
                 m_offset0,
                 m_offset1,
                 m_health,
+                m_colScales,
                 m_bondIsland,
                 islandSkip,
                 m_activeBonds,
@@ -6554,7 +6592,7 @@ private:
             nodeSpaceBuildJacobi<<<
                 (m_nodeCount + kBlockSize - 1) / kBlockSize, kBlockSize, 0, m_stream>>>(
                 m_nsJacobi, m_inertia, m_nodeBondBegin, m_nodeBondRef,
-                m_node0, m_node1, m_offset0, m_offset1, m_health,
+                m_node0, m_node1, m_offset0, m_offset1, m_health, m_colScales,
                 m_nodeCount, m_bondCount);
             m_kernelProfile.end(m_stream);
             m_jacobiBuilt = true;
@@ -6601,7 +6639,7 @@ private:
                 (m_graphBondCap + kBlockSize - 1) / kBlockSize,
                 kBlockSize, 0, m_stream>>>(
                 m_impulses, m_nsMu, m_inertia, m_node0, m_node1,
-                m_offset0, m_offset1, m_health, m_bondIsland, islandSkip,
+                m_offset0, m_offset1, m_health, m_colScales, m_bondIsland, islandSkip,
                 m_activeBonds, m_activeCounts);
             m_kernelProfile.end(m_stream);
         }
@@ -6611,6 +6649,11 @@ private:
         // the three places that read them for the OUTSIDE world apply the scale
         // themselves (applyStressDamage, bondStressWalk, and the host repack in
         // finishImpulseReadback). See initializeSolve.
+        //
+        // Column scaling (the CPU processor's compliance weights, colScale) is
+        // part of the stored variable too: the device holds J' = J / colScale,
+        // the operator is C*S on the way out and S*C^T on the way back, and the
+        // same three consumers multiply by colScale when converting to physical.
         checkCuda(
             cudaMemsetAsync(
                 m_brokenCount,
@@ -6632,7 +6675,9 @@ private:
                 kBlockSize,
                 0,
                 m_stream>>>(
+                m_bendGainMax,
                 m_impulses,
+                m_colScales,
                 m_normals,
                 m_areas,
                 m_nodeDistances,
@@ -6823,6 +6868,8 @@ private:
     PinnedVector<Inertia> m_hostInertia;
     PinnedVector<Vec4> m_hostNormals;
     PinnedVector<float> m_hostAreas;
+    /// Per-bond compliance weight, the CPU processor's column scale.
+    PinnedVector<float> m_hostColScale;
     PinnedVector<float> m_hostNodeDistances;
     PinnedVector<float> m_hostHealth;
     PinnedVector<std::uint32_t> m_hostBondMaterials;
@@ -6834,7 +6881,11 @@ private:
     Vec4* m_offset1{nullptr};
     Inertia* m_inertia{nullptr};
     Vec4* m_normals{nullptr};
+    /// Bending policy, taken from solve params so the device matches the host.
+    float m_bendGainMax{0.0f};
     float* m_areas{nullptr};
+    // Per-bond compliance weight, uploaded verbatim from the CPU processor.
+    float* m_colScales{nullptr};
     float* m_nodeDistances{nullptr};
     float* m_health{nullptr};
     std::uint32_t* m_bondMaterials{nullptr};

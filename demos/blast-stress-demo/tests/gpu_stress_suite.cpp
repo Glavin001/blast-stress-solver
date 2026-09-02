@@ -720,11 +720,55 @@ struct DestroyStats
     std::string note;
 };
 
+/// Stamp the CPU processor's compliance weights (column scale) onto the GPU
+/// bonds, exactly as ConjugateGradientImpulseSolver::initialize does in
+/// production (NvBlastExtStressSolver.cpp, `gpu.colScale = getColumnScale(i)`).
+///
+/// Without this the GPU solves the UNWEIGHTED system while the CPU reference
+/// solves the Young's-modulus-weighted one. Both satisfy equilibrium, so the
+/// residual gate cannot tell them apart -- it passed with single-building at
+/// peak |J| cpu 1.68e6 / gpu 1.24e6 -- but the load DISTRIBUTION between
+/// parallel paths, and therefore which bonds break, differs. The comparison
+/// must feed both backends the same operator.
+void stampColumnScale(Scene& scene)
+{
+    if (scene.bonds.empty()) return;
+    std::vector<SolverNodeS> nodes(scene.nodes.size());
+    for (std::size_t i = 0; i < scene.nodes.size(); ++i)
+    {
+        nodes[i].CoM = {scene.nodes[i].position[0], scene.nodes[i].position[1],
+                        scene.nodes[i].position[2]};
+        nodes[i].mass = scene.nodes[i].mass;
+        nodes[i].inertia = scene.nodes[i].inertia;
+    }
+    std::vector<SolverBond> bonds(scene.bonds.size());
+    for (std::size_t i = 0; i < scene.bonds.size(); ++i)
+    {
+        bonds[i].centroid = {scene.bonds[i].centroid[0], scene.bonds[i].centroid[1],
+                             scene.bonds[i].centroid[2]};
+        bonds[i].nodes[0] = scene.bonds[i].node0;
+        bonds[i].nodes[1] = scene.bonds[i].node1;
+        bonds[i].area = scene.bonds[i].area;
+        bonds[i].material = scene.bonds[i].material;
+    }
+    StressProcessor cpu;
+    StressProcessor::DataParams dp;
+    dp.centerBonds = true;
+    dp.equalizeMasses = true;
+    cpu.prepare(nodes.data(), static_cast<std::uint32_t>(nodes.size()),
+                bonds.data(), static_cast<std::uint32_t>(bonds.size()), dp);
+    for (std::size_t i = 0; i < scene.bonds.size(); ++i)
+    {
+        scene.bonds[i].colScale = cpu.getColumnScale(static_cast<std::uint32_t>(i));
+    }
+}
+
 DestroyStats runDestroy(const Scene& sceneIn, std::uint32_t iters, std::uint32_t ticks,
                         float gravity, bool skip)
 {
     DestroyStats st;
     Scene scene = sceneIn;
+    stampColumnScale(scene);
 
     ExtStressGpuSolver* solver = ExtStressGpuSolver::create(
         scene.nodes.data(), static_cast<std::uint32_t>(scene.nodes.size()),
@@ -1113,10 +1157,13 @@ RunResult runScenario(const std::string& name, const Scene& scene,
         return r;
     }
 
+    // Same compliance weights the CPU reference below will use.
+    Scene stamped = scene;
+    stampColumnScale(stamped);
     ExtStressGpuSolver* solver = ExtStressGpuSolver::create(
-        scene.nodes.data(), static_cast<std::uint32_t>(scene.nodes.size()),
-        scene.bonds.data(), static_cast<std::uint32_t>(scene.bonds.size()),
-        scene.materials.data(), static_cast<std::uint32_t>(scene.materials.size()));
+        stamped.nodes.data(), static_cast<std::uint32_t>(stamped.nodes.size()),
+        stamped.bonds.data(), static_cast<std::uint32_t>(stamped.bonds.size()),
+        stamped.materials.data(), static_cast<std::uint32_t>(stamped.materials.size()));
     if (!solver) { r.note = "solver create FAILED"; return r; }
 
     std::vector<ExtStressGpuImpulse> velocities(scene.nodes.size());

@@ -105,8 +105,21 @@ Impulse on a bond -> the normal and shear pressures it carries.
                             asset area.
 \param[in]  nodeDist        Distance between the bond's two node positions,
                             used to reinterpret angular pressure as linear.
+\param[in]  bendGainMax     Cap on the section-modulus bending gain, or <= 0 for
+                            the legacy behaviour of folding bend into the axial
+                            stress with its sign.
+
+                            A PARAMETER rather than a setting read inside,
+                            because this body compiles for the device too and
+                            cannot reach an environment variable. The host
+                            resolves the policy once and hands it over, which is
+                            also what keeps the two backends solving the same
+                            equation.
 \param[out] stressNormal    Signed: positive is tension, negative compression.
 \param[out] stressShear     Unsigned.
+\param[out] stressBend      Unsigned peak fibre pressure from bending, or 0 when
+                            bendGainMax <= 0 and bending has been folded into
+                            stressNormal instead.
 */
 NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
     const ExtStressVec3& impulseLinear,
@@ -114,8 +127,10 @@ NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
     const ExtStressVec3& normal,
     float area,
     float nodeDist,
+    float bendGainMax,
     float& stressNormal,
-    float& stressShear)
+    float& stressShear,
+    float& stressBend)
 {
     // Linear impulse along the normal is normal stress, perpendicular is
     // shear. Dividing by area converts impulse to pressure.
@@ -149,8 +164,63 @@ NVBLAST_STRESS_FORMULA_FN void extStressCalcBondStress(
     // Plain ops: multiplying by 2 is exact, and an add of a division result
     // offers the compiler nothing to contract, so these are already the same
     // sequence on both sides.
-    stressShear += twist * 2.0f / nodeDist;
-    stressNormal += copysignf(bend * 2.0f / nodeDist, stressNormal);
+    // Torsion, on the same footing as bending.
+    //
+    // This was the last user of the nodeDist scaling, and it was left behind
+    // when bending moved to a section modulus -- an asymmetry with no physical
+    // justification: both are angular impulses turned into a peak surface
+    // stress, and both want a section dimension rather than the distance
+    // between two chunk centroids. Metres where centimetres belong understates
+    // it by about an order of magnitude, which matters most in exactly the case
+    // it was reported in: a deck left hanging off a few columns twists at the
+    // joints that remain.
+    //
+    // For a roughly square patch of side a, the peak torsional shear is
+    // T/(0.208*a^3); since twist = T/a^2 that is twist/(0.208*a), i.e.
+    // 4.81*twist/sqrt(area). Same 1/sqrt(area) shape as bending, different
+    // constant, and bounded by the same gain for the same reason -- below a
+    // certain joint size the formula is amplifying the discretisation's own
+    // moments rather than the structure's.
+    if (bendGainMax > 0.0f)
+    {
+        const float torsionGain = 4.81f / sqrtf(area > 1.0e-6f ? area : 1.0e-6f);
+        stressShear += twist * (torsionGain < bendGainMax ? torsionGain : bendGainMax);
+    }
+    else
+    {
+        stressShear += twist * 2.0f / nodeDist;
+    }
+
+    if (bendGainMax <= 0.0f)
+    {
+        // Legacy: bend amplifies whatever sign the axial stress already has,
+        // scaled by the distance between the two chunks' CENTROIDS.
+        stressNormal += copysignf(bend * 2.0f / nodeDist, stressNormal);
+        stressBend = 0.0f;
+        return;
+    }
+
+    // Bending as the peak fibre pressure it actually causes.
+    //
+    // `bend` is moment/area. Turning that into the stress at the extreme fibre
+    // is what a section modulus does: for a roughly square patch of side
+    // a = sqrt(area), sigma = M*c/I = 6*M/a^3, and since bend = M/a^2 that is
+    // 6*bend/sqrt(area).
+    //
+    // The legacy path above divides by the distance between chunk centroids
+    // instead -- metres, where a section dimension of tens of centimetres
+    // belongs -- understating bending on a slab joint by about an order of
+    // magnitude. With the sign folding, that is why a twelve-metre plate
+    // cantilevered off a column grid reported two thirds of its elastic limit
+    // and stood there indefinitely.
+    //
+    // The gain is BOUNDED because 6/sqrt(area) runs away as the joint gets
+    // small: a 0.02 m^2 patch amplifies by 43, and at that scale what it
+    // amplifies is mostly the solve's own discretisation noise rather than a
+    // real moment. Two houses began shedding bonds under their own weight at
+    // that gain.
+    const float sectionGain = 6.0f / sqrtf(area > 1.0e-6f ? area : 1.0e-6f);
+    stressBend = bend * (sectionGain < bendGainMax ? sectionGain : bendGainMax);
 }
 
 }  // namespace Blast

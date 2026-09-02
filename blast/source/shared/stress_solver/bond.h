@@ -62,7 +62,7 @@ template <typename TensorType>
 struct BondMatrix
 {
     /** Constructor clears member data. */
-    BondMatrix() : C(nullptr), sqrt_I_inv(nullptr), scratch(nullptr), M(0), N(0) {}
+    BondMatrix() : C(nullptr), sqrt_I_inv(nullptr), scratch(nullptr), M(0), N(0), colScale(nullptr), colScratch(nullptr) {}
 
     /**
      * Set fields (shallow pointer copy).
@@ -76,19 +76,41 @@ struct BondMatrix
      * \param[in]   _N          The number of bonds.
      */
     void
-    set(const Coupling* _C, const Inertia<TensorType>* _sqrt_I_inv, void* _scratch, uint32_t _M, uint32_t _N)
+    set(const Coupling* _C, const Inertia<TensorType>* _sqrt_I_inv, void* _scratch, uint32_t _M, uint32_t _N,
+        const float* _colScale = nullptr, AngLin6* _colScratch = nullptr)
     {
         C = _C;
         sqrt_I_inv = _sqrt_I_inv;
         scratch = _scratch;
         M = _M;
         N = _N;
+        colScale = _colScale;
+        colScratch = _colScratch;
     }
 
     const Coupling* C;
     const Inertia<TensorType>* sqrt_I_inv;
     void* scratch;
     uint32_t M, N;
+    /**
+     * Optional per-column (per-bond) scale S, making the operator B = (I^-1/2)*C*S.
+     *
+     * This is what turns the minimum-NORM solution into the minimum-ENERGY one.
+     * The system is underdetermined -- these structures carry ~3 bonds per node,
+     * so many force distributions balance -- and unweighted CGNR returns the
+     * distribution minimising Sum(J^2), which treats a hairline seam and a
+     * two-square-metre bearing face as equally willing to carry load. With
+     * S = diag(sqrt(E*A/L)), the solved variable is J' = S^-1 * J and its
+     * minimum norm is Sum(J^2 * L/(E*A)) -- twice the elastic strain energy.
+     * That is the distribution a real structure adopts (least work), and it is
+     * what makes a thin joint attract force in proportion to its stiffness
+     * instead of an equal share.
+     *
+     * Null means unscaled (legacy behaviour). colScratch must hold N elements
+     * when colScale is set; it backs the scaled copy of x in rmul.
+     */
+    const float* colScale = nullptr;
+    AngLin6* colScratch = nullptr;
 };
 
 typedef BondMatrix<float>       BondMatrixS;
@@ -114,10 +136,24 @@ struct BondMatrixOps
         NV_UNUSED(M);   // BondMatrix stores these
         NV_UNUSED(N);
 
-        // Calculate y = C*x (apply C)
-        CouplingMatrixOps<AngLin6, Scalar>().rmul(y, B.C, x, B.M, B.N);
+        // Column scale first: x_s = S*x, so the operator applied is C*S. One
+        // multiply per bond; see BondMatrix::colScale for why it exists.
+        const AngLin6* x_in = x;
+        if (B.colScale != nullptr)
+        {
+            for (uint32_t j = 0; j < B.N; ++j)
+            {
+                const float s_j = B.colScale[j];
+                B.colScratch[j].ang = x[j].ang * s_j;
+                B.colScratch[j].lin = x[j].lin * s_j;
+            }
+            x_in = B.colScratch;
+        }
 
-        // Calculate y = (I^-1/2)*C*x (apply I^-1/2)
+        // Calculate y = C*S*x (apply C)
+        CouplingMatrixOps<AngLin6, Scalar>().rmul(y, B.C, x_in, B.M, B.N);
+
+        // Calculate y = (I^-1/2)*C*S*x (apply I^-1/2)
         InertiaMatrixOps<Scalar>().mul(y, B.sqrt_I_inv, y, B.M);
     }
 
@@ -143,6 +179,17 @@ struct BondMatrixOps
 
         // Calculate y = (C^T)*(I^-1/2)*x (apply C^T)
         CouplingMatrixOps<AngLin6, Scalar>().lmul(y, s, B.C, B.M, B.N);
+
+        // Transpose of the column scale: y = S*(C^T)*(I^-1/2)*x.
+        if (B.colScale != nullptr)
+        {
+            for (uint32_t j = 0; j < B.N; ++j)
+            {
+                const float s_j = B.colScale[j];
+                y[j].ang = y[j].ang * s_j;
+                y[j].lin = y[j].lin * s_j;
+            }
+        }
     }
 };
 

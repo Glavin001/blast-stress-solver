@@ -26,10 +26,12 @@
  */
 import {
   clipConvex, polygonArea, polygonCentroid, voronoiCells, sharedEdgeLength,
+  sharedEdgeMidpoint, convexIntersectPoly,
   prismMesh, mulberry32, round, v, convexIntersectArea,
 } from '../../scripts/export-fractured-city.mjs';
 import { MATERIALS, MATERIAL_INDEX, materialTable, bondMaterialName, material } from './materials.mjs';
 import { shardsFor, maxChunkVolume, cellVolumeFor } from './fracture.mjs';
+import { resolveBackend, unavailable } from './fracture-backends.mjs';
 import { prismContact } from './contact.mjs';
 
 /**
@@ -39,6 +41,15 @@ import { prismContact } from './contact.mjs';
  * matches the mesh that is drawn.
  */
 export const MAX_HULL_POINTS = 64;
+/**
+ * Lloyd relaxation passes applied to the fracture seeds before cutting.
+ *
+ * 0 restores the un-relaxed jittered grid. Two is where the seam widths stop
+ * improving much on the structures in this repo; more mostly makes the cells
+ * rounder without removing more hairlines.
+ */
+const LLOYD_PASSES = Number(process.env.BLAST_LLOYD_PASSES ?? 2);
+
 const MAX_POLY_VERTS = Math.floor(MAX_HULL_POINTS / 6);
 
 /**
@@ -54,6 +65,7 @@ const MAX_POLY_VERTS = Math.floor(MAX_HULL_POINTS / 6);
  * 250 cm^2 Villa Savoye's ribbon walls come loose.
  */
 const MIN_BOND_AREA = 8e-3;
+
 /** Two surfaces this close count as touching (1 mm). */
 const TOUCH_EPS = 1e-3;
 
@@ -159,7 +171,8 @@ export class ScenePackBuilder {
    * so its size is invisible and splitting it buys nothing.
    */
   piece({ type, material: matName, axis, poly, lo, hi,
-          fixed = false, fracture = true, cellVolume = null }) {
+          fixed = false, fracture = true, cellVolume = null,
+          fractureBackend = undefined, densityScale = 1 }) {
     if (!FRAME[axis]) throw new Error(`bad axis "${axis}"`);
     if (!(hi > lo)) throw new Error(`${type}/${matName}: empty extent ${lo}..${hi} on ${axis}`);
     if (poly.length > MAX_POLY_VERTS) {
@@ -172,16 +185,17 @@ export class ScenePackBuilder {
     material(matName); // validates the name
     this.pieces.push({
       type, material: matName, axis, poly, lo, hi, fixed, fracture, cellVolume,
-      group: this.currentGroup, shards: [],
+      fractureBackend, densityScale, group: this.currentGroup, shards: [],
     });
     return this.pieces.length - 1;
   }
 
   /** Convenience: an axis-aligned box, given world-space min/max corners. */
-  box({ type, material, min, max, axis = 'y', fixed = false, fracture = true, cellVolume = null }) {
+  box({ type, material, min, max, axis = 'y', fixed = false, fracture = true, cellVolume = null, densityScale = 1,
+        fractureBackend = undefined }) {
     const f = FRAME[axis];
     return this.piece({
-      type, material, axis, fixed, fracture, cellVolume,
+      type, material, axis, fixed, fracture, cellVolume, fractureBackend, densityScale,
       poly: rect(min[f.u], min[f.w], max[f.u], max[f.w]),
       lo: min[f.t], hi: max[f.t],
     });
@@ -208,7 +222,22 @@ export class ScenePackBuilder {
     const ct = (lo + hi) / 2;
     const centre = f.toWorld(cu, cw, ct);
     const volume = area * thickness;
-    const dens = material(matName).density;
+    // Superimposed load, carried as extra density on the piece that carries it.
+    //
+    // A parking deck holds cars, and 2.5 kPa of them is 35% of a 300 mm slab's
+    // own weight -- the difference between columns at 6% of capacity and
+    // columns with a real margin. Modelling each car as a body would be
+    // thousands of rigid bodies to express a distributed load, so it rides on
+    // the deck's density instead, which is what a design check does too.
+    // Superimposed load, carried as extra density on the piece that carries it.
+    //
+    // A parking deck holds cars, and 2.5 kPa of them is 35% of a 300 mm slab's
+    // own weight -- the difference between columns at 6% of their capacity and
+    // columns with a real margin. Modelling each car as a body would be
+    // thousands of rigid bodies to express a distributed load, so it rides on
+    // the deck's density, which is what a design check does too.
+    const scale = piece !== undefined ? (this.pieces[piece]?.densityScale ?? 1) : 1;
+    const dens = material(matName).density * scale;
     const [u0, w0, u1, w1] = polyBounds(poly);
     const size = f.toWorld(u1 - u0, w1 - w0, thickness);
 
@@ -250,13 +279,20 @@ export class ScenePackBuilder {
    * normal books compression as shear -- upstream traced a facade sitting below
    * a safety factor of 1 while standing still to exactly that.
    */
-  #addBond(a, b, area, normal, matName) {
+  #addBond(a, b, area, normal, matName, contactCentroid = null) {
     if (!(area > MIN_BOND_AREA)) return false;
     const ca = this.nodes[a].centroid, cb = this.nodes[b].centroid;
     const len = Math.hypot(...normal) || 1;
+    // The bond centroid is the moment arm's far end: the solver measures
+    // torque from each chunk's CoM to this point. The real contact patch when
+    // the caller knows it; the chunk midpoint only as a fallback, because a
+    // midpoint centroid reads every eccentric bearing as concentric.
+    const cc = contactCentroid;
     this.bonds.push({
       node0: a, node1: b,
-      centroid: v((ca.x + cb.x) / 2, (ca.y + cb.y) / 2, (ca.z + cb.z) / 2),
+      centroid: cc
+        ? v(cc[0], cc[1], cc[2])
+        : v((ca.x + cb.x) / 2, (ca.y + cb.y) / 2, (ca.z + cb.z) / 2),
       normal: v(normal[0] / len, normal[1] / len, normal[2] / len),
       area: round(area),
       m: MATERIAL_INDEX[matName],
@@ -363,14 +399,18 @@ export class ScenePackBuilder {
     return mulberry32(h);
   }
 
-  /** Voronoi-fracture one cell of a piece. */
+  /** Fracture one cell of a piece, with whichever backend it selected. */
   #fractureCell(p, pieceId, poly, lo, hi, cell) {
+    // Resolved per piece, so one structure can be cut two ways while the
+    // backends are being compared rather than the choice being global-only.
+    const backend = resolveBackend(p.fractureBackend);
+    if (backend !== 'voronoi-2d') unavailable(backend);
     const { axis, material: matName, type, fixed } = p;
     const [u0, w0, u1, w1] = polyBounds(poly);
     const faceArea = polygonArea(poly);
     // `fracture: false` means no Voronoi, not "one enormous chunk": the piece is
     // still cut on the size grid. A foundation left whole came out at 363 m^3.
-    const n = p.fracture ? shardsFor(matName, faceArea, faceArea * (hi - lo)) : 1;
+    const n = p.fracture ? shardsFor(matName, faceArea, faceArea * (hi - lo), type) : 1;
     this.shardStats.push({ material: matName, shards: n });
 
     if (n <= 1) {
@@ -398,6 +438,35 @@ export class ScenePackBuilder {
         const ju = (a + 0.25 + rng() * 0.5) / gu;
         const jw = (b + 0.25 + rng() * 0.5) / gw;
         seeds.push([u0 + ju * (u1 - u0), w0 + jw * (w1 - w0)]);
+      }
+    }
+    // Lloyd relaxation before cutting.
+    //
+    // A jittered grid keeps cell SIZES even, which is what it was chosen for.
+    // It does not keep cell ADJACENCIES sane: two seeds that land near each
+    // other still produce neighbours meeting along a hairline, and the bond
+    // between them is that hairline times the wall thickness. Measured on a
+    // 47,631-chunk masonry structure, 23% of all seams came out under 5 cm
+    // wide, the narrowest at 1 mm, between shards a metre across. Stress is
+    // force over area, so those seams read as failing under ordinary load,
+    // crack, and hand their share to their neighbours -- which is what a
+    // building slowly falling apart on its own looks like from outside.
+    //
+    // Moving each seed to the centre of its own cell and re-cutting pushes
+    // seeds apart where they crowded. A few rounds is the standard cure and
+    // costs nothing here: the cut is half-plane clipping over a handful of
+    // seeds, run once per panel class at build time.
+    //
+    // Determinism is preserved -- relaxation is a pure function of the seeds,
+    // which are already drawn from the panel class's own stream, so identical
+    // panels still produce identical shards and still share one upload.
+    for (let pass = 0; pass < LLOYD_PASSES; pass += 1) {
+      const relaxing = voronoiCells(seeds, u0, w0, u1, w1);
+      for (let i = 0; i < seeds.length; i += 1) {
+        const cellPoly = relaxing[i];
+        if (!cellPoly || cellPoly.length < 3) continue;
+        const c = polygonCentroid(cellPoly);
+        if (Number.isFinite(c[0]) && Number.isFinite(c[1])) seeds[i] = c;
       }
     }
     const cells = voronoiCells(seeds, u0, w0, u1, w1);
@@ -444,7 +513,12 @@ export class ScenePackBuilder {
           const edge = sharedEdgeLength(si.poly, nu, nw, d);
           if (edge > 1e-6) {
             const t = Math.min(si.hi, sj.hi) - Math.max(si.lo, sj.lo);
-            if (t > 1e-6) this.#addBond(si.node, sj.node, edge * t, f.toWorld(nu, nw, 0), mat);
+            if (t > 1e-6) {
+              const mid2 = sharedEdgeMidpoint(si.poly, nu, nw, d);
+              const tMid = (Math.max(si.lo, sj.lo) + Math.min(si.hi, sj.hi)) / 2;
+              this.#addBond(si.node, sj.node, edge * t, f.toWorld(nu, nw, 0), mat,
+                mid2 ? f.toWorld(mid2[0], mid2[1], tMid) : null);
+            }
           }
           continue;
         }
@@ -457,8 +531,14 @@ export class ScenePackBuilder {
         if (dt === 1) {
           // Stacked along the extrusion: the contact is the overlap of the two
           // cross-sections, which convexIntersectArea gives exactly.
-          const area = convexIntersectArea(si.poly, sj.poly);
-          if (area > 0) this.#addBond(si.node, sj.node, area, f.toWorld(0, 0, 1), mat);
+          const patch = convexIntersectPoly(si.poly, sj.poly);
+          const area = patch.length >= 3 ? polygonArea(patch) : 0;
+          if (area > 0) {
+            const [cu, cw] = polygonCentroid(patch);
+            const tFace = (Math.max(si.lo, sj.lo) + Math.min(si.hi, sj.hi)) / 2;
+            this.#addBond(si.node, sj.node, area, f.toWorld(0, 0, 1), mat,
+              f.toWorld(cu, cw, tFace));
+          }
           continue;
         }
 
@@ -480,7 +560,12 @@ export class ScenePackBuilder {
         const t = Math.min(si.hi, sj.hi) - Math.max(si.lo, sj.lo);
         if (edge > 1e-6 && t > 1e-6) {
           const n = k === 0 ? [1, 0] : [0, 1];
-          this.#addBond(si.node, sj.node, edge * t, f.toWorld(n[0], n[1], 0), mat);
+          const spanMid = (Math.max(a[0], b[0]) + Math.min(a[1], b[1])) / 2;
+          const tMid = (Math.max(si.lo, sj.lo) + Math.min(si.hi, sj.hi)) / 2;
+          const cu = k === 0 ? line : spanMid;
+          const cw = k === 0 ? spanMid : line;
+          this.#addBond(si.node, sj.node, edge * t, f.toWorld(n[0], n[1], 0), mat,
+            f.toWorld(cu, cw, tMid));
         }
       }
     }
@@ -513,7 +598,7 @@ export class ScenePackBuilder {
             );
             if (!c) continue;
             if (c.penetration > TOUCH_EPS) this.penetratingContacts++;
-            this.#addBond(sa.node, sb.node, c.area, c.normal, matName);
+            this.#addBond(sa.node, sb.node, c.area, c.normal, matName, c.centroid);
           }
         }
       }

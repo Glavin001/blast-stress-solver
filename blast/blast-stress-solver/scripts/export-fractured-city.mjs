@@ -447,6 +447,32 @@ export function voronoiCells(seeds, x0, y0, x1, y1) {
  * Cells i and j of a Voronoi diagram share their bisector, so we measure the
  * part of i's boundary lying on that bisector — the exact contact edge.
  */
+/**
+ * Length-weighted midpoint of the boundary segments lying on a bisector line,
+ * or null when nothing does. The companion of sharedEdgeLength, for callers
+ * that need to KNOW WHERE the seam is rather than only how long: the stress
+ * solver's moment arms run from chunk CoM to bond centroid, so a seam centroid
+ * placed at the chunk midpoint reads every eccentric seam as concentric.
+ */
+export function sharedEdgeMidpoint(poly, nx, ny, d) {
+  const len = Math.hypot(nx, ny);
+  if (len < EPS) return null;
+  nx /= len; ny /= len; d /= len;
+  let total = 0, mu = 0, mv = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const da = nx * a[0] + ny * a[1] - d;
+    const db = nx * b[0] + ny * b[1] - d;
+    if (Math.abs(da) < 1e-7 && Math.abs(db) < 1e-7) {
+      const seg = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      total += seg;
+      mu += seg * (a[0] + b[0]) / 2;
+      mv += seg * (a[1] + b[1]) / 2;
+    }
+  }
+  return total > 0 ? [mu / total, mv / total] : null;
+}
+
 export function sharedEdgeLength(poly, nx, ny, d) {
   const len = Math.hypot(nx, ny);
   if (len < EPS) return 0;
@@ -472,6 +498,20 @@ export function sharedEdgeLength(poly, nx, ny, d) {
  * the old code could use the column's 0.4 m square section because the column
  * was one piece.
  */
+/** The intersection polygon itself, for callers that need its centroid. */
+export function convexIntersectPoly(a, b) {
+  if (a.length < 3 || b.length < 3) return [];
+  const sign = polygonArea(b, true) >= 0 ? 1 : -1;
+  let poly = a;
+  for (let i = 0; i < b.length && poly.length; i++) {
+    const p = b[i], q = b[(i + 1) % b.length];
+    const nx = (q[1] - p[1]) * sign;
+    const ny = -(q[0] - p[0]) * sign;
+    poly = clipConvex(poly, nx, ny, nx * p[0] + ny * p[1]);
+  }
+  return poly.length >= 3 ? poly : [];
+}
+
 export function convexIntersectArea(a, b) {
   if (a.length < 3 || b.length < 3) return 0;
   // Outward normals depend on winding, so take it from the signed area.

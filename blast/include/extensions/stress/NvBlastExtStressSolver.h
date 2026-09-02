@@ -190,6 +190,31 @@ struct ExtStressMaterial
     float shearElasticLimit;        //!< < 0 inherits compression
     float shearFatalLimit;          //!< < 0 inherits compression
 
+    //! Fraction of a bond's ORIGINAL area that damage will not take below.
+    //!
+    //! Reinforcement, expressed as the thing it actually does. A reinforced
+    //! crack opens to a width the steel can hold and then STOPS -- it is a
+    //! stable state, not a stage of failure, and concrete past its tensile
+    //! strength with rebar across it stands for decades.
+    //!
+    //! Without this, damage accrues for as long as stress exceeds the elastic
+    //! limit, so any joint sitting even slightly over eventually sheds. That
+    //! is correct for a material with no reserve and wrong for every reinforced
+    //! one: a parking deck at 1.1x its cracking stress lost its seams whatever
+    //! the fatal limit said, and no combination of limits fixed it because the
+    //! missing behaviour was arrest rather than a threshold.
+    //!
+    //! 0 keeps the runaway, which is what plain masonry, glass and an
+    //! unreinforced seam should do.
+    float residualAreaFraction;
+
+    //! Young's modulus, Pa. STIFFNESS, not strength: how much this material
+    //! deforms under load, which is what decides how an over-connected
+    //! structure SHARES load between parallel paths (k = EA/L). 0 means
+    //! unknown and is treated as the 30 GPa reference (concrete), which
+    //! reduces the compliance weighting to pure geometry.
+    float elasticModulusPa;
+
     //! Chunk comminution. Disabled unless crush.capPressure > 0. @see ExtStressCrushProperties
     ExtStressCrushProperties crush;
 
@@ -199,7 +224,9 @@ struct ExtStressMaterial
         tensionElasticLimit(-1.0f),
         tensionFatalLimit(-1.0f),
         shearElasticLimit(-1.0f),
-        shearFatalLimit(-1.0f)
+        shearFatalLimit(-1.0f),
+        elasticModulusPa(0.0f),
+        residualAreaFraction(0.0f)
     {}
 };
 
@@ -268,6 +295,15 @@ public:
     \param[in]  localPosition   Node local position.
     */
     virtual void                            setNodeInfo(uint32_t graphNodeIndex, float mass, float volume, NvcVec3 localPosition) = 0;
+
+    /**
+    Real rotational inertia (kg m^2) for a graph node, from its actual shape.
+
+    The solver otherwise approximates every chunk as a sphere of its volume,
+    which mis-weights the moment balance for exactly the flat, wide pieces
+    buildings are made of. 0 restores the sphere fallback.
+    */
+    virtual void                            setNodeGeometricInertia(uint32_t graphNode, float inertia) = 0;
 
     /**
     Set all nodes info using low level NvBlastAsset data.
@@ -351,6 +387,22 @@ public:
                             rate into the work increment.
     */
     virtual void                            setNodeStrainRates(const float* strainRates, uint32_t nodeCount, float deltaTime) = 0;
+
+    /**
+    Set the timestep the next update() advances by, in seconds.
+
+    Bond damage is a RATE. A joint held past its elastic limit loses section
+    over time, so how much it loses depends on how much time passed -- and
+    without this the solver has no clock, so it charged damage per TICK and the
+    same overload ate a bond twice as fast at 120 Hz as at 60 Hz. Ductility was
+    therefore not a property of the material but of the frame rate.
+
+    Leaving this unset (or zero) keeps the legacy per-tick behaviour, which is
+    what offline callers that step once per notional frame want.
+
+    \param[in] deltaTime    Timestep (s), or 0 for per-tick damage.
+    */
+    virtual void                            setDeltaTime(float deltaTime) = 0;
 
     /**
     Read back per-node accumulated crush damage in [0, 1], indexed by graph

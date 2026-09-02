@@ -14,6 +14,9 @@ typedef struct ExtStressNodeDesc {
     StressVec3 centroid;
     float mass;
     float volume;
+    /* Rotational inertia (kg m^2) from the chunk's real shape, or 0 to let the
+       solver fall back to its sphere-of-equal-volume approximation. */
+    float inertia;
 } ExtStressNodeDesc;
 
 typedef struct ExtStressBondDesc {
@@ -45,6 +48,11 @@ typedef struct ExtStressMaterialDesc {
     float tension_fatal_limit;
     float shear_elastic_limit;
     float shear_fatal_limit;
+    /* Young's modulus, Pa. Stiffness, not strength: decides how parallel load
+       paths SHARE load (k = EA/L). 0 = unknown, treated as 30 GPa concrete. */
+    float elastic_modulus_pa;
+    /* Fraction of original bond area damage will not go below. 0 = runaway. */
+    float residual_area_fraction;
     float crush_cap_pressure;         /* Pa. <= 0 disables crushing. */
     float crush_cohesion;             /* Pa. Drucker-Prager intercept at p = 0. */
     float crush_friction_slope;       /* dq/dp of the cone, dimensionless. */
@@ -347,6 +355,11 @@ uint8_t ext_stress_solver_get_island_aware(const ExtStressSolverHandle* handle);
 
 // Enable/disable skipping of settled islands (requires island-aware). islands_skipped reports the
 // number skipped in the last update.
+// Timestep (s) the next update() advances by. Bond damage is a rate, so without
+// this the solver charges damage per tick and ductility becomes a property of
+// the frame rate rather than of the material. 0 keeps the legacy per-tick path.
+void ext_stress_solver_set_delta_time(ExtStressSolverHandle* handle, float delta_time);
+
 void ext_stress_solver_set_skip_settled(ExtStressSolverHandle* handle, uint8_t enabled);
 void ext_stress_solver_set_skip_stable_unconverged(ExtStressSolverHandle* handle, uint8_t enabled);
 uint8_t ext_stress_solver_get_skip_settled(const ExtStressSolverHandle* handle);

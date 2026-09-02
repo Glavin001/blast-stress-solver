@@ -30,6 +30,13 @@ export const ALGEDRA = {
   floors: 7,
   floorHeight: 3.4,
   groundHeight: 4.6,    // the tall, open, glazed base
+  // 0.45, not 0.35. Two reasons, both measured: a 10.7 m bay at 0.35 m is a
+  // span-to-depth ratio of 31, past what a flat plate is usually taken to; and
+  // slab-to-beam was the top joint class by time overloaded, which is the
+  // interface a thin plate leans on hardest. Real reinforced concrete pours
+  // beam and slab together and the two act as one T-section -- authored as
+  // separate pieces they can only share load through the bond between them,
+  // so the thinner the plate the more it asks of that seam.
   slabThickness: 0.35,
   columnSize: 0.6,
   // A stilt here carries ~900 t. At 0.5 m square that is 35 MPa on the
@@ -47,6 +54,12 @@ export const ALGEDRA = {
   // columns. A beam narrower than its column leaves the column's corners
   // bearing on the slab panels either side, which is where the load then goes.
   beamWidth: 0.9,
+  // Secondary ribs at the mid-line of every Z bay. Nothing lands on them, so
+  // they are narrower and shallower than the primaries; their job is only to
+  // halve the plate's span, which is the one lever that beats every other one
+  // because plate moment goes as span squared.
+  ribWidth: 0.5,
+  ribDepth: 0.55,
   segments: 16,         // per facade, per floor
   paneWidth: 3.0,
   footingDepth: 1.2,
@@ -73,10 +86,30 @@ export function buildAlgedra(cfg = {}) {
   const slabTop = (k) => (k === 0 ? podiumTop : slabBase(k) + C.slabThickness);
   const roofLevel = C.floors + 1;                    // the roof is one more slab
 
-  // Column grid: four lines in X, three in Z. Kept well inboard of the
-  // perimeter glazing so the two never share space.
-  const colX = [-hx * 0.72, -hx * 0.36, 0, hx * 0.36, hx * 0.72];
-  const colZ = [-hz * 0.62, 0, hz * 0.62];
+  // Column grid: five lines in X, three in Z, with the outer lines carried out
+  // to the facade.
+  //
+  // They used to stop at 0.72 and 0.62 of the half-width, which left 6.4 m of
+  // slab in X and 4.6 m in Z hanging off the last column with nothing under it
+  // but the lobby glazing -- for seven storeys, plus the balcony bands beyond
+  // that. A building does not work that way: the perimeter of every floor was
+  // being carried by cantilever action back to a line six metres inboard, and
+  // the only thing standing where the facade meets the ground was glass.
+  //
+  // Perimeter columns are what a real stilted base has, and they are also what
+  // makes the ground floor worth shooting at: cut one and the bay above it has
+  // somewhere to try to redistribute to, which is the whole point. Kept just
+  // clear of the glazing plane (bx below) so the two never share space.
+  const perimeterX = hx - 1.6;
+  const perimeterZ = hz - 1.4;
+  // Evenly spaced, which the 0.36 factor was not: it put the inner columns at
+  // +/-8.3 m inside a perimeter at +/-21.4 m, so the bays ran 13.1, 8.3, 8.3,
+  // 13.1 m. Plate bending goes as span squared, so the two long bays carried
+  // 2.5x the moment of the short ones and slab-to-slab plus slab-to-beam were
+  // the top two joint classes by time spent overloaded. Halving the perimeter
+  // gives 10.7 m bays throughout and takes a third off the worst moment.
+  const colX = [-perimeterX, -perimeterX / 2, 0, perimeterX / 2, perimeterX];
+  const colZ = [-perimeterZ, 0, perimeterZ];
 
   const bw = C.beamWidth / 2;
   const beamBottom = (k) => slabBase(k) - C.beamDepth;
@@ -205,6 +238,17 @@ export function buildAlgedra(cfg = {}) {
     material: 'reinforced-concrete', newelPost: false,
   });
 
+  // The outermost ring of panels is the EDGE BAND: the strip the balconies
+  // cantilever off, and the one strip of a balcony floor that is genuinely
+  // reinforced rather than a plain plate. It matters because a bond takes the
+  // WEAKER of its two materials: a reinforced-concrete balcony root landing on
+  // a concrete-slab plate resolves to the plate's 7 MPa tension, and a
+  // cantilever root is precisely a joint in tension. Pouring the band as part
+  // of the frame makes the joint reinforced-to-reinforced at 14.4 MPa instead —
+  // the same move as landing a masonry-borne roof on a timber wall plate.
+  const isEdgeBand = (i, j) =>
+    i === 0 || i + 2 === cellX.length || j === 0 || j + 2 === cellZ.length;
+
   for (let k = 0; k <= roofLevel; k++) {
     for (let i = 0; i + 1 < cellX.length; i++) {
       const [x0, x1] = inset(cellX, i);
@@ -215,6 +259,8 @@ export function buildAlgedra(cfg = {}) {
         // podium does not, because nothing arrives from below it.
         if (k > 0 && i === STAIR_CELL.i && j === STAIR_CELL.j) {
           slabWithOpening(b, { min, max, opening: stairOpening });
+        } else if (isEdgeBand(i, j)) {
+          b.box({ type: 'slab', material: 'reinforced-concrete', min, max });
         } else {
           b.box({ type: 'slab', material: 'concrete-slab', min, max });
         }
@@ -273,6 +319,81 @@ export function buildAlgedra(cfg = {}) {
         if (!(z1 - z0 > 0.1)) continue;
         b.box({ type: 'beam', material: 'reinforced-concrete',
           min: [x - bw, beamBottom(k), z0], max: [x + bw, slabTop(k), z1] });
+      }
+    }
+  }
+
+  // ── secondary ribs, halving the plate's span ─────────────────────────────
+  // The primaries above put a beam on every column line, which leaves a 9.8 x
+  // 9.7 m plate panel in every bay — a span-to-depth ratio of 22 on a plate
+  // with no reinforcement crossing its own fracture seams, and slab<->slab was
+  // duly the top joint class by time overloaded. Deepening the plate was tried
+  // and bought little (0.35 -> 0.45 m, 1,311 -> 1,000 broken bonds) because the
+  // depth is also dead load. Span is the better lever: moment goes as span
+  // SQUARED, so a rib down the middle of each bay is worth four of them.
+  //
+  // NOTHING CROSSES ANYTHING. A rib grid laid out naively puts 1,434 pairs of
+  // colliders inside each other where the two directions meet. Here the X ribs
+  // are continuous and the Z ribs are cut against them — the same discipline
+  // the primaries already use — and every run is also cut where a primary or
+  // the stair core stands, so each segment butts against something instead of
+  // sharing space with it. Segments shorter than 3 m are dropped rather than
+  // left as stubs: a metre of rib under a perimeter cantilever strip stiffens
+  // nothing and only adds a joint to fail.
+  //
+  // They stop at the plate soffit rather than running up through it. A rib that
+  // pierced the plate would cut every panel in two and hand the load to a
+  // 0.45 m-deep butt seam; stopping underneath leaves the panel whole and bonds
+  // the rib to it over its entire 0.5 m-wide top face, which is what a poured
+  // T-section actually is.
+  const ribZ = colZ.slice(0, -1).map((z, i) => (z + colZ[i + 1]) / 2);
+  const ribX = colX.slice(0, -1).map((x, i) => (x + colX[i + 1]) / 2);
+  const rw = C.ribWidth / 2;
+  // The stair core's outer face, which a rib must not run through. The -x side
+  // of the shaft is the open one, so there is no wall there to bear on and the
+  // rib is held a little further back.
+  const stairKeep = {
+    x0: stairVoid.x0 - CORE_T - 0.1, x1: stairVoid.x1 + CORE_T,
+    z0: stairVoid.z0 - CORE_T, z1: stairVoid.z1 + CORE_T,
+  };
+  /** [lo,hi] less every blocked interval, dropping the stubs left over. */
+  const spanMinus = (lo, hi, blocks) => {
+    const out = [];
+    let cur = lo;
+    for (const [a, e] of blocks.slice().sort((p, q) => p[0] - q[0])) {
+      if (e <= cur) continue;
+      if (a > cur) out.push([cur, Math.min(a, hi)]);
+      cur = Math.max(cur, e);
+      if (cur >= hi) break;
+    }
+    if (cur < hi) out.push([cur, hi]);
+    return out.filter(([a, e]) => e - a > 3.0);
+  };
+  for (let k = 1; k <= roofLevel; k++) {
+    const y0 = slabBase(k) - C.ribDepth, y1 = slabBase(k);
+    // Along X, cut only by the Z primaries and the core: these are the
+    // continuous direction.
+    for (const zr of ribZ) {
+      const blocks = colX.map((x) => [x - bw, x + bw]);
+      if (zr + rw > stairKeep.z0 && zr - rw < stairKeep.z1) {
+        blocks.push([stairKeep.x0, stairKeep.x1]);
+      }
+      for (const [x0, x1] of spanMinus(-bx, bx, blocks)) {
+        b.box({ type: 'beam', material: 'reinforced-concrete',
+          min: [x0, y0, zr - rw], max: [x1, y1, zr + rw] });
+      }
+    }
+    // Along Z, cut by the X primaries AND by the X ribs above, which is what
+    // keeps the grid out of its own way.
+    for (const xr of ribX) {
+      const blocks = colZ.map((z) => [z - bw, z + bw])
+        .concat(ribZ.map((z) => [z - rw, z + rw]));
+      if (xr + rw > stairKeep.x0 && xr - rw < stairKeep.x1) {
+        blocks.push([stairKeep.z0, stairKeep.z1]);
+      }
+      for (const [z0, z1] of spanMinus(-bz, bz, blocks)) {
+        b.box({ type: 'beam', material: 'reinforced-concrete',
+          min: [xr - rw, y0, z0], max: [xr + rw, y1, z1] });
       }
     }
   }

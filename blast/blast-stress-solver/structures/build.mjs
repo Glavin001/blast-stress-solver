@@ -26,10 +26,16 @@ import { buildPark432 } from './park-432.mjs';
 import { buildParkingGarage } from './parking-garage.mjs';
 import { buildPetronas } from './petronas.mjs';
 import { buildMinasTirith } from './minas-tirith.mjs';
-import { buildNeighbourhood, buildSkyline } from './neighbourhood.mjs';
+import { buildNeighbourhood, buildSkyline, buildStableSkyline } from './neighbourhood.mjs';
+import {
+  buildRigCantilever, buildRigColumn, buildRigGarage, buildRigPane,
+  buildRigPortal, buildRigToppled, buildRigWall,
+} from './rigs.mjs';
+import { standalone, row } from './components.mjs';
 import { shardHistogram } from './lib/fracture.mjs';
 import { verifyPack } from './verify.mjs';
 import { applyAutoBonds } from './lib/autobond.mjs';
+import { cullSliverBonds } from './lib/sliver.mjs';
 import { buildShapeLibrary } from './lib/colliders.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -45,19 +51,79 @@ const STRUCTURES = {
   'minas-tirith': buildMinasTirith,
   // All three in one scene, for looking at or playing in.
   neighbourhood: buildNeighbourhood,
+  'skyline-stable': buildStableSkyline,
   skyline: buildSkyline,
+  // Test rigs: small structures that each answer one structural question, so
+  // a scenario suite can run in minutes instead of hours. See rigs.mjs.
+  'rig-column': buildRigColumn,
+  'rig-portal': buildRigPortal,
+  'rig-cantilever': buildRigCantilever,
+  'rig-garage': buildRigGarage,
+  'rig-pane': buildRigPane,
+  'rig-wall': buildRigWall,
+  'rig-toppled': buildRigToppled,
+  // Components: one bay, and the same bay composed, so "does it compose" is a
+  // measurement rather than an assumption. See components.mjs.
+  'comp-frame-bay': () => standalone('frame-bay'),
+  'comp-frame-bay-x2': () => row('frame-bay', 2),
+  'comp-frame-bay-x4': () => row('frame-bay', 4),
+  'comp-frame-bay-x8': () => row('frame-bay', 8),
+  'comp-wall-bay': () => standalone('wall-bay'),
+  'comp-wall-bay-x2': () => row('wall-bay', 2),
+  'comp-wall-bay-x4': () => row('wall-bay', 4),
+  'comp-wall-bay-x8': () => row('wall-bay', 8),
+  // The composition ladder: wall -> room -> storey -> stack. Each rung is
+  // auditable on its own, and each is built from the rung below by the same
+  // code the real buildings call.
+  'comp-room': () => standalone('room'),
+  'comp-storey': () => standalone('storey'),
+  'comp-stack': () => standalone('stack'),
 };
 
 const argv = process.argv.slice(2);
 const names = [];
 let vibeLand = null;
 let autobond = true;
+// `--set key=value`, repeatable: override one of the structure's config
+// constants for this build. Every builder already takes a cfg object and
+// merges it over its defaults, so this needs no per-structure support -- and
+// it is what makes sweeping a parameter possible without editing the source
+// between runs. See sweep.mjs.
+const overrides = {};
 for (let i = 0; i < argv.length; i++) {
   if (argv[i] === '--emit-vibe-land') { vibeLand = argv[++i]; continue; }
   if (argv[i] === '--no-autobond') { autobond = false; continue; }
+  if (argv[i] === '--set') {
+    const [k, v] = String(argv[++i]).split('=');
+    if (v === undefined) throw new Error(`--set wants key=value, got "${k}"`);
+    overrides[k] = Number.isNaN(Number(v)) ? v : Number(v);
+    continue;
+  }
   names.push(argv[i]);
 }
-const selected = names.length ? names : Object.keys(STRUCTURES);
+if (Object.keys(overrides).length) {
+  console.log(`  overrides ${Object.entries(overrides).map(([k, v]) => `${k}=${v}`).join(' ')}`);
+}
+/**
+ * Built only when asked for by name.
+ *
+ * `skyline` is every authored structure in one scene: 56,509 chunks and
+ * 1.5 million hull points. The client builds draw data for every chunk in a
+ * scene up front and the GPU upload happens lazily, on the first frame a mesh
+ * is actually rendered -- so the whole cost arrives in one frame the moment
+ * the buildings come into view, which is enough to have Safari kill the tab on
+ * an iPhone. It survives loading, and it survives looking at empty sky; it
+ * dies when you turn around.
+ *
+ * It is still a useful scene for desktop work and for anything that wants
+ * every building at once, so it stays buildable -- `node build.mjs skyline` --
+ * and simply stops being something a plain rebuild hands to a phone.
+ */
+const OPT_IN_ONLY = new Set(['skyline']);
+
+const selected = names.length
+  ? names
+  : Object.keys(STRUCTURES).filter((name) => !OPT_IN_ONLY.has(name));
 for (const n of selected) {
   if (!STRUCTURES[n]) {
     console.error(`unknown structure "${n}" (have: ${Object.keys(STRUCTURES).join(', ')})`);
@@ -71,7 +137,7 @@ if (vibeLand) outDirs.push(path.resolve(vibeLand, 'destruction/assets/scenes'));
 let failed = 0;
 for (const name of selected) {
   const started = process.hrtime.bigint();
-  const { pack: result, builder } = STRUCTURES[name]();
+  const { pack: result, builder } = STRUCTURES[name](overrides);
   const ms = Number(process.hrtime.bigint() - started) / 1e6;
   const s = result.scenario;
 
@@ -99,6 +165,17 @@ for (const name of selected) {
     console.log(`  autobond  ${ab.remeasured} re-measured (${ab.shrunk} shrunk)  ` +
       `${ab.kept} flush kept  ${ab.dropped} dropped  ${ab.added} added  ` +
       `-> ${s.bonds.length} bonds, ${ab.areaBefore.toFixed(0)} -> ${ab.areaAfter.toFixed(0)} m^2`);
+  }
+
+  // After auto-bonding, because that is when contact areas are final: it
+  // re-measures every one and adds contacts the closed-form pass missed, so
+  // culling before it just gets the slivers put back.
+  const cull = cullSliverBonds(result);
+  if (cull.dropped > 0) {
+    console.log(`  slivers   ${cull.dropped} contacts below `
+      + `${(100 * 0.02).toFixed(0)}% of their smaller chunk's face dropped `
+      + `-> ${cull.kept} bonds`
+      + (cull.rescued > 0 ? `  (${cull.rescued} kept to avoid orphaning a chunk)` : ''));
   }
 
   // After bonding, before verifying: the validators resolve references, so the

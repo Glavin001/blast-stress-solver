@@ -108,6 +108,85 @@ static_assert(offsetof(NvVec3, x) == offsetof(NvcVec3, x) &&
 //                                           Conjugate Gradient Solver
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Bending policy, at file scope because two classes need it: the CG solver
+// hands it to the GPU (which cannot read an environment variable), and the
+// graph processor uses it on the host walk. Both must agree, which is the
+// whole reason the formula itself lives in a shared header.
+/// Ceiling on the section-modulus gain, tunable with BLAST_BEND_MAX_GAIN.
+///
+/// 6/sqrt(area) is the right shape for the gain and the wrong magnitude at
+/// a small joint, because part of what it amplifies there is the
+/// discretisation's own moments rather than the structure's. A chunk-to-
+/// chunk seam in a wall carries a moment that the wall, as a wall, does
+/// not.
+///
+/// Measured over ten seconds of gravity and nothing else on a 47,631-chunk
+/// masonry structure -- concentric stone ring walls, which should stand in
+/// almost pure compression, and whose stone yields in tension at 0.8 MPa:
+///
+///     gain 10   2,423 bonds broken and climbing
+///     gain  5      28
+///     gain  3       0
+///     gain  2       1
+///
+/// 3 is where it stops cracking itself apart, and costs nothing measurable
+/// elsewhere: the cantilever ladder behaves identically from 1.5 to 10 on
+/// the CUDA solver, so nothing in the set is relying on the higher gain.
+static float maxBendAmplification()
+{
+    static const float gain = []() {
+        const char* raw = std::getenv("BLAST_BEND_MAX_GAIN");
+        if (raw != nullptr)
+        {
+            const float parsed = static_cast<float>(std::atof(raw));
+            if (parsed > 0.0f)
+            {
+                return parsed;
+            }
+        }
+        return 3.0f;
+    }();
+    return gain;
+}
+
+/// Whether bending is scaled by a section modulus (see above).
+///
+/// A section modulus is what turns a moment into a fibre stress; the node
+/// spacing this replaces was never a section dimension, so the old scaling
+/// understated bending on a slab joint by roughly an order of magnitude.
+///
+/// This was briefly defaulted OFF on the strength of a measurement that
+/// showed the shipping city breaking 2,016 of its own bonds in ten seconds
+/// of gravity with it on. That measurement was worthless: it was taken on
+/// the CPU CG solve, whose 8-iteration residual is reported as real stress
+/// and which self-destructs cities on its own. On the CUDA solver the
+/// server actually runs, the same scene breaks ZERO bonds with this on.
+///
+/// The lesson is older than this change and is recorded elsewhere in the
+/// tree: a stress number from the CPU path is a property of the solver, not
+/// of the structure. BLAST_BEND_SECTION_MODULUS=0 restores the old scaling
+/// for A/B.
+static bool sectionModulusBending()
+{
+    static const bool enabled = []() {
+        const char* value = std::getenv("BLAST_BEND_SECTION_MODULUS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Whether bending resolves into separate tension and compression fibres
+/// rather than being added to the axial stress with its sign.
+static bool fibreBending()
+{
+    static const bool enabled = []() {
+        const char* value = std::getenv("BLAST_BEND_FIBER");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+
 class ConjugateGradientImpulseSolver
 {
 public:
@@ -166,6 +245,18 @@ public:
 
     void initialize()
     {
+        // Resolve each bond's Young's modulus from its material before the
+        // processor computes compliance weights: stiffness is EA/L, and
+        // without E a steel tie and a stone bed joint of equal size would
+        // share load equally when steel is ~20x stiffer.
+        for (uint32_t i = 0; i < m_bonds.size(); ++i)
+        {
+            const uint32_t material = m_bonds[i].material;
+            m_bonds[i].modulus = (m_materials && material < m_materialCount)
+                ? m_materials[material].elasticModulusPa
+                : 0.0f;
+        }
+
         StressProcessor::DataParams params;
         params.centerBonds = true;
         params.equalizeMasses = true;
@@ -234,6 +325,10 @@ public:
                 gpu.area = bond.area > 0.0f ? bond.area : 1.0f;
                 gpu.health = gpu.area;
                 gpu.material = bond.material;
+                // The exact weights the CPU processor computed, so the two
+                // backends solve the same weighted system rather than two
+                // systems that agree only when every joint is the same size.
+                gpu.colScale = m_stressProcessor.getColumnScale(i);
             }
             // Convert the resolved material table for the device-side damage
             // kernel; layouts match field-for-field.
@@ -577,6 +672,8 @@ public:
         m_converged = false;
         m_forceColdStart = true;
         m_inputsChanged = true;
+        m_solutionSteadyFrames = 0;
+        m_lastImpulses.resize(0);
     }
 
     void clearBonds()
@@ -587,6 +684,64 @@ public:
     }
 
     void setSkipStableUnconverged(bool enabled) { m_skipStableUnconverged = enabled; }
+    /// Count a frame as steady when it converged and the impulses it produced
+    /// are the ones the previous frame produced.
+    ///
+    /// Compared relative to the largest impulse in play, so the test means the
+    /// same thing for a garden wall and for a tower: a small structure's
+    /// absolute impulses are tiny and an absolute epsilon would call every
+    /// frame steady.
+    void updateSolutionSteadiness()
+    {
+        const uint32_t count = m_impulses.size();
+        if (!m_converged || count == 0)
+        {
+            m_solutionSteadyFrames = 0;
+            m_lastImpulses.resize(count);
+            for (uint32_t i = 0; i < count; ++i) m_lastImpulses[i] = m_impulses[i];
+            return;
+        }
+        bool comparable = (m_lastImpulses.size() == count);
+        float worstDelta = 0.0f;
+        float scale = 0.0f;
+        if (comparable)
+        {
+            const auto len = [](float x, float y, float z) {
+                return std::sqrt(x * x + y * y + z * z);
+            };
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const AngLin6& now = m_impulses[i];
+                const AngLin6& before = m_lastImpulses[i];
+                worstDelta = std::max(worstDelta, len(now.ang.x - before.ang.x,
+                                                     now.ang.y - before.ang.y,
+                                                     now.ang.z - before.ang.z));
+                worstDelta = std::max(worstDelta, len(now.lin.x - before.lin.x,
+                                                     now.lin.y - before.lin.y,
+                                                     now.lin.z - before.lin.z));
+                scale = std::max(scale, len(now.ang.x, now.ang.y, now.ang.z));
+                scale = std::max(scale, len(now.lin.x, now.lin.y, now.lin.z));
+            }
+        }
+        const bool steady = comparable
+            && worstDelta <= STEADY_IMPULSE_TOLERANCE * std::max(scale, 1.0e-6f);
+        m_solutionSteadyFrames = steady ? m_solutionSteadyFrames + 1 : 0;
+        m_lastImpulses.resize(count);
+        for (uint32_t i = 0; i < count; ++i) m_lastImpulses[i] = m_impulses[i];
+    }
+
+    /// Frames the answer must hold still before the whole solve may be skipped.
+    ///
+    /// The garage above needed ~18 to reach equilibrium; this is not a timer
+    /// for that, it is a guard against calling a moving answer settled. Four
+    /// consecutive frames within tolerance costs a few frames of solving on a
+    /// static structure and nothing after that.
+    static constexpr uint32_t STEADY_FRAMES_BEFORE_SKIP = 4;
+
+    /// Relative movement below which two consecutive solves count as the same
+    /// answer.
+    static constexpr float STEADY_IMPULSE_TOLERANCE = 1.0e-3f;
+
     void solve(uint32_t iterationCount, bool warmStart = true, bool islandAware = false, bool skipSettled = false)
     {
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
@@ -599,9 +754,37 @@ public:
         m_gpuFrameHostToDeviceBytes = 0;
         m_gpuFrameDeviceToHostBytes = 0;
 #endif
+        // Skipping the whole solve is only sound once the ANSWER has stopped
+        // moving, which is not the same as this frame reporting converged.
+        //
+        // The solve is warm-started and capped at a handful of iterations per
+        // frame, so it walks toward equilibrium over many frames. `converged`
+        // means "the residual is under tolerance for the system as posed this
+        // frame"; a supported structure has near-zero node velocities from the
+        // very first tick, so that can be true long before the impulses have
+        // finished growing. Skipping on it freezes a partial answer forever.
+        //
+        // Measured on a five-storey parking garage, peak bond utilisation by
+        // tick, with the two behaviours side by side:
+        //
+        //   skipping on `converged`   0.076 0.077 0.077 0.077 ... 0.077 forever
+        //   always solving            0.076 0.083 0.152 0.272 ... 0.463 rising
+        //
+        // The frozen value is six times too low and never recovers. Downstream
+        // that means a building cannot notice it is overloaded: cut 60% of that
+        // garage's columns and it reported zero stress, zero damage and did not
+        // move, which is not strength -- it is a structure that stopped being
+        // solved on its second tick.
+        //
+        // So the early-out now needs a run of consecutive converged frames
+        // during which the impulses barely changed. A genuinely static
+        // structure reaches that in a few frames and is skipped from then on,
+        // which is the whole point of the optimisation; one still settling
+        // keeps solving until it has actually settled.
         if (skipSettled
             && warmStart
             && m_converged
+            && m_solutionSteadyFrames >= STEADY_FRAMES_BEFORE_SKIP
             && !m_forceColdStart
             && !m_inputsChanged)
         {
@@ -637,6 +820,12 @@ public:
             // iterations were the only lever. Per-island convergence removes
             // the need, and removing it restores CPU/GPU agreement.
             gpuParams.maxIterations = iterationCount;
+            // The same bending policy the host walk uses. Read once here
+            // because the device cannot read an environment variable, and
+            // because host and device disagreeing about bending is exactly
+            // what the shared formula header exists to prevent.
+            gpuParams.bendGainMax =
+                sectionModulusBending() ? maxBendAmplification() : 0.0f;
             gpuParams.tolerance = 0.001f;
             gpuParams.warmStart = warmStart && !m_forceColdStart;
             // Settled-island skipping on the GPU, and it means the same thing
@@ -651,7 +840,18 @@ public:
             // tick regardless -- correct, and the right trade when a solve was
             // 2.4 ms over a few hundred islands, but not at city scale where
             // nearly every island is a settled debris cluster.
-            gpuParams.skipSettledIslands = skipSettled && warmStart;
+            // Same condition as the whole-solve early-out, and for the same
+            // reason: the device's own settled-island skip returns the
+            // previous impulses untouched, so letting it run before the answer
+            // has steadied both freezes the answer AND makes the steadiness
+            // test above see no change and agree. The two have to be gated
+            // together or the cheaper one quietly re-creates the bug.
+            //
+            // (Merge note: the device skip is ALSO converged-only since the
+            // depth-truncation fix, so this gate can only delay a skip, never
+            // admit an unconverged island.)
+            gpuParams.skipSettledIslands = skipSettled && warmStart
+                && m_solutionSteadyFrames >= STEADY_FRAMES_BEFORE_SKIP;
             if (std::getenv("BLAST_WARMSTART_TRACE"))
             {
                 static uint32_t traceTick = 0;
@@ -744,6 +944,7 @@ public:
                 m_error_sq = m_converged
                     ? AngLin6ErrorSq{0.0f, 0.0f}
                     : AngLin6ErrorSq{FLT_MAX, FLT_MAX};
+                updateSolutionSteadiness();
                 m_forceColdStart = false;
                 m_inputsChanged = false;
                 m_lastSolveOnDevice = true;
@@ -759,6 +960,7 @@ public:
         params.islandAware = islandAware;
         params.skipSettled = skipSettled;
         m_converged = (m_stressProcessor.solve(m_impulses.data(), m_velocities.data(), params, &m_error_sq) >= 0);
+        updateSolutionSteadiness();
         m_forceColdStart = false;
         m_inputsChanged = false;
         m_lastSolveOnDevice = false;
@@ -813,6 +1015,15 @@ private:
     bool                        m_forceColdStart;
     bool m_skipStableUnconverged = false;
     bool                        m_inputsChanged;
+    /// Consecutive frames whose solve converged AND barely moved the impulses.
+    /// See the early-out in solve() for why converged alone is not enough.
+    uint32_t                    m_solutionSteadyFrames = 0;
+    /// Impulses as of the previous solve, for measuring that movement.
+    ///
+    /// POD_Buffer, matching m_impulses: AngLin6 carries 16-byte-aligned
+    /// members and a generic Array does not honour that, which is a segfault
+    /// the first time the SIMD path touches it.
+    POD_Buffer<AngLin6>         m_lastImpulses;
     // Borrowed from the owning solver: resolved material table for the GPU
     // damage-kernel seed. Not consumed by the CPU solve.
     const ExtStressMaterial*    m_materials{nullptr};
@@ -870,6 +1081,15 @@ public:
         // linear stresses
         float    stressNormal;  // negative values represent compression pressure, positive represent tension
         float    stressShear;
+        // Bending, as an equivalent pressure, always >= 0.
+        //
+        // Kept apart from stressNormal rather than folded into it because
+        // bending is not axial load: it puts one face of the joint in tension
+        // and the opposite face in compression at the same time. Only the
+        // extreme fibres decide whether the joint fails, and which limit they
+        // are checked against depends on their sign -- so the two have to
+        // survive as separate numbers this far.
+        float    stressBend;
 
         // The normal used to compute stress values
         // Can be different than the bond normal if graph reduction is used
@@ -889,6 +1109,12 @@ public:
         NvVec3 localVel;
         uint32_t solverNode;
         uint32_t neighborsCount;
+        // Real rotational inertia (kg m^2) from the chunk's actual shape, or 0
+        // to fall back to the sphere approximation. A building is made of
+        // flat, wide things; a slab's inertia about its flat axis and about
+        // its edge differ by an order of magnitude, and the sphere splits the
+        // difference wrongly for exactly those pieces.
+        float geometricInertia;
 
         // --- chunk crushing (see ExtStressCrushProperties) ---
         // Love-Weber virial accumulator, sigma*V in Voigt order
@@ -918,6 +1144,7 @@ public:
             int32_t indexShift;
         };
         float volume;
+        float geometricInertia;
     };
 
     struct SolverBondData
@@ -1065,11 +1292,11 @@ public:
 
     void calcSolverBondStresses(
         uint32_t bondIdx, float bondArea, float nodeDist, const nvidia::NvVec3& bondNormal,
-        float& stressNormal, float& stressShear) const
+        float& stressNormal, float& stressShear, float& stressBend) const
     {
         if (!canTakeDamage(bondArea))
         {
-            stressNormal = stressShear = 0.0f;
+            stressNormal = stressShear = stressBend = 0.0f;
             return;
         }
 
@@ -1078,11 +1305,32 @@ public:
         // differences from the form that used to be inlined here.
         NvVec3 impulseLinear, impulseAngular;
         getSolverInternalBondImpulses(bondIdx, impulseLinear, impulseAngular);
+        // The shared formula, so the host and the device solve the same
+        // equation -- upstream measured 32% of stress values differing between
+        // them before this existed. Bending policy is passed in because the
+        // body compiles for the device and cannot read an environment variable.
         extStressCalcBondStress(
             ExtStressVec3{impulseLinear.x, impulseLinear.y, impulseLinear.z},
             ExtStressVec3{impulseAngular.x, impulseAngular.y, impulseAngular.z},
             ExtStressVec3{bondNormal.x, bondNormal.y, bondNormal.z},
-            bondArea, nodeDist, stressNormal, stressShear);
+            bondArea, nodeDist,
+            sectionModulusBending() ? maxBendAmplification() : 0.0f,
+            stressNormal, stressShear, stressBend);
+    }
+
+    static void fibreStresses(float stressNormal, float stressBend,
+                              float& compression, float& tension)
+    {
+        if (!fibreBending())
+        {
+            // Legacy: bend amplifies whatever the axial sign already is.
+            const float combined = stressNormal + std::copysign(stressBend, stressNormal);
+            compression = combined <= 0.0f ? -combined : 0.0f;
+            tension = combined > 0.0f ? combined : 0.0f;
+            return;
+        }
+        tension = std::max(0.0f, stressNormal + stressBend);
+        compression = std::max(0.0f, stressBend - stressNormal);
     }
 
     float mapStressToRange(float stress, float elasticLimit, float fatalLimit) const
@@ -1141,6 +1389,12 @@ public:
         m_nodesData[node].mass = mass;
         m_nodesData[node].volume = volume;
         m_nodesData[node].localPos = localPos;
+        m_nodesDirty = true;
+    }
+
+    void setNodeGeometricInertia(uint32_t node, float inertia)
+    {
+        m_nodesData[node].geometricInertia = inertia > 0.0f ? inertia : 0.0f;
         m_nodesDirty = true;
     }
 
@@ -1657,20 +1911,13 @@ public:
             return false;
         }
 
-        // compression and tension are mutually exclusive since they operate in opposite directions
-        // they both measure stress parallel to the bond normal direction
-        // compression is the force resisting two nodes being pushed together (it pushes them apart)
-        // tension is the force resisting two nodes being pulled apart (it pulls them together)
-        if (stressNormal <= 0.0f)
-        {
-            compression = -stressNormal;
-            tension = 0.0f;
-        }
-        else
-        {
-            compression = 0.0f;
-            tension = stressNormal;
-        }
+        // Axial load is one or the other -- compression resists two nodes being
+        // pushed together, tension resists them being pulled apart -- but a
+        // bending moment produces both at once, on opposite faces of the joint.
+        // These are therefore the two extreme fibres, and either can be the one
+        // that fails.
+        fibreStresses(m_bondsData[blastBondIndex].stressNormal,
+                      m_bondsData[blastBondIndex].stressBend, compression, tension);
 
         // shear is independent and can co-exist with compression and tension
         shear = stressShear;         // the force perpendicular to the bond normal direction
@@ -2342,9 +2589,12 @@ public:
             // (one constraint, one sigma over the summed area) — but each
             // member fails against its OWN material limits, so overstress is
             // counted per member rather than per group.
-            float stressNormal, stressShear;
-            calcSolverBondStresses(i, totalArea, averageNodeDisp.magnitude(), bondNormal, stressNormal, stressShear);
-            NVBLAST_ASSERT(!std::isnan(stressNormal) && !std::isnan(stressShear));
+            float stressNormal, stressShear, stressBend;
+            calcSolverBondStresses(i, totalArea, averageNodeDisp.magnitude(), bondNormal, stressNormal,
+                                   stressShear, stressBend);
+            NVBLAST_ASSERT(!std::isnan(stressNormal) && !std::isnan(stressShear) && !std::isnan(stressBend));
+            float fibreCompression, fibreTension;
+            fibreStresses(stressNormal, stressBend, fibreCompression, fibreTension);
 
             // store the stress values for all the bonds involved
             for (auto blastBondIndex : blastBondIndices)
@@ -2354,8 +2604,8 @@ public:
                 {
                     const ExtStressMaterial& material = materialForBlastBond(blastBondIndex);
                     BondData& bond = m_bondsData[bondIndex];
-                    if (-stressNormal > material.compressionElasticLimit
-                        || stressNormal > material.tensionElasticLimit
+                    if (fibreCompression > material.compressionElasticLimit
+                        || fibreTension > material.tensionElasticLimit
                         || stressShear > material.shearElasticLimit)
                     {
                         ++ctx.count;
@@ -2376,6 +2626,7 @@ public:
 
                     bond.stressNormal = stressNormal;
                     bond.stressShear = stressShear;
+                    bond.stressBend = stressBend;
 
                     // store the normal used to calc stresses so it can be used later to determine forces
                     bond.normal = bondNormal;
@@ -3380,6 +3631,7 @@ private:
             solverNode.localPos = NvVec3(NvZero);
             solverNode.mass = 0.0f;
             solverNode.volume = 0.0f;
+            solverNode.geometricInertia = 0.0f;
         }
 
         for (NodeData& node : m_nodesData)
@@ -3389,6 +3641,11 @@ private:
             solverNode.localPos += node.localPos;
             solverNode.mass += node.mass;
             solverNode.volume += node.volume;
+            // Summed without the parallel-axis term. Exact at graph reduction
+            // 0, where every solver node is a single chunk -- which is what
+            // production runs; an aggregate underestimates slightly, erring
+            // toward the old sphere behaviour.
+            solverNode.geometricInertia += node.geometricInertia;
         }
 
         for (SolverNodeData& solverNode : m_solverNodesData)
@@ -3401,8 +3658,14 @@ private:
         {
             const SolverNodeData& solverNode = m_solverNodesData[nodeIndex];
 
-            const float R = NvPow(solverNode.volume * 3.0f * NvInvPi / 4.0f, 1.0f / 3.0f); // sphere volume approximation
-            const float inertia = solverNode.mass * (R * R * 0.4f); // sphere inertia tensor approximation: I = 2/5 * M * R^2 ; invI = 1 / I;
+            // Real shape-derived inertia when the host supplied one; the sphere
+            // approximation (I = 2/5 M R^2 from volume) only as fallback.
+            float inertia = solverNode.geometricInertia;
+            if (inertia <= 0.0f)
+            {
+                const float R = NvPow(solverNode.volume * 3.0f * NvInvPi / 4.0f, 1.0f / 3.0f);
+                inertia = solverNode.mass * (R * R * 0.4f);
+            }
             m_solver.setNodeMassInfo(nodeIndex, solverNode.localPos, solverNode.mass, inertia);
         }
 
@@ -3425,6 +3688,7 @@ private:
             // reset stress, bond structure changed and internal bonds stress won't be updated during updateBondStress()
             bond.stressNormal = 0.0f;
             bond.stressShear = 0.0f;
+            bond.stressBend = 0.0f;
 
             // initialize normal and centroid using blast values
             bond.normal = *(NvVec3*)bonds[bond.blastBondIndex].normal;
@@ -3727,6 +3991,7 @@ public:
     virtual void                            setAllNodesInfoFromLL(float density = 1.0f) override;
 
     virtual void                            setNodeInfo(uint32_t graphNode, float mass, float volume, NvcVec3 localPos) override;
+    virtual void                            setNodeGeometricInertia(uint32_t graphNode, float inertia) override;
 
     virtual void                            setSettings(const ExtStressSolverSettings& settings) override
     {
@@ -4020,6 +4285,11 @@ public:
             m_nodeMaterials[node] = material < materialCount ? material : 0;
         }
         pushMaterialTables();
+    }
+
+    virtual void                            setDeltaTime(float deltaTime) override
+    {
+        m_deltaTime = deltaTime > 0.0f ? deltaTime : 0.0f;
     }
 
     virtual void                            setNodeStrainRates(const float* strainRates, uint32_t nodeCount, float deltaTime) override
@@ -4431,6 +4701,11 @@ void ExtStressSolverImpl::setNodeInfo(uint32_t graphNode, float mass, float volu
     m_graphProcessor->setNodeInfo(graphNode, mass, volume, toNvShared(localPos));
 }
 
+void ExtStressSolverImpl::setNodeGeometricInertia(uint32_t graphNode, float inertia)
+{
+    m_graphProcessor->setNodeGeometricInertia(graphNode, inertia);
+}
+
 bool ExtStressSolverImpl::getExcessForces(uint32_t actorIndex, const NvcVec3& com, NvcVec3& force, NvcVec3& torque)
 {
     // otherwise allocate enough space and query the Blast SDK
@@ -4769,29 +5044,71 @@ void ExtStressSolverImpl::solve()
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // check if this bond is over stressed in any way and generate a fracture command if it is
+/**
+How fast a bond past its elastic limit loses section, per second of being held
+there, per unit of overstress.
+
+This governs only the SUB-FATAL band: a joint held between its elastic and
+fatal limits loses health * multiplier * this per second, where the multiplier
+is how far into that band it sits. A joint at or past fatal fails immediately
+regardless of this value, because that is a different mechanism (see
+generateStressDamage).
+
+So a joint 20% into the band is gone in 1/(0.2 * rate) seconds. At 0.5 that is
+ten seconds; at the top of the band it is two. That spread is the point --
+something barely overloaded should visibly strain for a while, something badly
+overloaded should go almost at once, and the difference between them is what
+makes a delayed collapse read as a structure losing a fight rather than a timer
+expiring.
+
+Measured on the cantilever ladder at 2.0: a 10 m overhang lets go at 4 s and a
+12 m one at 3 s, both having visibly held first, while a parking deck with one
+whole side of columns cut sags and comes down over roughly twenty seconds. BLAST_DAMAGE_RATE overrides.
+*/
+static float damageRatePerSecond()
+{
+    static const float rate = []() {
+        const char* raw = std::getenv("BLAST_DAMAGE_RATE");
+        if (raw != nullptr)
+        {
+            const float parsed = static_cast<float>(std::atof(raw));
+            if (parsed > 0.0f)
+            {
+                return parsed;
+            }
+        }
+        return 2.0f;
+    }();
+    return rate;
+}
+
 bool ExtStressSolverImpl::generateStressDamage(const NvBlastActor& actor, uint32_t bondIndex, uint32_t node0, uint32_t node1)
 {
     const float bondHealth = m_bondHealths[bondIndex];
     float stressCompression, stressTension, stressShear;
     if (bondHealth > 0.0f && m_graphProcessor->getBondStress(bondIndex, stressCompression, stressTension, stressShear))
     {
-        // compression and tension are mutually exclusive, only one can be positive at a time since they act in opposite directions
+        // Compression and tension are opposite directions of AXIAL load, but a
+        // bending moment produces both at once on opposite faces, so both are
+        // checked. They are combined with max() rather than added: it is one
+        // cross-section failing, and summing would count the same failure twice.
         const ExtStressMaterial& material = materialForBond(bondIndex);
         float stressMultiplier = 0.0f;
+        float axialMultiplier = 0.0f;
         if (stressCompression > material.compressionElasticLimit)
         {
             const float excessStress = stressCompression - material.compressionElasticLimit;
             const float compressionDenom = material.compressionFatalLimit - material.compressionElasticLimit;
-            const float compressionMultiplier = excessStress / (compressionDenom > 0.0f ? compressionDenom : 1.0f);
-            stressMultiplier += compressionMultiplier;
+            axialMultiplier = excessStress / (compressionDenom > 0.0f ? compressionDenom : 1.0f);
         }
-        else if (stressTension > material.tensionElasticLimit)
+        if (stressTension > material.tensionElasticLimit)
         {
             const float excessStress = stressTension - material.tensionElasticLimit;
             const float tensionDenom = material.tensionFatalLimit - material.tensionElasticLimit;
             const float tensionMultiplier = excessStress / (tensionDenom > 0.0f ? tensionDenom : 1.0f);
-            stressMultiplier += tensionMultiplier;
+            axialMultiplier = std::max(axialMultiplier, tensionMultiplier);
         }
+        stressMultiplier += axialMultiplier;
 
         // shear can co-exist with either compression or tension so must be accounted for independently of them
         if (stressShear > material.shearElasticLimit)
@@ -4804,8 +5121,71 @@ bool ExtStressSolverImpl::generateStressDamage(const NvBlastActor& actor, uint32
 
         if (stressMultiplier > 0.0f)
         {
-            // bond health/area is reduced by excess pressure to approximate micro bonds in the material breaking
-            const float bondDamage = bondHealth * stressMultiplier;
+            // Bond health/area is reduced by excess pressure, approximating
+            // micro bonds in the material breaking.
+            //
+            // Two DIFFERENT failure mechanisms live in this one number, and
+            // they are separated here:
+            //
+            //   at or past the fatal limit (multiplier >= 1) the joint is
+            //   overloaded outright and fails now, in this tick, however
+            //   briefly the load was applied. This is what a blast or an
+            //   impact does: microseconds of enormous stress, and the thing
+            //   breaks.
+            //
+            //   between elastic and fatal it does not fail, it DAMAGES, at a
+            //   rate -- losing section for as long as it is held there. This
+            //   is what an overloaded cantilever does: holds, creaks, and lets
+            //   go some seconds later.
+            //
+            // Scaling both by the timestep, as a single rate, cannot serve
+            // both: slow enough for a floor to strain visibly before it goes
+            // is slow enough that a rocket deposits under a percent of a
+            // bond's health in its one tick and nothing breaks at all. Slow
+            // enough for a rocket is a floor that vanishes the instant it is
+            // overloaded. They are separate mechanisms and the model now says
+            // so.
+            //
+            // m_deltaTime of 0 means nobody told us the timestep, which is the
+            // offline case: fall back to per-tick, unchanged.
+            float bondDamage;
+            if (stressMultiplier >= 1.0f)
+            {
+                bondDamage = bondHealth;
+            }
+            else if (m_deltaTime > 0.0f)
+            {
+                bondDamage = bondHealth * std::min(
+                    1.0f, stressMultiplier * m_deltaTime * damageRatePerSecond());
+            }
+            else
+            {
+                bondDamage = bondHealth * stressMultiplier;
+            }
+            // Damage ARRESTS at the residual the reinforcement represents.
+            //
+            // Health is remaining area and stress is force/health, so a joint
+            // that keeps losing area keeps raising its own stress -- the
+            // runaway that makes an overloaded joint fail eventually no matter
+            // how slowly. Stopping at a floor turns that into what a
+            // reinforced crack does: crack, weaken to the section the steel
+            // holds, and stay there.
+            // ...but only on the GRADUAL path. Past the fatal limit the joint
+            // goes outright, arrest or no arrest: reinforcement holds a crack
+            // open at a stable width, it does not survive the steel yielding.
+            // Clamping the fatal case too let bonds sit at 172x their elastic
+            // limit indefinitely, which is how a garage stripped of 90% of its
+            // columns stood there with nothing broken.
+            if (stressMultiplier < 1.0f && material.residualAreaFraction > 0.0f)
+            {
+                const float floorHealth =
+                    m_bonds[bondIndex].area * material.residualAreaFraction;
+                if (bondHealth - bondDamage < floorHealth)
+                {
+                    bondDamage = std::max(0.0f, bondHealth - floorHealth);
+                }
+            }
+
             const NvBlastBondFractureData data = {
                 0,
                 node0,

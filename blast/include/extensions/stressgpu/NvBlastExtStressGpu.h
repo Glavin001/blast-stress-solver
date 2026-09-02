@@ -27,6 +27,10 @@ struct ExtStressGpuBond
     // Damage pool. Seed = area; a uniform seed makes authored strength
     // meaningless (see the CPU-path history).
     float health{1.0f};
+    // Per-column compliance weight sqrt((E/E_ref)*A/L), computed by the CPU
+    // StressProcessor and uploaded verbatim so both backends solve the same
+    // weighted system. 1.0 when compliance weighting is disabled.
+    float colScale{1.0f};
     // Index into the material table handed to create().
     std::uint32_t material{0};
 };
@@ -71,6 +75,14 @@ struct ExtStressGpuSolveParams
     /// inputs is physics-equal to recomputing it; any bond damage its residual
     /// implies accrues identically either way.
     bool skipStableUnconverged{false};
+    /// Cap on the section-modulus bending gain, or <= 0 for the legacy fold of
+    /// bend into axial stress.
+    ///
+    /// Passed rather than read, because the formula body compiles for the
+    /// device and cannot reach an environment variable -- and because the host
+    /// and device solving different bending is precisely the divergence the
+    /// shared formula header exists to prevent.
+    float bendGainMax{0.0f};
     // The damage kernel reads each bond's own material from the table given
     // to create(); there are no global limits.
     bool applyDamage{false};

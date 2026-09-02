@@ -73,6 +73,7 @@ impl ExtStressSolver {
                 centroid: n.centroid,
                 mass: n.mass,
                 volume: n.volume,
+                inertia: 0.0,
             })
             .collect();
 

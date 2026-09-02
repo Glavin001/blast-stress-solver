@@ -108,6 +108,19 @@ public:
     uint32_t    getBondCount() const { return (uint32_t)m_couplings.size(); }
 
     /** \return number of islands skipped as settled in the last island-aware solve. */
+    /**
+     * Per-bond compliance weight computed by prepare(), 1.0 when weighting is
+     * disabled. The GPU backend uploads exactly these values, which is what
+     * keeps the two backends solving the same weighted system.
+     */
+    float       getColumnScale(uint32_t bond) const
+    {
+        return bond < m_colScale.size() ? m_colScale[bond] : 1.0f;
+    }
+
+    /** Whether compliance weighting is active (env BLAST_AREA_COMPLIANCE, default on). */
+    static bool complianceWeightingEnabled();
+
     uint32_t    getLastIslandsSkipped() const { return m_lastIslandsSkipped; }
 
     /** \return number of islands processed in the last island-aware solve (0 if the whole-graph path ran). */
@@ -135,6 +148,15 @@ protected:
     float                   m_length_scale;
     POD_Buffer<InertiaS>    m_recip_sqrt_I;
     POD_Buffer<Coupling>    m_couplings;
+    /**
+     * Per-bond compliance weight sqrt((E/E_ref)*A/L) and its reciprocal, or
+     * empty when compliance weighting is disabled. See BondMatrix::colScale
+     * for the physics; computed in prepare(), kept in bond order, and
+     * swap-removed alongside m_couplings by removeBond().
+     */
+    POD_Buffer<float>       m_colScale;
+    POD_Buffer<float>       m_recipColScale;
+    POD_Buffer<AngLin6>     m_colScratch;       // N-sized scratch backing the scaled rmul input
     BondMatrixS             m_B;
     POD_Buffer<AngLin6>     m_rhs;
     POD_Buffer<AngLin6>     m_B_scratch;
@@ -160,6 +182,7 @@ protected:
     std::vector<uint32_t>   m_g2lStamp;         // version stamp so m_g2l can be reused without clearing
     std::vector<uint32_t>   m_l2g;              // island-local node index -> global node
     POD_Buffer<Coupling>    m_localC;           // island-local couplings (node indices renumbered local)
+    POD_Buffer<float>       m_localColScale;    // island-local compliance weights (gathered per solve)
     POD_Buffer<InertiaS>    m_localI;           // island-local recip_sqrt_I
     POD_Buffer<AngLin6>     m_localImpulses;    // island-local impulses (gather in, scatter out)
 
