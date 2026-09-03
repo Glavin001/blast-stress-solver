@@ -2348,7 +2348,6 @@ public:
             return 0;
         }
         const TelemetryClock::time_point captureStart = TelemetryClock::now();
-        m_resimIndexByBodyId.clear();
         m_resimProvenance.clear();
         m_resimSeeds.clear();
         // The crush-damage baseline travels with the motion snapshot: a
@@ -2399,7 +2398,7 @@ public:
             }
             snapshot.worldCenterOfMass =
                 snapshot.globalPose.transform(body.body->getCMassLocalPose().p);
-            m_resimIndexByBodyId.emplace(snapshot.bodyId, written);
+            body.resimRow = written;
             ++written;
         }
         m_resimSnapshot.resize(written);
@@ -2502,12 +2501,14 @@ public:
             {
                 continue;
             }
-            const auto found = m_resimIndexByBodyId.find(body.bodyId);
-            if (found == m_resimIndexByBodyId.end())
+            // A body created since the capture has no row (or a stale one
+            // from a recycled record); the bodyId check rejects both.
+            if (body.resimRow >= m_resimSnapshot.size()
+                || m_resimSnapshot[body.resimRow].bodyId != body.bodyId)
             {
                 continue;
             }
-            const ResimBodySnapshot& snapshot = m_resimSnapshot[found->second];
+            const ResimBodySnapshot& snapshot = m_resimSnapshot[body.resimRow];
             if (restoreScoped)
             {
                 // Exact, not inferred: the state alone is not enough, because
@@ -2721,6 +2722,12 @@ private:
         /// Verified against bodyId before use; a stale hint is a map lookup,
         /// never a wrong answer.
         mutable uint32_t snapshotRow = 0xffffffffu;
+        /// Row this body occupies in m_resimSnapshot, stamped by the capture.
+        /// Replaces a bodyId -> row hash map that was rebuilt with one emplace
+        /// per body on every capture (every tick with resim on): ~0.2 us/body,
+        /// which at 12-15k bodies was most of a 2-3 ms capture. Verified
+        /// against bodyId before use.
+        mutable uint32_t resimRow = 0xffffffffu;
         ExtStressPhysXId bodyId{0};
         uint32_t actorIndex{INVALID_INDEX};
         PxRigidDynamic* body{nullptr};
@@ -4477,7 +4484,6 @@ private:
     bool m_loadsValid{false};
     std::vector<ExtStressPhysXSplitContinuity> m_continuity;
     std::vector<ResimBodySnapshot> m_resimSnapshot;
-    std::unordered_map<ExtStressPhysXId, uint32_t> m_resimIndexByBodyId;
     std::vector<ResimBodyProvenance> m_resimProvenance;
     std::vector<PxRigidDynamic*> m_resimSeeds;
     bool m_resimSnapshotValid{false};
