@@ -1886,6 +1886,63 @@ public:
         }
     }
 
+    bool supportsSplitEnd() const override
+    {
+        // The generate half must stay PhysX-free; crush resistance reads and
+        // writes bodies before fracture, so those builds take the serial path.
+        return !m_settings.applyCrushResistance;
+    }
+
+    bool endTickGenerate() override
+    {
+        if (m_tickPhase != TickPhase::Solved)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "endTickGenerate requires a successful solveTick.");
+        }
+        m_fractureStage = FractureStage::None;
+        if (m_telemetry.overstressedBondCount > 0 || !m_pendingCrushedNodes.empty())
+        {
+            const TelemetryClock::time_point phaseStart = TelemetryClock::now();
+            const bool generated = fractureGenerate();
+            m_telemetry.fractureTopologyMilliseconds += elapsedMilliseconds(phaseStart);
+            if (!generated)
+            {
+                refreshNodeBondless();
+                m_tickPhase = TickPhase::Idle;
+                return false;
+            }
+        }
+        m_tickPhase = TickPhase::Generated;
+        return true;
+    }
+
+    bool endTickApply() override
+    {
+        if (m_tickPhase != TickPhase::Generated)
+        {
+            return fail(
+                ExtStressPhysXError::InvalidDescriptor,
+                INVALID_INDEX,
+                "endTickApply requires endTickGenerate.");
+        }
+        if (m_fractureStage != FractureStage::None)
+        {
+            const TelemetryClock::time_point phaseStart = TelemetryClock::now();
+            const bool fractured = fractureApply(m_tickDt);
+            m_telemetry.fractureTopologyMilliseconds += elapsedMilliseconds(phaseStart);
+            if (!fractured)
+            {
+                refreshNodeBondless();
+                m_tickPhase = TickPhase::Idle;
+                return false;
+            }
+        }
+        return endTickFinish();
+    }
+
     bool endTick() override
     {
         if (m_tickPhase != TickPhase::Solved)
@@ -1923,7 +1980,13 @@ public:
                 return false;
             }
         }
+        return endTickFinish();
+    }
 
+    /// The tail of endTick after topology settled: telemetry, the sampled
+    /// single-node census, the bondless flags, and the phase reset.
+    bool endTickFinish()
+    {
         m_telemetry.bodyCount = static_cast<uint32_t>(m_actorBodies.size());
         // Bodies with no internal bonds: nothing in them can break, so the
         // contacts routed into them and their share of the solve cannot
@@ -2726,7 +2789,17 @@ private:
     {
         Idle,
         Prepared,
-        Solved
+        Solved,
+        /// endTickGenerate ran; endTickApply is owed.
+        Generated
+    };
+
+    /// What fractureGenerate left for fractureApply.
+    enum class FractureStage : uint8_t
+    {
+        None,
+        CrushOnly,
+        Ready
     };
 
     struct BodyState;
@@ -3487,8 +3560,31 @@ private:
         return validateMappings();
     }
 
+    /// A/B on one binary: BLAST_FRACTURE_REUSE_BUFFERS=0 restores the
+    /// allocate-every-tick path. Value-checked, not presence-checked --
+    /// presence checks made `=0` mean "on" elsewhere in this tree.
+    static bool reuseFractureBuffers()
+    {
+        static const bool reuse = [] {
+            const char* raw = std::getenv("BLAST_FRACTURE_REUSE_BUFFERS");
+            return raw == nullptr || std::string(raw) != "0";
+        }();
+        return reuse;
+    }
+
     bool fracture(float dt)
     {
+        return fractureGenerate() && fractureApply(dt);
+    }
+
+    /// First half of fracture(): this tick's commands from the solver, sorted
+    /// and limited, left in m_fractureCommands for fractureApply. Touches
+    /// only this structure's solver and host buffers -- no PhysX -- so a host
+    /// may run it for every structure at once.
+    bool fractureGenerate()
+    {
+        m_fractureStage = FractureStage::None;
+        m_fractureReadyCount = 0;
         const uint32_t actorCapacity = ext_stress_solver_actor_count(m_solver);
         const uint32_t bondCapacity =
             std::max(1u, ext_stress_solver_bond_count(m_solver));
@@ -3498,13 +3594,7 @@ private:
         }
 
         TelemetryClock::time_point phase = TelemetryClock::now();
-        // A/B on one binary: BLAST_FRACTURE_REUSE_BUFFERS=0 restores the
-        // allocate-every-tick path. Value-checked, not presence-checked --
-        // presence checks made `=0` mean "on" elsewhere in this tree.
-        static const bool reuseBuffers = [] {
-            const char* raw = std::getenv("BLAST_FRACTURE_REUSE_BUFFERS");
-            return raw == nullptr || std::string(raw) != "0";
-        }();
+        const bool reuseBuffers = reuseFractureBuffers();
         if (reuseBuffers)
         {
             // resize() only grows here, and every element the callee reads it
@@ -3551,7 +3641,8 @@ private:
         }
         if (commandCount == 0)
         {
-            return finishCrushOnly();
+            m_fractureStage = FractureStage::CrushOnly;
+            return true;
         }
 
 
@@ -3571,7 +3662,8 @@ private:
         {
             // Still retire pulverized chunks: they REDUCE the body count, so
             // skipping them here would deadlock the structure at the cap.
-            return finishCrushOnly();
+            m_fractureStage = FractureStage::CrushOnly;
+            return true;
         }
         // Bounded by commandCount, not by the buffer's size. That was harmless
         // when the buffer was freshly value-initialised every tick (the tail
@@ -3607,8 +3699,34 @@ private:
         commandCount = static_cast<uint32_t>(commands.size());
         if (commandCount == 0)
         {
+            m_fractureStage = FractureStage::CrushOnly;
+            return true;
+        }
+
+        m_telemetry.fracturePrepMilliseconds += elapsedMilliseconds(phase);
+        m_fractureStage = FractureStage::Ready;
+        m_fractureReadyCount = commandCount;
+        return true;
+    }
+
+    /// Second half of fracture(): the solver apply, the split events, the
+    /// scene mutation. Serial -- it writes PhysX.
+    bool fractureApply(float dt)
+    {
+        if (m_fractureStage == FractureStage::None)
+        {
+            return true;
+        }
+        if (m_fractureStage == FractureStage::CrushOnly)
+        {
+            m_fractureStage = FractureStage::None;
             return finishCrushOnly();
         }
+        m_fractureStage = FractureStage::None;
+        const bool reuseBuffers = reuseFractureBuffers();
+        std::vector<ExtStressFractureCommands>& commands = m_fractureCommands;
+        uint32_t commandCount = m_fractureReadyCount;
+        TelemetryClock::time_point phase = TelemetryClock::now();
 
         // E7: the node-sized scratch, reused. These were fresh allocations —
         // zero-filled, ~1 MB each at 24k nodes — on EVERY fracturing tick,
@@ -4501,6 +4619,8 @@ private:
     /// the reuse would buy nothing.
     std::vector<ExtStressFractureCommands> m_fractureCommands;
     std::vector<ExtStressFractureCommands> m_fractureLimited;
+    FractureStage m_fractureStage{FractureStage::None};
+    uint32_t m_fractureReadyCount{0};
     std::vector<ExtStressBondFracture> m_fractureBonds;
     /// E7: node-sized fracture scratch, grow-only under
     /// BLAST_FRACTURE_REUSE_BUFFERS (see the bond-sized pair above).

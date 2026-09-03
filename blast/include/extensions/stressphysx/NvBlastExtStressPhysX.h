@@ -787,6 +787,18 @@ public:
     virtual void bondStressStrip(uint32_t stripIdx) = 0;
     virtual bool solveTickFinishSplit() = 0;
     virtual bool endTick() = 0;
+    /**
+     * endTick in two halves, so a host can run the first for every structure
+     * concurrently. endTickGenerate() asks the solver for this tick's fracture
+     * commands and limits them; it touches only this structure's solver and
+     * host buffers, never PhysX. endTickApply() applies them to the solver
+     * and the scene and finishes the tick. Together they equal endTick().
+     * supportsSplitEnd() is false when crush resistance is on, because that
+     * path reads and writes bodies before fracture.
+     */
+    virtual bool supportsSplitEnd() const = 0;
+    virtual bool endTickGenerate() = 0;
+    virtual bool endTickApply() = 0;
     virtual bool tick(float dt, const physx::PxVec3& worldGravity) = 0;
 
     virtual bool validateMappings() = 0;
