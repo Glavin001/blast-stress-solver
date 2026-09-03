@@ -251,6 +251,7 @@ ExtStressPhysXTelemetry::ExtStressPhysXTelemetry()
     , resimulationRestores(0)
     , resimulationBodiesRestored(0)
     , resimulationBodiesRederived(0)
+    , resimulationBodiesSkipped(0)
     , resimulationCaptureMilliseconds(0.0)
     , resimulationRestoreMilliseconds(0.0)
     , resimulationMaxRederivedDriftMeters(0.0f)
@@ -2458,12 +2459,41 @@ public:
             }
         }
 
+        // Only the provenance loop below needs bodies by id, and it is empty
+        // on most restores; building an O(bodies) map for it every time was
+        // paid for nothing.
         std::unordered_map<ExtStressPhysXId, BodyState*> bodiesById;
-        bodiesById.reserve(m_actorBodies.size());
-        for (auto& entry : m_actorBodies)
+        if (!m_resimProvenance.empty())
         {
-            bodiesById.emplace(entry.second->bodyId, entry.second.get());
+            bodiesById.reserve(m_actorBodies.size());
+            for (auto& entry : m_actorBodies)
+            {
+                bodiesById.emplace(entry.second->bodyId, entry.second.get());
+            }
         }
+
+        // A body that was asleep (or kinematic) when the snapshot was taken
+        // and still is now was never integrated by the step in between: its
+        // pose and velocity are the captured ones already, it accumulated no
+        // force (a force write wakes an actor), and PhysX cannot sleep a body
+        // it woke within the same step. Restoring it is eight PhysX setters
+        // that write back what is there. On a settled city that is most of
+        // the population -- the restore cost ~11 ms per split tick at grid 2
+        // with ~2k of ~13k bodies awake. BLAST_RESIM_RESTORE_SCOPED=0
+        // restores every captured body, for A/B.
+        static const bool restoreScoped = [] {
+            const char* raw = std::getenv("BLAST_RESIM_RESTORE_SCOPED");
+            return raw == nullptr || raw[0] != '0';
+        }();
+        // BLAST_RESIM_RESTORE_VERIFY=1: for every body the scoped path skips,
+        // check that PhysX still holds exactly the captured pose, and count
+        // the ones it does not. Same tick, so cascade chaos cannot hide it.
+        static const bool restoreVerify = [] {
+            const char* raw = std::getenv("BLAST_RESIM_RESTORE_VERIFY");
+            return raw != nullptr && raw[0] == '1';
+        }();
+        uint64_t verifyChecked = 0;
+        uint64_t verifyMoved = 0;
 
         for (auto& entry : m_actorBodies)
         {
@@ -2477,8 +2507,61 @@ public:
             {
                 continue;
             }
-            restoreBodyMotion(body, m_resimSnapshot[found->second]);
+            const ResimBodySnapshot& snapshot = m_resimSnapshot[found->second];
+            if (restoreScoped)
+            {
+                // Exact, not inferred: the state alone is not enough, because
+                // the adapter itself repositions kinematic and sleeping bodies
+                // between capture and restore (freeze parking, the kill
+                // floor, a test's own setGlobalPose) -- measured as 31 of
+                // 5,877 state-matched bodies with a different pose. So the
+                // skip also requires the pose PhysX holds to be bit-identical
+                // to the captured one: one read instead of eight writes, and
+                // every write restoreBodyMotion would have made is then a
+                // no-op by construction (a sleeping body has zero velocity and
+                // no accumulated force; a kinematic one gets only the pose).
+                const bool kinematicNow = isKinematic(body);
+                const bool stateMatches =
+                    (snapshot.kinematic && kinematicNow)
+                    || (snapshot.sleeping && !kinematicNow && body.body->isSleeping());
+                if (stateMatches)
+                {
+                    const PxTransform now = body.body->getGlobalPose();
+                    const bool samePose = now.p == snapshot.globalPose.p
+                        && now.q.x == snapshot.globalPose.q.x
+                        && now.q.y == snapshot.globalPose.q.y
+                        && now.q.z == snapshot.globalPose.q.z
+                        && now.q.w == snapshot.globalPose.q.w;
+                    if (restoreVerify)
+                    {
+                        ++verifyChecked;
+                        if (!samePose)
+                        {
+                            ++verifyMoved;
+                        }
+                    }
+                    if (samePose)
+                    {
+                        ++m_telemetry.resimulationBodiesSkipped;
+                        continue;
+                    }
+                }
+            }
+            restoreBodyMotion(body, snapshot);
             ++m_telemetry.resimulationBodiesRestored;
+        }
+        if (restoreVerify)
+        {
+            static uint64_t totalChecked = 0;
+            static uint64_t totalMoved = 0;
+            totalChecked += verifyChecked;
+            totalMoved += verifyMoved;
+            std::fprintf(stderr,
+                         "[resim-restore] scoped skip: checked=%llu moved=%llu (cumulative %llu / %llu)\n",
+                         static_cast<unsigned long long>(verifyChecked),
+                         static_cast<unsigned long long>(verifyMoved),
+                         static_cast<unsigned long long>(totalChecked),
+                         static_cast<unsigned long long>(totalMoved));
         }
 
         for (const ResimBodyProvenance& provenance : m_resimProvenance)

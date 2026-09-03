@@ -397,6 +397,9 @@ struct ExtStressPhysXTelemetry
     uint64_t resimulationRestores;
     uint64_t resimulationBodiesRestored;
     uint64_t resimulationBodiesRederived;
+    /// Bodies a restore left alone because they were asleep (or kinematic)
+    /// both at capture and at restore, so the step never integrated them.
+    uint64_t resimulationBodiesSkipped;
     double resimulationCaptureMilliseconds;
     double resimulationRestoreMilliseconds;
     float resimulationMaxRederivedDriftMeters;
