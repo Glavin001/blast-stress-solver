@@ -770,6 +770,37 @@ public:
         m_telemetry.bondlessContactsSkipped += count;
     }
 
+    void noteExternalImpulse(ExtStressPhysXId bodyId) override
+    {
+        // Same sorted-body cache getBodySnapshots keeps; a binary search, not
+        // a walk. The cache is rebuilt lazily when the body set changed.
+        if (!m_sortedBodiesValid || m_sortedBodies.size() != m_actorBodies.size())
+        {
+            m_sortedBodies.clear();
+            m_sortedBodies.reserve(m_actorBodies.size());
+            for (const auto& entry : m_actorBodies)
+            {
+                m_sortedBodies.push_back(entry.second.get());
+            }
+            std::sort(
+                m_sortedBodies.begin(),
+                m_sortedBodies.end(),
+                [](const BodyState* a, const BodyState* b) {
+                    return a->bodyId < b->bodyId;
+                });
+            m_sortedBodiesValid = true;
+        }
+        const auto found = std::lower_bound(
+            m_sortedBodies.begin(), m_sortedBodies.end(), bodyId,
+            [](const BodyState* entry, ExtStressPhysXId value) {
+                return entry->bodyId < value;
+            });
+        if (found != m_sortedBodies.end() && (*found)->bodyId == bodyId)
+        {
+            (*found)->forcedSinceCapture = true;
+        }
+    }
+
     uint32_t nodeForShape(const PxShape* shape) const override
     {
         if (shape == nullptr)
@@ -2399,6 +2430,7 @@ public:
             snapshot.worldCenterOfMass =
                 snapshot.globalPose.transform(body.body->getCMassLocalPose().p);
             body.resimRow = written;
+            body.forcedSinceCapture = false;
             ++written;
         }
         m_resimSnapshot.resize(written);
@@ -2728,6 +2760,10 @@ private:
         /// which at 12-15k bodies was most of a 2-3 ms capture. Verified
         /// against bodyId before use.
         mutable uint32_t resimRow = 0xffffffffu;
+        /// A force or impulse was added to this body after the last resim
+        /// capture (by this adapter or reported by the host), so a restore
+        /// must clear PhysX's accumulators on it. Cleared at capture.
+        mutable bool forcedSinceCapture = false;
         ExtStressPhysXId bodyId{0};
         uint32_t actorIndex{INVALID_INDEX};
         PxRigidDynamic* body{nullptr};
@@ -3099,10 +3135,25 @@ private:
             snapshot.angularVelocity.cross(restoredCenter - snapshot.worldCenterOfMass);
         body.body->setLinearVelocity(linearVelocity, false);
         body.body->setAngularVelocity(snapshot.angularVelocity, false);
-        body.body->clearForce(PxForceMode::eFORCE);
-        body.body->clearForce(PxForceMode::eIMPULSE);
-        body.body->clearTorque(PxForceMode::eFORCE);
-        body.body->clearTorque(PxForceMode::eIMPULSE);
+        // PhysX consumes and clears accumulated forces inside simulate, so
+        // after the step the accumulators are empty unless something added
+        // force between the capture and now: this adapter's split-child
+        // impulses (tracked per body), a host push (reported through
+        // noteExternalImpulse), or a crush-resistance levy (not tracked per
+        // body, so crush builds keep clearing everything). Four PhysX calls
+        // per awake body otherwise spent clearing zeros; half the restore.
+        // BLAST_RESIM_SKIP_CLEARS=0 restores the unconditional clears.
+        static const bool skipClears = [] {
+            const char* raw = std::getenv("BLAST_RESIM_SKIP_CLEARS");
+            return raw == nullptr || raw[0] != '0';
+        }();
+        if (!skipClears || m_settings.applyCrushResistance || body.forcedSinceCapture)
+        {
+            body.body->clearForce(PxForceMode::eFORCE);
+            body.body->clearForce(PxForceMode::eIMPULSE);
+            body.body->clearTorque(PxForceMode::eFORCE);
+            body.body->clearTorque(PxForceMode::eIMPULSE);
+        }
         if (snapshot.sleeping)
         {
             body.body->putToSleep();
@@ -4210,6 +4261,7 @@ private:
                         m_worldTransform.q.rotate(fromStress(excessTorque)) * impulseScale;
                     target.body->addForce(worldForce, PxForceMode::eIMPULSE, true);
                     target.body->addTorque(worldTorque, PxForceMode::eIMPULSE, true);
+                    target.forcedSinceCapture = true;
                 }
                 if (m_settings.minimumSeparationVelocity > 0.0f)
                 {
@@ -4227,6 +4279,7 @@ private:
                         separationImpulse,
                         PxForceMode::eIMPULSE,
                         true);
+                    target.forcedSinceCapture = true;
                 }
             }
         }

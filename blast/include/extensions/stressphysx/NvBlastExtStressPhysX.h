@@ -922,6 +922,14 @@ public:
      */
     virtual uint32_t captureResimulationSnapshot() = 0;
     /**
+     * The host applied a force or impulse to this body after the last
+     * captureResimulationSnapshot. A restore must then clear PhysX's
+     * accumulated force on it; bodies nobody pushed skip those four calls.
+     * Every host site that adds force to a chunk body between a capture and
+     * a restore must report here, or that force survives the rewind.
+     */
+    virtual void noteExternalImpulse(ExtStressPhysXId bodyId) = 0;
+    /**
      * Restore motion for captured bodies. When activeBodies is null / activeCount
      * is 0, every captured body is restored (full-scene §2.8). Otherwise only
      * bodies present in the active set are rewound; provenance children of
