@@ -3214,14 +3214,29 @@ private:
         }
     }
 
+    /// Snapshot the motion of every parent that SPLIT this tick, keyed by the
+    /// split events rather than by the commands.
+    ///
+    /// It used to run over every actor that received a command, reading a
+    /// PhysX pose per node. Under the sub-fatal damage band a standing city
+    /// issues damage-only commands to its four big structures on every tick,
+    /// so that was ~87k pose reads a tick -- 3.8 ms at rest -- for snapshots
+    /// nobody read, because only a parent that actually splits is consumed by
+    /// applySplit / makeChildPlan. The solver apply that precedes this call
+    /// touches the Blast family only; the PhysX bodies are untouched until
+    /// applySplit, so the values are the same as a pre-apply snapshot.
     std::map<uint32_t, ParentMotion> snapshotParents(
-        const std::vector<ExtStressFractureCommands>& commands,
+        const std::vector<ExtStressSplitEvent>& events,
         std::vector<NodeSnapshot>& nodeSnapshots) const
     {
         std::map<uint32_t, ParentMotion> parents;
-        for (const ExtStressFractureCommands& command : commands)
+        for (const ExtStressSplitEvent& event : events)
         {
-            const auto found = m_actorBodies.find(command.actorIndex);
+            if (parents.find(event.parentActorIndex) != parents.end())
+            {
+                continue;
+            }
+            const auto found = m_actorBodies.find(event.parentActorIndex);
             if (found == m_actorBodies.end())
             {
                 continue;
@@ -3235,7 +3250,7 @@ private:
                 motion.pose.transform(body.body->getCMassLocalPose().p);
             motion.linearVelocity = body.body->getLinearVelocity();
             motion.angularVelocity = body.body->getAngularVelocity();
-            parents.emplace(command.actorIndex, motion);
+            parents.emplace(event.parentActorIndex, motion);
 
             for (uint32_t nodeIndex : body.nodes)
             {
@@ -3482,8 +3497,8 @@ private:
         std::vector<ExtStressSplitEvent>& events = m_splitEventScratch;
         std::vector<ExtStressActor>& children = m_splitChildScratch;
         std::vector<uint32_t>& childNodes = m_splitChildNodeScratch;
-        const std::map<uint32_t, ParentMotion> parentMotions =
-            snapshotParents(commands, nodeSnapshots);
+        // Parent snapshots are taken AFTER the solver apply, from the split
+        // events, not here from the commands. See snapshotParents.
         m_telemetry.fracturePrepMilliseconds += elapsedMilliseconds(phase);
         phase = TelemetryClock::now();
         uint32_t eventCount = 0;
@@ -3525,6 +3540,14 @@ private:
         phase = TelemetryClock::now();
 
         events.resize(eventCount);
+        // Only now is it known WHICH parents split, and the PhysX bodies are
+        // still exactly where they were before the solver apply (nothing
+        // between here and applySplit moves them), so the snapshot can be
+        // taken here for just those parents.
+        const std::map<uint32_t, ParentMotion> parentMotions =
+            snapshotParents(events, nodeSnapshots);
+        m_telemetry.fracturePrepMilliseconds += elapsedMilliseconds(phase);
+        phase = TelemetryClock::now();
         std::sort(events.begin(), events.end(), [&](const ExtStressSplitEvent& a,
                                                     const ExtStressSplitEvent& b) {
             const auto aParent = parentMotions.find(a.parentActorIndex);

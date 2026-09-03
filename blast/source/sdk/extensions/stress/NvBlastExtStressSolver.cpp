@@ -48,6 +48,8 @@
 #endif
 
 #include <algorithm>
+#include <utility>
+#include <vector>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -4424,6 +4426,16 @@ private:
     void                                    solve();
 
     void                                    fillFractureCommands(const NvBlastActor& actor, NvBlastFractureBuffers& commands);
+    /// Bond-fracture commands for ONE actor, walking only the given graph
+    /// nodes (ascending) instead of the actor's whole node list. Used by the
+    /// candidate path of generateFractureCommandsPerActor.
+    void                                    fillFractureCommandsForNodes(const NvBlastActor& actor, NvBlastFractureBuffers& commands, const uint32_t* nodes, uint32_t nodeCount);
+    /// Scratch for the candidate path: (actor index, graph node) of every
+    /// overstressed node, sorted so one actor's nodes are contiguous.
+    std::vector<std::pair<uint32_t, uint32_t>> m_fractureCandidates;
+    uint64_t                                m_fractureCandidateChecks{0};
+    uint64_t                                m_fractureCandidateMismatches{0};
+    uint64_t                                m_fractureCandidateTicks{0};
 
     void                                    initialize();
 
@@ -5291,6 +5303,71 @@ void ExtStressSolverImpl::generateFractureCommands(const NvBlastActor& actor, Nv
     fillFractureCommands(actor, commands);
 }
 
+void ExtStressSolverImpl::fillFractureCommandsForNodes(const NvBlastActor& actor, NvBlastFractureBuffers& commands, const uint32_t* nodes, uint32_t nodeCount)
+{
+    uint32_t commandCount = 0;
+    for (uint32_t i = 0; i < nodeCount; ++i)
+    {
+        const uint32_t node0 = nodes[i];
+        for (uint32_t adjacencyIndex = m_graph.adjacencyPartition[node0]; adjacencyIndex < m_graph.adjacencyPartition[node0 + 1]; adjacencyIndex++)
+        {
+            const uint32_t node1 = m_graph.adjacentNodeIndices[adjacencyIndex];
+            // Same ownership rule as the full walk: a bond is visited from its
+            // lower-indexed endpoint, and both endpoints of an overstressed
+            // bond are flagged, so every overstressed bond is visited exactly
+            // once here too.
+            if (node0 < node1)
+            {
+                const uint32_t bondIndex = m_graph.adjacentBondIndices[adjacencyIndex];
+                if (generateStressDamage(actor, bondIndex, node0, node1))
+                {
+                    commandCount++;
+                }
+            }
+        }
+    }
+    commands.chunkFractureCount = 0;
+    commands.chunkFractures = nullptr;
+    commands.bondFractureCount = commandCount;
+    commands.bondFractures = commandCount > 0 ? m_bondFractureBuffer.end() - commandCount : nullptr;
+}
+
+/// Generate commands only for the actors that own an overstressed node,
+/// walking only those nodes.
+///
+/// The full walk visits EVERY active actor and fetches every actor's node
+/// list, then checks the overstressed flag per node: O(actors + nodes) per
+/// tick. Under the sub-fatal damage band a few hundred bonds sit overstressed
+/// on essentially every tick of a standing city, so that walk ran every tick
+/// -- 1.3 ms at rest on the 87k-node downtown to find ~300 bonds on four
+/// actors. The flagged nodes name their actor directly through the family's
+/// chunk -> actor table, so the work is O(overstressed nodes log n).
+///
+/// Values are identical: damage is a per-bond function of the bond's own
+/// stress and health, and the adapter sorts commands by actor index before
+/// applying them. Only the ORDER of bond commands within one actor differs
+/// (ascending node here, the actor's node-list order in the full walk), which
+/// nothing downstream depends on. BLAST_FRACTURE_CANDIDATES=0 restores the
+/// full walk; BLAST_FRACTURE_CANDIDATES_VERIFY=1 runs both every tick and
+/// compares the command sets.
+static bool fractureCandidatesEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_FRACTURE_CANDIDATES");
+        return raw == nullptr || raw[0] != '0';
+    }();
+    return enabled;
+}
+
+static bool fractureCandidatesVerify()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("BLAST_FRACTURE_CANDIDATES_VERIFY");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return enabled;
+}
+
 uint32_t ExtStressSolverImpl::generateFractureCommandsPerActor(const NvBlastActor** actorBuffer, NvBlastFractureBuffers* commandsBuffer, uint32_t bufferSize)
 {
     // A crushed chunk is fracture work even when no bond is overstressed: a
@@ -5300,9 +5377,114 @@ uint32_t ExtStressSolverImpl::generateFractureCommandsPerActor(const NvBlastActo
     if (m_graphProcessor->getOverstressedBondCount() == 0 && !crushPending)
         return 0;
 
+    // Crush commands are per node and not tracked by the overstressed flags,
+    // so a tick with pending crush work takes the full walk.
+    const uint32_t* chunkActorIndices =
+        (!crushPending && fractureCandidatesEnabled())
+            ? NvBlastFamilyGetChunkActorIndices(&m_family, logLL)
+            : nullptr;
+
+    // Verify mode: the full walk first, into a private copy, because the
+    // candidate walk appends to the same command buffer.
+    std::vector<NvBlastBondFractureData> verifyFull;
+    if (chunkActorIndices != nullptr && fractureCandidatesVerify())
+    {
+        m_bondFractureBuffer.clear();
+        m_chunkFractureBuffer.clear();
+        for (auto it = m_activeActors.getIterator(); !it.done(); ++it)
+        {
+            NvBlastFractureBuffers scratch{};
+            fillFractureCommands(**it, scratch);
+        }
+        verifyFull.assign(m_bondFractureBuffer.begin(), m_bondFractureBuffer.end());
+    }
+
     m_bondFractureBuffer.clear();
     m_chunkFractureBuffer.clear();
     uint32_t index = 0;
+
+    if (chunkActorIndices != nullptr)
+    {
+        m_fractureCandidates.clear();
+        const uint32_t nodeCount = m_graph.nodeCount;
+        for (uint32_t node = 0; node < nodeCount; ++node)
+        {
+            if (!m_graphProcessor->isNodeOverstressed(node))
+            {
+                continue;
+            }
+            const uint32_t actorIndex = chunkActorIndices[m_graph.chunkIndices[node]];
+            if (isInvalidIndex(actorIndex))
+            {
+                continue;
+            }
+            m_fractureCandidates.emplace_back(actorIndex, node);
+        }
+        std::sort(m_fractureCandidates.begin(), m_fractureCandidates.end());
+
+        std::vector<uint32_t> nodes;
+        for (size_t i = 0; i < m_fractureCandidates.size() && index < bufferSize;)
+        {
+            const uint32_t actorIndex = m_fractureCandidates[i].first;
+            nodes.clear();
+            for (; i < m_fractureCandidates.size() && m_fractureCandidates[i].first == actorIndex; ++i)
+            {
+                nodes.push_back(m_fractureCandidates[i].second);
+            }
+            const NvBlastActor* actor = NvBlastFamilyGetActorByIndex(&m_family, actorIndex, logLL);
+            if (actor == nullptr || !m_activeActors.contains(actor))
+            {
+                continue;
+            }
+            NvBlastFractureBuffers& nextCommand = commandsBuffer[index];
+            fillFractureCommandsForNodes(*actor, nextCommand, nodes.data(), static_cast<uint32_t>(nodes.size()));
+            if (nextCommand.bondFractureCount > 0)
+            {
+                actorBuffer[index] = actor;
+                index++;
+            }
+        }
+
+        if (fractureCandidatesVerify())
+        {
+            // Same multiset of (bond, damage) regardless of order.
+            std::vector<NvBlastBondFractureData> got(m_bondFractureBuffer.begin(), m_bondFractureBuffer.end());
+            auto key = [](const NvBlastBondFractureData& a, const NvBlastBondFractureData& b) {
+                if (a.nodeIndex0 != b.nodeIndex0) return a.nodeIndex0 < b.nodeIndex0;
+                if (a.nodeIndex1 != b.nodeIndex1) return a.nodeIndex1 < b.nodeIndex1;
+                return a.health < b.health;
+            };
+            std::sort(got.begin(), got.end(), key);
+            std::sort(verifyFull.begin(), verifyFull.end(), key);
+            bool same = got.size() == verifyFull.size();
+            for (size_t k = 0; same && k < got.size(); ++k)
+            {
+                same = got[k].nodeIndex0 == verifyFull[k].nodeIndex0
+                    && got[k].nodeIndex1 == verifyFull[k].nodeIndex1
+                    && got[k].health == verifyFull[k].health;
+            }
+            m_fractureCandidateChecks += verifyFull.size();
+            ++m_fractureCandidateTicks;
+            if (!same)
+            {
+                ++m_fractureCandidateMismatches;
+                std::fprintf(stderr,
+                             "[fracture-candidates] MISMATCH tick=%llu full=%zu candidates=%zu\n",
+                             static_cast<unsigned long long>(m_fractureCandidateTicks),
+                             verifyFull.size(), got.size());
+            }
+            if (m_fractureCandidateTicks % 600 == 0)
+            {
+                std::fprintf(stderr,
+                             "[fracture-candidates] ticks=%llu checks=%llu mismatches=%llu\n",
+                             static_cast<unsigned long long>(m_fractureCandidateTicks),
+                             static_cast<unsigned long long>(m_fractureCandidateChecks),
+                             static_cast<unsigned long long>(m_fractureCandidateMismatches));
+            }
+        }
+        return index;
+    }
+
     for (auto it = m_activeActors.getIterator(); !it.done() && index < bufferSize; ++it)
     {
         const NvBlastActor* actor = *it;
