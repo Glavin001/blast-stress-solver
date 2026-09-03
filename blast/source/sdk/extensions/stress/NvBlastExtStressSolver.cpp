@@ -698,9 +698,14 @@ public:
         const uint32_t count = m_impulses.size();
         if (!m_converged || count == 0)
         {
+            // Nothing to compare against next frame: an unconverged answer is
+            // not a candidate for "steady", so copying it (an O(bonds) pass,
+            // ~0.5 ms per structure on the 268k-bond downtown, every tick the
+            // 32-iteration budget fails to converge -- which is every tick)
+            // bought nothing. Dropping the history makes the next converged
+            // frame start the count from zero, exactly as before.
             m_solutionSteadyFrames = 0;
-            m_lastImpulses.resize(count);
-            for (uint32_t i = 0; i < count; ++i) m_lastImpulses[i] = m_impulses[i];
+            m_lastImpulses.resize(0);
             return;
         }
         bool comparable = (m_lastImpulses.size() == count);
@@ -849,11 +854,18 @@ public:
             // test above see no change and agree. The two have to be gated
             // together or the cheaper one quietly re-creates the bug.
             //
-            // (Merge note: the device skip is ALSO converged-only since the
-            // depth-truncation fix, so this gate can only delay a skip, never
-            // admit an unconverged island.)
-            gpuParams.skipSettledIslands = skipSettled && warmStart
-                && m_solutionSteadyFrames >= STEADY_FRAMES_BEFORE_SKIP;
+            //
+            // The device skip is PER ISLAND and converged-only (planSettledSkip,
+            // since the depth-truncation fix): an island is retired only once
+            // its own residual is under tolerance and its inputs are
+            // bit-identical, so it cannot freeze a moving answer. Gating it on
+            // the WHOLE solve having converged for STEADY_FRAMES_BEFORE_SKIP
+            // frames threw that away: at the 32-iteration budget the whole
+            // solve never converges, so the gate never opened and not one
+            // island was ever skipped (0% on a standing city, against 45%
+            // before the gate existed). The whole-solve early-out above keeps
+            // the gate; the per-island skip does not need it.
+            gpuParams.skipSettledIslands = skipSettled && warmStart;
             if (std::getenv("BLAST_WARMSTART_TRACE"))
             {
                 static uint32_t traceTick = 0;
