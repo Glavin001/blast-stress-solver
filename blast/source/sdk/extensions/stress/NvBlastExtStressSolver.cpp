@@ -1902,6 +1902,8 @@ public:
     mutable uint64_t m_bsOverHits{0};
     mutable uint64_t m_bsOverMisses{0};
     mutable uint64_t m_bsOverSkips{0};
+    mutable uint64_t m_bsOverRecordChecks{0};
+    mutable uint64_t m_bsOverRecordMismatches{0};
     std::vector<uint32_t> m_bsGpuRemovals;
     std::vector<uint32_t> m_bsVerifyRemovals;
     std::vector<uint32_t> m_bsSerialRemovals;
@@ -2079,10 +2081,19 @@ public:
     /// candidate walk asks about every bond of every flagged node, and most
     /// of those are not flagged themselves -- ~15 misses per hit measured --
     /// so without this the lazy full fetch ran on every fracture tick anyway.
+    static bool bondStressCompactSkip()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_BOND_STRESS_COMPACT_SKIP");
+            return raw == nullptr || std::string(raw) != "0";
+        }();
+        return enabled;
+    }
+
     bool getBondStressForDamage(
         uint32_t blastBondIndex, float& compression, float& tension, float& shear) const
     {
-        if (m_bsGpuActive && m_bsOverComplete)
+        if (m_bsGpuActive && m_bsOverComplete && bondStressCompactSkip())
         {
             const uint32_t hostGroup = blastBondIndex < m_bsBlastBondGroup.size()
                 ? m_bsBlastBondGroup[blastBondIndex]
@@ -3185,12 +3196,13 @@ public:
         {
             fprintf(stderr,
                     "[bs-compact] tick=%llu overGroups=%u complete=%d listed=%zu "
-                    "overstressedBonds=%u hits=%llu misses=%llu skips=%llu\n",
+                    "overstressedBonds=%u hits=%llu misses=%llu skips=%llu recChecks=%llu recMism=%llu\n",
                     (unsigned long long)m_bsCsrTicks, result.overGroupCount,
                     result.overGroupsComplete ? 1 : 0, m_bsOverGroupSlots.size(),
                     result.overstressedBondCount,
                     (unsigned long long)m_bsOverHits, (unsigned long long)m_bsOverMisses,
-                    (unsigned long long)m_bsOverSkips);
+                    (unsigned long long)m_bsOverSkips,
+                    (unsigned long long)m_bsOverRecordChecks, (unsigned long long)m_bsOverRecordMismatches);
         }
 
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
@@ -3340,6 +3352,29 @@ public:
                 stressBend = rec[2];
                 normal = nvidia::NvVec3(rec[3], rec[4], rec[5]);
                 centroid = nvidia::NvVec3(rec[6], rec[7], rec[8]);
+                if (bondStressCompactVerify())
+                {
+                    // The record must be the same numbers the full arrays hold.
+                    if (m_bsGpuStressNormal == nullptr) { fetchBondStressStresses(); }
+                    if (m_bsGpuNormal == nullptr) { fetchBondStressVectors(); }
+                    if (m_bsGpuStressNormal != nullptr)
+                    {
+                        const float a[3] = {m_bsGpuStressNormal[group], m_bsGpuStressShear[group], m_bsGpuStressBend[group]};
+                        if (memcmp(a, rec, sizeof(a)) != 0
+                            || (m_bsGpuNormal != nullptr
+                                && (memcmp(&m_bsGpuNormal[3 * group], rec + 3, 3 * sizeof(float)) != 0
+                                    || memcmp(&m_bsGpuCentroid[3 * group], rec + 6, 3 * sizeof(float)) != 0)))
+                        {
+                            ++m_bsOverRecordMismatches;
+                            if (m_bsOverRecordMismatches <= 6)
+                            {
+                                fprintf(stderr, "[bs-compact-verify] RECORD mismatch bond %u group %u: rec sn=%g ss=%g sb=%g | arr sn=%g ss=%g sb=%g\n",
+                                        blastBondIndex, group, rec[0], rec[1], rec[2], a[0], a[1], a[2]);
+                            }
+                        }
+                        ++m_bsOverRecordChecks;
+                    }
+                }
                 return true;
             }
             ++m_bsOverMisses;
