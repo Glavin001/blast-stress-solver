@@ -145,6 +145,14 @@ struct ExtStressGpuTelemetry
     float bondStressEnqueueMs{0.0f};
     std::uint64_t bondStressBytesUp{0};
     std::uint64_t bondStressBytesDown{0};
+    /// Groups flagged overstressed on the last walk (the compact readback's
+    /// length), and how the consumers behaved: a lazy fetch is a full
+    /// per-group D2H copy plus a stream sync, which is what the compact list
+    /// exists to avoid, so these should stay at zero on the fracture path.
+    std::uint32_t bondStressOverGroups{0};
+    std::uint64_t bondStressOverWindowMisses{0};
+    std::uint64_t bondStressLazyStressFetches{0};
+    std::uint64_t bondStressLazyVectorFetches{0};
 };
 
 /**
@@ -232,6 +240,26 @@ struct ExtStressGpuBondStressResult
     const float* groupStressShear{nullptr};
     const float* groupNormal{nullptr};    ///< 3 per group
     const float* groupCentroid{nullptr};  ///< 3 per group
+
+    /// The groups the walk flagged overstressed, compacted on the device and
+    /// brought back with the walk's own readback so the fracture path never
+    /// has to pull the full per-group arrays across. `overGroupIds[i]` is a
+    /// group index and `overGroupRecords[9*i..]` is that group's
+    /// {stressNormal, stressShear, stressBend, normal xyz, centroid xyz}.
+    /// Order is whatever the device's atomics produced; sort before use.
+    /// `overGroupsComplete` is false when more groups were flagged than the
+    /// readback window held, in which case fall back to the lazy full fetch.
+    const std::uint32_t* overGroupIds{nullptr};
+    const float* overGroupRecords{nullptr};
+    std::uint32_t overGroupCount{0};
+    bool overGroupsComplete{false};
+
+    /// ExtStressSolver::getBondUtilisations, reduced on the device: the
+    /// largest ratio over every live bond, and how many bonds sit at or above
+    /// half of a limit. The telemetry sample used to scan every bond on the
+    /// host for these two numbers.
+    float utilisationMax{0.0f};
+    std::uint32_t bondsAboveHalfUtilisation{0};
 };
 
 class ExtStressGpuSolver
@@ -336,7 +364,7 @@ public:
     /// stress unless its node came back flagged, which on a settled city is
     /// never, so pulling them across every tick was pure loss.
     virtual bool readbackGroupStresses(
-        const float*& stressNormal, const float*& stressShear) = 0;
+        const float*& stressNormal, const float*& stressShear, const float*& stressBend) = 0;
 
     virtual bool readbackGroupVectors(
         const float*& groupNormal, const float*& groupCentroid) = 0;

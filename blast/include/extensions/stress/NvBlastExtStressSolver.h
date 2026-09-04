@@ -479,6 +479,15 @@ public:
     virtual uint32_t                        getBondUtilisations(float* utilisation, uint32_t capacity) const = 0;
 
     /**
+    The two numbers telemetry actually wants from getBondUtilisations -- the
+    largest utilisation over every live bond, and how many bonds are at or
+    above half of a limit -- without filling a per-bond buffer. When the
+    device bond-stress walk is active they come from its last run for free;
+    otherwise this is the same host scan getBondUtilisations does.
+    */
+    virtual bool                            getBondUtilisationSummary(float& utilisationMax, uint32_t& bondsAboveHalf) const = 0;
+
+    /**
     Notify stress solver on newly created actor.
 
     Call this function for all initial actors present in family and later upon every actor split.

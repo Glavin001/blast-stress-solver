@@ -198,6 +198,17 @@ struct KernelProfile
     }
 };
 
+/// Mirrors ExtStressSolverImpl::fibreBending() (BLAST_BEND_FIBER): the walk
+/// kernel must test the same fibre stresses the host walk does.
+static bool bondStressFibreBending()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_BEND_FIBER");
+        return raw == nullptr || raw[0] != '0';
+    }();
+    return enabled;
+}
+
 static bool kernelProfileEnabled()
 {
     static const bool enabled = [] {
@@ -2326,8 +2337,30 @@ __global__ void applyStressDamage(
 /// degenerate normal untouched rather than zeroing it, and the centroid and
 /// node displacement are only divided through when the total area can take
 /// damage.
+/// The host's ExtStressSolverImpl::fibreStresses, operation for operation:
+/// a bending moment loads both extreme fibres at once, so it adds to the
+/// axial stress on one face and subtracts on the other. Which face fails is
+/// what the overstress test below has to decide, exactly as the host does.
+__device__ __forceinline__ void bondStressFibre(
+    int fibreBending, float stressNormal, float stressBend,
+    float& compression, float& tension)
+{
+    if (!fibreBending)
+    {
+        const float combined = stressNormal + copysignf(stressBend, stressNormal);
+        compression = combined <= 0.0f ? -combined : 0.0f;
+        tension = combined > 0.0f ? combined : 0.0f;
+        return;
+    }
+    const float t = stressNormal + stressBend;
+    const float c = stressBend - stressNormal;
+    tension = t > 0.0f ? t : 0.0f;
+    compression = c > 0.0f ? c : 0.0f;
+}
+
 __global__ void bondStressWalk(
     float bendGainMax,
+    int fibreBending,
     const std::uint32_t* groupBegin,
     const std::uint32_t* groupSize,
     const std::uint32_t* memberBlastBond,
@@ -2348,12 +2381,18 @@ __global__ void bondStressWalk(
     std::uint32_t groupCount,
     float* groupStressNormal,
     float* groupStressShear,
+    float* groupStressBend,
     float* groupNormalOut,
     float* groupCentroidOut,
     std::uint8_t* nodeOverstressed,
     std::uint32_t* groupRemoveCount,
     std::uint32_t* removeFlag,
-    std::uint32_t* overstressedCount)
+    std::uint32_t* overstressedCount,
+    std::uint32_t* overGroupIds,
+    float* overGroupRecords,
+    std::uint32_t* overGroupCount,
+    std::uint32_t* utilMaxBits,
+    std::uint32_t* aboveHalfCount)
 {
     const std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= groupCount)
@@ -2480,6 +2519,7 @@ __global__ void bondStressWalk(
 
     groupStressNormal[g] = stressNormal;
     groupStressShear[g] = stressShear;
+    groupStressBend[g] = stressBend;
     groupNormalOut[3u * g + 0u] = nx;
     groupNormalOut[3u * g + 1u] = ny;
     groupNormalOut[3u * g + 2u] = nz;
@@ -2488,8 +2528,15 @@ __global__ void bondStressWalk(
     groupCentroidOut[3u * g + 2u] = cz;
 
     // Every member shares the group's stress but fails against its OWN
-    // material, so overstress is counted per member.
+    // material, so overstress is counted per member. The axial test is on the
+    // extreme fibres (normal +/- bend), as on the host; testing the raw normal
+    // stress here would let a bond fail on the host walk and not on this one.
+    float fibreCompression = 0.0f;
+    float fibreTension = 0.0f;
+    bondStressFibre(fibreBending, stressNormal, stressBend, fibreCompression, fibreTension);
     std::uint32_t overstressed = 0;
+    std::uint32_t aboveHalf = 0;
+    float utilMax = 0.0f;
     for (std::uint32_t k = 0; k < size; ++k)
     {
         const std::uint32_t bb = memberBlastBond[begin + k];
@@ -2503,18 +2550,64 @@ __global__ void bondStressWalk(
         const float compressionElastic = materialElasticLimits[3u * materialIndex + 0u];
         const float tensionElastic = materialElasticLimits[3u * materialIndex + 1u];
         const float shearElastic = materialElasticLimits[3u * materialIndex + 2u];
-        if (-stressNormal > compressionElastic
-            || stressNormal > tensionElastic
+        if (fibreCompression > compressionElastic
+            || fibreTension > tensionElastic
             || stressShear > shearElastic)
         {
             ++overstressed;
             nodeOverstressed[node0] = 1u;
             nodeOverstressed[bondNode1[bb]] = 1u;
         }
+        // Utilisation, as ExtStressSolverImpl::getBondUtilisations defines
+        // it: the largest stress-to-elastic-limit ratio, taken in the same
+        // order with the same "keep the old value unless strictly less"
+        // comparison, so the summary equals the host's per-bond scan.
+        float util = 0.0f;
+        if (compressionElastic > 0.0f)
+        {
+            const float r = fibreCompression / compressionElastic;
+            util = util < r ? r : util;
+        }
+        if (tensionElastic > 0.0f)
+        {
+            const float r = fibreTension / tensionElastic;
+            util = util < r ? r : util;
+        }
+        if (shearElastic > 0.0f)
+        {
+            const float r = stressShear / shearElastic;
+            util = util < r ? r : util;
+        }
+        utilMax = utilMax < util ? util : utilMax;
+        if (util >= 0.5f)
+        {
+            ++aboveHalf;
+        }
+    }
+    // Non-negative floats order like their bit patterns, so a uint atomicMax
+    // is an exact float max; the count is a plain sum.
+    if (utilMax > 0.0f)
+    {
+        atomicMax(utilMaxBits, __float_as_uint(utilMax));
+    }
+    if (aboveHalf != 0)
+    {
+        atomicAdd(aboveHalfCount, aboveHalf);
     }
     if (overstressed != 0)
     {
         atomicAdd(overstressedCount, overstressed);
+        // Compact this group's outputs for the host: the fracture path reads
+        // stresses only for flagged groups, and those are a few hundred out of
+        // ~70k, so this is what rides the readback instead of the full arrays.
+        const std::uint32_t slot = atomicAdd(overGroupCount, 1u);
+        overGroupIds[slot] = g;
+        float* rec = overGroupRecords + 9u * static_cast<std::size_t>(slot);
+        rec[0] = stressNormal;
+        rec[1] = stressShear;
+        rec[2] = stressBend;
+        rec[3] = nx; rec[4] = ny; rec[5] = nz;
+        rec[6] = cx; rec[7] = cy; rec[8] = cz;
     }
 }
 
@@ -3124,6 +3217,7 @@ uploadIslands();
             // changes, because internal bonds stop being updated. Match it.
             checkCuda(cudaMemset(m_bsGroupStressNormal, 0, sizeof(float) * topology.groupCount), "bs clear sn");
             checkCuda(cudaMemset(m_bsGroupStressShear, 0, sizeof(float) * topology.groupCount), "bs clear ss");
+            checkCuda(cudaMemset(m_bsGroupStressBend, 0, sizeof(float) * topology.groupCount), "bs clear sb");
             checkCuda(cudaMemset(m_bsGroupNormal, 0, sizeof(float) * 3u * topology.groupCount), "bs clear n");
             checkCuda(cudaMemset(m_bsGroupCentroid, 0, sizeof(float) * 3u * topology.groupCount), "bs clear c");
             m_bsCsrResident = false;
@@ -3138,7 +3232,8 @@ uploadIslands();
         return true;
     }
 
-    bool readbackGroupStresses(const float*& stressNormal, const float*& stressShear) override
+    bool readbackGroupStresses(
+        const float*& stressNormal, const float*& stressShear, const float*& stressBend) override
     {
         // Every other public entry point pushes PhysX's CUDA context before
         // touching the device; these did not, so their allocations, streams
@@ -3171,6 +3266,12 @@ uploadIslands();
                                     sizeof(float) * m_bsVectorGroups,
                                     cudaMemcpyDeviceToHost, m_bsStream),
                     "bs lazy read ss");
+                checkCuda(
+                    cudaMemcpyAsync(m_bsHostGroupStressBend, m_bsGroupStressBend,
+                                    sizeof(float) * m_bsVectorGroups,
+                                    cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs lazy read sb");
+                ++m_telemetry.bondStressLazyStressFetches;
                 checkCuda(cudaStreamSynchronize(m_bsStream), "bs lazy stress sync");
             }
             catch (const std::exception&)
@@ -3181,6 +3282,7 @@ uploadIslands();
         }
         stressNormal = m_bsHostGroupStressNormal;
         stressShear = m_bsHostGroupStressShear;
+        stressBend = m_bsHostGroupStressBend;
         return true;
     }
 
@@ -3214,6 +3316,7 @@ uploadIslands();
                         sizeof(float) * 3u * m_bsVectorGroups,
                         cudaMemcpyDeviceToHost, m_bsStream),
                     "bs lazy read centroid");
+                ++m_telemetry.bondStressLazyVectorFetches;
                 checkCuda(cudaStreamSynchronize(m_bsStream), "bs lazy vector sync");
             }
             catch (const std::exception&)
@@ -3374,7 +3477,7 @@ uploadIslands();
                     m_bsNodeOverstressed, 0, sizeof(std::uint8_t) * csr.graphNodeCount, m_bsStream),
                 "bs clear node mask");
             checkCuda(
-                cudaMemsetAsync(m_bsOverstressedCount, 0, sizeof(std::uint32_t), m_bsStream),
+                cudaMemsetAsync(m_bsOverstressedCount, 0, 4u * sizeof(std::uint32_t), m_bsStream),
                 "bs clear count");
             // Sentinel entry for the exclusive scan, so offset[groups] is the
             // total without a second reduction.
@@ -3405,6 +3508,8 @@ uploadIslands();
                                 sizeof(float), cudaMemcpyDeviceToDevice, m_bsStream);
                 cudaMemcpyAsync(m_bsGroupStressShear + dst, m_bsGroupStressShear + src,
                                 sizeof(float), cudaMemcpyDeviceToDevice, m_bsStream);
+                cudaMemcpyAsync(m_bsGroupStressBend + dst, m_bsGroupStressBend + src,
+                                sizeof(float), cudaMemcpyDeviceToDevice, m_bsStream);
                 cudaMemcpyAsync(m_bsGroupNormal + 3 * dst, m_bsGroupNormal + 3 * src,
                                 sizeof(float) * 3, cudaMemcpyDeviceToDevice, m_bsStream);
                 cudaMemcpyAsync(m_bsGroupCentroid + 3 * dst, m_bsGroupCentroid + 3 * src,
@@ -3415,6 +3520,7 @@ uploadIslands();
             const std::uint32_t grid = (groups + block - 1) / block;
             bondStressWalk<<<grid, block, 0, m_bsStream>>>(
                 m_bendGainMax,
+                bondStressFibreBending() ? 1 : 0,
                 m_bsGroupBegin, m_bsGroupSize, m_bsMemberBlastBond,
                 m_bsBondNode0, m_bsBondNode1, m_bsBondMaterial,
                 m_bsBondNormal, m_bsBondCentroid, m_bsBondNodeDisp,
@@ -3423,10 +3529,12 @@ uploadIslands();
                 m_lengthScale * m_lengthScale * m_massScale,
                 m_bsMaterialLimits, csr.materialCount,
                 unbreakableLimit, groups,
-                m_bsGroupStressNormal, m_bsGroupStressShear,
+                m_bsGroupStressNormal, m_bsGroupStressShear, m_bsGroupStressBend,
                 m_bsGroupNormal, m_bsGroupCentroid,
                 m_bsNodeOverstressed, m_bsGroupRemoveCount,
-                m_bsRemoveFlag, m_bsOverstressedCount);
+                m_bsRemoveFlag, m_bsOverstressedCount,
+                m_bsOverGroupIds, m_bsOverGroupRecords, m_bsOverstressedCount + 1,
+                m_bsOverstressedCount + 2, m_bsOverstressedCount + 3);
             checkCuda(cudaGetLastError(), "bs walk launch");
 
             std::size_t scanBytes = 0;
@@ -3473,9 +3581,42 @@ uploadIslands();
                     sizeof(std::uint8_t) * csr.graphNodeCount,
                     cudaMemcpyDeviceToHost, m_bsStream),
                 "bs read node mask");
+            // The compact overstressed-group list rides the same readback. Its
+            // length is not known until the sync, so a window sized from the
+            // last tick is copied speculatively; if the count outgrows it the
+            // host falls back to the lazy full fetch for one tick and the
+            // window doubles.
+            const std::uint32_t overWindow =
+                m_bsOverWindow < groups ? m_bsOverWindow : groups;
+            checkCuda(
+                cudaMemcpyAsync(
+                    m_bsHostCounts + 2, m_bsOverstressedCount + 1, sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, m_bsStream),
+                "bs read over group count");
+            checkCuda(
+                cudaMemcpyAsync(
+                    m_bsHostCounts + 3, m_bsOverstressedCount + 2, 2u * sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, m_bsStream),
+                "bs read utilisation summary");
+            if (overWindow != 0)
+            {
+                checkCuda(
+                    cudaMemcpyAsync(
+                        m_bsHostOverGroupIds, m_bsOverGroupIds,
+                        sizeof(std::uint32_t) * overWindow,
+                        cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs read over ids");
+                checkCuda(
+                    cudaMemcpyAsync(
+                        m_bsHostOverGroupRecords, m_bsOverGroupRecords,
+                        sizeof(float) * 9u * overWindow,
+                        cudaMemcpyDeviceToHost, m_bsStream),
+                    "bs read over records");
+            }
             m_telemetry.bondStressBytesDown =
-                2ull * sizeof(std::uint32_t)
-                + sizeof(std::uint8_t) * csr.graphNodeCount;
+                3ull * sizeof(std::uint32_t)
+                + sizeof(std::uint8_t) * csr.graphNodeCount
+                + (sizeof(std::uint32_t) + 9u * sizeof(float)) * overWindow;
             m_bsVectorsFetched = false;
             m_bsStressFetched = false;
             m_bsVectorGroups = groups;
@@ -3543,6 +3684,49 @@ uploadIslands();
             // Left null on purpose: fetched only if someone asks.
             result.groupNormal = nullptr;
             result.groupCentroid = nullptr;
+            {
+                const std::uint32_t overCount =
+                    m_bsHostCounts[2] > groups ? groups : m_bsHostCounts[2];
+                const bool complete = overCount <= overWindow;
+                result.overGroupIds = m_bsHostOverGroupIds;
+                result.overGroupRecords = m_bsHostOverGroupRecords;
+                result.overGroupCount = overCount;
+                result.overGroupsComplete = complete;
+                {
+                    const std::uint32_t bits = m_bsHostCounts[3];
+                    float utilMax = 0.0f;
+                    std::memcpy(&utilMax, &bits, sizeof(float));
+                    result.utilisationMax = utilMax;
+                    result.bondsAboveHalfUtilisation = m_bsHostCounts[4];
+                }
+                m_telemetry.bondStressOverGroups = overCount;
+                if (!complete)
+                {
+                    ++m_telemetry.bondStressOverWindowMisses;
+                }
+                // Track the count with headroom: doubling on a miss, and
+                // shrinking only once the count has been well below the window
+                // for a while, so a demolition burst does not thrash it.
+                std::uint32_t want = overCount * 2u;
+                if (want < 256u) want = 256u;
+                if (!complete)
+                {
+                    m_bsOverWindow = want;
+                    m_bsOverQuietTicks = 0;
+                }
+                else if (want * 2u < m_bsOverWindow)
+                {
+                    if (++m_bsOverQuietTicks > 600u)
+                    {
+                        m_bsOverWindow = want;
+                        m_bsOverQuietTicks = 0;
+                    }
+                }
+                else
+                {
+                    m_bsOverQuietTicks = 0;
+                }
+            }
             m_telemetry.bondStressHostMs =
                 std::chrono::duration<float, std::milli>(
                     std::chrono::steady_clock::now() - bsHostStart).count();
@@ -3719,6 +3903,12 @@ uploadIslands();
             allocateDevice(m_bsGroupSize, n, "bs alloc groupSize");
             allocateDevice(m_bsGroupStressNormal, n, "bs alloc sn");
             allocateDevice(m_bsGroupStressShear, n, "bs alloc ss");
+            allocateDevice(m_bsGroupStressBend, n, "bs alloc sb");
+            allocateDevice(m_bsOverGroupIds, n, "bs alloc over ids");
+            allocateDevice(m_bsOverGroupRecords, 9u * n, "bs alloc over records");
+            allocateHost(m_bsHostOverGroupIds, n, "bs host over ids");
+            allocateHost(m_bsHostOverGroupRecords, 9u * n, "bs host over records");
+            allocateHost(m_bsHostGroupStressBend, n, "bs host sb");
             allocateDevice(m_bsGroupNormal, 3u * n, "bs alloc normal");
             allocateDevice(m_bsGroupCentroid, 3u * n, "bs alloc centroid");
             allocateDevice(m_bsGroupRemoveCount, n + 1u, "bs alloc removeCount");
@@ -3780,8 +3970,12 @@ uploadIslands();
         }
         if (m_bsOverstressedCount == nullptr)
         {
-            allocateDevice(m_bsOverstressedCount, 1, "bs alloc count");
-            allocateHost(m_bsHostCounts, 2, "bs host counts");
+            // [0] overstressed bonds, [1] overstressed groups,
+            // [2] max utilisation (float bits), [3] bonds at >= half utilisation.
+            allocateDevice(m_bsOverstressedCount, 4, "bs alloc count");
+            // [0] overstressed bonds, [1] removal total, [2] overstressed groups,
+            // [3] max utilisation bits, [4] bonds at >= half utilisation.
+            allocateHost(m_bsHostCounts, 5, "bs host counts");
         }
     }
 
@@ -3791,6 +3985,12 @@ uploadIslands();
         cudaFree(m_bsGroupSize); m_bsGroupSize = nullptr;
         cudaFree(m_bsGroupStressNormal); m_bsGroupStressNormal = nullptr;
         cudaFree(m_bsGroupStressShear); m_bsGroupStressShear = nullptr;
+        cudaFree(m_bsGroupStressBend); m_bsGroupStressBend = nullptr;
+        cudaFree(m_bsOverGroupIds); m_bsOverGroupIds = nullptr;
+        cudaFree(m_bsOverGroupRecords); m_bsOverGroupRecords = nullptr;
+        cudaFreeHost(m_bsHostOverGroupIds); m_bsHostOverGroupIds = nullptr;
+        cudaFreeHost(m_bsHostOverGroupRecords); m_bsHostOverGroupRecords = nullptr;
+        cudaFreeHost(m_bsHostGroupStressBend); m_bsHostGroupStressBend = nullptr;
         cudaFree(m_bsGroupNormal); m_bsGroupNormal = nullptr;
         cudaFree(m_bsGroupCentroid); m_bsGroupCentroid = nullptr;
         cudaFree(m_bsGroupRemoveCount); m_bsGroupRemoveCount = nullptr;
@@ -7143,8 +7343,16 @@ private:
     float* m_bsHealth{nullptr};
     float* m_bsGroupStressNormal{nullptr};
     float* m_bsGroupStressShear{nullptr};
+    float* m_bsGroupStressBend{nullptr};
     float* m_bsGroupNormal{nullptr};
     float* m_bsGroupCentroid{nullptr};
+    std::uint32_t* m_bsOverGroupIds{nullptr};
+    float* m_bsOverGroupRecords{nullptr};
+    std::uint32_t* m_bsHostOverGroupIds{nullptr};
+    float* m_bsHostOverGroupRecords{nullptr};
+    float* m_bsHostGroupStressBend{nullptr};
+    std::uint32_t m_bsOverWindow{256};
+    std::uint32_t m_bsOverQuietTicks{0};
     std::uint8_t* m_bsNodeOverstressed{nullptr};
     std::uint32_t* m_bsGroupRemoveCount{nullptr};
     std::uint32_t* m_bsGroupRemoveOffset{nullptr};

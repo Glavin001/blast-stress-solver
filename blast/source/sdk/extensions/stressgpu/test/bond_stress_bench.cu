@@ -320,7 +320,8 @@ int main(int argc, char** argv)
         {
             const float* gsn = nullptr;
             const float* gss = nullptr;
-            if (solver->readbackGroupStresses(gsn, gss) && gsn != nullptr)
+            const float* gsb = nullptr;
+            if (solver->readbackGroupStresses(gsn, gss, gsb) && gsn != nullptr)
             {
                 std::uint32_t bad = 0;
                 for (std::uint32_t g = 0; g < groups; ++g)

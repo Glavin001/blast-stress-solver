@@ -145,6 +145,13 @@ uint32_t ext_stress_solver_get_bond_utilisations(const ExtStressSolverHandle* ha
                                                  float* out_utilisation,
                                                  uint32_t capacity);
 
+/* The two numbers telemetry wants from the utilisations -- the largest, and
+ * how many are at or above 0.5 -- without a per-bond buffer. Returns 1 on
+ * success. */
+uint32_t ext_stress_solver_get_bond_utilisation_summary(const ExtStressSolverHandle* handle,
+                                                        float* out_max,
+                                                        uint32_t* out_above_half);
+
 uint32_t ext_stress_sizeof_material_desc(void);
 
 /* --- chunk crushing ------------------------------------------------------

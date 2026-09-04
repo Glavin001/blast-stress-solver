@@ -2431,6 +2431,20 @@ public:
         return ext_stress_solver_get_bond_utilisations(m_solver, utilisation, capacity);
     }
 
+    bool getBondUtilisationSummary(
+        float& utilisationMax,
+        uint32_t& bondsAboveHalf) const override
+    {
+        utilisationMax = 0.0f;
+        bondsAboveHalf = 0;
+        if (!m_solver)
+        {
+            return false;
+        }
+        return ext_stress_solver_get_bond_utilisation_summary(
+                   m_solver, &utilisationMax, &bondsAboveHalf) != 0U;
+    }
+
     uint32_t captureResimulationSnapshot() override
     {
         if (m_tickPhase != TickPhase::Idle)

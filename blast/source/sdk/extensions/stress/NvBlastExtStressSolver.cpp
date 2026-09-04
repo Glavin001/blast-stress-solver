@@ -51,6 +51,9 @@
 #include <utility>
 #include <vector>
 #include <cmath>
+#include <unordered_map>
+
+namespace Nv { namespace Blast { static bool bondStressCompactVerify(); } }
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1715,6 +1718,27 @@ public:
     }
 
     /// Dual-run audit of the device walk against the serial one. Default OFF.
+    /// Kill switch for the compact overstressed-group readback: with it off
+    /// every consumer goes through the lazy full-array fetch, which is the
+    /// pre-existing path and the A/B arm.
+    static bool bondStressCompact()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_BOND_STRESS_COMPACT");
+            return raw == nullptr || std::string(raw) != "0";
+        }();
+        return enabled;
+    }
+
+    static bool bondStressCompactTrace()
+    {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("BLAST_BOND_STRESS_COMPACT_TRACE");
+            return raw != nullptr && std::string(raw) != "0";
+        }();
+        return enabled;
+    }
+
     static bool bondStressGpuVerify()
     {
         static const bool enabled = [] {
@@ -1857,8 +1881,27 @@ public:
     bool m_bsGpuActive{false};
     mutable const float* m_bsGpuStressNormal{nullptr};
     mutable const float* m_bsGpuStressShear{nullptr};
+    mutable const float* m_bsGpuStressBend{nullptr};
     mutable const float* m_bsGpuNormal{nullptr};
     mutable const float* m_bsGpuCentroid{nullptr};
+    /// The device walk's compact overstressed-group list: (group, record slot)
+    /// sorted by group, and the 9-float records it indexes. Valid until the
+    /// next walk that actually runs (the unchanged-input skip keeps it, since
+    /// the device outputs it mirrors are unchanged too). Empty when the walk
+    /// did not run on the device, the window overflowed, or the list is
+    /// disabled (BLAST_BOND_STRESS_COMPACT=0), in which case bondStressOutputs
+    /// pays the lazy full fetch as before.
+    std::vector<std::pair<uint32_t, uint32_t>> m_bsOverGroupSlots;
+    const float* m_bsOverRecords{nullptr};
+    /// True when m_bsOverGroupSlots names EVERY flagged group of the last
+    /// device walk (an empty complete list means nothing is overstressed).
+    bool m_bsOverComplete{false};
+    std::unordered_map<uint32_t, uint32_t> m_bsSlotRemap;
+    float m_bsUtilMax{0.0f};
+    uint32_t m_bsAboveHalf{0};
+    mutable uint64_t m_bsOverHits{0};
+    mutable uint64_t m_bsOverMisses{0};
+    mutable uint64_t m_bsOverSkips{0};
     std::vector<uint32_t> m_bsGpuRemovals;
     std::vector<uint32_t> m_bsVerifyRemovals;
     std::vector<uint32_t> m_bsSerialRemovals;
@@ -1894,6 +1937,11 @@ public:
     uint64_t m_bsGpuStressChecks{0};
     uint64_t m_bsGpuStressMismatches{0};
     uint64_t m_bsGpuStressBig{0};
+    uint64_t m_bsGpuOverSetChecks{0};
+    uint64_t m_bsGpuOverSetMismatches{0};
+    uint64_t m_bsGpuBendMismatches{0};
+    double m_bsGpuBendMaxRel{0.0};
+    uint32_t m_bsCompactTracePrints{0};
     double m_bsGpuStressMaxRel{0.0};
     uint64_t m_bsImpChecks{0};
     uint64_t m_bsImpMismatches{0};
@@ -1918,9 +1966,9 @@ public:
 
     bool getBondStress(uint32_t blastBondIndex, float& compression, float& tension, float& shear) const
     {
-        float stressNormal, stressShear;
+        float stressNormal, stressShear, stressBend;
         nvidia::NvVec3 normal, centroid;
-        if (!bondStressOutputs(blastBondIndex, stressNormal, stressShear, normal, centroid))
+        if (!bondStressOutputs(blastBondIndex, stressNormal, stressShear, stressBend, normal, centroid))
         {
             return false;
         }
@@ -1930,8 +1978,13 @@ public:
         // bending moment produces both at once, on opposite faces of the joint.
         // These are therefore the two extreme fibres, and either can be the one
         // that fails.
-        fibreStresses(m_bondsData[blastBondIndex].stressNormal,
-                      m_bondsData[blastBondIndex].stressBend, compression, tension);
+        //
+        // From the walk's outputs, whichever walk ran: the device walk never
+        // writes BondData, so reading the stresses from there in GPU mode
+        // handed this zeros and only shear could ever damage a bond. (It also
+        // indexed BondData by blast bond index, which is only right until the
+        // first removal permutes the array.)
+        fibreStresses(stressNormal, stressBend, compression, tension);
 
         // shear is independent and can co-exist with compression and tension
         shear = stressShear;         // the force perpendicular to the bond normal direction
@@ -1941,6 +1994,115 @@ public:
 
     // Convert from Blast bond index to internal stress solver bond index
     // Will be InvalidIndex if the internal bond was removed from the stress solver
+    /// The device walk's utilisation summary, valid while the device walk is
+    /// the active one (the unchanged-input skip keeps the last run's values,
+    /// which are still exact because nothing it depends on changed).
+    bool bondUtilisationSummary(float& utilisationMax, uint32_t& bondsAboveHalf) const
+    {
+        if (!m_bsGpuActive)
+        {
+            return false;
+        }
+        utilisationMax = m_bsUtilMax;
+        bondsAboveHalf = m_bsAboveHalf;
+        return true;
+    }
+
+    /// Diagnostic: how the device walk sees a blast bond, for the verifiers.
+    void debugDeviceBondView(const char* tag, uint32_t blastBondIndex) const
+    {
+        const uint32_t bondIndex = blastBondIndex < m_blastBondIndexMap.size()
+            ? m_blastBondIndexMap[blastBondIndex] : invalidIndex<uint32_t>();
+        const uint32_t hostGroup = blastBondIndex < m_bsBlastBondGroup.size()
+            ? m_bsBlastBondGroup[blastBondIndex] : invalidIndex<uint32_t>();
+        const uint32_t group = isInvalidIndex(hostGroup) ? hostGroup : deviceSlotOf(hostGroup);
+        fprintf(stderr, "[bs-dbg %s] hostGroup %u deviceSlot %u pendingSwaps %zu\n",
+                tag, hostGroup, group, m_bsSlotRemap.size());
+        const uint32_t n0 = blastBondIndex < m_bsBondNode0.size()
+            ? m_bsBondNode0[blastBondIndex] : 0xFFFFFFFFu;
+        const uint32_t n1 = blastBondIndex < m_bsBondNode1.size()
+            ? m_bsBondNode1[blastBondIndex] : 0xFFFFFFFFu;
+        bool listed = false;
+        if (!isInvalidIndex(group))
+        {
+            const auto it = std::lower_bound(
+                m_bsOverGroupSlots.begin(), m_bsOverGroupSlots.end(),
+                std::make_pair(group, uint32_t(0)));
+            listed = it != m_bsOverGroupSlots.end() && it->first == group;
+        }
+        uint32_t hn0 = 0xFFFFFFFFu, hn1 = 0xFFFFFFFFu;
+        if (!isInvalidIndex(bondIndex))
+        {
+            hn0 = m_bondsData[bondIndex].node0;
+            hn1 = m_bondsData[bondIndex].node1;
+        }
+        fprintf(stderr,
+                "[bs-dbg %s] bond %u internal %u group %u/%zu devNodes %u/%u hostNodes %u/%u "
+                "listed %d complete %d gpuActive %d groupSize %u\n",
+                tag, blastBondIndex, bondIndex, group, m_bsCsrGroupSize.size(), n0, n1, hn0, hn1,
+                listed ? 1 : 0, m_bsOverComplete ? 1 : 0, m_bsGpuActive ? 1 : 0,
+                (!isInvalidIndex(group) && group < m_bsCsrGroupSize.size()) ? m_bsCsrGroupSize[group] : 0u);
+        if (!isInvalidIndex(group) && group < m_bsCsrGroupSize.size())
+        {
+            const uint32_t begin = m_bsCsrGroupBegin[group];
+            const uint32_t size = m_bsCsrGroupSize[group];
+            fprintf(stderr, "[bs-dbg %s]   members:", tag);
+            for (uint32_t k = 0; k < size && k < 6; ++k)
+            {
+                const uint32_t mb = m_bsCsrMemberBlastBond[begin + k];
+                fprintf(stderr, " %u(h=%g mat=%u)", mb,
+                        m_bsBondHealth ? m_bsBondHealth[mb] : -1.0f,
+                        mb < m_bsBondMaterial.size() ? m_bsBondMaterial[mb] : 0xFFFFFFFFu);
+            }
+            float sn = 0, ss = 0, sb = 0;
+            const float* pn = m_bsGpuStressNormal; const float* ps = m_bsGpuStressShear; const float* pb = m_bsGpuStressBend;
+            if (pn == nullptr) { fetchBondStressStresses(); pn = m_bsGpuStressNormal; ps = m_bsGpuStressShear; pb = m_bsGpuStressBend; }
+            if (pn) { sn = pn[group]; ss = ps[group]; sb = pb[group]; }
+            float fc = 0, ft = 0;
+            fibreStresses(sn, sb, fc, ft);
+            fprintf(stderr, " | dev sn=%g ss=%g sb=%g fibreC=%g fibreT=%g limits(mat %u)=",
+                    sn, ss, sb, fc, ft, blastBondIndex < m_bsBondMaterial.size() ? m_bsBondMaterial[blastBondIndex] : 0xFFFFFFFFu);
+            const uint32_t mi = blastBondIndex < m_bsBondMaterial.size() ? m_bsBondMaterial[blastBondIndex] : 0u;
+            if (3u * mi + 2u < m_bsMaterialLimits.size())
+            {
+                fprintf(stderr, "%g/%g/%g", m_bsMaterialLimits[3 * mi], m_bsMaterialLimits[3 * mi + 1], m_bsMaterialLimits[3 * mi + 2]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
+    /// getBondStress for the damage path only. The device walk flags a group
+    /// when ANY member exceeds its elastic limit, which is exactly the test
+    /// generateStressDamage applies per bond, so a group absent from a
+    /// complete flagged list cannot produce damage and there is nothing to
+    /// fetch: answer "no stress to report" without touching the device. The
+    /// candidate walk asks about every bond of every flagged node, and most
+    /// of those are not flagged themselves -- ~15 misses per hit measured --
+    /// so without this the lazy full fetch ran on every fracture tick anyway.
+    bool getBondStressForDamage(
+        uint32_t blastBondIndex, float& compression, float& tension, float& shear) const
+    {
+        if (m_bsGpuActive && m_bsOverComplete)
+        {
+            const uint32_t hostGroup = blastBondIndex < m_bsBlastBondGroup.size()
+                ? m_bsBlastBondGroup[blastBondIndex]
+                : invalidIndex<uint32_t>();
+            if (!isInvalidIndex(hostGroup) && hostGroup < m_bsCsrGroupSize.size())
+            {
+                const uint32_t group = deviceSlotOf(hostGroup);
+                const auto it = std::lower_bound(
+                    m_bsOverGroupSlots.begin(), m_bsOverGroupSlots.end(),
+                    std::make_pair(group, uint32_t(0)));
+                if (it == m_bsOverGroupSlots.end() || it->first != group)
+                {
+                    ++m_bsOverSkips;
+                    return false;
+                }
+            }
+        }
+        return getBondStress(blastBondIndex, compression, tension, shear);
+    }
+
     uint32_t getInternalBondIndex(uint32_t blastBondIndex)
     {
         return m_blastBondIndexMap[blastBondIndex];
@@ -2227,17 +2389,26 @@ private:
                 const BondData& bond = m_bondsData[bondIndex];
                 const NvVec3 force = impulseLinear * (remainingArea * recipTotalArea);
                 // In GPU mode the walk never wrote BondData, so the centroid
-                // comes from the per-group device output instead.
-                float ignoredNormalStress, ignoredShear;
+                // comes from the per-group device output instead. Only the
+                // virial wants it, so only ask when crushing is on: asking
+                // unconditionally was the one consumer that pulled the full
+                // vector arrays across on every tick with a broken bond.
+                const bool crush0 = materialForNode(bond.node0).crush.enabled();
+                const bool crush1 = materialForNode(bond.node1).crush.enabled();
+                if (!crush0 && !crush1)
+                {
+                    continue;
+                }
+                float ignoredNormalStress, ignoredShear, ignoredBend;
                 NvVec3 ignoredNormal, centroid = bond.centroid;
                 bondStressOutputs(
-                    blastBondIndex, ignoredNormalStress, ignoredShear, ignoredNormal, centroid);
+                    blastBondIndex, ignoredNormalStress, ignoredShear, ignoredBend, ignoredNormal, centroid);
 
-                if (materialForNode(bond.node0).crush.enabled())
+                if (crush0)
                 {
                     accumulateVirial(bond.node0, centroid - m_nodesData[bond.node0].localPos, force);
                 }
-                if (materialForNode(bond.node1).crush.enabled())
+                if (crush1)
                 {
                     accumulateVirial(bond.node1, centroid - m_nodesData[bond.node1].localPos, -force);
                 }
@@ -2358,6 +2529,8 @@ public:
         // A fallback tick must not leave the previous tick's device pointers
         // looking live.
         m_bsGpuActive = false;
+        m_bsOverComplete = false;
+        m_bsOverGroupSlots.clear();
 
         // Keep the flattened mirror in step before anything reads it.
         if (bondStressMirrorEnabled())
@@ -2391,7 +2564,7 @@ public:
                     "[bond-stress-gpu] ticks=%llu attempts=%llu ranOnDevice=%llu "
                     "checks=%llu MISMATCHES=%llu "
                     "(count=%llu removeSize=%llu removeOrder=%llu mask=%llu) "
-                    "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu) STRESS_MISMATCH=%llu/%llu big=%llu maxRel=%.3e IMPULSE=%llu/%llu impMaxRel=%.3e PAYLOAD(n=%llu node=%llu normal=%llu disp=%llu centroid=%llu)\n",
+                    "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu) STRESS_MISMATCH=%llu/%llu big=%llu maxRel=%.3e BEND_MISMATCH=%llu bendMaxRel=%.3e OVERSET_MISMATCH=%llu/%llu compactHits=%llu misses=%llu IMPULSE=%llu/%llu impMaxRel=%.3e PAYLOAD(n=%llu node=%llu normal=%llu disp=%llu centroid=%llu)\n",
                     (unsigned long long)m_bsCsrTicks,
                     (unsigned long long)m_bsGpuAttempts,
                     (unsigned long long)m_bsGpuRuns,
@@ -2411,6 +2584,12 @@ public:
                     (unsigned long long)m_bsGpuStressChecks,
                     (unsigned long long)m_bsGpuStressBig,
                     m_bsGpuStressMaxRel,
+                    (unsigned long long)m_bsGpuBendMismatches,
+                    m_bsGpuBendMaxRel,
+                    (unsigned long long)m_bsGpuOverSetMismatches,
+                    (unsigned long long)m_bsGpuOverSetChecks,
+                    (unsigned long long)m_bsOverHits,
+                    (unsigned long long)m_bsOverMisses,
                     (unsigned long long)m_bsImpMismatches,
                     (unsigned long long)m_bsImpChecks,
                     m_bsImpMaxRel,
@@ -2807,7 +2986,31 @@ public:
         {
             m_bsGroupSwapDst.push_back(group);
             m_bsGroupSwapSrc.push_back(last);
+            // The device still holds this group's outputs in the slot it had
+            // at the walk; every host read between now and the next walk has
+            // to go there. Compose with any earlier pending move of `last`.
+            const uint32_t srcSlot = deviceSlotOf(last);
+            m_bsSlotRemap.erase(last);
+            m_bsSlotRemap[group] = srcSlot;
         }
+        else
+        {
+            m_bsSlotRemap.erase(last);
+        }
+    }
+
+    /// Device output slot for a host group index, honouring group swaps made
+    /// since the last device walk (removals swap the last group into the
+    /// freed index on the host at once; the device carries the stored values
+    /// across only when it next runs). Identity when nothing is pending.
+    uint32_t deviceSlotOf(uint32_t group) const
+    {
+        if (m_bsSlotRemap.empty())
+        {
+            return group;
+        }
+        const auto it = m_bsSlotRemap.find(group);
+        return it == m_bsSlotRemap.end() ? group : it->second;
     }
 
     /// BLAST_BOND_STRESS_CSR_VERIFY=1: compare the incrementally-maintained
@@ -2905,6 +3108,7 @@ public:
             }
             m_bsGpuStressNormal = nullptr;
             m_bsGpuStressShear = nullptr;
+        m_bsGpuStressBend = nullptr;
             m_bsGpuNormal = nullptr;
             m_bsGpuCentroid = nullptr;
             m_bsGpuActive = true;
@@ -2952,10 +3156,42 @@ public:
         // Fetched on first use, like the vectors.
         m_bsGpuStressNormal = nullptr;
         m_bsGpuStressShear = nullptr;
+        m_bsGpuStressBend = nullptr;
         // Fetched on first use, not every tick -- see readbackGroupVectors.
         m_bsGpuNormal = nullptr;
         m_bsGpuCentroid = nullptr;
         m_bsGpuActive = true;
+        m_bsOverGroupSlots.clear();
+        m_bsOverRecords = nullptr;
+        m_bsOverComplete = false;
+        m_bsSlotRemap.clear();
+        m_bsUtilMax = result.utilisationMax;
+        m_bsAboveHalf = result.bondsAboveHalfUtilisation;
+        if (bondStressCompact() && result.overGroupsComplete
+            && result.overGroupIds != nullptr && result.overGroupRecords != nullptr)
+        {
+            m_bsOverComplete = true;
+            m_bsOverGroupSlots.reserve(result.overGroupCount);
+            for (uint32_t i = 0; i < result.overGroupCount; ++i)
+            {
+                m_bsOverGroupSlots.emplace_back(result.overGroupIds[i], i);
+            }
+            std::sort(m_bsOverGroupSlots.begin(), m_bsOverGroupSlots.end());
+            m_bsOverRecords = result.overGroupRecords;
+        }
+        if (bondStressCompactTrace()
+            && ((result.overGroupCount != 0 && m_bsCompactTracePrints++ < 12)
+                || (m_bsCsrTicks % 600u) < 2u))
+        {
+            fprintf(stderr,
+                    "[bs-compact] tick=%llu overGroups=%u complete=%d listed=%zu "
+                    "overstressedBonds=%u hits=%llu misses=%llu skips=%llu\n",
+                    (unsigned long long)m_bsCsrTicks, result.overGroupCount,
+                    result.overGroupsComplete ? 1 : 0, m_bsOverGroupSlots.size(),
+                    result.overstressedBondCount,
+                    (unsigned long long)m_bsOverHits, (unsigned long long)m_bsOverMisses,
+                    (unsigned long long)m_bsOverSkips);
+        }
 
 #if defined(NVBLAST_ENABLE_CUDA_STRESS)
         {
@@ -3054,7 +3290,7 @@ public:
     /// that 268k-entry scatter is most of the point -- so every consumer goes
     /// through here instead of reading BondData directly.
     bool bondStressOutputs(
-        uint32_t blastBondIndex, float& stressNormal, float& stressShear,
+        uint32_t blastBondIndex, float& stressNormal, float& stressShear, float& stressBend,
         nvidia::NvVec3& normal, nvidia::NvVec3& centroid) const
     {
         const uint32_t bondIndex = m_blastBondIndexMap[blastBondIndex];
@@ -3062,48 +3298,66 @@ public:
         {
             return false;
         }
-        // Only "is the device path live", NOT "have the stresses been fetched".
-        // Those became different questions when the readback went lazy, and
-        // conflating them sent every caller down the host path to read a
-        // BondData the device path never writes -- so every bond reported zero
-        // stress, nothing was ever damaged, and the city stopped fracturing
-        // entirely while the overstressed COUNT climbed to 4000. The dual-run
-        // audit could not see it: it makes the serial path authoritative, so
-        // it never exercises this branch.
         if (!m_bsGpuActive)
         {
             const BondData& bond = m_bondsData[bondIndex];
             stressNormal = bond.stressNormal;
             stressShear = bond.stressShear;
+            stressBend = bond.stressBend;
             normal = bond.normal;
             centroid = bond.centroid;
             return true;
         }
-        const uint32_t group = blastBondIndex < m_bsBlastBondGroup.size()
+        const uint32_t hostGroup = blastBondIndex < m_bsBlastBondGroup.size()
             ? m_bsBlastBondGroup[blastBondIndex]
             : invalidIndex<uint32_t>();
-        if (isInvalidIndex(group) || group >= m_bsCsrGroupSize.size())
+        if (isInvalidIndex(hostGroup) || hostGroup >= m_bsCsrGroupSize.size())
         {
-            // Internal bond (both endpoints in one solver node): the serial
-            // walk never updates it either, and syncBonds left it at zero.
             stressNormal = 0.0f;
             stressShear = 0.0f;
+            stressBend = 0.0f;
             normal = m_bondsData[bondIndex].normal;
             centroid = m_bondsData[bondIndex].centroid;
             return true;
+        }
+        const uint32_t group = deviceSlotOf(hostGroup);
+        // The compact list first: the fracture path only ever asks about
+        // bonds the walk flagged, and those groups came back with the walk's
+        // own readback. Anything else -- diagnostics that sweep every bond,
+        // the excess-force normal of a bond that broke outright -- pays the
+        // lazy full fetch below, once per tick, as before.
+        if (!m_bsOverGroupSlots.empty())
+        {
+            const auto it = std::lower_bound(
+                m_bsOverGroupSlots.begin(), m_bsOverGroupSlots.end(),
+                std::make_pair(group, uint32_t(0)));
+            if (it != m_bsOverGroupSlots.end() && it->first == group)
+            {
+                ++m_bsOverHits;
+                const float* rec = m_bsOverRecords + 9u * static_cast<size_t>(it->second);
+                stressNormal = rec[0];
+                stressShear = rec[1];
+                stressBend = rec[2];
+                normal = nvidia::NvVec3(rec[3], rec[4], rec[5]);
+                centroid = nvidia::NvVec3(rec[6], rec[7], rec[8]);
+                return true;
+            }
+            ++m_bsOverMisses;
         }
         if (m_bsGpuStressNormal == nullptr && !fetchBondStressStresses())
         {
             const BondData& bond = m_bondsData[bondIndex];
             stressNormal = bond.stressNormal;
             stressShear = bond.stressShear;
+            stressBend = bond.stressBend;
             normal = bond.normal;
             centroid = bond.centroid;
             return true;
         }
         stressNormal = m_bsGpuStressNormal[group];
         stressShear = m_bsGpuStressShear[group];
-        // The vectors cost 6 of the 8 floats per group and are wanted by
+        stressBend = m_bsGpuStressBend[group];
+        // The vectors cost 6 of the 9 floats per group and are wanted by
         // almost nothing on a given tick, so they are pulled across on first
         // use. Callers that only want stress never pay for them.
         if (m_bsGpuNormal == nullptr)
@@ -3290,7 +3544,48 @@ public:
                     if (m_bsGpuStressNormal == nullptr) { continue; }
                     const float devSn = m_bsGpuStressNormal[g];
                     const float devSs = m_bsGpuStressShear[g];
+                    const float devSb = m_bsGpuStressBend[g];
+                    if (k == 0)
+                    {
+                        // The compact list must name exactly the groups the
+                        // host flagged, and hand out the same numbers the full
+                        // arrays hold for them.
+                        ++m_bsGpuOverSetChecks;
+                        const auto it = std::lower_bound(
+                            m_bsOverGroupSlots.begin(), m_bsOverGroupSlots.end(),
+                            std::make_pair(g, uint32_t(0)));
+                        const bool inList =
+                            it != m_bsOverGroupSlots.end() && it->first == g;
+                        const bool hostFlag =
+                            g < m_groupOverstressed.size() && m_groupOverstressed[g] != 0u;
+                        if (!m_bsOverGroupSlots.empty() && inList != hostFlag)
+                        {
+                            ++m_bsGpuOverSetMismatches;
+                        }
+                        if (inList)
+                        {
+                            const float* rec = m_bsOverRecords + 9u * static_cast<size_t>(it->second);
+                            const float devN[3] = {m_bsGpuNormal ? m_bsGpuNormal[3 * g + 0] : rec[3],
+                                                   m_bsGpuNormal ? m_bsGpuNormal[3 * g + 1] : rec[4],
+                                                   m_bsGpuNormal ? m_bsGpuNormal[3 * g + 2] : rec[5]};
+                            if (memcmp(&rec[0], &devSn, sizeof(float)) != 0
+                                || memcmp(&rec[1], &devSs, sizeof(float)) != 0
+                                || memcmp(&rec[2], &devSb, sizeof(float)) != 0
+                                || memcmp(&rec[3], devN, sizeof(devN)) != 0)
+                            {
+                                ++m_bsGpuOverSetMismatches;
+                            }
+                        }
+                    }
                     ++m_bsGpuStressChecks;
+                    if (memcmp(&host.stressBend, &devSb, sizeof(float)) != 0)
+                    {
+                        ++m_bsGpuBendMismatches;
+                        const double hb = host.stressBend, db = devSb;
+                        const double rb = std::abs(hb) > 1e-9
+                            ? std::abs(db - hb) / std::abs(hb) : std::abs(db - hb);
+                        if (rb > m_bsGpuBendMaxRel) m_bsGpuBendMaxRel = rb;
+                    }
                     if (memcmp(&host.stressNormal, &devSn, sizeof(float)) != 0
                         || memcmp(&host.stressShear, &devSs, sizeof(float)) != 0)
                     {
@@ -3358,12 +3653,16 @@ public:
             // m_bondsData, so consumers must read that rather than the device
             // outputs.
             m_bsGpuActive = false;
+            m_bsOverComplete = false;
+            m_bsOverGroupSlots.clear();
+        m_bsOverComplete = false;
+        m_bsOverGroupSlots.clear();
             if (false)
             {
                 fprintf(stderr,
                         "[bond-stress-gpu] ticks=%llu checks=%llu MISMATCHES=%llu "
                         "(count=%llu removeSize=%llu removeOrder=%llu mask=%llu) "
-                        "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu) STRESS_MISMATCH=%llu/%llu big=%llu maxRel=%.3e IMPULSE=%llu/%llu impMaxRel=%.3e PAYLOAD(n=%llu node=%llu normal=%llu disp=%llu centroid=%llu)\n",
+                        "firstBadTick=%llu lastBadTick=%llu refuse(noSolver=%llu stale=%llu pendingTopo=%llu csr=%llu) STRESS_MISMATCH=%llu/%llu big=%llu maxRel=%.3e BEND_MISMATCH=%llu bendMaxRel=%.3e OVERSET_MISMATCH=%llu/%llu compactHits=%llu misses=%llu IMPULSE=%llu/%llu impMaxRel=%.3e PAYLOAD(n=%llu node=%llu normal=%llu disp=%llu centroid=%llu)\n",
                         (unsigned long long)m_bsCsrTicks,
                         (unsigned long long)m_bsGpuChecks,
                         (unsigned long long)m_bsGpuMismatches,
@@ -3381,6 +3680,12 @@ public:
                     (unsigned long long)m_bsGpuStressChecks,
                     (unsigned long long)m_bsGpuStressBig,
                     m_bsGpuStressMaxRel,
+                    (unsigned long long)m_bsGpuBendMismatches,
+                    m_bsGpuBendMaxRel,
+                    (unsigned long long)m_bsGpuOverSetMismatches,
+                    (unsigned long long)m_bsGpuOverSetChecks,
+                    (unsigned long long)m_bsOverHits,
+                    (unsigned long long)m_bsOverMisses,
                     (unsigned long long)m_bsImpMismatches,
                     (unsigned long long)m_bsImpChecks,
                     m_bsImpMaxRel,
@@ -3405,12 +3710,13 @@ public:
     /// consumers that were written against the AoS.
     void overlayBondStressOutputs(uint32_t blastBondIndex, BondData& bond) const
     {
-        float stressNormal, stressShear;
+        float stressNormal, stressShear, stressBend;
         nvidia::NvVec3 normal, centroid;
-        if (bondStressOutputs(blastBondIndex, stressNormal, stressShear, normal, centroid))
+        if (bondStressOutputs(blastBondIndex, stressNormal, stressShear, stressBend, normal, centroid))
         {
             bond.stressNormal = stressNormal;
             bond.stressShear = stressShear;
+            bond.stressBend = stressBend;
             bond.normal = normal;
             bond.centroid = centroid;
         }
@@ -3424,7 +3730,7 @@ public:
         {
             return false;
         }
-        return gpu->readbackGroupStresses(m_bsGpuStressNormal, m_bsGpuStressShear);
+        return gpu->readbackGroupStresses(m_bsGpuStressNormal, m_bsGpuStressShear, m_bsGpuStressBend);
 #else
         return false;
 #endif
@@ -4418,6 +4724,92 @@ public:
         return count;
     }
 
+    virtual bool                            getBondUtilisationSummary(float& utilisationMax, uint32_t& bondsAboveHalf) const override
+    {
+        if (m_graphProcessor->bondUtilisationSummary(utilisationMax, bondsAboveHalf))
+        {
+            if (bondStressCompactVerify())
+            {
+                // Recount on the host and, on disagreement, name the bonds
+                // the device left out.
+                uint32_t hostAbove = 0;
+                float hostMax = 0.0f;
+                static uint32_t dumps = 0;
+                for (uint32_t bondIndex = 0; bondIndex < m_assetBondCount; ++bondIndex)
+                {
+                    float c, t, sh;
+                    if (!(m_bondHealths[bondIndex] > 0.0f)
+                        || !m_graphProcessor->getBondStress(bondIndex, c, t, sh))
+                    {
+                        continue;
+                    }
+                    const ExtStressMaterial& material = materialForBond(bondIndex);
+                    float u = 0.0f;
+                    if (material.compressionElasticLimit > 0.0f) u = std::max(u, c / material.compressionElasticLimit);
+                    if (material.tensionElasticLimit > 0.0f) u = std::max(u, t / material.tensionElasticLimit);
+                    if (material.shearElasticLimit > 0.0f) u = std::max(u, sh / material.shearElasticLimit);
+                    if (!std::isfinite(u)) continue;
+                    hostMax = std::max(hostMax, u);
+                    if (u >= 0.5f)
+                    {
+                        ++hostAbove;
+                        if (u > utilisationMax && dumps < 6)
+                        {
+                            ++dumps;
+                            fprintf(stderr, "[bs-dbg] host util %g > device max %g\n", u, utilisationMax);
+                            m_graphProcessor->debugDeviceBondView("util", bondIndex);
+                        }
+                    }
+                }
+                if (hostAbove != bondsAboveHalf && dumps < 6)
+                {
+                    ++dumps;
+                    fprintf(stderr, "[bs-dbg] above-half host %u device %u max host %g device %g\n",
+                            hostAbove, bondsAboveHalf, hostMax, utilisationMax);
+                }
+            }
+            return true;
+        }
+        utilisationMax = 0.0f;
+        bondsAboveHalf = 0;
+        for (uint32_t bondIndex = 0; bondIndex < m_assetBondCount; ++bondIndex)
+        {
+            float bondUtilisation = 0.0f;
+            float bondCompression, bondTension, bondShear;
+            if (m_bondHealths[bondIndex] > 0.0f
+                && m_graphProcessor->getBondStress(
+                    bondIndex, bondCompression, bondTension, bondShear))
+            {
+                const ExtStressMaterial& material = materialForBond(bondIndex);
+                if (material.compressionElasticLimit > 0.0f)
+                {
+                    bondUtilisation = std::max(
+                        bondUtilisation, bondCompression / material.compressionElasticLimit);
+                }
+                if (material.tensionElasticLimit > 0.0f)
+                {
+                    bondUtilisation = std::max(
+                        bondUtilisation, bondTension / material.tensionElasticLimit);
+                }
+                if (material.shearElasticLimit > 0.0f)
+                {
+                    bondUtilisation = std::max(
+                        bondUtilisation, bondShear / material.shearElasticLimit);
+                }
+            }
+            if (!std::isfinite(bondUtilisation))
+            {
+                continue;
+            }
+            utilisationMax = std::max(utilisationMax, bondUtilisation);
+            if (bondUtilisation >= 0.5f)
+            {
+                ++bondsAboveHalf;
+            }
+        }
+        return true;
+    }
+
     virtual bool                            notifyActorCreated(const NvBlastActor& actor) override;
 
     virtual void                            notifyActorDestroyed(const NvBlastActor& actor) override;
@@ -5106,11 +5498,54 @@ static float damageRatePerSecond()
     return rate;
 }
 
+static bool bondStressCompactVerify()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("BLAST_BOND_STRESS_COMPACT_VERIFY");
+        return raw != nullptr && std::string(raw) != "0";
+    }();
+    return enabled;
+}
+static uint64_t s_compactVerifyChecks = 0;
+static uint64_t s_compactVerifyViolations = 0;
+
 bool ExtStressSolverImpl::generateStressDamage(const NvBlastActor& actor, uint32_t bondIndex, uint32_t node0, uint32_t node1)
 {
     const float bondHealth = m_bondHealths[bondIndex];
     float stressCompression, stressTension, stressShear;
-    if (bondHealth > 0.0f && m_graphProcessor->getBondStress(bondIndex, stressCompression, stressTension, stressShear))
+    const bool haveStress = bondHealth > 0.0f
+        && m_graphProcessor->getBondStressForDamage(bondIndex, stressCompression, stressTension, stressShear);
+    if (bondStressCompactVerify() && bondHealth > 0.0f && !haveStress)
+    {
+        // The shortcut said "this bond's group was not flagged, so it cannot
+        // be damaged". Fetch the real stresses and make sure that is so.
+        float c = 0.0f, t = 0.0f, sh = 0.0f;
+        ++s_compactVerifyChecks;
+        if (m_graphProcessor->getBondStress(bondIndex, c, t, sh))
+        {
+            const ExtStressMaterial& material = materialForBond(bondIndex);
+            if (c > material.compressionElasticLimit || t > material.tensionElasticLimit
+                || sh > material.shearElasticLimit)
+            {
+                ++s_compactVerifyViolations;
+                if (s_compactVerifyViolations <= 8)
+                {
+                    fprintf(stderr,
+                            "[bs-compact-verify] bond %u skipped but overstressed: c=%g/%g t=%g/%g s=%g/%g\n",
+                            bondIndex, c, material.compressionElasticLimit, t,
+                            material.tensionElasticLimit, sh, material.shearElasticLimit);
+                    m_graphProcessor->debugDeviceBondView("skip", bondIndex);
+                }
+            }
+        }
+        if ((s_compactVerifyChecks % 100000u) == 0u)
+        {
+            fprintf(stderr, "[bs-compact-verify] checks=%llu violations=%llu\n",
+                    (unsigned long long)s_compactVerifyChecks,
+                    (unsigned long long)s_compactVerifyViolations);
+        }
+    }
+    if (haveStress)
     {
         // Compression and tension are opposite directions of AXIAL load, but a
         // bending moment produces both at once on opposite faces, so both are

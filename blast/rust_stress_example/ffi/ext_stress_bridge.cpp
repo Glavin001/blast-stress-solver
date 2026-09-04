@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,7 +56,17 @@ struct ExtStressSolverHandleImpl
     // scan here is quadratic in the body count of a collapsing structure --
     // which is exactly the case that has to stay real time.
     std::vector<uint32_t> actorIndexToSlot;
+    // O(1) NvBlastActor* -> slot, rebuilt with the two above. The fracture
+    // generate wrapper used to rebuild this map on EVERY call -- one emplace
+    // per live actor per tick -- to resolve a handful of generated actors.
+    std::unordered_map<const NvBlastActor*, uint32_t> actorPointerToSlot;
     bool actorIndexDirty{true};
+    // Persistent scratch for generate_fracture_commands_per_actor: sized to
+    // the actor count but never filled -- the solver writes the first
+    // `generated` entries and reads none. Constructing two O(actors) vectors
+    // per tick was most of the wrapper's cost on a standing city.
+    std::vector<NvBlastFractureBuffers> generateBuffers;
+    std::vector<const NvBlastActor*> generateActors;
     std::vector<uint8_t> splitScratch;
     std::vector<NvBlastActor*> splitActors;
     std::vector<NvBlastBondFractureData> fractureScratch;
@@ -368,6 +379,12 @@ void ensureActorIndex(ExtStressSolverHandleImpl& handle)
                 handle.inputNodeToActorSlot[inputNode] = slot;
             }
         }
+    }
+    handle.actorPointerToSlot.clear();
+    handle.actorPointerToSlot.reserve(handle.actors.size());
+    for (uint32_t slot = 0; slot < handle.actors.size(); ++slot)
+    {
+        handle.actorPointerToSlot.emplace(handle.actors[slot].actor, slot);
     }
     handle.actorIndexDirty = false;
 }
@@ -934,6 +951,27 @@ ext_stress_solver_get_bond_utilisations(const ExtStressSolverHandle* handlePtr,
         return 0U;
     }
     return handle->solver->getBondUtilisations(out_utilisation, capacity);
+}
+
+extern "C" uint32_t
+ext_stress_solver_get_bond_utilisation_summary(const ExtStressSolverHandle* handlePtr,
+                                               float* out_max,
+                                               uint32_t* out_above_half)
+{
+    const auto* handle = reinterpret_cast<const ExtStressSolverHandleImpl*>(handlePtr);
+    if (!handle || !handle->solver || !out_max || !out_above_half)
+    {
+        return 0U;
+    }
+    float maxUtil = 0.0f;
+    uint32_t aboveHalf = 0;
+    if (!handle->solver->getBondUtilisationSummary(maxUtil, aboveHalf))
+    {
+        return 0U;
+    }
+    *out_max = maxUtil;
+    *out_above_half = aboveHalf;
+    return 1U;
 }
 
 /* --- chunk crushing -------------------------------------------------------
@@ -1804,35 +1842,44 @@ extern "C" uint8_t ext_stress_solver_generate_fracture_commands_per_actor(const 
     uint32_t commandCount = 0;
     uint32_t bondOffset = 0;
 
-    std::vector<NvBlastFractureBuffers> buffers(totalActors);
-    std::vector<const NvBlastActor*> llActors(totalActors);
-
-    for (uint32_t i = 0; i < totalActors; ++i)
+    // Non-const: the chunk fracture cache and the scratch are per handle.
+    auto* mutableHandle = const_cast<ExtStressSolverHandleImpl*>(handle);
+    // Capacity only. The solver writes the first `generated` entries of both
+    // and reads neither, so nothing here is initialised per call.
+    std::vector<NvBlastFractureBuffers>& buffers = mutableHandle->generateBuffers;
+    std::vector<const NvBlastActor*>& llActors = mutableHandle->generateActors;
+    if (buffers.size() < totalActors)
     {
-        const auto& entry = handle->actors[i];
-        llActors[i] = entry.actor;
-        buffers[i] = NvBlastFractureBuffers{};
+        buffers.resize(totalActors);
+        llActors.resize(totalActors);
     }
+
+    // BLAST_FFI_GEN_PROFILE=1: where the generate call's time goes -- the
+    // solver walk itself versus this wrapper's conversion -- printed every
+    // 600 calls. Diagnostic only.
+    static const bool genProfile = [] {
+        const char* raw = std::getenv("BLAST_FFI_GEN_PROFILE");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    const auto genStart = genProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     // The solver fills the first `generated` entries and also overwrites llActors[]
     // so that buffers[i] corresponds to llActors[i].
     const uint32_t generated = handle->solver->generateFractureCommandsPerActor(llActors.data(), buffers.data(), totalActors);
 
-    // Non-const: the chunk fracture cache is rebuilt from this generate pass.
-    auto* mutableHandle = const_cast<ExtStressSolverHandleImpl*>(handle);
+    static double genSolverMs = 0.0, genWrapMs = 0.0;
+    static uint64_t genCalls = 0, genBonds = 0;
+    const auto genMid = genProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     mutableHandle->pendingChunkFractures.clear();
 
-    // E6: one O(bodies) map build per CALL replaces one O(bodies) linear scan
-    // per generated actor. generate mutates no actor entries, so pointers
-    // stay valid for the whole loop.
-    std::unordered_map<const NvBlastActor*, const ExtStressSolverHandleImpl::ActorEntry*> actorsByPointer;
+    // Pointer -> slot through the persistent index, rebuilt only when the
+    // actor table changed (ensureActorIndex). This used to be rebuilt here on
+    // every call: one emplace per live actor per tick to resolve the few
+    // generated actors, ~0.2-0.4 ms at 4k bodies and growing with the city.
     if (applyIndexIncremental())
     {
-        actorsByPointer.reserve(handle->actors.size());
-        for (const auto& actorEntry : handle->actors)
-        {
-            actorsByPointer.emplace(actorEntry.actor, &actorEntry);
-        }
+        ensureActorIndex(*mutableHandle);
     }
 
     for (uint32_t i = 0; i < generated && commandCount < command_capacity; ++i)
@@ -1841,8 +1888,9 @@ extern "C" uint8_t ext_stress_solver_generate_fracture_commands_per_actor(const 
         const ExtStressSolverHandleImpl::ActorEntry* entry;
         if (applyIndexIncremental())
         {
-            const auto found = actorsByPointer.find(llActors[i]);
-            entry = found == actorsByPointer.end() ? nullptr : found->second;
+            const auto found = handle->actorPointerToSlot.find(llActors[i]);
+            entry = (found == handle->actorPointerToSlot.end() || found->second >= handle->actors.size())
+                ? nullptr : &handle->actors[found->second];
         }
         else
         {
@@ -1906,6 +1954,21 @@ extern "C" uint8_t ext_stress_solver_generate_fracture_commands_per_actor(const 
     if (out_bond_count)
     {
         *out_bond_count = bondOffset;
+    }
+
+    if (genProfile)
+    {
+        const auto genEnd = std::chrono::steady_clock::now();
+        genSolverMs += std::chrono::duration<double, std::milli>(genMid - genStart).count();
+        genWrapMs += std::chrono::duration<double, std::milli>(genEnd - genMid).count();
+        genBonds += bondOffset;
+        if (++genCalls % 600 == 0)
+        {
+            std::fprintf(stderr,
+                         "[ffi-gen] calls=%llu solver %.3f ms/call wrapper %.3f ms/call bonds %.1f/call\n",
+                         static_cast<unsigned long long>(genCalls), genSolverMs / genCalls,
+                         genWrapMs / genCalls, static_cast<double>(genBonds) / genCalls);
+        }
     }
 
     return (commandCount == generated) ? 1U : 2U;

@@ -916,6 +916,16 @@ public:
         uint32_t capacity) const = 0;
 
     /**
+     * The largest utilisation over every live bond and the number of bonds at
+     * or above 0.5, without filling a per-bond buffer. With the device
+     * bond-stress walk active these are reduced on the device and come back
+     * with the walk's own readback. Returns false if no solver is attached.
+     */
+    virtual bool getBondUtilisationSummary(
+        float& utilisationMax,
+        uint32_t& bondsAboveHalf) const = 0;
+
+    /**
      * Fracture-frame resimulation (engine contract §2.8). Capture before
      * PxScene::simulate; if the following tick fractured, restore between
      * fetchResults and the re-run simulate, then step and tick again so
