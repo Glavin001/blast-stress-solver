@@ -110,6 +110,12 @@ target_link_libraries(NvBlastExtStressPhysX PUBLIC blast_stress_core)
 
 if(BLAST_ENABLE_CUDA_STRESS)
     find_package(CUDAToolkit REQUIRED)
+    target_sources(NvBlastExtStressPhysX PRIVATE
+        "${BLAST_ROOT}/source/sdk/extensions/stressphysx/NvBlastExtStressPhysXContactGpu.cu")
+    target_compile_definitions(NvBlastExtStressPhysX PRIVATE NVBLAST_ENABLE_DIRECT_GPU_CONTACT_DRAIN)
+    set_target_properties(NvBlastExtStressPhysX PROPERTIES CUDA_ARCHITECTURES native CUDA_RUNTIME_LIBRARY Shared)
+    target_link_libraries(NvBlastExtStressPhysX PRIVATE CUDA::cudart)
+
     add_library(NvBlastExtStressGpu STATIC
         "${BLAST_ROOT}/source/sdk/extensions/stressgpu/NvBlastExtStressGpu.cu")
     target_include_directories(NvBlastExtStressGpu PUBLIC
@@ -145,6 +151,13 @@ set(PHYSX_LINK_LIBS
     dl
     pthread
     rt)
+
+# Application CUDA registration must resolve before the PhysX static group.
+# Otherwise its private CudaKernelWrangler intercepts __cudaRegisterFatBinary
+# and looks for engine-only PxGpuCudaRegister* symbols in our kernels.
+if(BLAST_ENABLE_CUDA_STRESS)
+    list(PREPEND PHYSX_LINK_LIBS CUDA::cudart)
+endif()
 
 add_executable(blast_stress_demo
     mini_city_main.cpp
@@ -487,6 +500,17 @@ add_test(NAME blast_stress_node_mesh
         "${REPO_ROOT}/blast/blast-stress-solver/assets/reference/reference-building.json")
 
 if(BLAST_ENABLE_CUDA_STRESS)
+    add_executable(direct_gpu_contact_test tests/direct_gpu_contact_test.cu physx_scene.cpp)
+    set_target_properties(direct_gpu_contact_test PROPERTIES CUDA_ARCHITECTURES native CUDA_RUNTIME_LIBRARY Shared)
+    target_link_options(direct_gpu_contact_test PRIVATE "-Wl,-rpath,${PHYSX_LIB_DIR}")
+    target_link_libraries(direct_gpu_contact_test PRIVATE NvBlastExtStressPhysX ${PHYSX_LINK_LIBS})
+    add_test(NAME blast_stress_physx_direct_gpu_contacts COMMAND direct_gpu_contact_test)
+
+    add_executable(gpu_device_input_test tests/gpu_device_input_test.cu)
+    set_target_properties(gpu_device_input_test PROPERTIES CUDA_ARCHITECTURES native)
+    target_link_libraries(gpu_device_input_test PRIVATE NvBlastExtStressGpu)
+    add_test(NAME blast_stress_gpu_device_input COMMAND gpu_device_input_test)
+
     add_executable(gpu_stress_test tests/gpu_stress_test.cpp)
     target_include_directories(gpu_stress_test PRIVATE
         "${BLAST_ROOT}/include/extensions/stressgpu"

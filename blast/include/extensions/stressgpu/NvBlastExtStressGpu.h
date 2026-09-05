@@ -109,6 +109,7 @@ struct ExtStressGpuTelemetry
     std::uint32_t iterations{0};
     std::uint64_t hostToDeviceBytes{0};
     std::uint64_t deviceToHostBytes{0};
+    std::uint64_t deviceToDeviceBytes{0};
     bool converged{false};
     /// Disconnected components the solver partitions its bonds into. Fixed for
     /// the solver's lifetime: topology changes go through a new solver.
@@ -279,6 +280,27 @@ public:
     virtual bool solve(
         const ExtStressGpuImpulse* nodeVelocities,
         const ExtStressGpuSolveParams& params) = 0;
+
+    /**
+     * Solve from node loads already resident in this solver's CUDA context.
+     *
+     * deviceNodeVelocities contains exactly nodeCount elements in solver node
+     * order. producerReady is an optional CUevent/cudaEvent_t, passed as void*
+     * to keep this header CUDA-independent. Record it on the producer stream
+     * before calling; without an event the inputs must already be ready.
+     * The input allocation and event must remain valid until this call returns.
+     *
+     * Loads never visit host memory. A device copy into persistent solver
+     * storage preserves captured graph addresses and the next solve's baseline.
+     * Settled skipping uses the same equality and convergence rules as solve();
+     * it currently reads back one dirty flag per island for host scheduling.
+     * This call waits for completion, like solve(). It does not read impulses.
+     */
+    virtual bool solveDevice(
+        const ExtStressGpuImpulse* deviceNodeVelocities,
+        std::uint32_t nodeCount,
+        const ExtStressGpuSolveParams& params,
+        void* producerReady = nullptr) = 0;
 
     virtual bool readbackImpulses(
         ExtStressGpuImpulse* bondImpulses,

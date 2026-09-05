@@ -36,6 +36,28 @@ namespace
 
 constexpr std::uint32_t kBlockSize = 256;
 
+// Compare on the device against the actual last submitted loads. Match the
+// host's float equality, including signed zero and NaN behavior. Static nodes
+// have no island; their values are still copied into the persistent baseline.
+__global__ void markChangedInputIslands(
+    const ExtStressGpuImpulse* next, const ExtStressGpuImpulse* previous,
+    const std::uint32_t* nodeIsland, std::uint32_t nodeCount,
+    std::uint32_t* dirty)
+{
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nodeCount) { return; }
+    const auto a = next[i];
+    const auto b = previous[i];
+    const bool equal = a.angular.x == b.angular.x && a.angular.y == b.angular.y
+        && a.angular.z == b.angular.z && a.linear.x == b.linear.x
+        && a.linear.y == b.linear.y && a.linear.z == b.linear.z;
+    if (!equal && nodeIsland[i] != 0xffffffffu)
+    {
+        atomicExch(dirty + nodeIsland[i], 1u);
+    }
+}
+
+
 /// BLAST_GPU_SKIP_DEBUG=1 traces the settled-island decision every 60 solves.
 /// Kept in because "islands skipped = 0" has two very different causes -- the
 /// mechanism is off, or the scene genuinely never settles -- and they are
@@ -2792,6 +2814,7 @@ uploadIslands();
         cudaFree(m_scatterIndices);
         cudaFree(m_islandConverged);
         cudaFree(m_islandSkip);
+        cudaFree(m_deviceIslandDirty);
         cudaFree(m_reduceScratch);
         cudaFree(m_status);
         cudaFree(m_previousGradientSquared);
@@ -2936,6 +2959,25 @@ uploadIslands();
         const ExtStressGpuImpulse* nodeVelocities,
         const ExtStressGpuSolveParams& params) override
     {
+        return solveInputs(nodeVelocities, params, false, nullptr);
+    }
+
+    bool solveDevice(
+        const ExtStressGpuImpulse* nodeVelocities,
+        std::uint32_t nodeCount,
+        const ExtStressGpuSolveParams& params,
+        void* producerReady) override
+    {
+        if (nodeCount != m_nodeCount) { return false; }
+        return solveInputs(nodeVelocities, params, true, producerReady);
+    }
+
+    bool solveInputs(
+        const ExtStressGpuImpulse* nodeVelocities,
+        const ExtStressGpuSolveParams& params,
+        bool deviceInput, void* producerReady)
+    {
+        m_skipStableUnconverged = params.skipStableUnconverged;
         ContextGuard context(m_cudaContext);
         using HostClock = std::chrono::steady_clock;
         const auto hostMs = [](HostClock::time_point from) {
@@ -2943,7 +2985,7 @@ uploadIslands();
                 .count();
         };
         const auto planStart = HostClock::now();
-        if (!enqueueSolve(nodeVelocities, params))
+        if (!enqueueSolve(nodeVelocities, params, deviceInput, producerReady))
         {
             return false;
         }
@@ -4152,7 +4194,8 @@ private:
 
     bool enqueueSolve(
         const ExtStressGpuImpulse* nodeVelocities,
-        const ExtStressGpuSolveParams& params)
+        const ExtStressGpuSolveParams& params,
+        bool deviceInput = false, void* producerReady = nullptr)
     {
         // Latch the bending policy the host resolved, so every kernel this
         // solve launches uses the same one the CPU walk does.
@@ -4209,38 +4252,43 @@ private:
         const bool skipping =
             params.skipSettledIslands && params.warmStart && m_hasWarmStart;
 
-        // m_hostInput is both the staging buffer and the settled baseline: it
-        // is a byte-for-byte record of what the device already holds, so
-        // "differs from the baseline" and "the device's copy is stale" are the
-        // same question and get asked once.
+        if (deviceInput && producerReady)
+        {
+            checkCuda(cudaStreamWaitEvent(m_stream,
+                reinterpret_cast<cudaEvent_t>(producerReady), 0),
+                "wait for device stress producer");
+        }
+        // Switching back to host input must not compare against an obsolete
+        // host mirror. Revalidate the settled baseline on that first host solve.
+        if (!deviceInput && !m_hostInputValid)
+        {
+            invalidateSettledBaseline();
+        }
         if (skipping)
         {
             const auto skipStart = StatClock::now();
-            planSettledSkip(nodeVelocities);
+            if (deviceInput) { planDeviceSettledSkip(nodeVelocities); }
+            else { planSettledSkip(nodeVelocities); }
             m_statPlanSkipMs += statMs(skipStart);
         }
         else
         {
-            std::memcpy(
-                m_hostInput,
-                nodeVelocities,
-                sizeof(ExtStressGpuImpulse) * m_nodeCount);
+            if (!deviceInput)
+            {
+                std::memcpy(m_hostInput, nodeVelocities,
+                    sizeof(ExtStressGpuImpulse) * m_nodeCount);
+            }
             std::fill(m_hostIslandSkip, m_hostIslandSkip + m_islandCount, 0u);
             m_changedBonds.resize(m_bondCount);
-            for (std::uint32_t i = 0; i < m_bondCount; ++i)
-            {
-                m_changedBonds[i] = i;
-            }
+            for (std::uint32_t i = 0; i < m_bondCount; ++i) { m_changedBonds[i] = i; }
             m_changedNodes.clear();
         }
+        m_hostInputValid = !deviceInput;
 
-        if (skipping
-            && m_changedNodes.empty()
-            && m_telemetry.islandsSkipped == m_islandCount)
+        const bool noOp = skipping && m_changedNodes.empty()
+            && m_telemetry.islandsSkipped == m_islandCount;
+        if (noOp && !deviceInput)
         {
-            // Nothing anywhere in the graph moved. Even the empty graph replay
-            // costs a launch per kernel per iteration, so the whole frame is
-            // elided rather than run over an all-skip mask.
             m_solveWasNoOp = true;
             m_changedBonds.clear();
             m_telemetry.converged = true;
@@ -4248,34 +4296,45 @@ private:
         }
 
         checkCuda(cudaEventRecord(m_uploadStart, m_stream), "record upload start");
-        if (skipping)
+        if (skipping && !noOp)
         {
-            checkCuda(
-                cudaMemcpyAsync(
-                    m_islandSkip,
-                    m_hostIslandSkip,
-                    sizeof(std::uint32_t) * m_islandCount,
-                    cudaMemcpyHostToDevice,
-                    m_stream),
-                "upload island skip mask");
+            checkCuda(cudaMemcpyAsync(m_islandSkip, m_hostIslandSkip,
+                sizeof(std::uint32_t) * m_islandCount, cudaMemcpyHostToDevice,
+                m_stream), "upload island skip mask");
             m_telemetry.hostToDeviceBytes +=
                 sizeof(std::uint32_t) * static_cast<std::uint64_t>(m_islandCount);
-            uploadChangedVelocities();
         }
+        if (deviceInput)
+        {
+            checkCuda(cudaMemcpyAsync(m_input, nodeVelocities,
+                sizeof(ExtStressGpuImpulse) * m_nodeCount, cudaMemcpyDeviceToDevice,
+                m_stream), "copy device stress inputs");
+            m_telemetry.deviceToDeviceBytes +=
+                sizeof(ExtStressGpuImpulse) * static_cast<std::uint64_t>(m_nodeCount);
+        }
+        else if (skipping) { uploadChangedVelocities(); }
         else
         {
-            checkCuda(
-                cudaMemcpyAsync(
-                    m_input,
-                    m_hostInput,
-                    sizeof(ExtStressGpuImpulse) * m_nodeCount,
-                    cudaMemcpyHostToDevice,
-                    m_stream),
-                "upload stress inputs");
+            checkCuda(cudaMemcpyAsync(m_input, m_hostInput,
+                sizeof(ExtStressGpuImpulse) * m_nodeCount, cudaMemcpyHostToDevice,
+                m_stream), "upload stress inputs");
             m_telemetry.hostToDeviceBytes +=
                 sizeof(ExtStressGpuImpulse) * static_cast<std::uint64_t>(m_nodeCount);
         }
         checkCuda(cudaEventRecord(m_uploadStop, m_stream), "record upload stop");
+
+        if (noOp)
+        {
+            // Even nodes outside a live island must refresh their baseline.
+            // Complete that copy before returning ownership to the producer.
+            const auto waitStart = StatClock::now();
+            checkCuda(cudaEventSynchronize(m_uploadStop), "wait for device input copy");
+            m_activeListSyncMilliseconds += statMs(waitStart);
+            m_solveWasNoOp = true;
+            m_changedBonds.clear();
+            m_telemetry.converged = true;
+            return true;
+        }
 
         // After the mask upload (compaction reads it), before the graph
         // launch (the kernels read the lists).
@@ -4454,6 +4513,41 @@ private:
             }
         }
 
+        finishSettledSkip(haveBaseline);
+    }
+
+    void planDeviceSettledSkip(const ExtStressGpuImpulse* nodeVelocities)
+    {
+        const bool haveBaseline = m_settledBaselineValid;
+        m_islandDirty.assign(m_islandCount, haveBaseline ? 0u : 1u);
+        m_changedNodes.clear();
+        if (haveBaseline)
+        {
+            checkCuda(cudaMemsetAsync(m_deviceIslandDirty, 0,
+                sizeof(std::uint32_t) * m_islandCount, m_stream), "clear input dirty flags");
+            markChangedInputIslands<<<(m_nodeCount + kBlockSize - 1) / kBlockSize,
+                kBlockSize, 0, m_stream>>>(nodeVelocities, m_input, m_nodeIsland,
+                    m_nodeCount, m_deviceIslandDirty);
+            checkCuda(cudaGetLastError(), "compare device stress inputs");
+            checkCuda(cudaMemcpyAsync(m_hostIslandSkip, m_deviceIslandDirty,
+                sizeof(std::uint32_t) * m_islandCount, cudaMemcpyDeviceToHost,
+                m_stream), "read input dirty flags");
+            m_telemetry.deviceToHostBytes +=
+                sizeof(std::uint32_t) * static_cast<std::uint64_t>(m_islandCount);
+            checkCuda(cudaEventRecord(m_statusReady, m_stream), "record input flags ready");
+            const auto waitStart = StatClock::now();
+            checkCuda(cudaEventSynchronize(m_statusReady), "wait for input flags");
+            m_activeListSyncMilliseconds += statMs(waitStart);
+            for (std::uint32_t k = 0; k < m_islandCount; ++k)
+            {
+                m_islandDirty[k] = m_hostIslandSkip[k] != 0u;
+            }
+        }
+        finishSettledSkip(haveBaseline);
+    }
+
+    void finishSettledSkip(bool haveBaseline)
+    {
         // Nodes whose bonds broke or were removed since the last solve: their
         // islands must re-solve regardless of the velocity compare, because
         // frozen impulses no longer describe the changed topology.
@@ -5720,6 +5814,7 @@ private:
         allocateDevice(m_islandActive, m_islandCapacity, "allocate island active flags");
         allocateDevice(m_islandConverged, m_islandCapacity, "allocate island converged flags");
         allocateDevice(m_islandSkip, m_islandCapacity, "allocate island skip mask");
+        allocateDevice(m_deviceIslandDirty, m_islandCapacity, "allocate device input dirty flags");
         allocateDevice(
             m_blockActiveCounts,
             (m_islandCapacity + kBlockSize - 1) / kBlockSize + 1,
@@ -7176,6 +7271,7 @@ private:
     /// This frame's decision, one entry per island, uploaded before the graph
     /// runs. 1 = settled, do not touch.
     std::uint32_t* m_islandSkip{nullptr};
+    std::uint32_t* m_deviceIslandDirty{nullptr};
     KernelProfile m_kernelProfile;
     std::uint32_t m_profiledSolves{0};
     std::uint32_t* m_blockActiveCounts{nullptr};
@@ -7232,6 +7328,7 @@ private:
     /// Pinned staging that doubles as the settled baseline: a byte-exact
     /// record of the velocities the device currently holds.
     ExtStressGpuImpulse* m_hostInput{nullptr};
+    bool m_hostInputValid{true};
     AngLin* m_hostImpulses{nullptr};
     SolveStatus* m_hostStatus{nullptr};
     std::uint32_t* m_hostBrokenCount{nullptr};
