@@ -309,6 +309,14 @@ target_link_libraries(direct_gpu_resim_test PRIVATE
     ${PHYSX_LINK_LIBS})
 add_test(NAME blast_stress_physx_direct_gpu_resim COMMAND direct_gpu_resim_test)
 
+# Opt-in performance experiment: sleeping versus readback savings. Not a CTest
+# latency gate; run exclusively on the GPU and retain the raw CSV.
+add_executable(gpu_activity_bench tests/gpu_activity_bench.cpp physx_scene.cpp)
+target_include_directories(gpu_activity_bench PRIVATE "${PHYSX_ROOT}/include")
+target_compile_definitions(gpu_activity_bench PRIVATE PX_PHYSX_STATIC_LIB NDEBUG)
+target_link_options(gpu_activity_bench PRIVATE "-Wl,-rpath,${PHYSX_LIB_DIR}")
+target_link_libraries(gpu_activity_bench PRIVATE ${PHYSX_LINK_LIBS})
+
 add_executable(scene_pack_test
     tests/scene_pack_test.cpp
     scene_pack.cpp)

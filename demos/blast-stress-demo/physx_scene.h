@@ -55,7 +55,8 @@ public:
         bool requireGpu,
         const SceneCapacity& capacity,
         physx::PxSimulationEventCallback* events,
-        bool enableDirectGpuApi = false);
+        bool enableDirectGpuApi = false,
+        bool disableSleeping = false);
     ~PhysXScene();
 
     PhysXScene(const PhysXScene&) = delete;

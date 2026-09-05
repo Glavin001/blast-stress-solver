@@ -105,7 +105,9 @@ int main()
         auto& cuda = *context.cudaContextManager();
         checkCouple(cuda);
         auto* body = context.physics().createRigidDynamic(PxTransform(PxVec3(0, 0.7f, 0)));
-        auto* shape = context.physics().createShape(PxBoxGeometry(0.5f), context.material(), true);
+        const PxBoxGeometry geometry(PxVec3(0.5f));
+        require(geometry.isValid(), "invalid fixture geometry");
+        auto* shape = context.physics().createShape(geometry, context.material(), true);
         require(body && shape && body->attachShape(*shape), "body creation failed");
         shape->release();
         body->setMass(2.0f); body->setMassSpaceInertiaTensor(PxVec3(1.0f));

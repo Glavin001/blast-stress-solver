@@ -102,7 +102,8 @@ PhysXScene::PhysXScene(
     bool requireGpu,
     const SceneCapacity& capacity,
     physx::PxSimulationEventCallback* events,
-    bool enableDirectGpuApi)
+    bool enableDirectGpuApi,
+    bool disableSleeping)
     : m_mode(mode)
     , m_requireGpu(requireGpu)
     , m_directGpuApiRequested(enableDirectGpuApi)
@@ -173,6 +174,10 @@ PhysXScene::PhysXScene(
     desc.solverType = physx::PxSolverType::eTGS;
     desc.flags |= physx::PxSceneFlag::eENABLE_PCM;
     desc.flags |= physx::PxSceneFlag::eENABLE_STABILIZATION;
+    if (disableSleeping)
+    {
+        desc.flags |= physx::PxSceneFlag::eDISABLE_SLEEPING;
+    }
 
     if (m_mode == PhysicsMode::Gpu)
     {

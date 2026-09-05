@@ -126,7 +126,9 @@ int main(int argc, char** argv)
         {
             auto* body = context.physics().createRigidDynamic(PxTransform(PxVec3(float(i % 128)*2, 100.0f, float(i/128)*2)));
             require(body != nullptr, "body create failed");
-            auto* shape = context.physics().createShape(PxBoxGeometry(0.25f), context.material(), true);
+            const PxBoxGeometry geometry(PxVec3(0.25f));
+            require(geometry.isValid(), "invalid fixture geometry");
+            auto* shape = context.physics().createShape(geometry, context.material(), true);
             require(shape && body->attachShape(*shape), "shape create failed");
             shape->release();
             body->setMass(1.0f);
